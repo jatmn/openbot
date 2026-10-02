@@ -1183,9 +1183,6 @@ export class BrowserHost {
     },
     evaluate: async ({ args }, params) => {
       this.#requireToolTab(params, args.tabId);
-      // Recorded before the script runs: a failed or timed-out evaluation can still have left a listener.
-      const origin = urlOrigin(currentTabUrl(this.#requireTab(args.tabId)));
-      if (origin) this.#agentScriptedOrigins.add(origin);
       return textResult(
         await this.#runEvaluation(
           args.tabId,
@@ -1969,13 +1966,22 @@ export class BrowserHost {
     timeoutMs: number,
   ): Promise<BrowserJsonValue> {
     const tab = this.#requireTab(tabId);
+    // The origin is read in the tab's queue, just before the script runs, and again when it ends: a
+    // navigation queued before it, or one that commits while it runs, decides where it ran.
+    const markScripted = () => {
+      const origin = urlOrigin(currentTabUrl(tab));
+      if (origin) this.#agentScriptedOrigins.add(origin);
+    };
     return runTabEvaluation(
       tab,
-      () => this.#requireNoSecretDocument(tab, "Page evaluation"),
+      () => {
+        this.#requireNoSecretDocument(tab, "Page evaluation");
+        markScripted();
+      },
       expression,
       awaitPromise,
       timeoutMs,
-    );
+    ).finally(markScripted);
   }
 
   /** The app contents that has focus, unless it is one of the browser's own tabs. */

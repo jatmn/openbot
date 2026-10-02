@@ -924,6 +924,47 @@ describe("secure browser handoff", () => {
     after.prepared.cancel();
   });
 
+  it("marks the site that the script runs on when a navigation is queued before it", async () => {
+    const tab = await host.open("https://example.com/secure", "thread", "agent");
+    const call = (tool: "navigate" | "evaluate", args: { url: string } | { expression: string }) =>
+      host.handleDynamicTool({
+        namespace: "openbot_browser",
+        tool,
+        arguments: { tabId: tab.id, ...args },
+        threadId: "thread",
+        ownerAgentId: "agent",
+        turnId: "turn",
+        callId: tool,
+      });
+    const passwordCard = (tabId: string) =>
+      host.prepareSecret({
+        namespace: "openbot_browser",
+        tool: "submit_secret",
+        threadId: "thread",
+        ownerAgentId: "agent",
+        turnId: "turn",
+        callId: "secret",
+        arguments: {
+          tabId,
+          method: "password",
+          targets: [{ kind: "css", selector: "input" }],
+          submission: "on_input",
+        },
+      });
+
+    // Sent together, as overlapping provider requests are: the script runs after the navigation.
+    await Promise.all([call("navigate", { url: "https://example.org/login" }), call("evaluate", { expression: "1" })]);
+
+    const scripted = await passwordCard(tab.id);
+    expect(scripted.request.origin).toBe("https://example.org");
+    expect(scripted.agentScriptedOrigin).toBe(true);
+    scripted.cancel();
+    const untouched = await host.open("https://example.com/secure", "thread", "agent");
+    const clean = await passwordCard(untouched.id);
+    expect(clean.agentScriptedOrigin).toBe(false);
+    clean.cancel();
+  });
+
   it("prepares a password card when the provider supplies zero unused digits", async () => {
     const { prepared } = await prepare("password", 0);
     expect(prepared.request.method).toBe("password");
