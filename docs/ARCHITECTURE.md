@@ -1649,7 +1649,9 @@ that `checkSetup()` reads: a CLI of 2.18 or later (the user's own on `PATH`, els
 `<userData>/provider-state/1password-cli`), the 1Password app's CLI integration (`op account list`
 answers at least one account), and Connect. The service keeps only the token in
 `openbot-onepassword-connector-v1.json`, encrypted with `safeStorage`. It reads the vault with
-`@1password/sdk` and implements `PasswordVault` (`src/backend/password-vault.ts`). The agent service
+`@1password/sdk` and implements `PasswordVault` (`src/backend/password-vault.ts`). The developer
+instructions tell agents about the vault only while `PasswordVault.connected()` is true, read at
+each session start and resume, because most users have no vault. The agent service
 uses it in two places: `openbot_browser.list_logins` returns the logins saved for the tab's HTTPS
 site (id, title, username), and `AttentionRegistry` answers a `submit_secret` password or
 authenticator request for a saved login by filling it through the same `prepareSecret` path as the

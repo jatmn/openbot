@@ -25,6 +25,8 @@ export interface VaultLogin {
 }
 
 export interface PasswordVault {
+  /** Whether a vault is connected now. Agents are told about the vault only while it is. */
+  connected(): boolean;
   /** The logins saved for `origin`, or null while no vault is connected. */
   loginsFor(origin: string): Promise<VaultLogin[] | null>;
   /**

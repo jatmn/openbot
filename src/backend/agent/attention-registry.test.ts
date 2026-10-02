@@ -1272,6 +1272,7 @@ describe("filling from the shared password vault", () => {
       }),
     };
     const passwordVault: PasswordVault = {
+      connected: () => true,
       loginsFor: async () => logins,
       secretFor: async (loginId, origin, kind) =>
         loginId === LOGIN.id && origin === "https://example.com" && kind === "password" ? PASSWORD : null,

@@ -411,6 +411,10 @@ export class OnePasswordConnectorService implements PasswordVault {
     return this.status();
   }
 
+  connected(): boolean {
+    return this.#store.read() !== null;
+  }
+
   async loginsFor(origin: string): Promise<VaultLogin[] | null> {
     if (!this.#store.read()) return null;
     // An answer read from a connection that Disconnect removed or a new one replaced is dropped.

@@ -578,6 +578,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       mcpToolRuntimes: () => this.#mcp.toolRuntimes(),
       mcpAuthorization: (config) => this.#mcp.authorization(config),
       ...(credentials.agentEnvironment ? { agentEnvironment: credentials.agentEnvironment } : {}),
+      passwordVaultConnected: () => options.passwordVault?.connected() ?? false,
       hooks: {
         logRecovery: (agentId, provider, outcome) =>
           logger.warn("Recovered an unavailable provider session.", { agentId, provider, outcome }),
