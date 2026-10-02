@@ -53,21 +53,28 @@ export function createOnePasswordConnector(
     unsubscribe();
   });
 
+  /**
+   * Each action is one attempt. Cancel starts a new one and frees the buttons at once: main can still
+   * be finishing the cancelled read, and its late answer must not replace the newer status or lock.
+   */
+  let attempt = 0;
   const run = (action: () => Promise<OnePasswordConnectorStatus>, waits = true) => {
     if (waits && busy()) return;
-    if (waits) setBusy(true);
+    const current = ++attempt;
+    setBusy(waits);
     void action()
       .then((next) => {
-        if (!disposed) setStatus(next);
+        if (!disposed && current === attempt) setStatus(next);
       })
       .catch((error: unknown) => {
+        if (current !== attempt) return;
         const { t, errorMessage } = currentText();
         toast.error(t("connector.onePassword.actionFailed"), {
           description: errorMessage(error, t("connector.onePassword.actionFailed")),
         });
       })
       .finally(() => {
-        if (waits && !disposed) setBusy(false);
+        if (!disposed && current === attempt) setBusy(false);
       });
   };
 
