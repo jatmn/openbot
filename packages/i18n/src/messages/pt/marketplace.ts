@@ -83,6 +83,7 @@ export const messages = {
   "marketplace.app.custom": "Servidor MCP",
   "marketplace.app.githubTagline": "Repositórios, issues e pull requests",
   "marketplace.app.onePasswordTagline": "Entre em sites com os logins que você compartilha",
+  "marketplace.app.onePasswordCategory": "Gerenciamento de logins e credenciais",
   "marketplace.app.yourApps": "Seus apps",
   "marketplace.app.moreApps": "Mais apps",
   "marketplace.app.server": "Servidor",

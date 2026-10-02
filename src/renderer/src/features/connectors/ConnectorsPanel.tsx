@@ -2,9 +2,14 @@ import type { GitHubConnectorStatus, OnePasswordConnectorStatus } from "@openbot
 import { Button, ChevronLeft } from "@openbot/ui";
 import type { AgentProfile } from "@openbot/ui/data";
 import { GitHubConnectorPanel } from "@openbot/ui/features/settings/GitHubConnectorPanel";
-import { GitHubMark, type IntegrationStatus, SlackMark } from "@openbot/ui/features/settings/IntegrationLayout";
+import {
+  GitHubMark,
+  type IntegrationStatus,
+  OnePasswordMark,
+  SlackMark,
+} from "@openbot/ui/features/settings/IntegrationLayout";
 import { IntegrationsHub, type IntegrationsHubRow } from "@openbot/ui/features/settings/IntegrationsHub";
-import { OnePasswordConnectorPanel, OnePasswordMark } from "@openbot/ui/features/settings/OnePasswordConnectorPanel";
+import { OnePasswordConnectorPanel } from "@openbot/ui/features/settings/OnePasswordConnectorPanel";
 import {
   SlackIntegrationPanel,
   slackIntegrationState,

@@ -48,7 +48,6 @@ export { default as HardDrive } from "lucide-solid/icons/hard-drive";
 export { default as Hash } from "lucide-solid/icons/hash";
 export { default as Image } from "lucide-solid/icons/image";
 export { default as Info } from "lucide-solid/icons/info";
-export { default as KeyRound } from "lucide-solid/icons/key-round";
 export { default as LifeBuoy } from "lucide-solid/icons/life-buoy";
 export { default as Link } from "lucide-solid/icons/link";
 export { default as Link2 } from "lucide-solid/icons/link-2";

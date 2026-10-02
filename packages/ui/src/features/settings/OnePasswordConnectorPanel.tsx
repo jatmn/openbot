@@ -13,7 +13,6 @@ import {
   ItemDescription,
   ItemGroup,
   ItemTitle,
-  KeyRound,
   OctagonX,
   SettingsSection,
   Spinner,
@@ -21,7 +20,7 @@ import {
 } from "@openbot/ui";
 import { createSignal, For, Show } from "solid-js";
 import { useText } from "../../text";
-import { DangerZone, DetailHeader, type IntegrationStatus } from "./IntegrationLayout";
+import { DangerZone, DetailHeader, type IntegrationStatus, OnePasswordMark } from "./IntegrationLayout";
 
 export interface OnePasswordConnectorPanelProps {
   status: OnePasswordConnectorStatus;
@@ -40,11 +39,6 @@ const HEADER_STATUS = {
   "choose-account": { status: "idle", label: "connector.onePassword.statusConnecting" },
   connected: { status: "connected", label: "connector.onePassword.statusConnected" },
 } as const satisfies Record<OnePasswordConnectorStatus["state"], { status: IntegrationStatus; label: string }>;
-
-/** 1Password's mark is not in Lucide; a key stands for it, as the page names 1Password next to it. */
-export function OnePasswordMark(props: { class?: string | undefined }) {
-  return <KeyRound class={props.class} aria-hidden="true" />;
-}
 
 /**
  * The 1Password page of one OpenBot computer. The token never reaches this component after the user

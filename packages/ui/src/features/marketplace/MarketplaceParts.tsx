@@ -5,8 +5,7 @@ import { SkillGradient } from "@openbot/ui/skill-gradient";
 import { useText } from "@openbot/ui/text";
 import type { JSX } from "@solidjs/web";
 import { createSignal, For, Match, Show, Switch } from "solid-js";
-import { GitHubMark, LogoTile } from "../settings/IntegrationLayout";
-import { OnePasswordMark } from "../settings/OnePasswordConnectorPanel";
+import { GitHubMark, LogoTile, OnePasswordMark } from "../settings/IntegrationLayout";
 import type { MarketplaceApp } from "./marketplace-model";
 
 /** The top of an agent or skill page. The window moves the focus to the title when the page opens. */
