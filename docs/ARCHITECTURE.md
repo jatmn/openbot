@@ -1643,7 +1643,11 @@ environment values, `src/backend/mcp-redaction.ts` removes them from logs, and O
 
 The 1Password connector is built in and has no SQLite row. `src/main/onepassword-connector-service.ts`
 runs the user's `op` CLI once to create the vault "Shared with OpenBot" and a `read_items` service
-account, or takes a pasted service account token, and keeps only the token in
+account, or takes a pasted service account token. Before Connect, the page shows three setup steps
+that `checkSetup()` reads: a CLI of 2.18 or later (the user's own on `PATH`, else the copy that
+`src/main/onepassword-cli-installer.ts` downloads, with a SHA-256 pinned per target, into
+`<userData>/provider-state/1password-cli`), the 1Password app's CLI integration (`op account list`
+answers at least one account), and Connect. The service keeps only the token in
 `openbot-onepassword-connector-v1.json`, encrypted with `safeStorage`. It reads the vault with
 `@1password/sdk` and implements `PasswordVault` (`src/backend/password-vault.ts`). The agent service
 uses it in two places: `openbot_browser.list_logins` returns the logins saved for the tab's HTTPS

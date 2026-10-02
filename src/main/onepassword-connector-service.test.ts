@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  type OnePasswordCli,
   type OnePasswordClient,
+  type OnePasswordCliRunner,
   OnePasswordConnectorService,
 } from "./onepassword-connector-service";
 import { OnePasswordConnectorStore } from "./onepassword-connector-store";
@@ -51,7 +51,7 @@ function fakeClient(): OnePasswordClient {
 }
 
 function fakeCli(accounts: Array<{ account_uuid: string; email: string; url: string }>) {
-  return vi.fn<OnePasswordCli>(async (args) => {
+  return vi.fn<OnePasswordCliRunner>(async (_executable, args) => {
     const command = args.slice(0, 2).join(" ");
     if (args[0] === "--version") return "2.30.0\n";
     if (command === "account list") return JSON.stringify(accounts);
@@ -63,8 +63,12 @@ function fakeCli(accounts: Array<{ account_uuid: string; email: string; url: str
 }
 
 function service(
-  cli: OnePasswordCli,
-  createClient: (token: string) => Promise<OnePasswordClient> = async () => fakeClient(),
+  runCli: OnePasswordCliRunner,
+  options: {
+    createClient?: (token: string) => Promise<OnePasswordClient>;
+    findCli?: () => Promise<string[]>;
+    installCli?: (signal: AbortSignal) => Promise<unknown>;
+  } = {},
 ) {
   const path = join(directory, "connector.json");
   return {
@@ -73,8 +77,12 @@ function service(
       store: new OnePasswordConnectorStore(path, cipher),
       hostName: "test-mac",
       appVersion: "1.0.0",
-      cli,
-      createClient,
+      cliInstall: null,
+      openExternal: async () => undefined,
+      findCli: options.findCli ?? (async () => ["/usr/local/bin/op"]),
+      runCli,
+      installCli: options.installCli,
+      createClient: options.createClient ?? (async () => fakeClient()),
     }),
   };
 }
@@ -88,7 +96,7 @@ describe("OnePasswordConnectorService", () => {
 
     expect(status).toMatchObject({ state: "connected", vaultNames: ["Shared with OpenBot"], loginCount: 1 });
     expect(JSON.stringify(status)).not.toContain(TOKEN);
-    const create = cli.mock.calls.find(([args]) => args[0] === "service-account")?.[0];
+    const create = cli.mock.calls.find(([, args]) => args[0] === "service-account")?.[1];
     expect(create).toEqual(expect.arrayContaining(["--vault", "vault-1:read_items", "--account", "account-1"]));
     expect(await readFile(path, "utf8")).not.toContain(TOKEN);
   });
@@ -104,7 +112,7 @@ describe("OnePasswordConnectorService", () => {
 
     expect(status.state).toBe("choose-account");
     expect(status.accounts.map((account) => account.id)).toEqual(["account-1", "account-2"]);
-    expect(cli.mock.calls.some(([args]) => args[0] === "vault" || args[0] === "service-account")).toBe(false);
+    expect(cli.mock.calls.some(([, args]) => args[0] === "vault" || args[0] === "service-account")).toBe(false);
   });
 
   it("gives a password only for a site that the login is saved for", async () => {
@@ -119,8 +127,10 @@ describe("OnePasswordConnectorService", () => {
   });
 
   it("stores nothing when 1Password refuses the token", async () => {
-    const { connector, path } = service(fakeCli([]), async () => {
-      throw new Error("invalid token");
+    const { connector, path } = service(fakeCli([]), {
+      createClient: async () => {
+        throw new Error("invalid token");
+      },
     });
 
     const status = await connector.connectWithToken(TOKEN);
@@ -129,5 +139,28 @@ describe("OnePasswordConnectorService", () => {
     expect(status.error).toBe("1Password did not accept the service account token.");
     expect(await connector.loginsFor("https://github.com")).toBeNull();
     await expect(readFile(path, "utf8")).rejects.toThrow();
+  });
+
+  it("walks the setup from no CLI, through Install, to an app integration that is off", async () => {
+    let installed = false;
+    const { connector } = service(fakeCli([]), {
+      findCli: async () => (installed ? ["/openbot/1password-cli/2.39.0/op"] : []),
+      installCli: async () => {
+        installed = true;
+      },
+    });
+
+    expect((await connector.checkSetup()).setup).toEqual({
+      cli: "missing",
+      cliVersion: null,
+      canInstall: true,
+      appIntegration: null,
+    });
+    expect((await connector.installCli()).setup).toEqual({
+      cli: "ready",
+      cliVersion: "2.30.0",
+      canInstall: true,
+      appIntegration: false,
+    });
   });
 });

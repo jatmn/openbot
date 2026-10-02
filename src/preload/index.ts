@@ -556,6 +556,9 @@ const openbotApi: OpenBotDesktopApi = {
   }),
   onePasswordConnector: bridgeGroup(IPC_ENDPOINTS.onePasswordConnector, {
     status: decodeOnePasswordConnectorStatus,
+    checkSetup: decodeOnePasswordConnectorStatus,
+    installCli: decodeOnePasswordConnectorStatus,
+    openApp: decodeVoid,
     connect: decodeOnePasswordConnectorStatus,
     connectWithToken: decodeOnePasswordConnectorStatus,
     cancel: decodeOnePasswordConnectorStatus,

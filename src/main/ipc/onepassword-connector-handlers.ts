@@ -14,7 +14,7 @@ const MAX_TOKEN_LENGTH = 4096;
 export interface OnePasswordConnectorIpcDependencies {
   onePasswordConnector: Pick<
     OnePasswordConnectorService,
-    "status" | "connect" | "connectWithToken" | "cancel" | "disconnect"
+    "status" | "checkSetup" | "installCli" | "openApp" | "connect" | "connectWithToken" | "cancel" | "disconnect"
   >;
 }
 
@@ -27,7 +27,8 @@ function decodeConnectInput(value: unknown): OnePasswordConnectInput {
 
 /**
  * The renderer names an account from the list main gave it, or hands over a token once. It never
- * names a CLI path, a vault or a command: main builds each `op` call itself.
+ * names a CLI path, a download, a vault or a command: main builds each `op` call and the install
+ * from the release it pins.
  */
 export function onePasswordConnectorIpcHandlers({
   onePasswordConnector,
@@ -35,6 +36,9 @@ export function onePasswordConnectorIpcHandlers({
   return {
     onePasswordConnector: {
       status: handler(() => onePasswordConnector.status()),
+      checkSetup: handler(() => onePasswordConnector.checkSetup()),
+      installCli: handler(() => onePasswordConnector.installCli()),
+      openApp: handler(() => onePasswordConnector.openApp()),
       connect: payloadHandler(decodeConnectInput, (input) => onePasswordConnector.connect(input)),
       connectWithToken: payloadHandler(stringPayload("token", MAX_TOKEN_LENGTH), (token) =>
         onePasswordConnector.connectWithToken(token),

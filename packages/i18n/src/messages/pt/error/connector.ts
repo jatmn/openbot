@@ -14,7 +14,8 @@ export const messages = {
   "error.connector.githubFileTooLarge": "O arquivo de conexão com o GitHub é muito grande.",
   "error.connector.onePasswordCliMissing":
     "O OpenBot não encontrou a CLI do 1Password. Instale-a e ative a integração no app do 1Password, ou use um token de conta de serviço.",
-  "error.connector.onePasswordCliTooOld": "A CLI do 1Password é antiga demais. Instale a versão 2.18 ou mais recente.",
+  "error.connector.onePasswordCliInstallFailed":
+    "O OpenBot não conseguiu instalar a CLI do 1Password. Verifique a conexão com a internet e tente novamente.",
   "error.connector.onePasswordCliSignedOut":
     "A CLI do 1Password não está conectada. Ative a integração no app do 1Password e conecte novamente.",
   "error.connector.onePasswordCliFailed": "A CLI do 1Password falhou: {detail}",

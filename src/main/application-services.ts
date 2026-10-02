@@ -140,7 +140,7 @@ import { OnePasswordConnectorStore } from "./onepassword-connector-store";
 import { ProviderCredentialStore } from "./provider-credential-store";
 import { createProviderDetection, type ProviderDetection } from "./provider-detection";
 import { PROVIDER_DETECTION_SETTINGS_FILE, ProviderDetectionSettingsStore } from "./provider-detection-settings-store";
-import { ProviderRuntimeManager, providerRuntimeRoot } from "./provider-runtime-manager";
+import { ProviderRuntimeManager, providerRuntimeRoot, runtimeTarget } from "./provider-runtime-manager";
 import { RemoteDesktopManager } from "./remote-desktop-manager";
 import { resolveRemoteDesktopRuntime } from "./remote-desktop-runtime-artifact";
 import { loadOrCreateRemoteDesktopCredentials } from "./remote-desktop-secret-store";
@@ -711,10 +711,16 @@ export async function createApplicationServices({
    * The 1Password connection. The browser fills logins from it, so the agent service reads it. The
    * login list is read from 1Password in the background; startup does not wait for it.
    */
+  const onePasswordCliTarget = runtimeTarget(process.platform, process.arch);
   const onePasswordConnector = new OnePasswordConnectorService({
     store: new OnePasswordConnectorStore(join(app.getPath("userData"), ONEPASSWORD_CONNECTOR_FILE), secretCipher),
     hostName: hostname(),
     appVersion: app.getVersion(),
+    // Outside every root an agent can write, like the GitHub tool files.
+    cliInstall: onePasswordCliTarget
+      ? { directory: join(app.getPath("userData"), "provider-state", "1password-cli"), target: onePasswordCliTarget }
+      : null,
+    openExternal: (url) => shell.openExternal(url),
   });
   await onePasswordConnector.load();
   teardown.push(TEARDOWN_ORDER.onePasswordConnector, "the 1Password connection", () => onePasswordConnector.dispose());

@@ -411,6 +411,10 @@ Network traffic can also occur when:
   sign-in, OpenBot connects to the server's authorization service to register itself, to exchange
   the grant the browser returns, and to renew the token. Nothing about the user's agents,
   conversations or files is sent in those requests;
+- the user presses Install on the 1Password page. OpenBot downloads the 1Password CLI release that it
+  pins from `cache.agilebits.com`, checks its SHA-256, and keeps it in
+  `~/Library/Application Support/OpenBot/provider-state/1password-cli`. The request carries no user
+  data;
 - the user connects 1Password. Connect runs the user's own 1Password CLI (`op`) on this computer to
   create the vault "Shared with OpenBot" and a service account that can read only it. OpenBot then
   reads that vault from 1Password's servers with the token: the vault names, the login titles and

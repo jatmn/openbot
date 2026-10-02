@@ -10,6 +10,7 @@ import {
   type OnePasswordAccount,
   type OnePasswordConnectInput,
   type OnePasswordConnectorStatus,
+  type OnePasswordSetup,
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText, registerSecretValue, toLogValue } from "@openbot/logging";
@@ -21,7 +22,9 @@ import {
   type VaultWebsite,
   websiteMatchesOrigin,
 } from "../backend/password-vault";
+import { installedManagedCli, installOnePasswordCli } from "./onepassword-cli-installer";
 import type { OnePasswordConnectorRecord, OnePasswordConnectorStore } from "./onepassword-connector-store";
+import type { RuntimeTarget } from "./provider-runtime-descriptors";
 
 const logger = createOpenBotLogger("onepassword-connector");
 
@@ -31,6 +34,10 @@ export const ONEPASSWORD_SHARED_VAULT = "Shared with OpenBot";
 const MIN_CLI_VERSION = [2, 18] as const;
 /** 1Password can wait for the user to approve the CLI in the desktop app. */
 const CLI_TIMEOUT_MS = 2 * 60_000;
+/** A setup check reads only local state; one that takes longer counts as not ready. */
+const SETUP_CHECK_TIMEOUT_MS = 15_000;
+/** Where Open 1Password goes when the app is not installed. */
+const ONEPASSWORD_DOWNLOAD_URL = "https://1password.com/downloads/";
 /** Service accounts have hourly read limits, so the list of logins is read again only this often. */
 const INDEX_MAX_AGE_MS = 5 * 60_000;
 /** Each listed login costs one read. A page with more saved logins than this lists the first ones. */
@@ -42,8 +49,8 @@ const accountListSchema = z.array(
 const vaultListSchema = z.array(z.object({ id: z.string().min(1), name: z.string() }));
 const vaultSchema = z.object({ id: z.string().min(1) });
 
-/** Runs the 1Password CLI and returns its standard output. */
-export type OnePasswordCli = (args: string[], signal: AbortSignal) => Promise<string>;
+/** Runs one 1Password CLI executable and returns its standard output. */
+export type OnePasswordCliRunner = (executable: string, args: string[], signal: AbortSignal) => Promise<string>;
 
 /** The part of the 1Password SDK client this service uses, so a test can pass a fake. */
 export interface OnePasswordClient {
@@ -68,7 +75,13 @@ export interface OnePasswordConnectorServiceOptions {
   /** Names the service account, so the user can find it on 1Password.com. */
   hostName: string;
   appVersion: string;
-  cli?: OnePasswordCli;
+  /** Where Install puts the CLI, or null when OpenBot has no CLI build for this computer. */
+  cliInstall: { directory: string; target: RuntimeTarget } | null;
+  openExternal: (url: string) => Promise<void>;
+  /** The CLI executables to try, in order. A test passes a fake. */
+  findCli?: () => Promise<string[]>;
+  runCli?: OnePasswordCliRunner;
+  installCli?: (signal: AbortSignal) => Promise<unknown>;
   createClient?: (token: string) => Promise<OnePasswordClient>;
   now?: () => number;
 }
@@ -105,28 +118,31 @@ function accountLabel(account: z.infer<typeof accountListSchema>[number]): strin
 /** A failure whose message is already a `sourceText` sentence for the user. */
 class OnePasswordConnectError extends Error {}
 
-/** The 1Password CLI, found where installers put it: a Finder launch has no shell `PATH`. */
-async function findCli(): Promise<string | null> {
+/**
+ * The CLIs to try, in order: the user's own, where installers put it (a Finder launch has no shell
+ * `PATH`), then the copy that Install put in OpenBot's folder.
+ */
+async function findCliExecutables(install: OnePasswordConnectorServiceOptions["cliInstall"]): Promise<string[]> {
   const name = process.platform === "win32" ? "op.exe" : "op";
   const directories = [...(process.env.PATH ?? "").split(delimiter), "/opt/homebrew/bin", "/usr/local/bin"];
-  for (const directory of directories.filter(Boolean)) {
+  const found: string[] = [];
+  for (const directory of new Set(directories.filter(Boolean))) {
     const candidate = join(directory, name);
     const executable = await access(candidate, constants.X_OK).then(
       () => true,
       () => false,
     );
-    if (executable) return candidate;
+    if (executable) found.push(candidate);
   }
-  return null;
+  const managed = install ? await installedManagedCli(install.directory, install.target) : null;
+  return managed ? [...found, managed] : found;
 }
 
 /** Variables that would make `op` act as another identity than the user's own session. */
 const CLI_IDENTITY_VARIABLES = new Set(["OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN", "OP_CONNECT_HOST"]);
 
 /** Runs `op` with no shell, as the user's own CLI session. */
-export const runOnePasswordCli: OnePasswordCli = async (args, signal) => {
-  const executable = await findCli();
-  if (!executable) throw new OnePasswordConnectError(sourceText("error.connector.onePasswordCliMissing"));
+export const runOnePasswordCli: OnePasswordCliRunner = async (executable, args, signal) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !CLI_IDENTITY_VARIABLES.has(name)));
   return new Promise((resolve, reject) => {
     execFile(
@@ -173,10 +189,19 @@ async function createSdkClient(token: string, appVersion: string): Promise<OnePa
 export class OnePasswordConnectorService implements PasswordVault {
   readonly #store: OnePasswordConnectorStore;
   readonly #hostName: string;
-  readonly #cli: OnePasswordCli;
+  readonly #findCli: () => Promise<string[]>;
+  readonly #runCli: OnePasswordCliRunner;
+  /** Null when OpenBot has no CLI build for this computer. */
+  readonly #installCli: ((signal: AbortSignal) => Promise<unknown>) | null;
+  readonly #openExternal: (url: string) => Promise<void>;
   readonly #createClient: (token: string) => Promise<OnePasswordClient>;
   readonly #now: () => number;
   readonly #listeners = new Set<(status: OnePasswordConnectorStatus) => void>();
+  /** The CLI that the last setup check found, or null. */
+  #cliPath: string | null = null;
+  #setup: OnePasswordSetup;
+  #checking: Promise<void> | null = null;
+  #installing: AbortController | null = null;
   #connecting: AbortController | null = null;
   #accounts: OnePasswordAccount[] = [];
   #error: string | null = null;
@@ -189,7 +214,16 @@ export class OnePasswordConnectorService implements PasswordVault {
   constructor(options: OnePasswordConnectorServiceOptions) {
     this.#store = options.store;
     this.#hostName = options.hostName;
-    this.#cli = options.cli ?? runOnePasswordCli;
+    const install = options.cliInstall;
+    this.#findCli = options.findCli ?? (() => findCliExecutables(install));
+    this.#runCli = options.runCli ?? runOnePasswordCli;
+    this.#installCli =
+      options.installCli ??
+      (install
+        ? (signal) => installOnePasswordCli({ directory: install.directory, target: install.target, signal })
+        : null);
+    this.#openExternal = options.openExternal;
+    this.#setup = { ...DISCONNECTED_ONEPASSWORD_CONNECTOR.setup, canInstall: this.#installCli !== null };
     this.#createClient = options.createClient ?? ((token) => createSdkClient(token, options.appVersion));
     this.#now = options.now ?? Date.now;
   }
@@ -219,6 +253,7 @@ export class OnePasswordConnectorService implements PasswordVault {
           : this.#accounts.length > 0
             ? "choose-account"
             : "disconnected",
+      setup: { ...this.#setup },
       accounts: this.#connecting || connected ? [] : [...this.#accounts],
       vaultNames: connected ? [...(this.#index?.vaultNames ?? [])] : [],
       loginCount: connected ? (this.#index?.logins.length ?? null) : null,
@@ -229,6 +264,47 @@ export class OnePasswordConnectorService implements PasswordVault {
   onChanged(listener: (status: OnePasswordConnectorStatus) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  /**
+   * Looks for a CLI that Connect can run and asks it whether the 1Password app lets it use an
+   * account. Nothing here asks 1Password to unlock or approve anything. Checks that overlap share one
+   * run, and a check during Install waits for the next one.
+   */
+  async checkSetup(): Promise<OnePasswordConnectorStatus> {
+    if (!this.#installing) {
+      this.#checking ??= this.#check().finally(() => {
+        this.#checking = null;
+      });
+      await this.#checking;
+    }
+    return this.status();
+  }
+
+  /** Downloads OpenBot's copy of the CLI, then checks the setup again. */
+  async installCli(): Promise<OnePasswordConnectorStatus> {
+    if (!this.#installCli || this.#installing) return this.status();
+    const controller = new AbortController();
+    this.#installing = controller;
+    this.#error = null;
+    this.#setup = { ...this.#setup, cli: "installing" };
+    this.#emitStatus();
+    try {
+      await this.#installCli(controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        logger.warn("Unable to install the 1Password CLI", { cause: toLogValue(error) });
+        this.#error = sourceText("error.connector.onePasswordCliInstallFailed");
+      }
+    } finally {
+      if (this.#installing === controller) this.#installing = null;
+    }
+    return this.checkSetup();
+  }
+
+  /** Opens the 1Password app, where the user turns on the CLI integration, or its download page. */
+  async openApp(): Promise<void> {
+    await this.#openExternal("onepassword://").catch(() => this.#openExternal(ONEPASSWORD_DOWNLOAD_URL));
   }
 
   /**
@@ -346,13 +422,52 @@ export class OnePasswordConnectorService implements PasswordVault {
   dispose(): void {
     this.#connecting?.abort();
     this.#connecting = null;
+    this.#installing?.abort();
+    this.#installing = null;
     this.#listeners.clear();
   }
 
   /** The new token, or null when the user must first choose an account. */
+  async #check(): Promise<void> {
+    let found: { path: string; version: string } | null = null;
+    for (const path of await this.#findCli()) {
+      const version = await this.#runCli(path, ["--version"], AbortSignal.timeout(SETUP_CHECK_TIMEOUT_MS)).then(
+        (output) => output.trim(),
+        () => null,
+      );
+      if (version && cliVersionSupported(version)) {
+        found = { path, version };
+        break;
+      }
+    }
+    this.#cliPath = found?.path ?? null;
+    // No account means the app integration is off: the CLI then has no session to create anything with.
+    const appIntegration = found
+      ? await this.#runCli(
+          found.path,
+          ["account", "list", "--format", "json"],
+          AbortSignal.timeout(SETUP_CHECK_TIMEOUT_MS),
+        )
+          .then((output) => accountListSchema.parse(JSON.parse(output)).length > 0)
+          .catch(() => false)
+      : null;
+    this.#setup = {
+      cli: found ? "ready" : "missing",
+      cliVersion: found?.version ?? null,
+      canInstall: this.#installCli !== null,
+      appIntegration,
+    };
+    this.#emitStatus();
+  }
+
+  /** Runs the CLI that the setup check found, looking again when there is none yet. */
+  async #cli(args: string[], signal: AbortSignal): Promise<string> {
+    if (!this.#cliPath) await this.checkSetup();
+    if (!this.#cliPath) throw new OnePasswordConnectError(sourceText("error.connector.onePasswordCliMissing"));
+    return this.#runCli(this.#cliPath, args, signal);
+  }
+
   async #createServiceAccount(accountId: string | null, signal: AbortSignal): Promise<string | null> {
-    if (!cliVersionSupported(await this.#cli(["--version"], signal)))
-      throw new OnePasswordConnectError(sourceText("error.connector.onePasswordCliTooOld"));
     const accounts = accountListSchema.parse(
       JSON.parse(await this.#cli(["account", "list", "--format", "json"], signal)),
     );

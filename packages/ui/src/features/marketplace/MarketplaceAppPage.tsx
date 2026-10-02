@@ -362,6 +362,10 @@ export function MarketplaceAppPage(props: { scope: MarketplaceScope; id: string 
                 <OnePasswordConnectorPanel
                   status={current().status}
                   busy={current().busy}
+                  onWatchSetup={() => current().onWatchSetup()}
+                  onCheckSetup={() => current().onCheckSetup()}
+                  onInstallCli={() => current().onInstallCli()}
+                  onOpenApp={() => current().onOpenApp()}
                   onConnect={(accountId) => current().onConnect(accountId)}
                   onConnectWithToken={(token) => current().onConnectWithToken(token)}
                   onCancel={() => current().onCancel()}

@@ -154,6 +154,27 @@ export const messages = defineMessages("connector", {
   "connector.onePassword.howItWorks":
     "Connecting sets up a “Shared with OpenBot” vault in your 1Password account and a service account that can read only that vault. OpenBot fills saved logins in its browser on this computer, so only the items you move into that vault are ever shared. Agents never see a password.",
   "connector.onePassword.connect": "Connect 1Password",
+  // The three setup steps before a connection, each with the one button it needs.
+  "connector.onePassword.setupTitle": "Set up",
+  "connector.onePassword.stepCliTitle": "Install the 1Password CLI",
+  "connector.onePassword.stepCliChecking": "Looking for the 1Password CLI on this computer",
+  "connector.onePassword.stepCliInstalling": "Downloading the 1Password CLI from 1Password",
+  // {version} is a version number, such as 2.39.0.
+  "connector.onePassword.stepCliReady": "Version {version} is installed.",
+  "connector.onePassword.stepCliMissing":
+    "OpenBot downloads it from 1Password into its own folder. It needs no administrator password.",
+  "connector.onePassword.stepCliManual":
+    "OpenBot cannot install it on this computer. Install it from 1Password, then come back to this page.",
+  "connector.onePassword.installCli": "Install",
+  "connector.onePassword.stepAppTitle": "Turn on the CLI integration",
+  "connector.onePassword.stepAppDescription":
+    "In the 1Password app, open Settings > Developer and turn on “Integrate with 1Password CLI”.",
+  "connector.onePassword.stepAppReady": "The 1Password app lets the CLI create the shared vault.",
+  "connector.onePassword.openApp": "Open 1Password",
+  "connector.onePassword.checkAgain": "Check again",
+  "connector.onePassword.stepVaultTitle": "Create the shared vault",
+  "connector.onePassword.stepVaultDescription":
+    "OpenBot creates the vault “Shared with OpenBot” and a service account that can only read it. 1Password asks you to approve.",
   "connector.onePassword.useToken": "Use a service account token instead",
   "connector.onePassword.tokenLabel": "Service account token",
   "connector.onePassword.tokenPlaceholder": "ops_…",

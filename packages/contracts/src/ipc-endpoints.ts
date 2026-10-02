@@ -615,6 +615,12 @@ export const IPC_ENDPOINTS = {
   // from the renderer to main once, in `connectWithToken`; every answer is the status only.
   onePasswordConnector: {
     status: request<undefined, OnePasswordConnectorStatus>()("onepassword-connector:status"),
+    // Looks again for the CLI and the 1Password app's CLI integration, for a page that opens or regains focus.
+    checkSetup: request<undefined, OnePasswordConnectorStatus>()("onepassword-connector:check-setup"),
+    // Downloads the CLI release that main pins, into a folder that OpenBot owns.
+    installCli: request<undefined, OnePasswordConnectorStatus>()("onepassword-connector:install-cli"),
+    // Opens the 1Password app, or its download page when it is not installed.
+    openApp: request<undefined, void>()("onepassword-connector:open-app"),
     connect: request<OnePasswordConnectInput, OnePasswordConnectorStatus>()("onepassword-connector:connect"),
     connectWithToken: request<string, OnePasswordConnectorStatus>()("onepassword-connector:connect-with-token"),
     cancel: request<undefined, OnePasswordConnectorStatus>()("onepassword-connector:cancel"),

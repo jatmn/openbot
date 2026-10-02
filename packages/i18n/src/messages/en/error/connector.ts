@@ -15,7 +15,8 @@ export const messages = defineMessages("error.connector", {
   // The 1Password connection: the CLI that creates the service account, the token and the stored file.
   "error.connector.onePasswordCliMissing":
     "OpenBot cannot find the 1Password CLI. Install it and turn on its integration in the 1Password app, or use a service account token.",
-  "error.connector.onePasswordCliTooOld": "The 1Password CLI is too old. Install version 2.18 or later.",
+  "error.connector.onePasswordCliInstallFailed":
+    "OpenBot could not install the 1Password CLI. Check the connection to the internet, then try again.",
   "error.connector.onePasswordCliSignedOut":
     "The 1Password CLI is not signed in. Turn on its integration in the 1Password app, then connect again.",
   "error.connector.onePasswordCliFailed": "The 1Password CLI failed: {detail}",
