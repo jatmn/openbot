@@ -14,7 +14,7 @@ import type { RuntimeTarget } from "./provider-runtime-descriptors";
  * The release that Install puts in place. 1Password publishes no hash for its downloads, so each
  * archive's SHA-256 is pinned here, taken from 1Password's own CDN. A new release is a code change.
  */
-export const ONEPASSWORD_CLI_VERSION = "2.39.0";
+const ONEPASSWORD_CLI_VERSION = "2.39.0";
 
 const ARCHIVES: Record<RuntimeTarget, { name: string; sha256: string }> = {
   "darwin-arm64": {
@@ -55,7 +55,7 @@ function archiveUrl(target: RuntimeTarget): string {
 }
 
 /** Where Install puts the CLI. It exists only after a complete, verified install. */
-export function managedCliPath(directory: string, target: RuntimeTarget): string {
+function managedCliPath(directory: string, target: RuntimeTarget): string {
   return join(directory, ONEPASSWORD_CLI_VERSION, executableName(target));
 }
 

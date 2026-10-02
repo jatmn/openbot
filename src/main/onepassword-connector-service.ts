@@ -29,7 +29,7 @@ import type { RuntimeTarget } from "./provider-runtime-descriptors";
 const logger = createOpenBotLogger("onepassword-connector");
 
 /** The vault that Connect creates. The user moves the logins that OpenBot may use into it. */
-export const ONEPASSWORD_SHARED_VAULT = "Shared with OpenBot";
+const ONEPASSWORD_SHARED_VAULT = "Shared with OpenBot";
 /** `op service-account create` needs this version. */
 const MIN_CLI_VERSION = [2, 18] as const;
 /** 1Password can wait for the user to approve the CLI in the desktop app. */
@@ -66,6 +66,7 @@ export interface OnePasswordClient {
       itemId: string,
     ): Promise<{
       fields: Array<{ id: string; fieldType: string; value: string; details?: { type: string; content?: unknown } }>;
+      websites: Array<{ url: string; autofillBehavior: string }>;
     }>;
   };
 }
@@ -105,6 +106,15 @@ function autofill(value: string): VaultAutofill {
   return "anywhere";
 }
 
+function vaultWebsites(websites: ReadonlyArray<{ url: string; autofillBehavior: string }>): VaultWebsite[] {
+  return websites.map((site) => ({ url: site.url, autofill: autofill(site.autofillBehavior) }));
+}
+
+/** Whether 1Password lets a login with these websites fill the page at `origin`. */
+function savedFor(websites: ReadonlyArray<{ url: string; autofillBehavior: string }>, origin: string): boolean {
+  return vaultWebsites(websites).some((site) => websiteMatchesOrigin(site, origin));
+}
+
 function cliVersionSupported(output: string): boolean {
   const [major = 0, minor = 0] = output.trim().split(".").map(Number);
   return major > MIN_CLI_VERSION[0] || (major === MIN_CLI_VERSION[0] && minor >= MIN_CLI_VERSION[1]);
@@ -142,7 +152,7 @@ async function findCliExecutables(install: OnePasswordConnectorServiceOptions["c
 const CLI_IDENTITY_VARIABLES = new Set(["OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN", "OP_CONNECT_HOST"]);
 
 /** Runs `op` with no shell, as the user's own CLI session. */
-export const runOnePasswordCli: OnePasswordCliRunner = async (executable, args, signal) => {
+const runOnePasswordCli: OnePasswordCliRunner = async (executable, args, signal) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !CLI_IDENTITY_VARIABLES.has(name)));
   return new Promise((resolve, reject) => {
     execFile(
@@ -340,22 +350,29 @@ export class OnePasswordConnectorService implements PasswordVault {
 
   /** Connects with a service account token the user created on 1Password.com. */
   async connectWithToken(token: string): Promise<OnePasswordConnectorStatus> {
+    // Tracked like a CLI connect, so Cancel, Disconnect and a newer connection stop this one.
     this.#connecting?.abort();
-    this.#connecting = null;
+    const controller = new AbortController();
+    this.#connecting = controller;
     this.#accounts = [];
     this.#error = null;
     const trimmed = token.trim();
     registerSecretValue(trimmed);
-    try {
-      await this.#save({ token: trimmed, accountId: null, connectedAt: this.#now() }, new AbortController().signal);
-    } catch (error) {
-      logger.warn("Unable to connect 1Password with a token", { cause: toLogValue(error) });
-      this.#error =
-        error instanceof OnePasswordConnectError
-          ? error.message
-          : sourceText("error.connector.onePasswordTokenRejected");
-    }
     this.#emitStatus();
+    try {
+      await this.#save({ token: trimmed, accountId: null, connectedAt: this.#now() }, controller.signal);
+    } catch (error) {
+      if (this.#connecting === controller && !controller.signal.aborted) {
+        logger.warn("Unable to connect 1Password with a token", { cause: toLogValue(error) });
+        this.#error =
+          error instanceof OnePasswordConnectError
+            ? error.message
+            : sourceText("error.connector.onePasswordTokenRejected");
+      }
+    } finally {
+      if (this.#connecting === controller) this.#connecting = null;
+      this.#emitStatus();
+    }
     return this.status();
   }
 
@@ -388,28 +405,36 @@ export class OnePasswordConnectorService implements PasswordVault {
 
   async loginsFor(origin: string): Promise<VaultLogin[] | null> {
     if (!this.#store.read()) return null;
+    // An answer read from a connection that Disconnect removed or a new one replaced is dropped.
+    const generation = this.#generation;
     const index = await this.#readIndex();
     const client = await this.#clientForToken();
     const matches = index.logins.filter((login) => login.websites.some((site) => websiteMatchesOrigin(site, origin)));
-    return Promise.all(
-      matches.slice(0, MAX_LISTED_LOGINS).map(async (login) => {
-        const item = await client.items.get(login.vaultId, login.id);
-        const username = item.fields.find((field) => field.id === "username")?.value || null;
-        return {
-          id: login.id,
-          title: login.title,
-          username,
-          hasOneTimePassword: item.fields.some((field) => field.fieldType === "Totp"),
-        };
-      }),
+    const items = await Promise.all(
+      matches.slice(0, MAX_LISTED_LOGINS).map(async (login) => ({
+        login,
+        item: await client.items.get(login.vaultId, login.id),
+      })),
     );
+    if (generation !== this.#generation) return null;
+    return items
+      .filter(({ item }) => savedFor(item.websites, origin))
+      .map(({ login, item }) => ({
+        id: login.id,
+        title: login.title,
+        username: item.fields.find((field) => field.id === "username")?.value || null,
+        hasOneTimePassword: item.fields.some((field) => field.fieldType === "Totp"),
+      }));
   }
 
   async secretFor(loginId: string, origin: string, kind: "password" | "totp"): Promise<string | null> {
     if (!this.#store.read()) return null;
+    const generation = this.#generation;
     const login = (await this.#readIndex()).logins.find((candidate) => candidate.id === loginId);
-    if (!login?.websites.some((site) => websiteMatchesOrigin(site, origin))) return null;
+    if (!login) return null;
     const item = await (await this.#clientForToken()).items.get(login.vaultId, login.id);
+    // The index can be minutes old: the item's websites as 1Password holds them now decide.
+    if (generation !== this.#generation || !savedFor(item.websites, origin)) return null;
     const value =
       kind === "password"
         ? item.fields.find((field) => field.id === "password")?.value
@@ -579,7 +604,7 @@ export class OnePasswordConnectorService implements PasswordVault {
           id: item.id,
           vaultId: vault.id,
           title: item.title,
-          websites: item.websites.map((site) => ({ url: site.url, autofill: autofill(site.autofillBehavior) })),
+          websites: vaultWebsites(item.websites),
         });
       }
     }

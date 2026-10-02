@@ -28,24 +28,25 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-function fakeClient(): OnePasswordClient {
+type Websites = Array<{ url: string; autofillBehavior: string }>;
+
+/** `current` is the item as 1Password holds it now; the list keeps what it held when indexed. */
+function fakeClient(current: { websites?: () => Websites; get?: <T>(item: T) => Promise<T> } = {}): OnePasswordClient {
+  const indexed: Websites = [{ url: "https://github.com", autofillBehavior: "AnywhereOnWebsite" }];
   return {
     vaults: { list: async () => [{ id: "vault-1", title: "Shared with OpenBot" }] },
     items: {
-      list: async () => [
-        {
-          id: "login-1",
-          title: "GitHub",
-          category: "Login",
-          websites: [{ url: "https://github.com", autofillBehavior: "AnywhereOnWebsite" }],
-        },
-      ],
-      get: async () => ({
-        fields: [
-          { id: "username", fieldType: "Text", value: "ada" },
-          { id: "password", fieldType: "Concealed", value: PASSWORD },
-        ],
-      }),
+      list: async () => [{ id: "login-1", title: "GitHub", category: "Login", websites: indexed }],
+      get: async () => {
+        const item = {
+          websites: current.websites?.() ?? indexed,
+          fields: [
+            { id: "username", fieldType: "Text", value: "ada" },
+            { id: "password", fieldType: "Concealed", value: PASSWORD },
+          ],
+        };
+        return current.get ? current.get(item) : item;
+      },
     },
   };
 }
@@ -124,6 +125,60 @@ describe("OnePasswordConnectorService", () => {
     expect(await connector.loginsFor("https://github.com")).toEqual([
       { id: "login-1", title: "GitHub", username: "ada", hasOneTimePassword: false },
     ]);
+  });
+
+  it("gives no password once 1Password no longer saves the login for that site", async () => {
+    let websites: Websites = [{ url: "https://github.com", autofillBehavior: "AnywhereOnWebsite" }];
+    const client = fakeClient({ websites: () => websites });
+    const { connector } = service(fakeCli([]), { createClient: async () => client });
+    await connector.connectWithToken(TOKEN);
+
+    // The index is still fresh and lists github.com; the user has since set the login to Never.
+    websites = [{ url: "https://github.com", autofillBehavior: "Never" }];
+
+    expect(await connector.secretFor("login-1", "https://github.com", "password")).toBeNull();
+    expect(await connector.loginsFor("https://github.com")).toEqual([]);
+  });
+
+  it("drops a password that 1Password sends after Disconnect", async () => {
+    let release: (() => void) | undefined;
+    let pending = false;
+    const client = fakeClient({
+      get: (item) => {
+        if (!pending) return Promise.resolve(item);
+        return new Promise((resolve) => {
+          release = () => resolve(item);
+        });
+      },
+    });
+    const { connector } = service(fakeCli([]), { createClient: async () => client });
+    await connector.connectWithToken(TOKEN);
+    pending = true;
+
+    const secret = connector.secretFor("login-1", "https://github.com", "password");
+    await vi.waitFor(() => expect(release).toBeDefined());
+    await connector.disconnect();
+    release?.();
+
+    expect(await secret).toBeNull();
+  });
+
+  it("stores no token whose check finishes after Disconnect", async () => {
+    let accept: (() => void) | undefined;
+    const { connector, path } = service(fakeCli([]), {
+      createClient: () =>
+        new Promise((resolve) => {
+          accept = () => resolve(fakeClient());
+        }),
+    });
+
+    const connecting = connector.connectWithToken(TOKEN);
+    await vi.waitFor(() => expect(accept).toBeDefined());
+    await connector.disconnect();
+    accept?.();
+
+    expect((await connecting).state).toBe("disconnected");
+    await expect(readFile(path, "utf8")).rejects.toThrow();
   });
 
   it("stores nothing when 1Password refuses the token", async () => {
