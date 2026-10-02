@@ -1,11 +1,12 @@
 import { createHmac, generateKeyPairSync } from "node:crypto";
+import { Effect } from "effect";
 import { exportJWK, SignJWT } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import { createRemoteApiApp, signalClientIp } from "../src/app";
 import { readRemoteApiConfig } from "../src/config";
 import type { RemoteTicketClaims } from "../src/protocol";
 import { type RemoteTokenProvider, SignalService } from "../src/signal-service";
-import { RemoteTokenService, signServiceRequest } from "../src/tokens";
+import { RemoteTokenError, RemoteTokenService, signServiceRequest } from "../src/tokens";
 
 describe("Remote API proxy addresses", () => {
   it("uses the first forwarded address only when the proxy is trusted", () => {
@@ -243,10 +244,12 @@ describe("Slack request route", () => {
     // Signal restarted, so it lost the revocations it held. D1 links T1 to this host with the
     // newer link only.
     let available = true;
-    const { app, signal, route } = await slackRoute(signingSecret, async (_hostId, teams) => {
-      if (!available) throw new Error("offline");
-      return teams.filter((team) => team.linkedAt === 2_000).map((team) => team.id);
-    });
+    const { app, signal, route } = await slackRoute(signingSecret, (_hostId, teams) =>
+      Effect.gen(function* () {
+        if (!available) return yield* new RemoteTokenError({ message: "offline" });
+        return teams.filter((team) => team.linkedAt === 2_000).map((team) => team.id);
+      }),
+    );
     const hello = async (linkedAt: number) => {
       const socket = testSocket(crypto.randomUUID());
       signal.connect(socket);
@@ -386,8 +389,8 @@ describe("Slack request route", () => {
 async function slackRoute(
   signingSecret: string | null,
   // What D1 answers while Signal starts: by default, every link is current.
-  validateSlackRoute: RemoteTokenProvider["validateSlackRoute"] = async (_hostId, teams) =>
-    teams.map((team) => team.id),
+  validateSlackRoute: RemoteTokenProvider["validateSlackRoute"] = (_hostId, teams) =>
+    Effect.succeed(teams.map((team) => team.id)),
 ) {
   const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   const jwk = await exportJWK(publicKey);
@@ -478,10 +481,10 @@ function hostTickets(): RemoteTokenProvider {
     exp: now + 300,
   };
   return {
-    verifyTicket: async () => ({ ...claims, jti: crypto.randomUUID() }),
-    verifyResumeToken: async () => claims,
-    validateClaims: async () => true,
-    issueResumeToken: async () => "resume-host",
+    verifyTicket: () => Effect.sync(() => ({ ...claims, jti: crypto.randomUUID() })),
+    verifyResumeToken: () => Effect.succeed(claims),
+    validateClaims: () => Effect.succeed(true),
+    issueResumeToken: () => Effect.succeed("resume-host"),
     iceServers: () => [],
   };
 }

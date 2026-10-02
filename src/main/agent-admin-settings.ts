@@ -1,3 +1,4 @@
+import { Effect, Result, Schema } from "effect";
 // Access and auto-approve of one agent, as this computer holds them. The local IPC handlers and the
 // `agent-admin-v1` host routes share this, so a remote admin changes the same state as the local
 // window does, through the same writers.
@@ -44,11 +45,34 @@ export function createAgentAdminSettings({
   }
   return {
     read: (agentId) => settings(requireAgent(agentId)),
-    async update({ agentId, access, autoApprove }) {
-      let agent = requireAgent(agentId);
-      if (access !== undefined) agent = await agents.updateAgent({ agentId, access });
-      if (autoApprove !== undefined) await approvalAutomation.set({ agentId, autoApprove });
-      return settings(agent);
+    update(input) {
+      return runSettings(update(input));
     },
   };
+  function runSettings(
+    operation: Effect.Effect<AgentAdminSettings, AgentSettingsFailure>,
+  ): Promise<AgentAdminSettings> {
+    return Effect.runPromise(Effect.result(operation)).then((result) => {
+      if (Result.isFailure(result)) throw result.failure.cause;
+      return result.success;
+    });
+  }
+  function update({ agentId, access, autoApprove }: UpdateAgentAdminSettingsInput) {
+    return Effect.fn("AgentAdminSettings.update")(function* () {
+      let agent = yield* Effect.try({
+        try: () => requireAgent(agentId),
+        catch: (cause) => new AgentSettingsFailure({ cause }),
+      });
+      if (access !== undefined) agent = yield* settingsIO(() => agents.updateAgent({ agentId, access }));
+      if (autoApprove !== undefined) yield* settingsIO(() => approvalAutomation.set({ agentId, autoApprove }));
+      return settings(agent);
+    })().pipe(Effect.uninterruptible);
+  }
+}
+
+class AgentSettingsFailure extends Schema.TaggedError<AgentSettingsFailure>()("AgentSettingsFailure", {
+  cause: Schema.Defect(),
+}) {}
+function settingsIO<A>(operation: () => Promise<A>): Effect.Effect<A, AgentSettingsFailure> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new AgentSettingsFailure({ cause }) });
 }

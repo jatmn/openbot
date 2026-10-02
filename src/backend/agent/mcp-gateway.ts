@@ -8,10 +8,11 @@ import type {
 } from "@openbot/contracts/ipc";
 import { GITHUB_CONNECTOR_MCP_SERVER_ID, mcpConfigErrors, normalizeMcpConfig } from "@openbot/contracts/ipc";
 import type { Logger } from "@openbot/logging";
+import { Effect, Result, Schema } from "effect";
 import type { AgentProvider } from "../agent-client";
 import { McpHandoffLog } from "../mcp-handoff-log";
 import { type McpOAuthAuthority, normalizeResource } from "../mcp-oauth-provider";
-import { testMcpServer } from "../mcp-probe";
+import { testMcpServerEffect } from "../mcp-probe";
 import {
   type McpServerDrop,
   type McpToolRuntimeSource,
@@ -122,17 +123,24 @@ export class McpGateway {
   }
 
   /** The bearer token for one configuration, asked at every hand-off and never written to a row. */
-  async authorization(config: McpServerConfig): Promise<string | null> {
-    // The built-in GitHub entry spends the GitHub connection, not an MCP sign-in of its own.
+  authorization(config: McpServerConfig): Promise<string | null> {
+    return runGateway(this.authorizationEffect(config));
+  }
+
+  readonly authorizationEffect = Effect.fnUntraced(function* (this: McpGateway, config: McpServerConfig) {
+    const github = this.#githubConnector;
+    const oauth = this.#oauth;
     const token =
       config.id === GITHUB_CONNECTOR_MCP_SERVER_ID
-        ? ((await this.#githubConnector?.mcpAuthorization()) ?? null)
-        : ((await this.#oauth?.accessToken(config.url)) ?? null);
-    // The one place a minted token is known before it leaves this process. The row never holds
-    // it, so this is what lets `redact` keep it out of a provider's own report of a failure.
+        ? github
+          ? yield* gatewayIo(() => github.mcpAuthorization())
+          : null
+        : oauth
+          ? yield* gatewayIo(() => oauth.accessToken(config.url))
+          : null;
     if (token) this.#handoff.recordSecret(token);
     return token;
-  }
+  });
 
   /**
    * Remembers a set that leaves for a provider, so its secrets stay redactable after the user edits
@@ -215,11 +223,19 @@ export class McpGateway {
    * is saved. It is validated here first: a name this machine reserves, or a missing command, is a
    * sentence rather than a connection attempt.
    */
-  async test(input: TestMcpServerInput, options: TestMcpServerOptions = {}): Promise<McpTestResult> {
+  test(input: TestMcpServerInput, options: TestMcpServerOptions = {}): Promise<McpTestResult> {
+    return runGateway(this.testEffect(input, options));
+  }
+
+  readonly testEffect = Effect.fnUntraced(function* (
+    this: McpGateway,
+    input: TestMcpServerInput,
+    options: TestMcpServerOptions = {},
+  ) {
     const config = normalizeMcpConfig(input.config);
     const errors = mcpConfigErrors(config);
     const firstError = errors.name ?? errors.command ?? errors.url;
-    if (firstError) throw new Error(firstError);
+    if (firstError) return yield* new McpGatewayFailed({ cause: new Error(firstError) });
     // A browser only opens when a person is waiting for it. The remote Team API route asks for the
     // same test and gets the silent answer, because nobody is at this machine to finish a sign-in.
     // The stored sign-ins are still spent: without them the probe cannot read or refresh the host's
@@ -235,8 +251,10 @@ export class McpGateway {
           }
         : undefined;
     const oauth = options.interactive ? (stored ?? undefined) : silent;
-    return testMcpServer(config, undefined, this.#toolRuntimes(), oauth);
-  }
+    return yield* testMcpServerEffect(config, undefined, this.#toolRuntimes(), oauth).pipe(
+      Effect.mapError((failure) => new McpGatewayFailed({ cause: failure.cause })),
+    );
+  });
 
   /**
    * What the providers are given at spawn. They connect for themselves; a test is not used.
@@ -299,4 +317,18 @@ export class McpGateway {
   redact(text: string): string {
     return redactMcpValues(text, [...mcpSecretValues(this.#servers.list()), ...this.#handoff.values()]);
   }
+}
+
+export class McpGatewayFailed extends Schema.TaggedError<McpGatewayFailed>()("McpGatewayFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function gatewayIo<A>(run: () => Promise<A>): Effect.Effect<A, McpGatewayFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new McpGatewayFailed({ cause }) });
+}
+
+async function runGateway<A>(effect: Effect.Effect<A, McpGatewayFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

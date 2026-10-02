@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { Effect, Result, Schema } from "effect";
 
 /** Every stored JSON file carries a schema version, so a later release can read an older one. */
 export interface VersionedJsonFile {
@@ -33,12 +34,42 @@ export async function writeFileAtomically(
   content: string | Uint8Array,
   options: WriteJsonFileOptions = {},
 ): Promise<void> {
-  if (options.createDirectory) await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${path}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporaryPath, content, { mode: 0o600 });
-    await rename(temporaryPath, path);
-  } finally {
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
-  }
+  const result = await Effect.runPromise(Effect.result(writeFileAtomicallyEffect(path, content, options)));
+  if (Result.isFailure(result)) throw result.failure.cause;
 }
+
+/** The native cause stays at the adapter; callers must not export it without redaction. */
+export class AtomicFileWriteError extends Schema.TaggedError<AtomicFileWriteError>()("AtomicFileWriteError", {
+  operation: Schema.Literals(["directory", "write", "rename"]),
+  cause: Schema.Defect(),
+}) {}
+
+/** Keep the write and rename together even when the caller interrupts the operation. */
+export const writeFileAtomicallyEffect = Effect.fn("AtomicFile.write")(function* (
+  path: string,
+  content: string | Uint8Array,
+  options: WriteJsonFileOptions = {},
+) {
+  if (options.createDirectory) {
+    yield* Effect.tryPromise({
+      try: () => mkdir(dirname(path), { recursive: true, mode: 0o700 }),
+      catch: (cause) => new AtomicFileWriteError({ operation: "directory", cause }),
+    });
+  }
+  yield* Effect.acquireUseRelease(
+    Effect.sync(() => `${path}.${randomUUID()}.tmp`),
+    (temporaryPath) =>
+      Effect.gen(function* () {
+        yield* Effect.tryPromise({
+          try: () => writeFile(temporaryPath, content, { mode: 0o600 }),
+          catch: (cause) => new AtomicFileWriteError({ operation: "write", cause }),
+        });
+        yield* Effect.tryPromise({
+          try: () => rename(temporaryPath, path),
+          catch: (cause) => new AtomicFileWriteError({ operation: "rename", cause }),
+        });
+      }),
+    // Cleanup failure must not replace the write failure, as in the native adapter.
+    (temporaryPath) => Effect.promise(() => rm(temporaryPath, { force: true }).catch(() => undefined)),
+  );
+}, Effect.uninterruptible);

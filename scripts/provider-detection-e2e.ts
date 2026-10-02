@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { type CustomProviderCipher, CustomProviderStore } from "../src/main/custom-provider-store";
-import { probeModels } from "../src/main/model-server-probe";
+import { probeModelsEffect } from "../src/main/model-server-probe";
 import { createProviderDetection } from "../src/main/provider-detection";
 import { ProviderDetectionSettingsStore } from "../src/main/provider-detection-settings-store";
 
@@ -85,6 +85,7 @@ const root = await mkdtemp(join(tmpdir(), "openbot-provider-detection-e2e-"));
 const report: Report = { passed: false };
 const servers: FakeServer[] = [];
 
+const detections: ReturnType<typeof createProviderDetection>[] = [];
 try {
   const primary = await fakeServer(["llama-3.1-8b", "qwen2.5-coder"]);
   const other = await fakeServer(["other-model"]);
@@ -99,8 +100,9 @@ try {
     settings,
     customProviders: endpoints,
     customAgents: { configs: () => [] },
-    probe: probeModels,
+    probe: probeModelsEffect,
   });
+  detections.push(detection);
 
   // 1. A listed address is found with its models, with no key; a redirect is not followed.
   const agentFolder = join(root, "tools");
@@ -200,6 +202,7 @@ try {
 
   report.passed = true;
 } finally {
+  for (const detection of detections) await detection.close();
   await Promise.all(servers.map((server) => server.close()));
   await rm(root, { recursive: true, force: true });
   await mkdir(OUT, { recursive: true });

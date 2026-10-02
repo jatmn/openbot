@@ -27,9 +27,17 @@ import {
   type RemoteTicketClaims,
 } from "@openbot/contracts/signal-protocol/ticket";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, ManagedRuntime, Result, Schema } from "effect";
 import { createLocalJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import { isMissingFileError } from "../backend/file-errors";
+import {
+  authCall,
+  authDecode,
+  CentralAuthOperationError,
+  CentralAuthTransport,
+  runCentralAuthEffect,
+} from "./central-auth-effects";
 import {
   decodeAcceptedRemoteInvite,
   decodeCentralAuthUser,
@@ -118,6 +126,7 @@ export type VerifiedRemoteSessionTicket = Pick<
 
 export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   readonly #options: Required<CentralAuthManagerOptions>;
+  readonly #runtime: ManagedRuntime.ManagedRuntime<CentralAuthTransport, never>;
   #state: CentralAuthState = { status: "loading" };
   #sessionToken: string | null = null;
   readonly #teamHostTokens = new Map<string, string>();
@@ -132,6 +141,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   constructor(options: CentralAuthManagerOptions) {
     super();
+    this.#runtime = ManagedRuntime.make(CentralAuthTransport.layer(options.fetch ?? fetch));
     this.#options = {
       ...options,
       mobileConnectApiUrl: options.mobileConnectApiUrl ?? options.apiUrl,
@@ -142,6 +152,23 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       startupRetryDelaysMs: options.startupRetryDelaysMs ?? STARTUP_RETRY_DELAYS_MS,
       emailCodeRequestTimeoutMs: options.emailCodeRequestTimeoutMs ?? EMAIL_CODE_REQUEST_TIMEOUT_MS,
     };
+  }
+
+  readonly #pending = new Set<Promise<unknown>>();
+  async dispose(): Promise<void> {
+    this.stopProfileRefresh();
+    while (this.#pending.size) await Promise.allSettled([...this.#pending]);
+    await this.#sessionWriteChain.catch(() => undefined);
+    await this.#runtime.dispose();
+  }
+  #run<A>(operation: Effect.Effect<A, CentralAuthOperationError, CentralAuthTransport>): Promise<A> {
+    const pending = runCentralAuthEffect(this.#runtime, operation);
+    this.#pending.add(pending);
+    void pending.then(
+      () => this.#pending.delete(pending),
+      () => this.#pending.delete(pending),
+    );
+    return pending;
   }
 
   getState(): CentralAuthState {
@@ -158,30 +185,42 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     const token = this.#sessionToken;
     const generation = this.#profileRefreshGeneration;
     if (state.status !== "signed_in" || !token) return Promise.resolve(this.getState());
-    const pending = this.#authorizedRequest("/v1/me", { method: "GET" }, decodeCentralAuthUser)
-      .then((user) => {
-        if (this.#state !== state || this.#sessionToken !== token || generation !== this.#profileRefreshGeneration) {
-          return this.getState();
-        }
-        if (user.id !== state.user.id) throw new Error("The account service returned an invalid user.");
-        const resolved = this.#resolveUserAvatar(user);
-        if (
-          resolved.name === state.user.name &&
-          resolved.email === state.user.email &&
-          resolved.avatarUrl === state.user.avatarUrl
-        ) {
-          return this.getState();
-        }
-        return this.#setState({ status: "signed_in", user: resolved });
-      })
-      // Background refresh must not replace a usable profile with a loading/error screen.
-      .catch(() => this.getState())
-      .finally(() => {
-        this.#profileRefreshPromise = null;
-      });
+    const pending = this.#run(this.#refreshProfileEffect(state, token, generation));
     this.#profileRefreshPromise = pending;
     return pending;
   }
+
+  readonly #refreshProfileEffect = Effect.fn("CentralAuth.refreshProfile")(function* (
+    this: CentralAuthManager,
+    state: Extract<CentralAuthState, { status: "signed_in" }>,
+    token: string,
+    generation: number,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* Effect.gen({ self: this }, function* () {
+      const user = yield* this.#authorizedRequestEffect("/v1/me", { method: "GET" }, decodeCentralAuthUser);
+      if (this.#state !== state || this.#sessionToken !== token || generation !== this.#profileRefreshGeneration)
+        return this.getState();
+      if (user.id !== state.user.id)
+        return yield* new CentralAuthOperationError({
+          cause: new Error("The account service returned an invalid user."),
+        });
+      const resolved = yield* authDecode(() => this.#resolveUserAvatar(user));
+      if (
+        resolved.name === state.user.name &&
+        resolved.email === state.user.email &&
+        resolved.avatarUrl === state.user.avatarUrl
+      )
+        return this.getState();
+      return this.#setState({ status: "signed_in", user: resolved });
+    }).pipe(
+      Effect.catch(() => Effect.sync(() => this.getState())),
+      Effect.ensuring(
+        Effect.sync(() => {
+          this.#profileRefreshPromise = null;
+        }),
+      ),
+    );
+  });
 
   getSignedInUser(): CentralAuthUser {
     if (this.#state.status !== "signed_in") {
@@ -200,21 +239,51 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     decoder: (value: unknown) => T,
     timeoutMs?: number,
   ): Promise<T> {
-    return this.#authorizedRequest(path, init, decoder, timeoutMs);
+    return this.#run(this.#requestAuthorizedEffect(path, init, decoder, timeoutMs));
   }
+  readonly #requestAuthorizedEffect = Effect.fn("CentralAuth.requestAuthorized")(function* <T>(
+    this: CentralAuthManager,
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs?: number,
+  ): Effect.fn.Return<T, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(path, init, decoder, timeoutMs);
+  });
 
-  async downloadAuthorized(path: string, timeoutMs = 30_000): Promise<Uint8Array> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
-    const response = await this.#options.fetch(new URL(path, this.#options.apiUrl), {
-      headers: { Authorization: `Bearer ${this.#sessionToken}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) throw await AuthApiError.fromResponse(response);
-    return new Uint8Array(await response.arrayBuffer());
+  downloadAuthorized(path: string, timeoutMs = 30_000): Promise<Uint8Array> {
+    return this.#run(this.#downloadAuthorizedEffect(path, timeoutMs));
   }
+  readonly #downloadAuthorizedEffect = Effect.fn("CentralAuth.downloadAuthorized")(function* (
+    this: CentralAuthManager,
+    path: string,
+    timeoutMs = 30_000,
+  ): Effect.fn.Return<Uint8Array, CentralAuthOperationError, CentralAuthTransport> {
+    if (!this.#sessionToken)
+      return yield* new CentralAuthOperationError({
+        cause: new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired")),
+      });
+    const response = yield* CentralAuthTransport.use((transport) =>
+      transport.fetch(new URL(path, this.#options.apiUrl), {
+        headers: { Authorization: `Bearer ${this.#sessionToken}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      }),
+    );
+    if (!response.ok)
+      return yield* new CentralAuthOperationError({
+        cause: yield* AuthApiError.fromResponseEffect(response),
+      });
+    return new Uint8Array(yield* authCall(() => response.arrayBuffer()));
+  });
 
-  async createTeamAuthTicket(serverId: string): Promise<string> {
-    const result = await this.#authorizedRequest(
+  createTeamAuthTicket(serverId: string): Promise<string> {
+    return this.#run(this.#createTeamAuthTicketEffect(serverId));
+  }
+  readonly #createTeamAuthTicketEffect = Effect.fn("CentralAuth.createTeamAuthTicket")(function* (
+    this: CentralAuthManager,
+    serverId: string,
+  ): Effect.fn.Return<string, CentralAuthOperationError, CentralAuthTransport> {
+    const result = yield* this.#authorizedRequestEffect(
       "/v1/team-auth/ticket",
       {
         method: "POST",
@@ -224,13 +293,21 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       decodeTicketResponse,
     );
     if (!result.ticket || !Number.isFinite(result.expiresAt)) {
-      throw new Error("The account service returned an invalid team ticket.");
+      return yield* new CentralAuthOperationError({
+        cause: new Error("The account service returned an invalid team ticket."),
+      });
     }
     return result.ticket;
-  }
+  });
 
-  async createMobileConnect(host: MobileConnectHostBinding): Promise<MobileConnectTicket> {
-    const result = await this.#authorizedRequest(
+  createMobileConnect(host: MobileConnectHostBinding): Promise<MobileConnectTicket> {
+    return this.#run(this.#createMobileConnectEffect(host));
+  }
+  readonly #createMobileConnectEffect = Effect.fn("CentralAuth.createMobileConnect")(function* (
+    this: CentralAuthManager,
+    host: MobileConnectHostBinding,
+  ): Effect.fn.Return<MobileConnectTicket, CentralAuthOperationError, CentralAuthTransport> {
+    const result = yield* this.#authorizedRequestEffect(
       "/v1/mobile-auth/ticket",
       {
         method: "POST",
@@ -240,25 +317,37 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       decodeTicketResponse,
     );
     if (!result.ticket || !Number.isFinite(result.expiresAt) || result.expiresAt <= Date.now()) {
-      throw new Error("The account service returned an invalid Mobile Connect ticket.");
+      return yield* new CentralAuthOperationError({
+        cause: new Error("The account service returned an invalid Mobile Connect ticket."),
+      });
     }
     return {
       qrData: createMobileConnectUrl({ apiUrl: this.#options.mobileConnectApiUrl, ticket: result.ticket, host }),
       expiresAt: result.expiresAt,
     };
-  }
+  });
 
-  async listMobileConnectedDevices(): Promise<MobileConnectedDevice[]> {
-    const result = await this.#authorizedRequest(
+  listMobileConnectedDevices(): Promise<MobileConnectedDevice[]> {
+    return this.#run(this.#listMobileConnectedDevicesEffect());
+  }
+  readonly #listMobileConnectedDevicesEffect = Effect.fn("CentralAuth.listMobileConnectedDevices")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<MobileConnectedDevice[], CentralAuthOperationError, CentralAuthTransport> {
+    const result = yield* this.#authorizedRequestEffect(
       "/v1/mobile-auth/devices",
       { method: "GET" },
       decodeMobileConnectedDevices,
     );
     return result.devices;
-  }
+  });
 
-  async listAccountSessions() {
-    const result = await this.#authorizedRequest(
+  listAccountSessions() {
+    return this.#run(this.#listAccountSessionsEffect());
+  }
+  readonly #listAccountSessionsEffect = Effect.fn("CentralAuth.listAccountSessions")(function* (
+    this: CentralAuthManager,
+  ) {
+    const result = yield* this.#authorizedRequestEffect(
       "/v1/mobile-auth/devices?includeDesktop=true",
       { method: "GET" },
       (value) =>
@@ -278,33 +367,56 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
           .parse(value),
     );
     return result.sessions;
-  }
+  });
 
-  async revokeAccountSession(sessionId: string): Promise<void> {
-    await this.#authorizedRequest(
+  revokeAccountSession(sessionId: string): Promise<void> {
+    return this.#run(this.#revokeAccountSessionEffect(sessionId));
+  }
+  readonly #revokeAccountSessionEffect = Effect.fn("CentralAuth.revokeAccountSession")(function* (
+    this: CentralAuthManager,
+    sessionId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    yield* this.#authorizedRequestEffect(
       `/v1/mobile-auth/devices/${encodeURIComponent(sessionId)}?includeDesktop=true`,
       { method: "DELETE" },
       () => undefined,
     );
-  }
+  });
 
-  async revokeMobileConnectedDevice(sessionId: string): Promise<void> {
-    await this.#authorizedRequest(
+  revokeMobileConnectedDevice(sessionId: string): Promise<void> {
+    return this.#run(this.#revokeMobileConnectedDeviceEffect(sessionId));
+  }
+  readonly #revokeMobileConnectedDeviceEffect = Effect.fn("CentralAuth.revokeMobileConnectedDevice")(function* (
+    this: CentralAuthManager,
+    sessionId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    yield* this.#authorizedRequestEffect(
       `/v1/mobile-auth/devices/${encodeURIComponent(sessionId)}`,
       { method: "DELETE" },
       () => undefined,
     );
-  }
+  });
 
-  async registerRemoteHost(input: {
+  registerRemoteHost(input: {
     hostId: string;
     name: string;
     ownerMembershipId: string;
     devicePublicKey?: string | null;
   }): Promise<RegisteredRemoteHost> {
+    return this.#run(this.#registerRemoteHostEffect(input));
+  }
+  readonly #registerRemoteHostEffect = Effect.fn("CentralAuth.registerRemoteHost")(function* (
+    this: CentralAuthManager,
+    input: {
+      hostId: string;
+      name: string;
+      ownerMembershipId: string;
+      devicePublicKey?: string | null;
+    },
+  ): Effect.fn.Return<RegisteredRemoteHost, CentralAuthOperationError, CentralAuthTransport> {
     const sessionToken = this.#sessionToken;
     const storedMachineToken = this.#teamHostTokens.get(input.hostId.toLowerCase());
-    const result = await this.#authorizedRequest(
+    const result = yield* this.#authorizedRequestEffect(
       "/v2/remote/hosts/register",
       {
         method: "POST",
@@ -321,12 +433,14 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       // The credential belongs to the account that asked for it. Writing it now would file
       // it under whichever session is stored next, so the caller is told the registration
       // no longer applies instead.
-      throw new Error(sourceText("error.auth.accountChangedDuringRegister"));
+      return yield* new CentralAuthOperationError({
+        cause: new Error(sourceText("error.auth.accountChangedDuringRegister")),
+      });
     }
     if (result.machineToken) this.#teamHostTokens.set(input.hostId.toLowerCase(), result.machineToken);
-    await this.#writeStoredSession();
+    yield* authCall(() => this.#writeStoredSession());
     return result;
-  }
+  });
 
   /** The machine token of a registered host, so a site request can prove the server. Never log it. */
   hostSiteCredential(hostId: string): { hostId: string; machineToken: string } | null {
@@ -335,34 +449,62 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   }
 
   issueRemoteHostTicket(hostId: string): Promise<RemoteConnectionBootstrap> {
+    return this.#run(this.#issueRemoteHostTicketEffect(hostId));
+  }
+  readonly #issueRemoteHostTicketEffect = Effect.fn("CentralAuth.issueRemoteHostTicket")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+  ): Effect.fn.Return<RemoteConnectionBootstrap, CentralAuthOperationError, CentralAuthTransport> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
-    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
-    return this.#request(
+    if (!machineToken)
+      return yield* new CentralAuthOperationError({
+        cause: new Error(sourceText("error.auth.hostCredentialUnavailable")),
+      });
+    return yield* this.#requestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/ticket`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machineToken }) },
       decodeRemoteSessionTicket,
     );
-  }
+  });
 
   /**
    * The Slack route ticket of this host: the workspaces that the account service links to it, which
    * Signal routes to its `ingress` socket.
    */
   issueSlackRoute(hostId: string): Promise<string> {
+    return this.#run(this.#issueSlackRouteEffect(hostId));
+  }
+  readonly #issueSlackRouteEffect = Effect.fn("CentralAuth.issueSlackRoute")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+  ): Effect.fn.Return<string, CentralAuthOperationError, CentralAuthTransport> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
-    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
-    return this.#request(
+    if (!machineToken)
+      return yield* new CentralAuthOperationError({
+        cause: new Error(sourceText("error.auth.hostCredentialUnavailable")),
+      });
+    return yield* this.#requestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/slack-route`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machineToken }) },
       (value) => requiredString(decodeRecord(value, "Slack route"), "ticket"),
     );
-  }
+  });
 
   /** Unlinks a Slack workspace from this host, so Signal stops routing its events here. */
-  async unlinkSlackWorkspace(hostId: string, teamId: string): Promise<void> {
+  unlinkSlackWorkspace(hostId: string, teamId: string): Promise<void> {
+    return this.#run(this.#unlinkSlackWorkspaceEffect(hostId, teamId));
+  }
+  readonly #unlinkSlackWorkspaceEffect = Effect.fn("CentralAuth.unlinkSlackWorkspace")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    teamId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
-    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
-    await this.#request(
+    if (!machineToken)
+      return yield* new CentralAuthOperationError({
+        cause: new Error(sourceText("error.auth.hostCredentialUnavailable")),
+      });
+    yield* this.#requestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/slack-disconnect`,
       {
         method: "POST",
@@ -371,18 +513,32 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       },
       () => undefined,
     );
-  }
+  });
 
   /**
    * Sends one Live Activity update through the account service to Apple. The host sealed the
    * content with keys that only the phone has, so the service forwards bytes it cannot read.
    * Returns `gone` when Apple refused the token.
    */
-  async sendLiveActivityPush(hostId: string, push: LiveActivityRelayPush): Promise<"sent" | "gone"> {
+  sendLiveActivityPush(hostId: string, push: LiveActivityRelayPush): Promise<"sent" | "gone"> {
+    return this.#run(this.#sendLiveActivityPushEffect(hostId, push));
+  }
+  readonly #sendLiveActivityPushEffect = Effect.fn("CentralAuth.sendLiveActivityPush")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    push: LiveActivityRelayPush,
+  ): Effect.fn.Return<"sent" | "gone", CentralAuthOperationError, CentralAuthTransport> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
-    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
-    try {
-      await this.#request(
+    if (!machineToken)
+      return yield* new CentralAuthOperationError({
+        cause: new Error(sourceText("error.auth.hostCredentialUnavailable")),
+      });
+    return yield* Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      "sent" | "gone",
+      CentralAuthOperationError,
+      CentralAuthTransport
+    > {
+      yield* this.#requestEffect(
         `/v2/remote/hosts/${encodeURIComponent(hostId)}/live-activity`,
         {
           method: "POST",
@@ -392,26 +548,52 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         () => undefined,
       );
       return "sent";
-    } catch (error) {
-      if (error instanceof AuthApiError && error.status === 410) return "gone";
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* (): Effect.fn.Return<
+          "sent" | "gone",
+          CentralAuthOperationError,
+          CentralAuthTransport
+        > {
+          if (error instanceof AuthApiError && error.status === 410) return "gone";
+          return yield* new CentralAuthOperationError({ cause: error });
+        }),
+      ),
+    );
+  });
 
-  async startRemoteSession(hostId: string): Promise<RemoteSession> {
-    return this.#authorizedRequest(
+  startRemoteSession(hostId: string): Promise<RemoteSession> {
+    return this.#run(this.#startRemoteSessionEffect(hostId));
+  }
+  readonly #startRemoteSessionEffect = Effect.fn("CentralAuth.startRemoteSession")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+  ): Effect.fn.Return<RemoteSession, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       "/v2/remote/sessions/",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ hostId }) },
       decodeRemoteSession,
     );
-  }
+  });
 
   listRemoteHosts(): Promise<RemoteHostSummary[]> {
-    return this.#authorizedRequest("/v2/remote/hosts/", { method: "GET" }, decodeRemoteHosts);
+    return this.#run(this.#listRemoteHostsEffect());
   }
+  readonly #listRemoteHostsEffect = Effect.fn("CentralAuth.listRemoteHosts")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<RemoteHostSummary[], CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect("/v2/remote/hosts/", { method: "GET" }, decodeRemoteHosts);
+  });
 
   issueRemoteSessionTicket(sessionId: string, clientPublicKey: string): Promise<RemoteConnectionBootstrap> {
-    return this.#authorizedRequest(
+    return this.#run(this.#issueRemoteSessionTicketEffect(sessionId, clientPublicKey));
+  }
+  readonly #issueRemoteSessionTicketEffect = Effect.fn("CentralAuth.issueRemoteSessionTicket")(function* (
+    this: CentralAuthManager,
+    sessionId: string,
+    clientPublicKey: string,
+  ): Effect.fn.Return<RemoteConnectionBootstrap, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/sessions/${encodeURIComponent(sessionId)}/ticket`,
       {
         method: "POST",
@@ -420,25 +602,32 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       },
       decodeRemoteSessionTicket,
     );
-  }
+  });
 
-  async verifyRemoteSessionTicket(ticket: string): Promise<VerifiedRemoteSessionTicket> {
-    const verify = async () => {
+  verifyRemoteSessionTicket(ticket: string): Promise<VerifiedRemoteSessionTicket> {
+    return this.#run(this.#verifyRemoteSessionTicketEffect(ticket));
+  }
+  readonly #verifyRemoteSessionTicketEffect = Effect.fn("CentralAuth.verifyRemoteSessionTicket")(function* (
+    this: CentralAuthManager,
+    ticket: string,
+  ): Effect.fn.Return<VerifiedRemoteSessionTicket, CentralAuthOperationError, CentralAuthTransport> {
+    const verify = Effect.gen({ self: this }, function* () {
       if (!this.#remoteTicketJwks) this.#remoteTicketJwks = this.#fetchRemoteTicketJwks();
-      const jwks = await this.#remoteTicketJwks;
-      return jwtVerify(ticket, createLocalJWKSet(jwks), {
-        audience: REMOTE_TICKET_AUDIENCE,
-        algorithms: ["ES256"],
-      });
-    };
-    let payload: Awaited<ReturnType<typeof verify>>["payload"];
-    try {
-      ({ payload } = await verify());
-    } catch (error) {
-      if (!isDynamicRecord(error) || error.code !== "ERR_JWKS_NO_MATCHING_KEY") throw error;
-      this.#remoteTicketJwks = null;
-      ({ payload } = await verify());
-    }
+      const jwksPromise = this.#remoteTicketJwks;
+      const jwks = yield* authCall(() => jwksPromise);
+      const keySet = yield* authDecode(() => createLocalJWKSet(jwks));
+      return yield* authCall(() =>
+        jwtVerify(ticket, keySet, { audience: REMOTE_TICKET_AUDIENCE, algorithms: ["ES256"] }),
+      );
+    });
+    const { payload } = yield* verify.pipe(
+      Effect.catch((failure) => {
+        const error = failure.cause;
+        if (!isDynamicRecord(error) || error.code !== "ERR_JWKS_NO_MATCHING_KEY") return Effect.fail(failure);
+        this.#remoteTicketJwks = null;
+        return verify;
+      }),
+    );
     if (
       !isString(payload.sessionId) ||
       !isString(payload.hostId) ||
@@ -451,7 +640,9 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       !Number.isInteger(payload.sessionExpiresAt) ||
       !isString(payload.clientPublicKey)
     ) {
-      throw new Error("The remote session ticket has invalid claims.");
+      return yield* new CentralAuthOperationError({
+        cause: new Error("The remote session ticket has invalid claims."),
+      });
     }
     return {
       sessionId: payload.sessionId,
@@ -463,69 +654,131 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       sessionExpiresAt: payload.sessionExpiresAt,
       clientPublicKey: payload.clientPublicKey,
     };
-  }
+  });
 
-  async #fetchRemoteTicketJwks(): Promise<z.infer<typeof remoteTicketJwksSchema>> {
-    const response = await this.#options.fetch(new URL("/.well-known/jwks.json", this.#options.apiUrl), {
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw await AuthApiError.fromResponse(response);
-    return remoteTicketJwksSchema.parse(await response.json());
+  #fetchRemoteTicketJwks(): Promise<z.infer<typeof remoteTicketJwksSchema>> {
+    return this.#run(this.#fetchRemoteTicketJwksEffect());
   }
+  readonly #fetchRemoteTicketJwksEffect = Effect.fn("CentralAuth.fetchRemoteTicketJwks")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<z.infer<typeof remoteTicketJwksSchema>, CentralAuthOperationError, CentralAuthTransport> {
+    const response = yield* CentralAuthTransport.use((transport) =>
+      transport.fetch(new URL("/.well-known/jwks.json", this.#options.apiUrl), {
+        signal: AbortSignal.timeout(10_000),
+      }),
+    );
+    if (!response.ok)
+      return yield* new CentralAuthOperationError({
+        cause: yield* AuthApiError.fromResponseEffect(response),
+      });
+    const value = yield* authCall(() => response.json());
+    return yield* authDecode(() => remoteTicketJwksSchema.parse(value));
+  });
 
   endRemoteSession(sessionId: string): Promise<void> {
-    return this.#authorizedRequest(
+    return this.#run(this.#endRemoteSessionEffect(sessionId));
+  }
+  readonly #endRemoteSessionEffect = Effect.fn("CentralAuth.endRemoteSession")(function* (
+    this: CentralAuthManager,
+    sessionId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/sessions/${encodeURIComponent(sessionId)}/end`,
       { method: "POST" },
       decodeVoid,
     );
-  }
+  });
 
   createRemoteInvite(
     hostId: string,
     input: { role: "admin" | "member"; email?: string; permanent?: boolean },
   ): Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }> {
-    return this.#authorizedRequest(
+    return this.#run(this.#createRemoteInviteEffect(hostId, input));
+  }
+  readonly #createRemoteInviteEffect = Effect.fn("CentralAuth.createRemoteInvite")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ): Effect.fn.Return<
+    { inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number },
+    CentralAuthOperationError,
+    CentralAuthTransport
+  > {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/invites`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
       decodeCreatedRemoteInvite,
     );
-  }
+  });
 
   listRemoteInvites(hostId: string): Promise<RemoteInviteRecord[]> {
-    return this.#authorizedRequest(
+    return this.#run(this.#listRemoteInvitesEffect(hostId));
+  }
+  readonly #listRemoteInvitesEffect = Effect.fn("CentralAuth.listRemoteInvites")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+  ): Effect.fn.Return<RemoteInviteRecord[], CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/invites`,
       { method: "GET" },
       decodeRemoteInvites,
     );
-  }
+  });
 
   previewRemoteInvite(token: string): Promise<RemoteInvitePreview> {
-    return this.#request(
+    return this.#run(this.#previewRemoteInviteEffect(token));
+  }
+  readonly #previewRemoteInviteEffect = Effect.fn("CentralAuth.previewRemoteInvite")(function* (
+    this: CentralAuthManager,
+    token: string,
+  ): Effect.fn.Return<RemoteInvitePreview, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#requestEffect(
       "/v2/remote/invites/preview",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) },
       decodeRemoteInvitePreview,
     );
-  }
+  });
 
   acceptRemoteInvite(token: string): Promise<{ hostId: string; membershipId: string; role: "admin" | "member" }> {
-    return this.#authorizedRequest(
+    return this.#run(this.#acceptRemoteInviteEffect(token));
+  }
+  readonly #acceptRemoteInviteEffect = Effect.fn("CentralAuth.acceptRemoteInvite")(function* (
+    this: CentralAuthManager,
+    token: string,
+  ): Effect.fn.Return<
+    { hostId: string; membershipId: string; role: "admin" | "member" },
+    CentralAuthOperationError,
+    CentralAuthTransport
+  > {
+    return yield* this.#authorizedRequestEffect(
       "/v2/remote/invites/accept",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) },
       decodeAcceptedRemoteInvite,
     );
-  }
+  });
 
   revokeRemoteInvite(inviteId: string): Promise<void> {
-    return this.#authorizedRequest(
+    return this.#run(this.#revokeRemoteInviteEffect(inviteId));
+  }
+  readonly #revokeRemoteInviteEffect = Effect.fn("CentralAuth.revokeRemoteInvite")(function* (
+    this: CentralAuthManager,
+    inviteId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/invites/${encodeURIComponent(inviteId)}`,
       { method: "DELETE" },
       decodeVoid,
     );
-  }
+  });
 
-  async listRemoteMembers(hostId: string): Promise<RemoteMemberRecord[]> {
-    const members = await this.#authorizedRequest(
+  listRemoteMembers(hostId: string): Promise<RemoteMemberRecord[]> {
+    return this.#run(this.#listRemoteMembersEffect(hostId));
+  }
+  readonly #listRemoteMembersEffect = Effect.fn("CentralAuth.listRemoteMembers")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+  ): Effect.fn.Return<RemoteMemberRecord[], CentralAuthOperationError, CentralAuthTransport> {
+    const members = yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/members/`,
       { method: "GET" },
       decodeRemoteMembers,
@@ -534,7 +787,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       ...member,
       avatarUrl: member.avatarUrl ? this.resolveApiUrl(member.avatarUrl) : null,
     }));
-  }
+  });
 
   updateRemoteMember(
     hostId: string,
@@ -542,7 +795,16 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     role: "admin" | "member",
     reactivate = false,
   ): Promise<void> {
-    return this.#authorizedRequest(
+    return this.#run(this.#updateRemoteMemberEffect(hostId, membershipId, role, reactivate));
+  }
+  readonly #updateRemoteMemberEffect = Effect.fn("CentralAuth.updateRemoteMember")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    membershipId: string,
+    role: "admin" | "member",
+    reactivate = false,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/members/${encodeURIComponent(membershipId)}`,
       {
         method: "PATCH",
@@ -551,30 +813,45 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       },
       decodeVoid,
     );
-  }
+  });
 
   removeRemoteMember(hostId: string, membershipId: string): Promise<void> {
-    return this.#authorizedRequest(
+    return this.#run(this.#removeRemoteMemberEffect(hostId, membershipId));
+  }
+  readonly #removeRemoteMemberEffect = Effect.fn("CentralAuth.removeRemoteMember")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    membershipId: string,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/members/${encodeURIComponent(membershipId)}`,
       { method: "DELETE" },
       decodeVoid,
     );
-  }
+  });
 
-  async updateRemoteHostLogo(
+  updateRemoteHostLogo(
     hostId: string,
     image: AvatarImageInput | null,
     version?: string | null,
   ): Promise<string | null> {
+    return this.#run(this.#updateRemoteHostLogoEffect(hostId, image, version));
+  }
+  readonly #updateRemoteHostLogoEffect = Effect.fn("CentralAuth.updateRemoteHostLogo")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    image: AvatarImageInput | null,
+    version?: string | null,
+  ): Effect.fn.Return<string | null, CentralAuthOperationError, CentralAuthTransport> {
     if (image === null) {
-      await this.#authorizedRequest(
+      yield* this.#authorizedRequestEffect(
         `/v2/remote/hosts/${encodeURIComponent(hostId)}/logo`,
         { method: "DELETE" },
         decodeVoid,
       );
       return null;
     }
-    return this.#authorizedRequest(
+    return yield* this.#authorizedRequestEffect(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/logo`,
       {
         method: "PUT",
@@ -583,27 +860,49 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       },
       (value) => requiredString(decodeRecord(value, "remote host logo"), "logoKey"),
     );
-  }
+  });
 
-  async downloadRemoteHostLogo(hostId: string, version: string): Promise<{ bytes: Uint8Array; mimeType: string }> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
+  downloadRemoteHostLogo(hostId: string, version: string): Promise<{ bytes: Uint8Array; mimeType: string }> {
+    return this.#run(this.#downloadRemoteHostLogoEffect(hostId, version));
+  }
+  readonly #downloadRemoteHostLogoEffect = Effect.fn("CentralAuth.downloadRemoteHostLogo")(function* (
+    this: CentralAuthManager,
+    hostId: string,
+    version: string,
+  ): Effect.fn.Return<{ bytes: Uint8Array; mimeType: string }, CentralAuthOperationError, CentralAuthTransport> {
+    if (!this.#sessionToken)
+      return yield* new CentralAuthOperationError({
+        cause: new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired")),
+      });
     const url = new URL(`/v2/remote/hosts/${encodeURIComponent(hostId)}/logo`, this.#options.apiUrl);
     url.searchParams.set("v", version);
-    const response = await this.#options.fetch(url, {
-      headers: { Authorization: `Bearer ${this.#sessionToken}` },
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!response.ok) throw await AuthApiError.fromResponse(response);
+    const response = yield* CentralAuthTransport.use((transport) =>
+      transport.fetch(url, {
+        headers: { Authorization: `Bearer ${this.#sessionToken}` },
+        signal: AbortSignal.timeout(30_000),
+      }),
+    );
+    if (!response.ok)
+      return yield* new CentralAuthOperationError({
+        cause: yield* AuthApiError.fromResponseEffect(response),
+      });
     return {
-      bytes: new Uint8Array(await response.arrayBuffer()),
+      bytes: new Uint8Array(yield* authCall(() => response.arrayBuffer())),
       mimeType: response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "application/octet-stream",
     };
-  }
+  });
 
-  async redeemTeamAuthTicket(ticket: string, serverId: string): Promise<CentralAuthUser | null> {
+  redeemTeamAuthTicket(ticket: string, serverId: string): Promise<CentralAuthUser | null> {
+    return this.#run(this.#redeemTeamAuthTicketEffect(ticket, serverId));
+  }
+  readonly #redeemTeamAuthTicketEffect = Effect.fn("CentralAuth.redeemTeamAuthTicket")(function* (
+    this: CentralAuthManager,
+    ticket: string,
+    serverId: string,
+  ): Effect.fn.Return<CentralAuthUser | null, CentralAuthOperationError, CentralAuthTransport> {
     if (!ticket) return null;
-    try {
-      const user = await this.#request(
+    return yield* Effect.gen({ self: this }, function* () {
+      const user = yield* this.#requestEffect(
         "/v1/team-auth/redeem",
         {
           method: "POST",
@@ -613,11 +912,15 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         decodeCentralAuthUser,
       );
       return this.#resolveUserAvatar(user);
-    } catch (error) {
-      if (error instanceof AuthApiError && error.status === 401) return null;
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          if (error instanceof AuthApiError && error.status === 401) return null;
+          return yield* new CentralAuthOperationError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   sendTeamInviteEmail(input: {
     email: string;
@@ -625,7 +928,18 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     inviteUrl: string;
     role: "admin" | "member";
   }): Promise<void> {
-    return this.#authorizedRequest(
+    return this.#run(this.#sendTeamInviteEmailEffect(input));
+  }
+  readonly #sendTeamInviteEmailEffect = Effect.fn("CentralAuth.sendTeamInviteEmail")(function* (
+    this: CentralAuthManager,
+    input: {
+      email: string;
+      serverName: string;
+      inviteUrl: string;
+      role: "admin" | "member";
+    },
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
+    return yield* this.#authorizedRequestEffect(
       "/v1/team-invitations/email",
       {
         method: "POST",
@@ -634,7 +948,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       },
       decodeVoid,
     );
-  }
+  });
 
   initialize(): Promise<CentralAuthState> {
     if (this.#initializationPromise) return this.#initializationPromise;
@@ -650,35 +964,47 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     return this.initialize();
   }
 
-  async #initialize(): Promise<CentralAuthState> {
+  #initialize(): Promise<CentralAuthState> {
+    return this.#run(this.#initializeEffect());
+  }
+  readonly #initializeEffect = Effect.fn("CentralAuth.initialize")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     this.#setState({ status: "loading" });
     if (this.#options.canPersist()) {
-      try {
-        const encrypted = Buffer.from(await readFile(this.#options.storagePath, "utf8"), "base64");
-        this.#restoreStoredSession(this.#options.decrypt(encrypted));
-      } catch (error) {
+      const attempt4 = yield* Effect.gen({ self: this }, function* () {
+        const encrypted = Buffer.from(yield* authCall(() => readFile(this.#options.storagePath, "utf8")), "base64");
+        yield* authDecode(() => this.#restoreStoredSession(this.#options.decrypt(encrypted)));
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt4)) {
+        const error = attempt4.failure.cause;
         if (!isMissingFileError(error)) {
-          await this.#clearStoredSession();
+          yield* this.#clearStoredSessionEffect();
         }
       }
     } else {
-      await rm(this.#options.storagePath, { force: true });
+      yield* authCall(() => rm(this.#options.storagePath, { force: true }));
     }
     if (!this.#sessionToken) {
-      await this.#startupRequest("/health/live", { method: "GET" }, decodeRecordHealth);
+      yield* this.#startupRequestEffect("/health/live", { method: "GET" }, decodeRecordHealth);
       return this.#setState({ status: "signed_out" });
     }
-    try {
-      const user = await this.#startupRequest("/v1/me", { method: "GET" }, decodeCentralAuthUser, this.#sessionToken);
+    const sessionToken = this.#sessionToken;
+    return yield* Effect.gen({ self: this }, function* () {
+      const user = yield* this.#startupRequestEffect("/v1/me", { method: "GET" }, decodeCentralAuthUser, sessionToken);
       return this.#setState({ status: "signed_in", user: this.#resolveUserAvatar(user) });
-    } catch (error) {
-      if (error instanceof AuthApiError && error.status === 401) {
-        await this.#clearStoredSession();
-        return this.#setState({ status: "signed_out" });
-      }
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          if (error instanceof AuthApiError && error.status === 401) {
+            yield* this.#clearStoredSessionEffect();
+            return this.#setState({ status: "signed_out" });
+          }
+          return yield* new CentralAuthOperationError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   requestEmailCode(email: string): Promise<CentralAuthState> {
     const normalizedEmail = email.trim().toLowerCase();
@@ -695,15 +1021,21 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     return pending;
   }
 
-  async #performEmailCodeRequest(request: EmailCodeRequest): Promise<CentralAuthState> {
+  #performEmailCodeRequest(request: EmailCodeRequest): Promise<CentralAuthState> {
+    return this.#run(this.#performEmailCodeRequestEffect(request));
+  }
+  readonly #performEmailCodeRequestEffect = Effect.fn("CentralAuth.performEmailCodeRequest")(function* (
+    this: CentralAuthManager,
+    request: EmailCodeRequest,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     const existingChallenge = this.#state.status === "code_sent" ? this.#state : null;
     if (existingChallenge) {
       this.#setState({ ...existingChallenge, issue: undefined });
     } else {
       this.#setState({ status: "signing_in" });
     }
-    try {
-      const result = await this.#request(
+    return yield* Effect.gen({ self: this }, function* () {
+      const result = yield* this.#requestEffect(
         "/v1/auth/email/start",
         {
           method: "POST",
@@ -717,7 +1049,9 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         this.#options.emailCodeRequestTimeoutMs,
       );
       if (!result.challengeId || !Number.isFinite(result.expiresAt)) {
-        throw new Error("The account service returned an invalid sign-in challenge.");
+        return yield* new CentralAuthOperationError({
+          cause: new Error("The account service returned an invalid sign-in challenge."),
+        });
       }
       if (this.#emailCodeRequest === request) this.#emailCodeRequest = null;
       return this.#setState({
@@ -728,29 +1062,46 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         resendAvailableAt: result.resendAt ?? Math.min(result.expiresAt, Date.now() + RESEND_FALLBACK_DELAY_MS),
         ...(result.developmentCode ? { developmentCode: result.developmentCode } : {}),
       });
-    } catch (error) {
-      if (isDefinitiveEmailCodeRequestFailure(error) && this.#emailCodeRequest === request) {
-        this.#emailCodeRequest = null;
-      }
-      const issue = emailCodeRequestIssue(error);
-      if (existingChallenge && !UNCERTAIN_EMAIL_CODE_REQUEST_FAILURES.has(issue.code)) {
-        return this.#setState({ ...existingChallenge, issue });
-      }
-      return this.#setState({
-        status: "error",
-        issue,
-      });
-    } finally {
-      if (this.#emailCodeRequest === request) request.promise = null;
-    }
-  }
+    })
+      .pipe(
+        Effect.catch(({ cause: error }) =>
+          Effect.sync(() => {
+            if (isDefinitiveEmailCodeRequestFailure(error) && this.#emailCodeRequest === request) {
+              this.#emailCodeRequest = null;
+            }
+            const issue = emailCodeRequestIssue(error);
+            if (existingChallenge && !UNCERTAIN_EMAIL_CODE_REQUEST_FAILURES.has(issue.code)) {
+              return this.#setState({ ...existingChallenge, issue });
+            }
+            return this.#setState({
+              status: "error",
+              issue,
+            });
+          }),
+        ),
+      )
+      .pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (this.#emailCodeRequest === request) request.promise = null;
+          }).pipe(Effect.orDie),
+        ),
+      );
+  });
 
-  async verifyEmailCode(challengeId: string, code: string): Promise<CentralAuthState> {
+  verifyEmailCode(challengeId: string, code: string): Promise<CentralAuthState> {
+    return this.#run(this.#verifyEmailCodeEffect(challengeId, code));
+  }
+  readonly #verifyEmailCodeEffect = Effect.fn("CentralAuth.verifyEmailCode")(function* (
+    this: CentralAuthManager,
+    challengeId: string,
+    code: string,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     const challenge = this.#state.status === "code_sent" ? this.#state : null;
     if (challenge) this.#setState({ ...challenge, issue: undefined });
     let sessionApplied = false;
-    try {
-      const session = await this.#request(
+    return yield* Effect.gen({ self: this }, function* () {
+      const session = yield* this.#requestEffect(
         "/v1/auth/email/verify",
         {
           method: "POST",
@@ -766,28 +1117,32 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       }
       this.#sessionToken = session.sessionToken;
       sessionApplied = true;
-      await this.#writeStoredSession();
+      yield* authCall(() => this.#writeStoredSession());
       return this.#setState({
         status: "signed_in",
         user: this.#resolveUserAvatar(session.user),
       });
-    } catch (error) {
-      // A wrong code or a failed request for a challenge leaves the stored session as it was: the
-      // user can still be signed in to another account, or have a session that only a startup
-      // check failed on.
-      if (sessionApplied || !challenge) await this.#clearStoredSession();
-      if (challenge) {
-        return this.#setState({
-          ...challenge,
-          issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
-        });
-      }
-      return this.#setState({
-        status: "error",
-        issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
-      });
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          // A wrong code or a failed request for a challenge leaves the stored session as it was: the
+          // user can still be signed in to another account, or have a session that only a startup
+          // check failed on.
+          if (sessionApplied || !challenge) yield* this.#clearStoredSessionEffect();
+          if (challenge) {
+            return this.#setState({
+              ...challenge,
+              issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
+            });
+          }
+          return this.#setState({
+            status: "error",
+            issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
+          });
+        }),
+      ),
+    );
+  });
 
   /** False when the session can live only in memory, so it would be lost at the next start. */
   canPersistSession(): boolean {
@@ -798,8 +1153,18 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
    * Signs a new hosted server in with the claim that the account server put in its VM.
    * The result names the host ID that the account server reserved for this account.
    */
-  async redeemHostedServerClaim(claim: string): Promise<{ hostId: string; name: string; user: CentralAuthUser }> {
-    const redeemed = await this.#request(
+  redeemHostedServerClaim(claim: string): Promise<{ hostId: string; name: string; user: CentralAuthUser }> {
+    return this.#run(this.#redeemHostedServerClaimEffect(claim));
+  }
+  readonly #redeemHostedServerClaimEffect = Effect.fn("CentralAuth.redeemHostedServerClaim")(function* (
+    this: CentralAuthManager,
+    claim: string,
+  ): Effect.fn.Return<
+    { hostId: string; name: string; user: CentralAuthUser },
+    CentralAuthOperationError,
+    CentralAuthTransport
+  > {
+    const redeemed = yield* this.#requestEffect(
       "/v2/hosting/claims/redeem",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ claim }) },
       (value) => {
@@ -816,35 +1181,52 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     // The claim is spent. A session that is not stored ends at the next start, so a failed write fails
     // the redeem, and the session is not kept in memory. The start retry redeems the claim again in its
     // retry window.
-    try {
-      await this.#writeStoredSession({ required: true });
-    } catch (error) {
+    const attempt7 = yield* Effect.gen({ self: this }, function* () {
+      yield* authCall(() => this.#writeStoredSession({ required: true }));
+    }).pipe(Effect.result);
+    if (Result.isFailure(attempt7)) {
+      const error = attempt7.failure.cause;
       this.#sessionToken = previousToken;
-      throw error;
+      return yield* new CentralAuthOperationError({ cause: error });
     }
     const user = this.#resolveUserAvatar(redeemed.user);
     this.#setState({ status: "signed_in", user });
     return { hostId: redeemed.hostId, name: redeemed.name, user };
-  }
+  });
 
-  async logout(): Promise<CentralAuthState> {
+  logout(): Promise<CentralAuthState> {
+    return this.#run(this.#logoutEffect());
+  }
+  readonly #logoutEffect = Effect.fn("CentralAuth.logout")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     this.#emailCodeRequest = null;
     if (this.#sessionToken) {
-      try {
-        await this.#authorizedRequest("/v1/auth/logout", { method: "POST" }, decodeVoid);
-      } catch {
+      const attempt8 = yield* Effect.gen({ self: this }, function* () {
+        yield* this.#authorizedRequestEffect("/v1/auth/logout", { method: "POST" }, decodeVoid);
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt8)) {
         // Local logout must still remove the session from this device.
       }
     }
-    await this.#clearStoredSession();
+    yield* this.#clearStoredSessionEffect();
     return this.#setState({ status: "signed_out" });
-  }
+  });
 
-  async updateAvatar(image: AvatarImageInput | null): Promise<CentralAuthState> {
+  updateAvatar(image: AvatarImageInput | null): Promise<CentralAuthState> {
+    return this.#run(this.#updateAvatarEffect(image));
+  }
+  readonly #updateAvatarEffect = Effect.fn("CentralAuth.updateAvatar")(function* (
+    this: CentralAuthManager,
+    image: AvatarImageInput | null,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     const sessionToken = this.#sessionToken;
-    if (!sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
+    if (!sessionToken)
+      return yield* new CentralAuthOperationError({
+        cause: new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired")),
+      });
     const user = image
-      ? await this.#authorizedRequest(
+      ? yield* this.#authorizedRequestEffect(
           "/v1/me/avatar",
           {
             method: "PUT",
@@ -853,7 +1235,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
           },
           decodeCentralAuthUser,
         )
-      : await this.#authorizedRequest(
+      : yield* this.#authorizedRequestEffect(
           "/v1/me/avatar",
           {
             method: "DELETE",
@@ -866,12 +1248,21 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       status: "signed_in",
       user: { ...this.#state.user, avatarUrl: resolvedUser.avatarUrl },
     });
-  }
+  });
 
-  async updateName(name: string): Promise<CentralAuthState> {
+  updateName(name: string): Promise<CentralAuthState> {
+    return this.#run(this.#updateNameEffect(name));
+  }
+  readonly #updateNameEffect = Effect.fn("CentralAuth.updateName")(function* (
+    this: CentralAuthManager,
+    name: string,
+  ): Effect.fn.Return<CentralAuthState, CentralAuthOperationError, CentralAuthTransport> {
     const sessionToken = this.#sessionToken;
-    if (!sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
-    const user = await this.#authorizedRequest(
+    if (!sessionToken)
+      return yield* new CentralAuthOperationError({
+        cause: new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired")),
+      });
+    const user = yield* this.#authorizedRequestEffect(
       "/v1/me/profile",
       {
         method: "PATCH",
@@ -885,63 +1276,80 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       status: "signed_in",
       user: { ...this.#state.user, name: user.name },
     });
-  }
+  });
 
-  async #request<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs = 10_000): Promise<T> {
-    const response = await this.#options.fetch(new URL(path, this.#options.apiUrl), {
-      ...init,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) throw await AuthApiError.fromResponse(response);
-    return decoder(response.status === 204 ? undefined : await response.json());
-  }
+  readonly #requestEffect = Effect.fn("CentralAuth.request")(function* <T>(
+    this: CentralAuthManager,
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs = 10_000,
+  ): Effect.fn.Return<T, CentralAuthOperationError, CentralAuthTransport> {
+    const response = yield* CentralAuthTransport.use((transport) =>
+      transport.fetch(new URL(path, this.#options.apiUrl), {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+      }),
+    );
+    if (!response.ok)
+      return yield* new CentralAuthOperationError({
+        cause: yield* AuthApiError.fromResponseEffect(response),
+      });
+    const value = response.status === 204 ? undefined : yield* authCall(() => response.json());
+    return yield* authDecode(() => decoder(value));
+  });
 
-  async #startupRequest<T>(
+  readonly #startupRequestEffect = Effect.fn("CentralAuth.startupRequest")(function* <T>(
+    this: CentralAuthManager,
     path: string,
     init: RequestInit,
     decoder: (value: unknown) => T,
     sessionToken?: string,
-  ): Promise<T> {
+  ): Effect.fn.Return<T, CentralAuthOperationError, CentralAuthTransport> {
     const deadline = Date.now() + this.#options.startupRetryWindowMs;
     let retryIndex = 0;
     while (true) {
       const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) throw new Error(sourceText("error.auth.serviceUnavailable"));
-      try {
-        return await this.#request(
-          path,
-          {
-            ...init,
-            headers: sessionToken ? { ...init.headers, Authorization: `Bearer ${sessionToken}` } : init.headers,
-          },
-          decoder,
-          Math.max(1, Math.min(this.#options.startupRequestTimeoutMs, remainingMs)),
-        );
-      } catch (error) {
-        if (!isTransientStartupError(error)) throw error;
-        const delayMs = Math.min(
-          this.#options.startupRetryDelaysMs[Math.min(retryIndex, this.#options.startupRetryDelaysMs.length - 1)] ?? 0,
-          Math.max(0, deadline - Date.now()),
-        );
-        if (delayMs <= 0) throw error;
-        await delay(delayMs);
-        retryIndex += 1;
-      }
+      if (remainingMs <= 0)
+        return yield* new CentralAuthOperationError({ cause: new Error(sourceText("error.auth.serviceUnavailable")) });
+      const result = yield* this.#requestEffect(
+        path,
+        {
+          ...init,
+          headers: sessionToken ? { ...init.headers, Authorization: `Bearer ${sessionToken}` } : init.headers,
+        },
+        decoder,
+        Math.max(1, Math.min(this.#options.startupRequestTimeoutMs, remainingMs)),
+      ).pipe(Effect.result);
+      if (Result.isSuccess(result)) return result.success;
+      const error = result.failure.cause;
+      if (!isTransientStartupError(error)) return yield* result.failure;
+      const delayMs = Math.min(
+        this.#options.startupRetryDelaysMs[Math.min(retryIndex, this.#options.startupRetryDelaysMs.length - 1)] ?? 0,
+        Math.max(0, deadline - Date.now()),
+      );
+      if (delayMs <= 0) return yield* result.failure;
+      yield* Effect.sleep(delayMs);
+      retryIndex += 1;
     }
-  }
+  });
 
-  #authorizedRequest<T>(
+  readonly #authorizedRequestEffect = Effect.fn("CentralAuth.authorizedRequest")(function* <T>(
+    this: CentralAuthManager,
     path: string,
     init: RequestInit,
     decoder: (value: unknown) => T,
     timeoutMs?: number,
-  ): Promise<T> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
+  ): Effect.fn.Return<T, CentralAuthOperationError, CentralAuthTransport> {
+    if (!this.#sessionToken)
+      return yield* new CentralAuthOperationError({
+        cause: new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired")),
+      });
     // A spread drops the entries of a `Headers` object, such as the hosting developer key.
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.#sessionToken}`);
-    return this.#request(path, { ...init, headers }, decoder, timeoutMs);
-  }
+    return yield* this.#requestEffect(path, { ...init, headers }, decoder, timeoutMs);
+  });
 
   #resolveUserAvatar(user: CentralAuthUser): CentralAuthUser {
     return {
@@ -960,34 +1368,51 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     return this.#sessionWriteChain;
   }
 
-  async #writeStoredSessionNow(required: boolean): Promise<void> {
+  #writeStoredSessionNow(required: boolean): Promise<void> {
+    return this.#run(this.#writeStoredSessionNowEffect(required));
+  }
+  readonly #writeStoredSessionNowEffect = Effect.fn("CentralAuth.writeStoredSessionNow")(function* (
+    this: CentralAuthManager,
+    required: boolean,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
     if (!this.#sessionToken) return;
     if (!this.#options.canPersist()) {
-      await rm(this.#options.storagePath, { force: true });
-      if (required) throw new Error("The session could not be stored.");
+      yield* authCall(() => rm(this.#options.storagePath, { force: true }));
+      if (required)
+        return yield* new CentralAuthOperationError({ cause: new Error("The session could not be stored.") });
       return;
     }
     const temporaryPath = `${this.#options.storagePath}.${randomUUID()}.tmp`;
-    try {
+    yield* Effect.gen({ self: this }, function* () {
       const value = JSON.stringify({
         version: 2,
         sessionToken: this.#sessionToken,
         teamHostTokens: Object.fromEntries(this.#teamHostTokens),
       });
-      const encrypted = this.#options.encrypt(value).toString("base64");
-      await mkdir(dirname(this.#options.storagePath), { recursive: true });
-      await writeFile(temporaryPath, encrypted, { mode: 0o600 });
-      await chmod(temporaryPath, 0o600);
-      await rename(temporaryPath, this.#options.storagePath);
-    } catch (error) {
-      await Promise.allSettled([rm(this.#options.storagePath, { force: true }), rm(temporaryPath, { force: true })]);
-      if (required) throw error;
-    } finally {
-      await Promise.allSettled([rm(temporaryPath, { force: true })]);
-    }
-  }
+      const encrypted = yield* authDecode(() => this.#options.encrypt(value).toString("base64"));
+      yield* authCall(() => mkdir(dirname(this.#options.storagePath), { recursive: true }));
+      yield* authCall(() => writeFile(temporaryPath, encrypted, { mode: 0o600 }));
+      yield* authCall(() => chmod(temporaryPath, 0o600));
+      yield* authCall(() => rename(temporaryPath, this.#options.storagePath));
+    }).pipe(
+      Effect.catch((failure) =>
+        Effect.gen({ self: this }, function* () {
+          yield* Effect.all(
+            [this.#options.storagePath, temporaryPath].map((path) =>
+              authCall(() => rm(path, { force: true })).pipe(Effect.catch(() => Effect.void)),
+            ),
+            { concurrency: "unbounded" },
+          );
+          if (required) return yield* failure;
+        }),
+      ),
+      Effect.ensuring(authCall(() => rm(temporaryPath, { force: true })).pipe(Effect.catch(() => Effect.void))),
+    );
+  });
 
-  async #clearStoredSession(): Promise<void> {
+  readonly #clearStoredSessionEffect = Effect.fn("CentralAuth.clearStoredSession")(function* (
+    this: CentralAuthManager,
+  ): Effect.fn.Return<void, CentralAuthOperationError, CentralAuthTransport> {
     this.#sessionToken = null;
     this.#sessionAccountId = null;
     this.#teamHostTokens.clear();
@@ -997,8 +1422,8 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       () => rm(this.#options.storagePath, { force: true }),
       () => rm(this.#options.storagePath, { force: true }),
     );
-    await this.#sessionWriteChain;
-  }
+    yield* authCall(() => this.#sessionWriteChain);
+  });
 
   #restoreStoredSession(value: string): void {
     if (!value.trimStart().startsWith("{")) {
@@ -1060,28 +1485,26 @@ export function readMobileConnectApiUrl(value: string | undefined, fallback: str
   return new URL(apiUrl).origin;
 }
 
-class AuthApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly retryAfterSeconds?: number,
-  ) {
-    super(message);
+class AuthApiError extends Schema.TaggedError<AuthApiError>()("AuthApiError", {
+  status: Schema.Number,
+  code: Schema.String,
+  message: Schema.String,
+  retryAfterSeconds: Schema.optional(Schema.Number),
+}) {
+  constructor(status: number, code: string, message: string, retryAfterSeconds?: number) {
+    super({ status, code, message, retryAfterSeconds });
   }
 
-  static async fromResponse(response: Response): Promise<AuthApiError> {
+  static readonly fromResponseEffect = Effect.fn("CentralAuth.decodeError")(function* (response: Response) {
     const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get("Retry-After"));
-    try {
-      const value = await response.json();
-      if (!isDynamicRecord(value) || !isDynamicRecord(value.error)) {
-        throw new Error("Invalid error response.");
-      }
-      if (isString(value.error.code) && isString(value.error.message)) {
-        return new AuthApiError(response.status, value.error.code, value.error.message, retryAfterSeconds);
-      }
-    } catch {
-      // Use a generic error when the server did not return the API error shape.
+    const value = yield* authCall(() => response.json()).pipe(Effect.catch(() => Effect.succeed(null)));
+    if (
+      isDynamicRecord(value) &&
+      isDynamicRecord(value.error) &&
+      isString(value.error.code) &&
+      isString(value.error.message)
+    ) {
+      return new AuthApiError(response.status, value.error.code, value.error.message, retryAfterSeconds);
     }
     return new AuthApiError(
       response.status,
@@ -1089,7 +1512,7 @@ class AuthApiError extends Error {
       sourceText("error.auth.serviceError"),
       retryAfterSeconds,
     );
-  }
+  });
 }
 
 function centralAuthIssue(error: unknown, fallbackCode: string, fallbackMessage: string): CentralAuthIssue {
@@ -1149,8 +1572,4 @@ function errorMessage(error: unknown, fallback: string): string {
 
 function isTransientStartupError(error: unknown): boolean {
   return !(error instanceof AuthApiError) || error.status >= 500;
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

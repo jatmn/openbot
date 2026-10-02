@@ -1,37 +1,61 @@
+import { Effect, Schema } from "effect";
+import { runApiEffect } from "./effect-runtime";
+
+class CryptoOperationError extends Schema.TaggedError<CryptoOperationError>()("CryptoOperationError", {}) {}
+function cryptoCall<A>(operation: () => Promise<A>): Effect.Effect<A, CryptoOperationError> {
+  return Effect.tryPromise({ try: operation, catch: () => new CryptoOperationError({}) });
+}
+
 export function randomToken(bytes = 32): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
   return base64Url(value);
 }
 
-export async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return base64Url(new Uint8Array(digest));
+export function sha256(value: string): Promise<string> {
+  return runApiEffect(sha256Effect(value));
 }
 
-export async function hmacSha256(secret: string, value: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
-  const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+export const sha256Effect = Effect.fn("Crypto.sha256")(function* (value: string) {
+  const digest = yield* cryptoCall(() => crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
   return base64Url(new Uint8Array(digest));
+});
+
+export function hmacSha256(secret: string, value: string): Promise<string> {
+  return runApiEffect(hmacSha256Effect(secret, value));
 }
+
+export const hmacSha256Effect = Effect.fn("Crypto.hmacSha256")(function* (secret: string, value: string) {
+  const encoder = new TextEncoder();
+  const key = yield* cryptoCall(() =>
+    crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+  );
+  const digest = yield* cryptoCall(() => crypto.subtle.sign("HMAC", key, encoder.encode(value)));
+  return base64Url(new Uint8Array(digest));
+});
 
 /**
  * Derives a key for one use from a secret that has another use. A different label gives an unrelated
  * key, so the derived key tells nothing about the secret or about a key with another label.
  */
-export async function deriveSecret(secret: string, label: string): Promise<string> {
+export function deriveSecret(secret: string, label: string): Promise<string> {
+  return runApiEffect(deriveSecretEffect(secret, label));
+}
+
+export const deriveSecretEffect = Effect.fn("Crypto.deriveSecret")(function* (secret: string, label: string) {
   const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), "HKDF", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: encoder.encode(label) },
-    key,
-    256,
+  const key = yield* cryptoCall(() =>
+    crypto.subtle.importKey("raw", encoder.encode(secret), "HKDF", false, ["deriveBits"]),
+  );
+  const bits = yield* cryptoCall(() =>
+    crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: encoder.encode(label) },
+      key,
+      256,
+    ),
   );
   return base64Url(new Uint8Array(bits));
-}
+});
 
 function base64Url(value: Uint8Array): string {
   let binary = "";

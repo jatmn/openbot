@@ -4,6 +4,7 @@ import {
   openSlackWorkspaceGrant,
   type SlackWorkspaceGrant,
 } from "@openbot/contracts/slack-workspace-grant";
+import { Effect, Result, Schema } from "effect";
 
 /** How long a connect link stays usable. */
 const PENDING_TTL_MS = 15 * 60_000;
@@ -31,30 +32,56 @@ export class SlackConnect {
   }
 
   /** Opens Slack's install page in the browser. The deep link to `complete` ends it. */
-  async start(): Promise<void> {
-    this.#prune();
-    const nonce = randomBytes(24).toString("base64url");
-    const { privateKey, publicKey } = await createSlackWorkspaceKeyPair();
-    this.#pending.set(nonce, { privateKey, expiresAt: Date.now() + PENDING_TTL_MS });
-    const url = await this.#port.authorize({ hostNonce: nonce, hostPublicKey: publicKey });
-    await this.#port.openExternal(url);
+  start(): Promise<void> {
+    return runConnect(this.startEffect());
   }
 
+  readonly startEffect = Effect.fnUntraced(function* (this: SlackConnect) {
+    this.#prune();
+    const nonce = randomBytes(24).toString("base64url");
+    const { privateKey, publicKey } = yield* connectIo(() => createSlackWorkspaceKeyPair());
+    this.#pending.set(nonce, { privateKey, expiresAt: Date.now() + PENDING_TTL_MS });
+    const url = yield* connectIo(() => this.#port.authorize({ hostNonce: nonce, hostPublicKey: publicKey }));
+    yield* connectIo(() => this.#port.openExternal(url));
+  });
+
   /** Null for a nonce this run did not start: such a link does nothing. */
-  async complete(nonce: string, grant: string): Promise<SlackWorkspaceGrant | null> {
+  complete(nonce: string, grant: string): Promise<SlackWorkspaceGrant | null> {
+    return runConnect(this.completeEffect(nonce, grant));
+  }
+
+  readonly completeEffect = Effect.fnUntraced(function* (this: SlackConnect, nonce: string, grant: string) {
     this.#prune();
     const pending = this.#pending.get(nonce);
     if (!pending) return null;
     this.#pending.delete(nonce);
-    return openSlackWorkspaceGrant(pending.privateKey, nonce, grant);
-  }
+    return yield* connectIo(() => openSlackWorkspaceGrant(pending.privateKey, nonce, grant));
+  });
 
   unlink(workspaceId: string): Promise<void> {
-    return this.#port.unlink(workspaceId);
+    return runConnect(this.unlinkEffect(workspaceId));
   }
+
+  readonly unlinkEffect = Effect.fnUntraced(function* (this: SlackConnect, workspaceId: string) {
+    yield* connectIo(() => this.#port.unlink(workspaceId));
+  });
 
   #prune(): void {
     const now = Date.now();
     for (const [nonce, pending] of this.#pending) if (pending.expiresAt < now) this.#pending.delete(nonce);
   }
+}
+
+export class SlackConnectFailed extends Schema.TaggedError<SlackConnectFailed>()("SlackConnectFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function connectIo<A>(run: () => Promise<A>): Effect.Effect<A, SlackConnectFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new SlackConnectFailed({ cause }) });
+}
+
+async function runConnect<A>(operation: Effect.Effect<A, SlackConnectFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

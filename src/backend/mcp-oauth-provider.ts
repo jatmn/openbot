@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import { type McpOperationError, mcpCall, mcpFailure, mcpSync, runMcpEffect } from "./mcp-effects";
 /**
  * The OAuth client OpenBot is, for an http MCP server that asks its users to sign in.
  *
@@ -165,15 +167,23 @@ export class McpOAuth implements McpOAuthAuthority {
    * arrive out of nowhere. A refresh that fails answers with the token that is stored anyway, so
    * the server states the refusal itself rather than the tool quietly losing its credential.
    */
-  async accessToken(url: string): Promise<string | null> {
+  accessToken(url: string): Promise<string | null> {
+    return runMcpEffect(this.#accessTokenOperation(url));
+  }
+
+  readonly #accessTokenOperation = Effect.fn("McpOAuth.accessToken")(function* (
+    this: McpOAuth,
+    url: string,
+  ): Effect.fn.Return<string | null, McpOperationError> {
     const resource = normalizeResource(url);
     if (!resource) return null;
-    const stored = this.#options.storage.read(resource);
+    const stored = yield* mcpSync(() => this.#options.storage.read(resource));
     if (!stored?.tokens) return null;
-    if (!expiringSoon(stored)) return stored.tokens.access_token;
-    await this.#refresh(resource);
-    return this.#options.storage.read(resource)?.tokens?.access_token ?? stored.tokens.access_token;
-  }
+    const fallback = stored.tokens.access_token;
+    if (!expiringSoon(stored)) return fallback;
+    yield* mcpCall(() => this.#refresh(resource));
+    return yield* mcpSync(() => this.#options.storage.read(resource)?.tokens?.access_token ?? fallback);
+  });
 
   /**
    * One exchange per server at a time, whoever asks.
@@ -201,18 +211,23 @@ export class McpOAuth implements McpOAuthAuthority {
     const controller = new AbortController();
     // A refresh the authorization server refused, or one it never got, is not reported here: the
     // stored token is the best answer left, and the server is the right place for the refusal.
-    const exchange = auth(this.#provider(resource, null), {
-      serverUrl: resource,
-      fetchFn: secureOAuthFetch(controller.signal),
-    })
-      .then(
-        () => undefined,
-        () => undefined,
-      )
-      .finally(() => {
-        clearTimeout(deadline);
-        if (this.#refreshing.get(resource)?.exchange === exchange) this.#refreshing.delete(resource);
-      });
+    const exchange = runMcpEffect(
+      mcpCall(() =>
+        auth(this.#provider(resource, null), {
+          serverUrl: resource,
+          fetchFn: secureOAuthFetch(controller.signal),
+        }),
+      ).pipe(
+        Effect.asVoid,
+        Effect.catch(() => Effect.void),
+        Effect.ensuring(
+          Effect.sync(() => {
+            clearTimeout(deadline);
+            if (this.#refreshing.get(resource)?.exchange === exchange) this.#refreshing.delete(resource);
+          }),
+        ),
+      ),
+    );
     const entry = { exchange, cancel: () => controller.abort() };
     this.#refreshing.set(resource, entry);
     const deadline = setTimeout(() => {
@@ -222,9 +237,16 @@ export class McpOAuth implements McpOAuthAuthority {
     return this.#awaitRefresh(exchange);
   }
 
-  async #awaitRefresh(exchange: Promise<void>): Promise<void> {
-    await stopWaiting(exchange, this.#options.refreshTimeoutMs ?? MCP_TOKEN_TIMEOUT_MS);
+  #awaitRefresh(exchange: Promise<void>): Promise<void> {
+    return runMcpEffect(this.#awaitRefreshEffect(exchange));
   }
+
+  readonly #awaitRefreshEffect = Effect.fn("McpOAuth.awaitRefresh")(function* (
+    this: McpOAuth,
+    exchange: Promise<void>,
+  ): Effect.fn.Return<void, McpOperationError> {
+    yield* mcpCall(() => stopWaiting(exchange, this.#options.refreshTimeoutMs ?? MCP_TOKEN_TIMEOUT_MS));
+  });
 
   /** A sign-in the user asked for, or `null` when the URL is not one this can sign in to. */
   signIn(url: string): McpSignIn | null {
@@ -246,37 +268,48 @@ export class McpOAuth implements McpOAuthAuthority {
     };
     return {
       provider,
-      complete: async () => {
-        if (abandoned) throw new Error(sourceText("error.backend.mcpSignInAbandonedGeneric"));
-        // Aborts with the wait: a token endpoint that never completes must not keep a request
-        // running after this attempt ends, or its late response would write credentials a later
-        // sign-in already replaced.
-        const controller = new AbortController();
-        try {
-          const code = await withSignInDeadline(grant, this.#options.signInTimeoutMs ?? MCP_SIGN_IN_TIMEOUT_MS);
-          // The grant is a credential until it is spent, and a token endpoint that refuses it
-          // commonly quotes it back in `error_description`.
-          provider.recordSecret(code);
-          // From here the registration on file is the one the grant was issued to, whatever
-          // address it names: registering again would trade the code against another client.
-          provider.beginCodeExchange();
-          // The grant waited on the person; the trade waits on the server, and on nothing else.
-          // Without this a hung token endpoint holds the test past its own deadline after the user
-          // has done everything right.
-          await withTimeout(
-            auth(provider, {
-              serverUrl: resource,
-              authorizationCode: code,
-              fetchFn: secureOAuthFetch(controller.signal),
-            }),
-            this.#options.refreshTimeoutMs ?? MCP_TOKEN_TIMEOUT_MS,
-            "The sign-in response did not arrive in time.",
-          );
-        } finally {
-          controller.abort();
-          abandon();
-        }
-      },
+      complete: () =>
+        runMcpEffect(
+          Effect.gen({ self: this }, function* () {
+            if (abandoned) return yield* mcpFailure(new Error(sourceText("error.backend.mcpSignInAbandonedGeneric")));
+            // Aborts with the wait: a token endpoint that never completes must not keep a request
+            // running after this attempt ends, or its late response would write credentials a later
+            // sign-in already replaced.
+            const controller = new AbortController();
+            yield* Effect.gen({ self: this }, function* () {
+              const code = yield* mcpCall(() =>
+                withSignInDeadline(grant, this.#options.signInTimeoutMs ?? MCP_SIGN_IN_TIMEOUT_MS),
+              );
+              // The grant is a credential until it is spent, and a token endpoint that refuses it
+              // commonly quotes it back in `error_description`.
+              provider.recordSecret(code);
+              // From here the registration on file is the one the grant was issued to, whatever
+              // address it names: registering again would trade the code against another client.
+              provider.beginCodeExchange();
+              // The grant waited on the person; the trade waits on the server, and on nothing else.
+              // Without this a hung token endpoint holds the test past its own deadline after the user
+              // has done everything right.
+              yield* mcpCall(() =>
+                withTimeout(
+                  auth(provider, {
+                    serverUrl: resource,
+                    authorizationCode: code,
+                    fetchFn: secureOAuthFetch(controller.signal),
+                  }),
+                  this.#options.refreshTimeoutMs ?? MCP_TOKEN_TIMEOUT_MS,
+                  "The sign-in response did not arrive in time.",
+                ),
+              );
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  controller.abort();
+                  abandon();
+                }),
+              ),
+            );
+          }),
+        ),
       abandon,
       secrets: () => provider.secrets(),
       registrationFailed: () => provider.registrationPending,
@@ -303,7 +336,7 @@ export class McpOAuth implements McpOAuthAuthority {
     // count, so the write it finishes with is refused below rather than restoring the account.
     // Re-adding the same URL starts a new sign-in at the new count, which its writes carry.
     this.#generations.set(resource, (this.#generations.get(resource) ?? 0) + 1);
-    return this.#options.storage.clear(resource);
+    return runMcpEffect(mcpCall(() => this.#options.storage.clear(resource)));
   }
 
   /** A `state` makes the provider interactive; `null` keeps it silent. */
@@ -320,17 +353,23 @@ export class McpOAuth implements McpOAuthAuthority {
     };
     const guarded: McpOAuthStorage = {
       read: (candidate) => storage.read(candidate),
-      write: async (candidate, record) => {
-        ensureCurrent();
-        await storage.write(candidate, record);
-      },
+      write: (candidate, record) =>
+        runMcpEffect(
+          Effect.gen({ self: this }, function* () {
+            yield* mcpSync(ensureCurrent);
+            yield* mcpCall(() => storage.write(candidate, record));
+          }),
+        ),
       // Removal is guarded exactly as a write is. The SDK answers `invalid_client` by calling
       // `invalidateCredentials("all")`, so a refusal that arrives after this attempt ended would
       // otherwise delete the account a later sign-in had already stored.
-      clear: async (candidate) => {
-        ensureCurrent();
-        await storage.clear(candidate);
-      },
+      clear: (candidate) =>
+        runMcpEffect(
+          Effect.gen({ self: this }, function* () {
+            ensureCurrent();
+            yield* mcpCall(() => storage.clear(candidate));
+          }),
+        ),
     };
     return new McpOAuthClientProvider({
       resource,
@@ -464,11 +503,18 @@ class McpOAuthClientProvider implements OAuthClientProvider {
     this.#exchangingCode = true;
   }
 
-  async saveClientInformation(information: OAuthClientInformationFull): Promise<void> {
+  saveClientInformation(information: OAuthClientInformationFull): Promise<void> {
+    return runMcpEffect(this.#saveClientInformationOperation(information));
+  }
+
+  readonly #saveClientInformationOperation = Effect.fn("McpOAuthClientProvider.saveClientInformation")(function* (
+    this: McpOAuthClientProvider,
+    information: OAuthClientInformationFull,
+  ): Effect.fn.Return<void, McpOperationError> {
     this.#registrationPending = false;
     this.recordSecret(information.client_secret);
-    await this.#save({ client: information });
-  }
+    yield* this.#saveEffect({ client: information });
+  });
 
   tokens(): OAuthTokens | undefined {
     const tokens = this.#record().tokens;
@@ -476,10 +522,17 @@ class McpOAuthClientProvider implements OAuthClientProvider {
     return tokens;
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
-    this.#recordTokens(tokens);
-    await this.#save({ tokens, obtainedAt: Date.now() });
+  saveTokens(tokens: OAuthTokens): Promise<void> {
+    return runMcpEffect(this.#saveTokensOperation(tokens));
   }
+
+  readonly #saveTokensOperation = Effect.fn("McpOAuthClientProvider.saveTokens")(function* (
+    this: McpOAuthClientProvider,
+    tokens: OAuthTokens,
+  ): Effect.fn.Return<void, McpOperationError> {
+    this.#recordTokens(tokens);
+    yield* this.#saveEffect({ tokens, obtainedAt: Date.now() });
+  });
 
   /** What this attempt must never quote back. Short values are left to `redactMcpValues`. */
   recordSecret(value: string | undefined): void {
@@ -502,17 +555,25 @@ class McpOAuthClientProvider implements OAuthClientProvider {
    * existing session and the address bar that proves which site is asking - which is the whole
    * reason RFC 8252 says a native app must not do it.
    */
-  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+  redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    return runMcpEffect(this.#redirectToAuthorizationOperation(authorizationUrl));
+  }
+
+  readonly #redirectToAuthorizationOperation = Effect.fn("McpOAuthClientProvider.redirectToAuthorization")(function* (
+    this: McpOAuthClientProvider,
+    authorizationUrl: URL,
+  ): Effect.fn.Return<void, McpOperationError> {
     // The probe moved on: a discovery slow enough to outlast it must not open a browser
     // afterwards for a grant nobody waits for.
     if (this.#options.isAbandoned()) return;
-    if (!this.#options.state) throw new Error(sourceText("error.backend.mcpSignInNoBrowser"));
+    if (!this.#options.state) return yield* mcpFailure(new Error(sourceText("error.backend.mcpSignInNoBrowser")));
     // The address arrives in the server's own discovery document, and the SDK accepts more than
     // web pages: an https server naming a file or an installed protocol handler must not reach
     // the browser. Loopback http stays, for a sign-in server on the user's own machine.
-    if (!isAuthorizationUrlSafe(authorizationUrl)) throw new Error(sourceText("error.backend.mcpSignInNotWebPage"));
-    await this.#options.openExternal(authorizationUrl.toString());
-  }
+    if (!isAuthorizationUrlSafe(authorizationUrl))
+      return yield* mcpFailure(new Error(sourceText("error.backend.mcpSignInNotWebPage")));
+    yield* mcpCall(() => this.#options.openExternal(authorizationUrl.toString()));
+  });
 
   /**
    * The authorization server the last exchange found, kept with the encrypted credentials so a
@@ -520,14 +581,21 @@ class McpOAuthClientProvider implements OAuthClientProvider {
    * rediscovers at the default locations: metadata that lives only at the advertised URL is
    * missed, and the exchange falls back to the MCP origin's token endpoint.
    */
-  async saveDiscoveryState(discovery: OAuthDiscoveryState): Promise<void> {
-    await this.#save({
+  saveDiscoveryState(discovery: OAuthDiscoveryState): Promise<void> {
+    return runMcpEffect(this.#saveDiscoveryStateOperation(discovery));
+  }
+
+  readonly #saveDiscoveryStateOperation = Effect.fn("McpOAuthClientProvider.saveDiscoveryState")(function* (
+    this: McpOAuthClientProvider,
+    discovery: OAuthDiscoveryState,
+  ): Effect.fn.Return<void, McpOperationError> {
+    yield* this.#saveEffect({
       discovery: {
         authorizationServerUrl: discovery.authorizationServerUrl,
         resourceMetadataUrl: discovery.resourceMetadataUrl,
       },
     });
-  }
+  });
 
   discoveryState(): OAuthDiscoveryState | undefined {
     return this.#record().discovery;
@@ -548,31 +616,43 @@ class McpOAuthClientProvider implements OAuthClientProvider {
    * recover from, and then tries once more, so dropping the right part here is what turns a stale
    * registration into one sign-in rather than a server the user can never connect again.
    */
-  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+  invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    return runMcpEffect(this.#invalidateCredentialsOperation(scope));
+  }
+
+  readonly #invalidateCredentialsOperation = Effect.fn("McpOAuthClientProvider.invalidateCredentials")(function* (
+    this: McpOAuthClientProvider,
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ): Effect.fn.Return<void, McpOperationError> {
     if (scope === "verifier" || scope === "discovery") {
       if (scope === "verifier") this.#codeVerifier = null;
-      else await this.#save({ discovery: undefined });
+      else yield* this.#saveEffect({ discovery: undefined });
       return;
     }
     if (scope === "all") {
       this.#codeVerifier = null;
-      await this.#options.storage.clear(this.#options.resource);
+      yield* mcpCall(() => this.#options.storage.clear(this.#options.resource));
       return;
     }
     const record = this.#record();
-    await this.#options.storage.write(
-      this.#options.resource,
-      scope === "client" ? { tokens: record.tokens, obtainedAt: record.obtainedAt } : { client: record.client },
+    yield* mcpCall(() =>
+      this.#options.storage.write(
+        this.#options.resource,
+        scope === "client" ? { tokens: record.tokens, obtainedAt: record.obtainedAt } : { client: record.client },
+      ),
     );
-  }
+  });
 
   #record(): McpOAuthRecord {
     return this.#options.storage.read(this.#options.resource) ?? {};
   }
 
-  async #save(part: Partial<McpOAuthRecord>): Promise<void> {
-    await this.#options.storage.write(this.#options.resource, { ...this.#record(), ...part });
-  }
+  readonly #saveEffect = Effect.fn("McpOAuthClientProvider.save")(function* (
+    this: McpOAuthClientProvider,
+    part: Partial<McpOAuthRecord>,
+  ): Effect.fn.Return<void, McpOperationError> {
+    yield* mcpCall(() => this.#options.storage.write(this.#options.resource, { ...this.#record(), ...part }));
+  });
 }
 
 /**
@@ -660,29 +740,40 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * never say where it went.
  */
 export function secureOAuthFetch(signal?: AbortSignal): FetchLike {
-  return async (input, init) => {
-    let url = new URL(input instanceof URL ? input.toString() : input);
-    let request: RequestInit = { ...init, ...(signal ? { signal } : {}), redirect: "manual" };
-    for (let hop = 0; ; hop++) {
-      if (!isSecureEndpoint(url)) throw new Error(sourceText("error.backend.oauthNotHttps", { origin: url.origin }));
-      const response = await fetch(url, request);
-      const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
-      // Not a redirect this follows: the SDK reads the answer, including a 3xx that names nowhere.
-      if (location === null) return response;
-      if (hop >= MAX_OAUTH_REDIRECTS) throw new Error(sourceText("error.backend.oauthTooManyRedirects"));
-      const next = new URL(location, url);
-      // Following by hand means the stripping `fetch` would have done is this loop's job now. A
-      // token request carries `Authorization: Basic` for a client with a secret, and the form
-      // holding the code or the refresh token in its body; neither belongs to an origin the first
-      // one only pointed at. Discovery carries neither, so an issuer may still redirect to the
-      // authorization server that answers for it.
-      if (next.origin !== url.origin && carriesCredential(request))
-        throw new Error(sourceText("error.backend.oauthRedirectOrigin", { origin: next.origin }));
-      url = next;
-      request = redirected(request, response.status);
-    }
-  };
+  return (input, init) => runMcpEffect(secureOAuthRequest(input, init, signal));
 }
+
+const secureOAuthRequest = Effect.fn("McpOAuth.secureFetch")(function* (
+  input: Parameters<FetchLike>[0],
+  init: Parameters<FetchLike>[1],
+  signal?: AbortSignal,
+): Effect.fn.Return<Response, McpOperationError> {
+  let url = yield* mcpSync(() => new URL(input instanceof URL ? input.toString() : input));
+  let request: RequestInit = { ...init, ...(signal ? { signal } : {}), redirect: "manual" };
+  for (let hop = 0; ; hop++) {
+    if (!isSecureEndpoint(url))
+      return yield* mcpFailure(new Error(sourceText("error.backend.oauthNotHttps", { origin: url.origin })));
+    const response = yield* Effect.tryPromise({
+      try: (requestSignal) =>
+        fetch(url, {
+          ...request,
+          signal: request.signal ? AbortSignal.any([request.signal, requestSignal]) : requestSignal,
+        }),
+      catch: mcpFailure,
+    });
+    const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
+    if (location === null) return response;
+    // Redirect response bodies are not consumed by the SDK.
+    yield* mcpCall(() => response.body?.cancel()).pipe(Effect.catch(() => Effect.void));
+    if (hop >= MAX_OAUTH_REDIRECTS)
+      return yield* mcpFailure(new Error(sourceText("error.backend.oauthTooManyRedirects")));
+    const next = yield* mcpSync(() => new URL(location, url));
+    if (next.origin !== url.origin && carriesCredential(request))
+      return yield* mcpFailure(new Error(sourceText("error.backend.oauthRedirectOrigin", { origin: next.origin })));
+    url = next;
+    request = redirected(request, response.status);
+  }
+});
 
 /** Whether this request would hand the next origin something only the first one should have. */
 function carriesCredential(request: RequestInit): boolean {

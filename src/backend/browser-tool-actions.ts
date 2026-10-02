@@ -1,5 +1,7 @@
 import type { BrowserTarget } from "@openbot/contracts/ipc";
+import { Effect } from "effect";
 import type { BrowserCdpEngine } from "./browser-cdp";
+import { browserCall, browserSync, runBrowserEffect } from "./browser-effects";
 import type { BrowserToolCall } from "./browser-tools";
 
 export interface BrowserDynamicToolHooks {
@@ -122,16 +124,21 @@ export function browserInputAction(call: BrowserInputCall, hooks: BrowserDynamic
       return {
         name: "upload-files",
         target: args.target,
-        run: async (engine, deadline, markDispatched) => {
-          const assignment = await engine.uploadFiles(
-            args.target,
-            args.paths,
-            (resolved) => hooks.onUploadTargetResolved?.(resolved.inputId, resolved.documentId),
-            deadline,
-            markDispatched,
-          );
-          hooks.onUploadAssigned?.(assignment.inputId, assignment.documentId);
-        },
+        run: (engine, deadline, markDispatched) =>
+          runBrowserEffect(
+            Effect.gen(function* () {
+              const assignment = yield* browserCall(() =>
+                engine.uploadFiles(
+                  args.target,
+                  args.paths,
+                  (resolved) => hooks.onUploadTargetResolved?.(resolved.inputId, resolved.documentId),
+                  deadline,
+                  markDispatched,
+                ),
+              );
+              yield* browserSync(() => hooks.onUploadAssigned?.(assignment.inputId, assignment.documentId));
+            }),
+          ),
       };
     }
   }

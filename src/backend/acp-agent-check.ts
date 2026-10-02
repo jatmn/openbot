@@ -1,3 +1,11 @@
+import { Effect } from "effect";
+import {
+  type ProviderClientOperationError,
+  providerCall,
+  providerFailure,
+  providerSync,
+  runProviderClientEffect,
+} from "./provider-client-effects";
 // "Check agent": one trial start of a custom agent, before the user saves it.
 //
 // Only `initialize` is sent. `session/new` is not: it can make an agent write in its folder, start
@@ -37,64 +45,82 @@ export interface AgentCheckTarget {
  * agent's last stderr line is added only after `redactText` and after the agent's own environment
  * values are masked, because an agent can print the key it was given.
  */
-export async function checkAcpAgent(target: AgentCheckTarget): Promise<CustomAgentCheckResult> {
-  const folder = await mkdtemp(join(tmpdir(), "openbot-agent-check-"));
-  const secrets = Object.values(target.env).filter((value) => value.length >= 4);
-  const redact = (text: string) => maskValues(redactText(text), secrets);
-  const spawnTarget = cliSpawnTarget(target.executable, target.args);
-  let child: ChildProcessWithoutNullStreams | null = null;
-  let lastStderr: string | null = null;
-  try {
-    child = spawn(spawnTarget.command, spawnTarget.args, {
-      cwd: folder,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...target.env },
-      detached: process.platform !== "win32",
-      windowsVerbatimArguments: spawnTarget.windowsVerbatimArguments,
-      windowsHide: true,
-    });
-    const started = child;
-    started.stderr.on("data", (chunk: Buffer) => {
-      const lines = chunk.toString("utf8").split(/\r?\n/u).filter(Boolean);
-      const last = lines.at(-1);
-      if (last) lastStderr = last;
-    });
-    const ended = new Promise<never>((_resolve, reject) => {
-      started.once("error", () => reject(new CheckEnd("stopped")));
-      started.once("close", () => reject(new CheckEnd("stopped")));
-    });
-    const connection = new ClientSideConnection(
-      () => ({
-        requestPermission: () => ({ outcome: { outcome: "cancelled" } }),
-        sessionUpdate: () => undefined,
-      }),
-      ndJsonStream(...processStreams(started)),
-    );
-    const initialization = await withTimeout(
-      Promise.race([
-        connection.initialize({
-          protocolVersion: OPENBOT_ACP_PROTOCOL_VERSION,
-          clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
-          clientInfo: OPENBOT_ACP_CLIENT_INFO,
-        }),
-        ended,
-      ]),
-      target.timeoutMs ?? AGENT_CHECK_TIMEOUT_MS,
-      sourceText("error.provider.customAgentCheckTimedOut"),
-    );
-    if (initialization.protocolVersion !== OPENBOT_ACP_PROTOCOL_VERSION) {
-      throw new CheckFailure(
-        sourceText("error.provider.customAgentProtocolVersion", { version: String(initialization.protocolVersion) }),
-      );
-    }
-    return checkResult(initialization, target.executable);
-  } catch (error) {
-    throw checkError(error, lastStderr, redact);
-  } finally {
-    if (child) await stopGroup(child);
-    await rm(folder, { recursive: true, force: true });
-  }
+export function checkAcpAgent(target: AgentCheckTarget): Promise<CustomAgentCheckResult> {
+  return runProviderClientEffect(checkAcpAgentEffect(target));
 }
+export const checkAcpAgentEffect = Effect.fn("AcpAgent.check")((target: AgentCheckTarget) =>
+  Effect.acquireUseRelease(
+    providerCall(() => mkdtemp(join(tmpdir(), "openbot-agent-check-"))),
+    (folder) =>
+      Effect.gen(function* () {
+        const secrets = Object.values(target.env).filter((value) => value.length >= 4);
+        const redact = (text: string) => maskValues(redactText(text), secrets);
+        const spawnTarget = cliSpawnTarget(target.executable, target.args);
+        let child: ChildProcessWithoutNullStreams | null = null;
+        let lastStderr: string | null = null;
+        return yield* Effect.gen(function* () {
+          child = yield* providerSync(() =>
+            spawn(spawnTarget.command, spawnTarget.args, {
+              cwd: folder,
+              stdio: ["pipe", "pipe", "pipe"],
+              env: { ...process.env, ...target.env },
+              detached: process.platform !== "win32",
+              windowsVerbatimArguments: spawnTarget.windowsVerbatimArguments,
+              windowsHide: true,
+            }),
+          );
+          const started = child;
+          started.stderr.on("data", (chunk: Buffer) => {
+            const lines = chunk.toString("utf8").split(/\r?\n/u).filter(Boolean);
+            const last = lines.at(-1);
+            if (last) lastStderr = last;
+          });
+          const ended = new Promise<never>((_resolve, reject) => {
+            started.once("error", () => reject(new CheckEnd("stopped")));
+            started.once("close", () => reject(new CheckEnd("stopped")));
+          });
+          const connection = yield* providerSync(
+            () =>
+              new ClientSideConnection(
+                () => ({
+                  requestPermission: () => ({ outcome: { outcome: "cancelled" } }),
+                  sessionUpdate: () => undefined,
+                }),
+                ndJsonStream(...processStreams(started)),
+              ),
+          );
+          const initialization = yield* providerCall(() =>
+            withTimeout(
+              Promise.race([
+                connection.initialize({
+                  protocolVersion: OPENBOT_ACP_PROTOCOL_VERSION,
+                  clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
+                  clientInfo: OPENBOT_ACP_CLIENT_INFO,
+                }),
+                ended,
+              ]),
+              target.timeoutMs ?? AGENT_CHECK_TIMEOUT_MS,
+              sourceText("error.provider.customAgentCheckTimedOut"),
+            ),
+          );
+          if (initialization.protocolVersion !== OPENBOT_ACP_PROTOCOL_VERSION) {
+            return yield* providerFailure(
+              new CheckFailure(
+                sourceText("error.provider.customAgentProtocolVersion", {
+                  version: String(initialization.protocolVersion),
+                }),
+              ),
+            );
+          }
+          return checkResult(initialization, target.executable);
+        }).pipe(
+          Effect.mapError((error) => providerFailure(checkError(error.cause, lastStderr, redact))),
+          Effect.ensuring(Effect.suspend(() => (child ? stopGroup(child) : Effect.void)).pipe(Effect.orDie)),
+        );
+      }),
+    (folder) => providerCall(() => rm(folder, { recursive: true, force: true })).pipe(Effect.orDie),
+  ),
+);
 
 /** The process ended before it answered. */
 class CheckEnd extends Error {}
@@ -197,10 +223,12 @@ function processStreams(
 }
 
 /** Stops the process group, and waits for the process to exit. SIGKILL after a short wait. */
-async function stopGroup(child: ChildProcessWithoutNullStreams): Promise<void> {
+const stopGroup = Effect.fn("AcpAgent.stopGroup")(function* (
+  child: ChildProcessWithoutNullStreams,
+): Effect.fn.Return<void, ProviderClientOperationError> {
   if (process.platform === "win32") {
     child.stdin.destroy();
-    return stopWindowsProcessTree(child);
+    return yield* providerCall(() => stopWindowsProcessTree(child));
   }
   const signal = (name: NodeJS.Signals) => {
     try {
@@ -216,13 +244,14 @@ async function stopGroup(child: ChildProcessWithoutNullStreams): Promise<void> {
     signal("SIGKILL");
     return;
   }
-  await new Promise<void>((resolve) => {
+  yield* Effect.callback<void>((resume) => {
     const force = setTimeout(() => signal("SIGKILL"), STOP_GRACE_MS);
     child.once("exit", () => {
       clearTimeout(force);
       signal("SIGKILL");
-      resolve();
+      resume(Effect.void);
     });
     signal("SIGTERM");
+    return Effect.sync(() => clearTimeout(force));
   });
-}
+});

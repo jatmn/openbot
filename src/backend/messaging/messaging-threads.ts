@@ -1,6 +1,7 @@
 import type { AgentEvent, ConversationMessage } from "@openbot/contracts/ipc";
 import { CONVERSATION_PLAN_ITEM_TYPE, MESSAGING_LIMITS } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import type { DeliveryContext, MailboxStore, MessagingOrigin } from "../mailbox-store";
 import type { OpenBotDatabase } from "../openbot-database";
 import { type MessagingContextMessage, messagingPromptText } from "./messaging-prompt";
@@ -140,31 +141,47 @@ export class MessagingThreads {
     }
   }
 
-  async #admit(agentId: string, link: MessagingLink, input: MessagingReceiveInput): Promise<MessagingReceiveResult> {
+  #admit(agentId: string, link: MessagingLink, input: MessagingReceiveInput): Promise<MessagingReceiveResult> {
+    return runThreads(this.#admitEffect(agentId, link, input));
+  }
+
+  readonly #admitEffect = Effect.fn("MessagingThreads.admit")(function* (
+    this: MessagingThreads,
+    agentId: string,
+    link: MessagingLink,
+    input: MessagingReceiveInput,
+  ): Effect.fn.Return<MessagingReceiveResult, MessagingThreadFailed> {
     // Only external messages count: a teammate's answer to a request from here is the agent's own work.
-    const pending = this.store
-      .links(agentId)
-      .flatMap((candidate) => this.#mailbox.unresolvedMessagingDeliveries(candidate.linkId))
-      .filter((context) => context.delivery.sender.kind === "user");
+    const pending = yield* threadsStep(() =>
+      this.store
+        .links(agentId)
+        .flatMap((candidate) => this.#mailbox.unresolvedMessagingDeliveries(candidate.linkId))
+        .filter((context) => context.delivery.sender.kind === "user"),
+    );
     const byAuthor = pending.filter(
       (context) => this.#mailbox.messagingOrigin(context.delivery.id)?.authorId === input.origin.authorId,
     );
     if (pending.length >= AGENT_QUEUE_LIMIT || byAuthor.length >= AUTHOR_QUEUE_LIMIT) return { status: "busy", link };
     const waiting = this.#hooks.busy(agentId);
-    const receipt = await this.#mailbox.enqueue({
-      sender: { kind: "user" },
-      messaging: { ...input.origin, linkId: link.linkId },
-      recipientAgentIds: [agentId],
-      text: input.text || "(The message has no text.)",
-      sourcePaths: input.sourcePaths,
-      idempotencyKey: input.idempotencyKey,
-    });
+    const receipt = yield* threadsIo(() =>
+      this.#mailbox.enqueue({
+        sender: { kind: "user" },
+        messaging: { ...input.origin, linkId: link.linkId },
+        recipientAgentIds: [agentId],
+        text: input.text || "(The message has no text.)",
+        sourcePaths: input.sourcePaths,
+        idempotencyKey: input.idempotencyKey,
+      }),
+    );
     const deliveryId = receipt.deliveries[0]?.id;
-    if (!deliveryId) throw new Error(sourceText("error.agent.queuedMessageCreateFailed"));
-    this.store.touch(link.linkId);
+    if (!deliveryId)
+      return yield* new MessagingThreadFailed({
+        cause: new Error(sourceText("error.agent.queuedMessageCreateFailed")),
+      });
+    yield* threadsStep(() => this.store.touch(link.linkId));
     this.#hooks.schedule(agentId);
     return { status: "queued", link, deliveryId, waiting };
-  }
+  });
 
   /** The execution thread of a messaging delivery, or null for any other delivery. */
   threadForDelivery(deliveryId: string): string | null {
@@ -176,7 +193,14 @@ export class MessagingThreads {
     return this.#mailbox.messagingOrigin(deliveryId) !== null;
   }
 
-  async prepare(context: DeliveryContext): Promise<{ threadId: string; text: string } | null> {
+  prepare(context: DeliveryContext): Promise<{ threadId: string; text: string } | null> {
+    return runThreads(this.prepareEffect(context));
+  }
+
+  readonly prepareEffect = Effect.fn("MessagingThreads.prepare")(function* (
+    this: MessagingThreads,
+    context: DeliveryContext,
+  ): Effect.fn.Return<{ threadId: string; text: string } | null, MessagingThreadFailed> {
     const origin = this.#mailbox.messagingOrigin(context.delivery.id);
     if (!origin) return null;
     const link = this.store.link(origin.linkId);
@@ -185,7 +209,7 @@ export class MessagingThreads {
     // presents it as a teammate's reply, and the turn's answer is posted to the conversation.
     if (context.delivery.sender.kind === "agent") return { threadId: link.threadId, text: context.delivery.text };
     const connection = this.store.connection(link.connectionId);
-    const prompt = await this.#promptContext(link, origin);
+    const prompt = yield* this.#promptContextEffect(link, origin);
     if (prompt.cursor) this.store.touch(link.linkId, prompt.cursor);
     return {
       threadId: link.threadId,
@@ -201,10 +225,14 @@ export class MessagingThreads {
         skippedFiles: prompt.skippedFiles,
       }),
     };
-  }
+  });
 
   /** The prompt context from the platform, or none when it is slow or fails: the message still runs. */
-  async #promptContext(link: MessagingLink, origin: MessagingOrigin): Promise<MessagingPromptContext> {
+  readonly #promptContextEffect = Effect.fn("MessagingThreads.promptContext")(function* (
+    this: MessagingThreads,
+    link: MessagingLink,
+    origin: MessagingOrigin,
+  ) {
     const fallback: MessagingPromptContext = {
       workspaceName: null,
       place: link.title,
@@ -214,20 +242,11 @@ export class MessagingThreads {
     };
     const source = this.#contextSource;
     if (!source) return fallback;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        source(link, origin),
-        new Promise<MessagingPromptContext>((resolve) => {
-          timer = setTimeout(() => resolve(fallback), CONTEXT_TIMEOUT_MS);
-        }),
-      ]);
-    } catch {
-      return fallback;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
+    return yield* threadsIo(() => source(link, origin)).pipe(
+      Effect.timeout(CONTEXT_TIMEOUT_MS),
+      Effect.catch(() => Effect.succeed(fallback)),
+    );
+  });
 
   /**
    * Takes the conversation events of a messaging thread, so the agent's public chat and the Team
@@ -295,7 +314,15 @@ export class MessagingThreads {
   }
 
   /** Stops what one author asked for in this link: the running turn and queued messages. */
-  async stop(linkId: string, authorId: string): Promise<boolean> {
+  stop(linkId: string, authorId: string): Promise<boolean> {
+    return runThreads(this.stopEffect(linkId, authorId));
+  }
+
+  readonly stopEffect = Effect.fn("MessagingThreads.stop")(function* (
+    this: MessagingThreads,
+    linkId: string,
+    authorId: string,
+  ): Effect.fn.Return<boolean, MessagingThreadFailed> {
     const link = this.store.link(linkId);
     if (!link) return false;
     let stopped = false;
@@ -303,17 +330,18 @@ export class MessagingThreads {
       const origin = this.#mailbox.messagingOrigin(context.delivery.id);
       if (!origin || origin.authorId !== authorId) continue;
       if (context.delivery.status === "queued") {
-        await this.#mailbox.cancel(link.agentId, context.delivery.id);
+        yield* threadsIo(() => this.#mailbox.cancel(link.agentId, context.delivery.id));
         this.#publish({ type: "cancelled", link, origin });
         stopped = true;
       } else if (context.delivery.status === "running" && context.delivery.turnId) {
-        await this.#hooks.interrupt(link.agentId, context.delivery.turnId, link.threadId);
+        const turnId = context.delivery.turnId;
+        yield* threadsIo(() => this.#hooks.interrupt(link.agentId, turnId, link.threadId));
         stopped = true;
       }
     }
     if (stopped) this.#hooks.schedule(link.agentId);
     return stopped;
-  }
+  });
 
   /** True while a teammate works on a request that the agent sent from this conversation. */
   awaitsTeammate(linkId: string): boolean {
@@ -321,25 +349,44 @@ export class MessagingThreads {
   }
 
   /** Removes the agent's links and execution threads, and takes it out of every connection. The mailbox leaves separately. */
-  async deleteForAgent(agentId: string): Promise<void> {
-    for (const threadId of this.store.threadIdsForAgent(agentId)) await this.#hooks.forgetThread(threadId);
-    this.store.deleteForAgent(agentId);
+  deleteForAgent(agentId: string): Promise<void> {
+    return runThreads(this.deleteForAgentEffect(agentId));
   }
 
-  async #finished(
+  readonly deleteForAgentEffect = Effect.fn("MessagingThreads.deleteForAgent")(function* (
+    this: MessagingThreads,
+    agentId: string,
+  ): Effect.fn.Return<void, MessagingThreadFailed> {
+    for (const threadId of this.store.threadIdsForAgent(agentId))
+      yield* threadsIo(() => this.#hooks.forgetThread(threadId));
+    yield* threadsStep(() => this.store.deleteForAgent(agentId));
+  });
+
+  #finished(
     link: MessagingLink,
     turnId: string,
     status: string,
     origin: MessagingOrigin | null,
     followUp: boolean,
   ): Promise<void> {
-    const messages = this.#turnMessages(link, turnId);
+    return runThreads(this.#finishedEffect(link, turnId, status, origin, followUp));
+  }
+
+  readonly #finishedEffect = Effect.fn("MessagingThreads.finished")(function* (
+    this: MessagingThreads,
+    link: MessagingLink,
+    turnId: string,
+    status: string,
+    origin: MessagingOrigin | null,
+    followUp: boolean,
+  ): Effect.fn.Return<void, MessagingThreadFailed> {
+    const messages = yield* threadsStep(() => this.#turnMessages(link, turnId));
     const answer = [...messages].reverse().find(isAnswer)?.text ?? null;
     const files: MessagingAnswerFile[] = [];
     for (const message of messages) {
       if (message.author === "user") continue;
       for (const attachment of message.attachments ?? []) {
-        const resolved = await this.#mailbox.resolveAttachment(attachment.id);
+        const resolved = yield* threadsIo(() => this.#mailbox.resolveAttachment(attachment.id));
         if (resolved) files.push(resolved);
       }
     }
@@ -353,7 +400,7 @@ export class MessagingThreads {
       answer,
       files,
     });
-  }
+  });
 
   #turnMessages(link: MessagingLink, turnId: string): ConversationMessage[] {
     return this.#database
@@ -375,4 +422,22 @@ function isAnswer(message: ConversationMessage): boolean {
     message.itemType !== CONVERSATION_PLAN_ITEM_TYPE &&
     Boolean(message.text.trim())
   );
+}
+
+export class MessagingThreadFailed extends Schema.TaggedError<MessagingThreadFailed>()("MessagingThreadFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function threadsStep<A>(run: () => A): Effect.Effect<A, MessagingThreadFailed> {
+  return Effect.try({ try: run, catch: (cause) => new MessagingThreadFailed({ cause }) });
+}
+
+function threadsIo<A>(run: () => Promise<A>): Effect.Effect<A, MessagingThreadFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new MessagingThreadFailed({ cause }) });
+}
+
+async function runThreads<A>(operation: Effect.Effect<A, MessagingThreadFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

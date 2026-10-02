@@ -27,6 +27,7 @@
         "@speed-highlight/core": "catalog:",
         "@tanstack/virtual-core": "catalog:",
         "class-variance-authority": "catalog:",
+        "effect": "catalog:",
         "electron-updater": "6.8.9",
         "fflate": "catalog:",
         "jose": "catalog:",
@@ -85,6 +86,7 @@
         "@tanstack/solid-router": "2.0.0-rc.0",
         "@tanstack/solid-start": "2.0.0-rc.0",
         "class-variance-authority": "catalog:",
+        "effect": "catalog:",
         "fflate": "catalog:",
         "jose": "catalog:",
         "solid-js": "2.0.0-rc.0",
@@ -191,6 +193,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@openbot/contracts": "workspace:*",
+        "effect": "catalog:",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "catalog:",
@@ -262,6 +265,7 @@
         "@noble/hashes": "catalog:",
         "@openbot/contracts": "workspace:*",
         "@openbot/i18n": "workspace:*",
+        "effect": "catalog:",
       },
       "devDependencies": {
         "typescript": "catalog:",
@@ -312,6 +316,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@openbot/contracts": "workspace:*",
+        "effect": "catalog:",
         "elysia": "1.4.30",
         "jose": "catalog:",
         "zod": "catalog:",
@@ -357,6 +362,7 @@
     "@testing-library/jest-dom": "7.0.1",
     "@types/node": "24.13.3",
     "class-variance-authority": "0.7.1",
+    "effect": "4.0.0",
     "fflate": "0.8.2",
     "jose": "6.2.10",
     "jsdom": "30.0.1",
@@ -1782,6 +1788,8 @@
     "duplexer2": ["duplexer2@0.1.4", "", { "dependencies": { "readable-stream": "^2.0.2" } }, "sha512-asLFVfWWtJ90ZyOUHMqk7/S2w2guQKxUI2itj3d92ADHhxUSbCMGi1f1cBcJ7xM1To+pE/Khbwo1yuNbMEPKeA=="],
 
     "ee-first": ["ee-first@1.1.1", "", {}, "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow=="],
+
+    "effect": ["effect@4.0.0", "", {}, "sha512-ooc1TG5t+FfzgYnFz2ff6BBKyZ7EwBRVXC7c4RhQUAD6/TZ2gTXXMeb4WX7a19ozQo4J73/QW+S00YAIresoMQ=="],
 
     "ejs": ["ejs@3.1.10", "", { "dependencies": { "jake": "^10.8.5" }, "bin": { "ejs": "bin/cli.js" } }, "sha512-UeJmFfOrAQS8OJWPZ4qtgHyWExa088/MtK5UEyoJGFH67cDEXkZSviOiKRCZ4Xij0zxI3JECgYs3oKx+AizQBA=="],
 

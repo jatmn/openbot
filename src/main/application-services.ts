@@ -132,7 +132,6 @@ import { ManagedSkillService } from "./managed-skill-service";
 import { startMcpOAuthRedirectServer } from "./mcp-oauth-redirect-server";
 import { McpOAuthStore } from "./mcp-oauth-store";
 import { MessagingCredentialStore } from "./messaging-credential-store";
-import { probeModels } from "./model-server-probe";
 import { NotificationPreferenceStore } from "./notification-preference-store";
 import { ProviderCredentialStore } from "./provider-credential-store";
 import { createProviderDetection, type ProviderDetection } from "./provider-detection";
@@ -229,6 +228,7 @@ const TEARDOWN_ORDER = {
   browser: 30,
   browserPictureInPicture: 40,
   browserView: 45,
+  providerDetection: 48,
   providerRuntimes: 50,
   cuaDriver: 55,
   remoteServers: 60,
@@ -244,6 +244,9 @@ const TEARDOWN_ORDER = {
   // Before the agent service, so no agent is handed a token file that is being removed.
   githubConnector: 107,
   service: 110,
+  analytics: 112,
+  // After all account consumers have stopped.
+  centralAuth: 115,
   // Last, so the turns that end while the services stop are still written.
   trace: 120,
 } as const;
@@ -410,6 +413,7 @@ export async function createApplicationServices({
   });
   // Registered before `initialize()`, which publishes `{ status: "loading" }` synchronously: the
   // listener therefore runs on the next line with most of this function's services still unbuilt.
+  teardown.push(TEARDOWN_ORDER.centralAuth, "the account runtime", () => centralAuth.dispose());
   centralAuth.on("changed", forwardCentralAuth);
   const centralAuthInitialization = centralAuth.initialize();
   let profileRefreshActive = true;
@@ -617,8 +621,8 @@ export async function createApplicationServices({
     settings: providerDetectionSettings,
     customProviders,
     customAgents,
-    probe: probeModels,
   });
+  teardown.push(TEARDOWN_ORDER.providerDetection, "model server discovery", () => providerDetection.close());
   /*
    * Loaded before the service, not on first use: a provider spawn reads its key synchronously, so
    * the decrypted map has to already exist by the time any client is built. A machine with no
@@ -1331,6 +1335,7 @@ export async function createApplicationServices({
     },
     inventoryDay: analyticsInventoryDayStore(join(app.getPath("userData"), ANALYTICS_INVENTORY_FILE)),
   });
+  teardown.push(TEARDOWN_ORDER.analytics, "host analytics", () => analytics.close());
   // Immediately after construction: this attributes buffered events to the current owner rather
   // than flushing a queue, so a later call would attribute them to nobody.
   analytics.flushPending();

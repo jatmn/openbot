@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ScheduledUpdateRestart, UpdateBusyPhase, UpdateFailureCode, UpdateStatus } from "@openbot/contracts/ipc";
 import { isUpdateBusyPhase } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import type { ProgressInfo, UpdateInfo } from "electron-updater";
 import type { HostUpdateState } from "../../packages/contracts/src/host-manager";
 import type { OpenBotSiblingInstance } from "./update-sibling-instances";
@@ -341,61 +342,69 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
    * "checking" and settles on a real outcome even when an earlier call is still unsettled, because
    * an action that answers a press by leaving the same error on screen reads as a dead button.
    */
-  async checkForUpdates(): Promise<UpdateStatus> {
+  checkForUpdates(): Promise<UpdateStatus> {
     return this.#check(true);
   }
 
-  async #check(joinOutstandingRequest: boolean): Promise<UpdateStatus> {
-    if (this.#managedByHost || !this.#options.enabled || this.#teardownCommitted) return this.getStatus();
-    if (this.#status.phase === "ready") return this.#checkSupersedingRelease();
-    if (["checking", "downloading", "installing"].includes(this.#status.phase)) {
-      // A download ends in "ready" or in a failure, and neither schedules a check, so the periodic
-      // loop has to outlive it here.
-      if (this.#status.phase === "downloading" && !joinOutstandingRequest) {
+  #check(joinOutstandingRequest: boolean): Promise<UpdateStatus> {
+    return runUpdate(this.#checkEffect(joinOutstandingRequest));
+  }
+  #checkEffect(joinOutstandingRequest: boolean): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (this.#managedByHost || !this.#options.enabled || this.#teardownCommitted) return this.getStatus();
+      if (this.#status.phase === "ready") return yield* this.#checkSupersedingRelease();
+      if (["checking", "downloading", "installing"].includes(this.#status.phase)) {
+        // A download ends in "ready" or in a failure, and neither schedules a check, so the periodic
+        // loop has to outlive it here.
+        if (this.#status.phase === "downloading" && !joinOutstandingRequest) {
+          this.#scheduleCheck(this.#options.checkIntervalMs);
+        }
+        return this.getStatus();
+      }
+      // electron-updater returns the outstanding promise when a check is already running, so issuing
+      // another one here would only re-await the call this service has already given up on. The
+      // periodic loop waits quietly for it rather than spinning the UI once every interval; a user
+      // who asked for an answer joins that call instead, and gets progress and its real outcome.
+      if (this.#checkRequest && !joinOutstandingRequest) {
+        // Keep the periodic loop alive, or refusing here would be the last check of the session.
         this.#scheduleCheck(this.#options.checkIntervalMs);
+        return this.getStatus();
       }
-      return this.getStatus();
-    }
-    // electron-updater returns the outstanding promise when a check is already running, so issuing
-    // another one here would only re-await the call this service has already given up on. The
-    // periodic loop waits quietly for it rather than spinning the UI once every interval; a user
-    // who asked for an answer joins that call instead, and gets progress and its real outcome.
-    if (this.#checkRequest && !joinOutstandingRequest) {
-      // Keep the periodic loop alive, or refusing here would be the last check of the session.
-      this.#scheduleCheck(this.#options.checkIntervalMs);
-      return this.getStatus();
-    }
-    const generation = ++this.#checkGeneration;
-    this.#operation = "check";
-    this.#setStatus({ phase: "checking", progress: null, message: null, errorCode: null });
-    try {
-      const result = await (this.#checkRequest ?? this.#issueCheck());
+      const generation = ++this.#checkGeneration;
+      this.#operation = "check";
+      this.#setStatus({ phase: "checking", progress: null, message: null, errorCode: null });
+      const checked = yield* Effect.result(updateIO(() => this.#checkRequest ?? this.#issueCheck())).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (this.#checkGeneration === generation) this.#scheduleCheck(this.#options.checkIntervalMs);
+          }),
+        ),
+      );
       if (this.#checkGeneration !== generation) return this.getStatus();
-      this.#cancellationToken = result?.cancellationToken ?? null;
-      if (result?.isUpdateAvailable) {
-        if (result.updateInfo.version !== this.#downloadedVersion) this.#downloadedVersion = null;
-        this.#markAvailable(result.updateInfo.version);
-      } else {
-        this.#downloadedVersion = null;
-        this.#setStatus({
-          phase: "up-to-date",
-          availableVersion: null,
-          progress: null,
-          message: null,
-          errorCode: null,
-          checkedAt: new Date().toISOString(),
-        });
+      if (Result.isFailure(checked)) this.#setError("check_failed", describeCheckFailure(checked.failure.cause));
+      else {
+        const result = checked.success;
+        this.#cancellationToken = result?.cancellationToken ?? null;
+        if (result?.isUpdateAvailable) {
+          if (result.updateInfo.version !== this.#downloadedVersion) this.#downloadedVersion = null;
+          this.#markAvailable(result.updateInfo.version);
+        } else {
+          this.#downloadedVersion = null;
+          this.#setStatus({
+            phase: "up-to-date",
+            availableVersion: null,
+            progress: null,
+            message: null,
+            errorCode: null,
+            checkedAt: new Date().toISOString(),
+          });
+        }
       }
-    } catch (error) {
-      if (this.#checkGeneration === generation) this.#setError("check_failed", describeCheckFailure(error));
-    } finally {
-      // A late completion must not push out the schedule the timeout branch already set.
-      if (this.#checkGeneration === generation) this.#scheduleCheck(this.#options.checkIntervalMs);
-    }
-    // downloadUpdate() moves into "downloading" before its first await, so the caller and the
-    // renderer see the download start rather than a stale "available".
-    if (this.#autoDownload && this.#status.phase === "available") void this.downloadUpdate();
-    return this.getStatus();
+      // downloadUpdate() moves into "downloading" before its first await, so the caller and the
+      // renderer see the download start rather than a stale "available".
+      if (this.#autoDownload && this.#status.phase === "available") void this.downloadUpdate();
+      return this.getStatus();
+    });
   }
 
   /**
@@ -406,133 +415,128 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
    * still a valid update. With automatic downloads off the download stays as well: replacing it
    * would take away the restart and start a transfer the user did not ask for.
    */
-  async #checkSupersedingRelease(): Promise<UpdateStatus> {
-    // Scheduled before the request, because a request that never settles must not end the loop.
-    this.#scheduleCheck(this.#options.checkIntervalMs);
-    if (!this.#autoDownload || this.#checkRequest) return this.getStatus();
-    const downloaded = this.#downloadedVersion;
-    let result: UpdateCheckOutcome | null;
-    try {
-      result = await this.#issueCheck();
-    } catch {
-      return this.getStatus();
-    }
-    // An install can start, a host can take over, or the preference can change while the request
-    // is out. An install still in its sibling scan counts: it expects the download it was asked for.
-    if (
-      this.#status.phase !== "ready" ||
-      this.#downloadedVersion !== downloaded ||
-      this.#installStarted ||
-      this.#pendingInstallRequests > 0 ||
-      this.#managedByHost ||
-      this.#teardownCommitted ||
-      !this.#autoDownload ||
-      !result?.isUpdateAvailable ||
-      downloaded === null ||
-      !isNewerRelease(result.updateInfo.version, downloaded)
-    ) {
-      return this.getStatus();
-    }
-    this.#cancellationToken = result.cancellationToken ?? null;
-    this.#downloadedVersion = null;
-    this.#markAvailable(result.updateInfo.version);
-    void this.downloadUpdate();
-    return this.getStatus();
-  }
-
-  async downloadUpdate(): Promise<UpdateStatus> {
-    if (this.#managedByHost) return this.getStatus();
-    if (!this.#options.enabled || this.#teardownCommitted || !this.#canDownload()) return this.getStatus();
-    // Same deduplication applies to downloads, and starting a second attempt while the abandoned one
-    // is still unsettled is also what would let its buffered events be read as the new attempt's.
-    if (this.#downloadInFlight) return this.getStatus();
-    this.#downloadInFlight = true;
-    const generation = ++this.#downloadGeneration;
-    this.#activeDownload = generation;
-    this.#operation = "download";
-    this.#setStatus({ phase: "downloading", progress: 0, message: null, errorCode: null });
-    try {
-      const token = await this.#ensureCancellationToken();
-      if (this.#downloadGeneration !== generation) return this.getStatus();
-      if (!token) {
-        // Without a token the stall watchdog could not stop the transfer, so the attempt would run
-        // untracked and an unsettled one would block every retry. Refuse instead of starting it.
-        this.#activeDownload = null;
-        this.#setError("download_failed");
+  #checkSupersedingRelease(): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      // Scheduled before the request, because a request that never settles must not end the loop.
+      this.#scheduleCheck(this.#options.checkIntervalMs);
+      if (!this.#autoDownload || this.#checkRequest) return this.getStatus();
+      const downloaded = this.#downloadedVersion;
+      const checked = yield* Effect.result(updateIO(() => this.#issueCheck()));
+      if (Result.isFailure(checked)) return this.getStatus();
+      const result = checked.success;
+      // An install can start, a host can take over, or the preference can change while the request
+      // is out. An install still in its sibling scan counts: it expects the download it was asked for.
+      if (
+        this.#status.phase !== "ready" ||
+        this.#downloadedVersion !== downloaded ||
+        this.#installStarted ||
+        this.#pendingInstallRequests > 0 ||
+        this.#managedByHost ||
+        this.#teardownCommitted ||
+        !this.#autoDownload ||
+        !result?.isUpdateAvailable ||
+        downloaded === null ||
+        !isNewerRelease(result.updateInfo.version, downloaded)
+      ) {
         return this.getStatus();
       }
-      await this.#updater.downloadUpdate(token);
-    } catch {
-      // A superseded attempt is one the stall watchdog already cancelled and reported, so its
-      // rejection must not overwrite the error the user is looking at.
-      if (this.#downloadGeneration === generation) {
-        this.#activeDownload = null;
-        this.#setError("download_failed");
+      this.#cancellationToken = result.cancellationToken ?? null;
+      this.#downloadedVersion = null;
+      this.#markAvailable(result.updateInfo.version);
+      void this.downloadUpdate();
+      return this.getStatus();
+    });
+  }
+
+  downloadUpdate(): Promise<UpdateStatus> {
+    return runUpdate(this.#downloadEffect());
+  }
+  #downloadEffect(): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (this.#managedByHost) return this.getStatus();
+      if (!this.#options.enabled || this.#teardownCommitted || !this.#canDownload()) return this.getStatus();
+      // Same deduplication applies to downloads, and starting a second attempt while the abandoned one
+      // is still unsettled is also what would let its buffered events be read as the new attempt's.
+      if (this.#downloadInFlight) return this.getStatus();
+      this.#downloadInFlight = true;
+      const generation = ++this.#downloadGeneration;
+      this.#activeDownload = generation;
+      this.#operation = "download";
+      this.#setStatus({ phase: "downloading", progress: 0, message: null, errorCode: null });
+      yield* Effect.gen({ self: this }, function* () {
+        const token = yield* this.#ensureCancellationToken();
+        if (this.#downloadGeneration !== generation) return;
+        if (!token) {
+          this.#activeDownload = null;
+          this.#setError("download_failed");
+          return;
+        }
+        const result = yield* Effect.result(updateIO(() => this.#updater.downloadUpdate(token)));
+        if (Result.isFailure(result) && this.#downloadGeneration === generation) {
+          this.#activeDownload = null;
+          this.#setError("download_failed");
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#downloadInFlight = false;
+          }),
+        ),
+      );
+      return this.getStatus();
+    });
+  }
+
+  installUpdate(): Promise<void> {
+    return runUpdate(
+      Effect.gen({ self: this }, function* () {
+        if (!this.#canInstall() || this.#installStarted)
+          return yield* new UpdateOperationFailure({ cause: new Error(sourceText("error.update.notReady")) });
+        if (this.#managedByHost) return yield* new UpdateOperationFailure({ cause: new Error(MANAGED_HOST_MESSAGE) });
+        yield* this.#install();
+      }),
+    );
+  }
+
+  #install(): Effect.Effect<void, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      this.#pendingInstallRequests += 1;
+      const siblings = yield* updateIO(async () => (await this.#options.checkSiblingInstances?.()) ?? []).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#pendingInstallRequests -= 1;
+          }),
+        ),
+      );
+      if (siblings.length > 0) return yield* new UpdateOperationFailure({ cause: new Error(SIBLING_SESSION_MESSAGE) });
+      if (this.#managedByHost) return yield* new UpdateOperationFailure({ cause: new Error(MANAGED_HOST_MESSAGE) });
+      if (!this.#canInstall() || this.#installStarted)
+        return yield* new UpdateOperationFailure({ cause: new Error(sourceText("error.update.notReady")) });
+      const generation = ++this.#installGeneration;
+      this.#activeInstall = generation;
+      this.#installStarted = true;
+      this.#operation = "install";
+      this.#setStatus({ phase: "installing", progress: 100, message: null, errorCode: null });
+      const installed = yield* Effect.result(
+        Effect.gen({ self: this }, function* () {
+          // Shutdown is irreversible. Keep the latch after failure and never restart a stale attempt.
+          this.#teardownCommitted = true;
+          yield* updateIO(() => this.#options.beforeInstall());
+          if (this.#installGeneration !== generation) return;
+          yield* updateIO(async () => {
+            await this.#checkRequest?.catch(() => null);
+          });
+          if (this.#installGeneration !== generation) return;
+          this.#installHandedOver = true;
+          yield* updateSync(() => this.#updater.quitAndInstall(false, true));
+          this.#armPhaseTimer();
+        }),
+      );
+      if (Result.isFailure(installed) && this.#installGeneration === generation) {
+        this.#setError("install_failed", INSTALL_FAILED_MESSAGE);
+        return yield* new UpdateOperationFailure({ cause: new Error(sourceText("error.update.restartFailed")) });
       }
-    } finally {
-      this.#downloadInFlight = false;
-    }
-    return this.getStatus();
-  }
-
-  async installUpdate(): Promise<void> {
-    if (!this.#canInstall() || this.#installStarted) {
-      throw new Error(sourceText("error.update.notReady"));
-    }
-    // Host-managed tenants never install on their own, even with no sibling in sight: the
-    // host owns the timing. Like the sibling refusal this throws before the latch, so the
-    // update stays ready.
-    if (this.#managedByHost) {
-      throw new Error(MANAGED_HOST_MESSAGE);
-    }
-    await this.#install();
-  }
-
-  async #install(): Promise<void> {
-    // Replacing the application bundle while another login session runs OpenBot from it breaks
-    // that session, so refuse before the one-shot install latch and before shutdown preparation.
-    // Nothing is torn down, the update stays ready, and the user retries once every session stopped.
-    this.#pendingInstallRequests += 1;
-    let siblings: readonly OpenBotSiblingInstance[];
-    try {
-      siblings = (await this.#options.checkSiblingInstances?.()) ?? [];
-    } finally {
-      this.#pendingInstallRequests -= 1;
-    }
-    if (siblings.length > 0) {
-      throw new Error(SIBLING_SESSION_MESSAGE);
-    }
-    if (this.#managedByHost) throw new Error(MANAGED_HOST_MESSAGE);
-    if (!this.#canInstall() || this.#installStarted) throw new Error(sourceText("error.update.notReady"));
-    const generation = ++this.#installGeneration;
-    this.#activeInstall = generation;
-    this.#installStarted = true;
-    this.#operation = "install";
-    this.#setStatus({ phase: "installing", progress: 100, message: null, errorCode: null });
-    try {
-      // Shutdown preparation stops services for good and is not reversible, so from here on this
-      // process can only quit into the installer or be relaunched. Checking or downloading would be
-      // acting on a torn-down app, so both are refused for the rest of its life.
-      this.#teardownCommitted = true;
-      await this.#options.beforeInstall();
-      // Shutdown preparation can outlive the install deadline. Once the watchdog has reported the
-      // attempt as failed, or a retry has taken over, this attempt must not go on to restart the
-      // app behind a UI that says it did not happen.
-      if (this.#installGeneration !== generation) return;
-      // A quiet check can still be out. electron-updater emits its error before the call settles, so
-      // waiting here keeps that error on the side of the handover that the error handler ignores.
-      await this.#checkRequest?.catch(() => null);
-      if (this.#installGeneration !== generation) return;
-      this.#installHandedOver = true;
-      this.#updater.quitAndInstall(false, true);
-      // The handover is where a restart is most likely to stall, and shutdown preparation may have
-      // torn down the deadline along with everything else, so re-arm it here as well.
-      this.#armPhaseTimer();
-    } catch {
-      if (this.#installGeneration !== generation) return;
-      this.#setError("install_failed", INSTALL_FAILED_MESSAGE);
-      throw new Error(sourceText("error.update.restartFailed"));
-    }
+    }).pipe(Effect.uninterruptible);
   }
 
   stop(): void {
@@ -591,15 +595,13 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
    * metadata. Re-check quietly when the stored token is missing or spent so that a retry after the
    * stall watchdog cancelled the last attempt still downloads under a live token.
    */
-  async #ensureCancellationToken(): Promise<UpdateCancellationToken | null> {
-    if (this.#cancellationToken && !this.#cancellationToken.cancelled) return this.#cancellationToken;
-    try {
-      const result = await this.#updater.checkForUpdates();
-      this.#cancellationToken = result?.cancellationToken ?? null;
-    } catch {
-      this.#cancellationToken = null;
-    }
-    return this.#cancellationToken;
+  #ensureCancellationToken(): Effect.Effect<UpdateCancellationToken | null, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (this.#cancellationToken && !this.#cancellationToken.cancelled) return this.#cancellationToken;
+      const checked = yield* Effect.result(updateIO(() => this.#updater.checkForUpdates()));
+      this.#cancellationToken = Result.isSuccess(checked) ? (checked.success?.cancellationToken ?? null) : null;
+      return this.#cancellationToken;
+    });
   }
 
   #markAvailable(version: string): void {
@@ -770,34 +772,38 @@ function errorMessage(code: UpdateFailureCode) {
   return sourceText("error.update.checkFailed");
 }
 
-async function appendUpdateLog(directory: string, event: UpdateDiagnosticEvent): Promise<void> {
-  try {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const path = join(directory, "update.log");
-    const rotatedPath = `${path}.1`;
-    const size = await stat(path)
-      .then((value) => value.size)
-      .catch(() => 0);
-    if (size >= MAX_LOG_BYTES) {
-      await rm(rotatedPath, { force: true });
-      await rename(path, rotatedPath);
-    }
-    await appendFile(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
-  } catch {
-    // Update logging must not block updates.
-  }
+function appendUpdateLog(directory: string, event: UpdateDiagnosticEvent): Promise<void> {
+  return runUpdate(
+    Effect.gen(function* () {
+      yield* updateIO(() => mkdir(directory, { recursive: true, mode: 0o700 }));
+      const path = join(directory, "update.log");
+      const rotatedPath = `${path}.1`;
+      const size = yield* updateIO(() => stat(path)).pipe(
+        Effect.map((value) => value.size),
+        Effect.catch(() => Effect.succeed(0)),
+      );
+      if (size >= MAX_LOG_BYTES) {
+        yield* updateIO(() => rm(rotatedPath, { force: true }));
+        yield* updateIO(() => rename(path, rotatedPath));
+      }
+      yield* updateIO(() => appendFile(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }));
+    }).pipe(Effect.catch(() => Effect.void)),
+  );
 }
 
-export async function pruneShipItLogs(directory: string): Promise<void> {
-  try {
-    const entries = (await readdir(directory, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && /^ShipIt_(?:stdout|stderr)\.log\.\d+$/u.test(entry.name))
-      .map((entry) => entry.name)
-      .sort((left, right) => Number(right.split(".").at(-1)) - Number(left.split(".").at(-1)));
-    await Promise.all(entries.slice(10).map((entry) => rm(join(directory, entry), { force: true })));
-  } catch {
-    // ShipIt creates this directory only after its first update.
-  }
+export function pruneShipItLogs(directory: string): Promise<void> {
+  return runUpdate(
+    Effect.gen(function* () {
+      const entries = (yield* updateIO(() => readdir(directory, { withFileTypes: true })))
+        .filter((entry) => entry.isFile() && /^ShipIt_(?:stdout|stderr)\.log\.\d+$/u.test(entry.name))
+        .map((entry) => entry.name)
+        .sort((left, right) => Number(right.split(".").at(-1)) - Number(left.split(".").at(-1)));
+      yield* Effect.forEach(entries.slice(10), (entry) => updateIO(() => rm(join(directory, entry), { force: true })), {
+        concurrency: "unbounded",
+        discard: true,
+      });
+    }).pipe(Effect.catch(() => Effect.void)),
+  );
 }
 
 /**
@@ -817,4 +823,19 @@ function isNewerRelease(candidate: string, current: string): boolean {
 
 function clampProgress(value: number): number {
   return Math.max(0, Math.min(100, Number.isFinite(value) ? Math.round(value) : 0));
+}
+
+class UpdateOperationFailure extends Schema.TaggedError<UpdateOperationFailure>()("UpdateOperationFailure", {
+  cause: Schema.Defect(),
+}) {}
+function updateIO<A>(operation: () => Promise<A>): Effect.Effect<A, UpdateOperationFailure> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new UpdateOperationFailure({ cause }) });
+}
+function updateSync<A>(operation: () => A): Effect.Effect<A, UpdateOperationFailure> {
+  return Effect.try({ try: operation, catch: (cause) => new UpdateOperationFailure({ cause }) });
+}
+async function runUpdate<A>(operation: Effect.Effect<A, UpdateOperationFailure>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

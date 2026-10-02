@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import { remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 /**
  * A hosted server has nobody to press Retry, so it publishes the host again after a failed start. A
  * start that could not sign in leaves the host idle or unconfigured, so those phases also start again.
@@ -45,13 +47,13 @@ export class HostedServerStartRetry {
   }
 
   tick(): Promise<void> {
-    this.#pending ??= this.#tick().finally(() => {
+    this.#pending ??= runRemoteWorkflow(this.#tickEffect()).finally(() => {
       this.#pending = null;
     });
     return this.#pending;
   }
 
-  async #tick(): Promise<void> {
+  readonly #tickEffect = Effect.fn("HostedServerStartRetry.tick")(function* (this: HostedServerStartRetry) {
     const now = this.#now();
     const phase = this.#options.hostPhase();
     if (phase === "online") {
@@ -63,6 +65,6 @@ export class HostedServerStartRetry {
     const delay = START_RETRY_DELAYS_MS[Math.min(this.#startFailures, START_RETRY_DELAYS_MS.length - 1)] ?? 0;
     this.#startFailures += 1;
     this.#nextStartAt = now + delay;
-    await this.#options.startHost();
-  }
+    yield* remoteCall(() => this.#options.startHost());
+  });
 }

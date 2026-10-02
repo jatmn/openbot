@@ -1,3 +1,4 @@
+import { Effect, Result, Schema } from "effect";
 import type { AgentProvider } from "../agent-client";
 import type { AgentStore } from "../agent-store";
 import { mergeProviderHistory, snapshotFromThread } from "../conversation-snapshots";
@@ -106,8 +107,14 @@ export class BootRecovery {
     }
   }
 
-  async reconcileUnresolvedDeliveries(): Promise<void> {
-    const unresolved = this.#mailbox.unresolvedDeliveries();
+  reconcileUnresolvedDeliveries(): Promise<void> {
+    return runRecovery(this.reconcileUnresolvedDeliveriesEffect());
+  }
+
+  readonly reconcileUnresolvedDeliveriesEffect = Effect.fn("BootRecovery.reconcileUnresolvedDeliveries")(function* (
+    this: BootRecovery,
+  ) {
+    const unresolved = yield* recoveryStep(() => this.#mailbox.unresolvedDeliveries());
     // A delivery settled by another path never becomes unresolved again, so its mark goes too.
     const unresolvedIds = new Set(unresolved.map(({ delivery }) => delivery.id));
     for (const id of this.#orphanedDeliveryIds) {
@@ -126,16 +133,21 @@ export class BootRecovery {
       if (!this.#orphanedDeliveryIds.delete(delivery.id)) continue;
       let terminal: "completed" | "failed" | "interrupted" = "interrupted";
       let reason = "OpenBot restarted before this delivery reached a confirmed terminal state.";
-      try {
-        const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
-        const client = agent ? this.#providers.clientForAgent(agent) : null;
-        const threadId = this.#hooks.deliveryThreadId?.(delivery.id) ?? agent?.threadId;
-        const session = agent && threadId ? this.#store.database.activeProviderSession(threadId, agent.provider) : null;
+      yield* Effect.gen({ self: this }, function* () {
+        const { agent, client, session } = yield* recoveryStep(() => {
+          const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
+          const client = agent ? this.#providers.clientForAgent(agent) : null;
+          const threadId = this.#hooks.deliveryThreadId?.(delivery.id) ?? agent?.threadId;
+          const session =
+            agent && threadId ? this.#store.database.activeProviderSession(threadId, agent.provider) : null;
+          return { agent, client, session };
+        });
         if (agent && session && client) {
-          const response = await client.request(
-            "thread/read",
-            { ...(await this.#threads.threadParams(agent, client, session.externalSessionId)), includeTurns: true },
-            decodeThreadResponse,
+          const params = yield* this.#threads
+            .threadParamsEffect(agent, client, session.externalSessionId)
+            .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
+          const response = yield* recoveryIo(() =>
+            client.request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse),
           );
           const batchIds = delivery.turnId ? null : unconfirmedStarts.get(delivery.recipientAgentId);
           const turn = response.thread.turns?.find(
@@ -149,7 +161,7 @@ export class BootRecovery {
               ),
           );
           if (turn && !delivery.turnId) {
-            await this.#mailbox.markRunning(delivery.id, turn.id);
+            yield* recoveryIo(() => this.#mailbox.markRunning(delivery.id, turn.id));
           }
           if (turn?.status === "completed") {
             terminal = "completed";
@@ -159,29 +171,32 @@ export class BootRecovery {
             reason = "The recovered Codex turn failed.";
           }
         }
-      } catch {
-        // Conservatively keep the interrupted result; never repeat uncertain side effects.
-      }
-      await this.#mailbox.markTerminal(delivery.id, terminal, terminal === "completed" ? null : reason);
-      const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
-      const threadId = this.#hooks.deliveryThreadId?.(delivery.id) ?? agent?.threadId;
-      if (agent && threadId) {
-        const snapshot = this.#store.database.readConversation(agent.id, threadId);
-        snapshot.activeTurnId = null;
-        for (const message of snapshot.messages) {
-          if (message.turnId === delivery.turnId && message.status === "streaming") {
-            message.status = terminal;
-            markIncompleteImageGeneration(message, terminal);
+      }).pipe(Effect.catch(() => Effect.void));
+      // A failed provider read keeps the conservative interrupted result; never replay side effects.
+      yield* recoveryIo(() =>
+        this.#mailbox.markTerminal(delivery.id, terminal, terminal === "completed" ? null : reason),
+      );
+      yield* recoveryStep(() => {
+        const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
+        const threadId = this.#hooks.deliveryThreadId?.(delivery.id) ?? agent?.threadId;
+        if (agent && threadId) {
+          const snapshot = this.#store.database.readConversation(agent.id, threadId);
+          snapshot.activeTurnId = null;
+          for (const message of snapshot.messages) {
+            if (message.turnId === delivery.turnId && message.status === "streaming") {
+              message.status = terminal;
+              markIncompleteImageGeneration(message, terminal);
+            }
           }
+          this.#store.database.persistConversation(snapshot, "turn.reconciled-after-restart", {
+            turnId: delivery.turnId,
+            status: terminal,
+          });
         }
-        this.#store.database.persistConversation(snapshot, "turn.reconciled-after-restart", {
-          turnId: delivery.turnId,
-          status: terminal,
-        });
-      }
-      this.#mailboxSync.emitQueue(delivery.recipientAgentId);
+        this.#mailboxSync.emitQueue(delivery.recipientAgentId);
+      });
     }
-  }
+  }, Effect.uninterruptible);
 
   recoverPersistedTurns(): void {
     for (const { delivery } of this.#mailbox.unresolvedDeliveries()) this.#orphanedDeliveryIds.add(delivery.id);
@@ -211,48 +226,82 @@ export class BootRecovery {
     }
   }
 
-  async backfillProviderHistory(): Promise<void> {
-    for (const agent of this.threads()) {
-      if (!agent.threadId) continue;
+  backfillProviderHistory(): Promise<void> {
+    return runRecovery(this.backfillProviderHistoryEffect());
+  }
+
+  readonly backfillProviderHistoryEffect = Effect.fn("BootRecovery.backfillProviderHistory")(function* (
+    this: BootRecovery,
+  ) {
+    for (const agent of yield* recoveryStep(() => this.threads())) {
+      const publicThreadId = agent.threadId;
+      if (!publicThreadId) continue;
       // Inactive sessions still own history after an upgrade or provider switch.
-      const active = this.#store.database.activeProviderSession(agent.threadId, agent.provider);
-      for (const session of this.#store.database.listProviderSessions(agent.threadId)) {
+      const active = this.#store.database.activeProviderSession(publicThreadId, agent.provider);
+      for (const session of this.#store.database.listProviderSessions(publicThreadId)) {
         const client = this.#providers.clientFor(session.provider);
         if (!client) continue;
-        try {
+        yield* Effect.gen({ self: this }, function* () {
           // The full parameters for the session the agent still runs on, and the id alone for the
           // retired ones: a client that loads a session to read it must not reopen a session that
           // was deliberately replaced.
           const params =
             session.externalSessionId === active?.externalSessionId
-              ? await this.#threads.threadParams(agent, client, session.externalSessionId)
+              ? yield* this.#threads
+                  .threadParamsEffect(agent, client, session.externalSessionId)
+                  .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })))
               : { threadId: session.externalSessionId };
-          const response = await client.request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse);
-          const imported = snapshotFromThread(agent.id, response.thread, (deliveryId) =>
-            this.#mailbox.getDelivery(deliveryId),
+          const response = yield* recoveryIo(() =>
+            client.request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse),
           );
-          imported.threadId = agent.threadId;
-          const current = this.#store.database.readConversation(agent.id, agent.threadId);
-          const merged = mergeProviderHistory(current, imported, session.provider);
-          this.#mailboxSync.syncMailboxMessages(merged);
-          if (conversationContentSignature(merged) === conversationContentSignature(current)) {
-            const live = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
-            if (!live?.activeTurnId) this.#conversation.setSnapshot(agent.id, current);
-            continue;
-          }
-          const persisted = this.#store.database.persistConversation(merged, "provider-history.backfilled", {
-            provider: session.provider,
-            externalSessionId: session.externalSessionId,
+          yield* recoveryStep(() => {
+            const imported = snapshotFromThread(agent.id, response.thread, (deliveryId) =>
+              this.#mailbox.getDelivery(deliveryId),
+            );
+            imported.threadId = publicThreadId;
+            const current = this.#store.database.readConversation(agent.id, publicThreadId);
+            const merged = mergeProviderHistory(current, imported, session.provider);
+            this.#mailboxSync.syncMailboxMessages(merged);
+            if (conversationContentSignature(merged) === conversationContentSignature(current)) {
+              const live = this.#conversation.ensureSnapshot(agent.id, publicThreadId);
+              if (!live?.activeTurnId) this.#conversation.setSnapshot(agent.id, current);
+              return;
+            }
+            const persisted = this.#store.database.persistConversation(merged, "provider-history.backfilled", {
+              provider: session.provider,
+              externalSessionId: session.externalSessionId,
+            });
+            const live = this.#conversation.ensureSnapshot(agent.id, publicThreadId);
+            if (!live?.activeTurnId) {
+              this.#conversation.setSnapshot(agent.id, persisted);
+              if (this.#conversation.isExecutionThread(publicThreadId))
+                this.#conversation.publishConversation(persisted);
+            }
           });
-          const live = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
-          if (!live?.activeTurnId) {
-            this.#conversation.setSnapshot(agent.id, persisted);
-            if (this.#conversation.isExecutionThread(agent.threadId)) this.#conversation.publishConversation(persisted);
-          }
-        } catch (error) {
-          this.#hooks.emitError("provider_history_backfill_pending", error, agent.id);
-        }
+        }).pipe(
+          Effect.catch((failure) =>
+            Effect.sync(() => this.#hooks.emitError("provider_history_backfill_pending", failure.cause, agent.id)),
+          ),
+        );
       }
     }
-  }
+  });
+}
+
+export class BootRecoveryFailed extends Schema.TaggedError<BootRecoveryFailed>()("BootRecoveryFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function recoveryIo<A>(run: () => Promise<A>): Effect.Effect<A, BootRecoveryFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new BootRecoveryFailed({ cause }) });
+}
+
+function recoveryStep<A>(run: () => A): Effect.Effect<A, BootRecoveryFailed> {
+  return Effect.try({ try: run, catch: (cause) => new BootRecoveryFailed({ cause }) });
+}
+
+async function runRecovery<A>(operation: Effect.Effect<A, BootRecoveryFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

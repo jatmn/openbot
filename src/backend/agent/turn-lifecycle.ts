@@ -10,6 +10,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import type { AgentClient } from "../agent-client";
 import type { AgentStore } from "../agent-store";
 import { newAssistantMessage, normalizeCompletionStatus } from "../conversation-snapshots";
@@ -401,7 +402,17 @@ export class TurnLifecycle {
     }
   }
 
-  async #completeTurn(agentId: string, threadId: string, turnId: string, status: string): Promise<void> {
+  #completeTurn(agentId: string, threadId: string, turnId: string, status: string): Promise<void> {
+    return runTurn(this.#completeTurnEffect(agentId, threadId, turnId, status));
+  }
+
+  readonly #completeTurnEffect = Effect.fn("TurnLifecycle.completeTurn")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    threadId: string,
+    turnId: string,
+    status: string,
+  ) {
     const running = this.#runningTurns.get(turnId);
     this.#runningTurns.delete(turnId);
     const reportedError = this.#turnErrors.get(turnId);
@@ -413,8 +424,9 @@ export class TurnLifecycle {
       reportedError !== undefined &&
       isForeignReasoningError(reportedError);
     this.#deltas.flushTurn(turnId);
-    await this.#images.waitForOperations(threadId, turnId);
-    await this.#turnAssociations.get(turnId)?.catch(() => undefined);
+    yield* this.#images.waitForOperationsEffect(threadId, turnId);
+    const association = this.#turnAssociations.get(turnId);
+    if (association) yield* turnIo(() => association).pipe(Effect.catch(() => Effect.void));
     this.#memories.finishTurn(turnId, status);
     // A refused session is closed below, so it is not compacted.
     const shouldCompact = !refused && this.#compaction.reserve(agentId, threadId);
@@ -430,7 +442,7 @@ export class TurnLifecycle {
       !this.#conversation.isExecutionThread(snapshot.threadId) &&
       deliveries.every(({ delivery }) => !this.#refusedRetries.has(delivery.id));
     if (retry) {
-      await this.#retryRefusedTurn(agentId, threadId, turnId, snapshot, deliveries);
+      yield* this.#retryRefusedTurnEffect(agentId, threadId, turnId, snapshot, deliveries);
       return;
     }
     if (status === "failed") this.#failedTurns.set(agentId, turnId);
@@ -445,7 +457,10 @@ export class TurnLifecycle {
     const failure = refused
       ? sourceText("error.provider.foreignReasoning", { provider: providerLabel(running.client.provider) })
       : reportedError;
-    if (refused) this.#hooks.emitError("agent_error", failure, agentId);
+    if (refused) {
+      this.#hooks.dropRefusedSession(agentId, threadId);
+      this.#hooks.emitError("agent_error", failure, agentId);
+    }
     if (deliveries.some((delivery) => delivery.delivery.sender.kind === "agent")) {
       dropPlaceholderAnswers(snapshot, turnId);
     }
@@ -465,14 +480,14 @@ export class TurnLifecycle {
       for (const delivery of deliveries) {
         this.#refusedRetries.delete(delivery.delivery.id);
         const reason = terminal === "failed" && failure ? this.#hooks.redactMcp(failure) : null;
-        await this.#mailbox.markTerminal(delivery.delivery.id, terminal, reason);
+        yield* turnIo(() => this.#mailbox.markTerminal(delivery.delivery.id, terminal, reason));
         this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.delivery.id);
       }
       // A turn can start with the answers of several teammates. `#relayAgentResult` skips each one
       // that wants no answer, so only a teammate that asked for a result gets one.
       if (!this.#conversation.isExecutionThread(snapshot.threadId) && terminal === "completed" && latestAssistant) {
         for (const delivery of deliveries)
-          await this.#relayAgentResult(agentId, turnId, delivery, latestAssistant.text);
+          yield* this.#relayAgentResultEffect(agentId, turnId, delivery, latestAssistant.text);
       }
       // The requester holds the answers of the other teammates until each request has ended, so
       // this end can release them, also when this turn failed and sends no result.
@@ -481,7 +496,7 @@ export class TurnLifecycle {
       }
     }
     if (latestAssistant && !this.#conversation.isExecutionThread(snapshot.threadId)) {
-      await this.#store.updatePreview(agentId, latestAssistant.text);
+      yield* turnIo(() => this.#store.updatePreview(agentId, latestAssistant.text));
       this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
     }
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status });
@@ -501,10 +516,9 @@ export class TurnLifecycle {
       status,
       origin: deliveries[0]?.delivery.sender.kind ?? "unknown",
     });
-    if (refused) this.#hooks.dropRefusedSession(agentId, threadId);
-    if (shouldCompact) await this.#compaction.request(agentId, threadId);
+    if (shouldCompact) yield* this.#compaction.requestEffect(agentId, threadId);
     else this.#hooks.scheduleDrain(agentId);
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Queues the deliveries of a turn once more, after the provider refused the session's history.
@@ -512,16 +526,17 @@ export class TurnLifecycle {
    * session repeats nothing. The turn ends as interrupted, which no one is told of as a failure,
    * and the queued delivery starts again at once.
    */
-  async #retryRefusedTurn(
+  readonly #retryRefusedTurnEffect = Effect.fn("TurnLifecycle.retryRefusedTurn")(function* (
+    this: TurnLifecycle,
     agentId: string,
     threadId: string,
     turnId: string,
     snapshot: ConversationSnapshot,
     deliveries: readonly DeliveryContext[],
-  ): Promise<void> {
+  ) {
     for (const { delivery } of deliveries) {
       this.#refusedRetries.add(delivery.id);
-      await this.#mailbox.requeueRefused(delivery.id);
+      yield* turnIo(() => this.#mailbox.requeueRefused(delivery.id));
       this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id);
     }
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status: "interrupted" });
@@ -541,28 +556,45 @@ export class TurnLifecycle {
     });
     this.#hooks.dropRefusedSession(agentId, threadId);
     this.#hooks.scheduleDrain(agentId);
-  }
+  }, Effect.uninterruptible);
 
   #markProduced(turnId: string): void {
     const running = this.#runningTurns.get(turnId);
     if (running) running.produced = true;
   }
 
-  async #associateStartedTurn(agentId: string, turnId: string, snapshot: ConversationSnapshot): Promise<void> {
-    const deliveries = this.#mailbox.startingDeliveriesForAgent(agentId);
-    if (deliveries.length === 0) return;
-    try {
-      for (const { delivery } of deliveries) {
-        await this.#mailbox.markRunning(delivery.id, turnId);
-        this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id);
-      }
-      this.#mailboxSync.emitQueue(agentId);
-    } catch (error) {
-      this.#hooks.emitError("delivery_turn_association_failed", error, agentId);
-    }
+  #associateStartedTurn(agentId: string, turnId: string, snapshot: ConversationSnapshot): Promise<void> {
+    return runTurn(this.#associateStartedTurnEffect(agentId, turnId, snapshot));
   }
 
-  async #relayAgentResult(agentId: string, turnId: string, delivery: DeliveryContext, text: string): Promise<void> {
+  readonly #associateStartedTurnEffect = Effect.fn("TurnLifecycle.associateStartedTurn")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    turnId: string,
+    snapshot: ConversationSnapshot,
+  ) {
+    const deliveries = yield* turnStep(() => this.#mailbox.startingDeliveriesForAgent(agentId));
+    if (deliveries.length === 0) return;
+    yield* Effect.gen({ self: this }, function* () {
+      for (const { delivery } of deliveries) {
+        yield* turnIo(() => this.#mailbox.markRunning(delivery.id, turnId));
+        yield* turnStep(() => this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id));
+      }
+      yield* turnStep(() => this.#mailboxSync.emitQueue(agentId));
+    }).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => this.#hooks.emitError("delivery_turn_association_failed", failure.cause, agentId)),
+      ),
+    );
+  }, Effect.uninterruptible);
+
+  readonly #relayAgentResultEffect = Effect.fn("TurnLifecycle.relayAgentResult")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    turnId: string,
+    delivery: DeliveryContext,
+    text: string,
+  ) {
     if (delivery.delivery.sender.kind !== "agent") return;
     const messageId = delivery.delivery.messageId;
     const originAgentId = this.#mailbox.chainOriginAgentId(messageId);
@@ -578,16 +610,18 @@ export class TurnLifecycle {
     )
       return;
 
-    await this.#mailbox.enqueue({
-      sender: { kind: "agent", agentId },
-      recipientAgentIds: [recipientAgentId],
-      text,
-      replyToMessageId: messageId,
-      // The requested result, not a new request. The chain-origin guard above already stops a
-      // second relay; this is what tells the recipient it owes no acknowledgement for one.
-      expectsReply: false,
-      idempotencyKey: `auto-result:${turnId}:${messageId}`,
-    });
+    yield* turnIo(() =>
+      this.#mailbox.enqueue({
+        sender: { kind: "agent", agentId },
+        recipientAgentIds: [recipientAgentId],
+        text,
+        replyToMessageId: messageId,
+        // The requested result, not a new request. The chain-origin guard above already stops a
+        // second relay; this is what tells the recipient it owes no acknowledgement for one.
+        expectsReply: false,
+        idempotencyKey: `auto-result:${turnId}:${messageId}`,
+      }),
+    );
     const senderSnapshot = this.#conversation.snapshotToUpdate(agentId);
     if (senderSnapshot) {
       this.#mailboxSync.syncMailboxMessages(senderSnapshot);
@@ -595,7 +629,7 @@ export class TurnLifecycle {
     }
     this.#mailboxSync.emitQueue(recipientAgentId);
     this.#hooks.scheduleDrain(recipientAgentId);
-  }
+  }, Effect.uninterruptible);
 
   #applyItem(agentId: string, threadId: string, turnId: string, item: ThreadItem, completed: boolean): void {
     const usage = completed ? toolUsage(item) : null;
@@ -689,4 +723,22 @@ function dropPlaceholderAnswers(snapshot: ConversationSnapshot, turnId: string):
     if (!message.text.trim() || /[\p{L}\p{N}]/u.test(message.text)) continue;
     snapshot.messages.splice(index, 1);
   }
+}
+
+export class TurnOperationFailed extends Schema.TaggedError<TurnOperationFailed>()("TurnOperationFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function turnIo<A>(run: () => Promise<A>): Effect.Effect<A, TurnOperationFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new TurnOperationFailed({ cause }) });
+}
+
+function turnStep<A>(run: () => A): Effect.Effect<A, TurnOperationFailed> {
+  return Effect.try({ try: run, catch: (cause) => new TurnOperationFailed({ cause }) });
+}
+
+async function runTurn<A>(operation: Effect.Effect<A, TurnOperationFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

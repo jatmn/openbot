@@ -1,4 +1,6 @@
 import type { HostedServerActivityReport } from "@openbot/contracts/hosted-servers";
+import { Effect } from "effect";
+import { remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 
 /**
  * A hosted server tells the Worker that it is in use (a client works with it or an agent works) and
@@ -54,13 +56,13 @@ export class HostedServerActivity {
   }
 
   tick(): Promise<void> {
-    this.#pending ??= this.#tick().finally(() => {
+    this.#pending ??= runRemoteWorkflow(this.#tickEffect()).finally(() => {
       this.#pending = null;
     });
     return this.#pending;
   }
 
-  async #tick(): Promise<void> {
+  readonly #tickEffect = Effect.fn("HostedServerActivity.tick")(function* (this: HostedServerActivity) {
     const now = this.#options.now?.() ?? Date.now();
     const inUse = this.#options.inUse();
     const nextRunAt = this.#options.nextRunAt();
@@ -72,13 +74,15 @@ export class HostedServerActivity {
       this.#wasInUse = inUse;
       return;
     }
-    await this.#options.report(`/v2/hosting/servers/${encodeURIComponent(this.#options.hostId)}/activity`, {
-      inUse,
-      nextRunAt,
-    });
+    yield* remoteCall(() =>
+      this.#options.report(`/v2/hosting/servers/${encodeURIComponent(this.#options.hostId)}/activity`, {
+        inUse,
+        nextRunAt,
+      }),
+    );
     // A failed report changes nothing here, so the next sample sends it again.
     this.#wasInUse = inUse;
     this.#reportedNextRunAt = nextRunAt;
     if (inUse) this.#lastInUseReportAt = now;
-  }
+  });
 }

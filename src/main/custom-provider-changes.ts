@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import { runRuntime, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 // The user's own model endpoints: list, add, remove. The local IPC handlers and the `providers-v1`
 // host routes share one instance, so a change from a joined admin and a change from this window
 // wait for each other.
@@ -62,40 +64,58 @@ export function createCustomProviderChanges({
      * arrive through the ready `status` event, like every other provider's.
      */
     save: (input) =>
-      serialize(async () => {
-        // The backend owns this order as well: it excludes the id being saved, then runs the write.
-        // The id is served again only once a new process has read the file, which the backend hears
-        // from the provider runtime. A restart that is skipped or that fails leaves the CLI
-        // answering on the endpoints as they were, so the id stays out -- whether it was removed
-        // before this write or already named models in that process's catalogue.
-        const providers = await service.saveCustomProvider(input.id, () => customProviders.save(input));
-        return { providers, restart: await service.reloadOpenCodeConfig() };
-      }),
+      serialize(() =>
+        runRuntime(
+          Effect.fn("CustomProviderChanges.save")(function* () {
+            // The backend owns this order as well: it excludes the id being saved, then runs the write.
+            // The id is served again only once a new process has read the file, which the backend hears
+            // from the provider runtime. A restart that is skipped or that fails leaves the CLI
+            // answering on the endpoints as they were, so the id stays out -- whether it was removed
+            // before this write or already named models in that process's catalogue.
+            const providers = yield* runtimeIO(() =>
+              service.saveCustomProvider(input.id, () => customProviders.save(input)),
+            );
+            return { providers, restart: yield* runtimeIO(() => service.reloadOpenCodeConfig()) };
+          })().pipe(Effect.uninterruptible),
+        ),
+      ),
     /**
      * Like `save`, and the agents on a model that the edit takes out move first. The store checks
      * the edit before that, so an edit it refuses moves no agent.
      */
     update: (input) =>
-      serialize(async () => {
-        customProviders.checkUpdate(input);
-        const saved = customProviders.list().find((provider) => provider.id === input.id);
-        const kept = new Set(input.models.map((model) => model.id));
-        const removed = (saved?.models ?? []).filter((model) => !kept.has(model.id)).map((model) => model.id);
-        const providers = await service.updateCustomProvider(input.id, removed, () => customProviders.update(input));
-        return { providers, restart: await service.reloadOpenCodeConfig() };
-      }),
+      serialize(() =>
+        runRuntime(
+          Effect.fn("CustomProviderChanges.update")(function* () {
+            yield* runtimeSync(() => customProviders.checkUpdate(input));
+            const saved = customProviders.list().find((provider) => provider.id === input.id);
+            const kept = new Set(input.models.map((model) => model.id));
+            const removed = (saved?.models ?? []).filter((model) => !kept.has(model.id)).map((model) => model.id);
+            const providers = yield* runtimeIO(() =>
+              service.updateCustomProvider(input.id, removed, () => customProviders.update(input)),
+            );
+            return { providers, restart: yield* runtimeIO(() => service.reloadOpenCodeConfig()) };
+          })().pipe(Effect.uninterruptible),
+        ),
+      ),
     /**
      * Agents move off the endpoint's models *before* it is removed, so no agent is left naming a
      * model the restarted CLI does not list.
      */
     remove: (id) =>
-      serialize(async () => {
-        // The backend owns this order: it excludes the endpoint, moves the agents off it, and runs
-        // the write as one change no agent update can interleave with. A write that throws gives the
-        // exclusion back, because the endpoint is then still saved and still served.
-        const providers = await service.removeCustomProvider(id, () => customProviders.remove(id));
-        return { providers, restart: await service.reloadOpenCodeConfig() };
-      }),
+      serialize(() =>
+        runRuntime(
+          Effect.fn("CustomProviderChanges.remove")(function* () {
+            // The backend owns this order: it excludes the endpoint, moves the agents off it, and runs
+            // the write as one change no agent update can interleave with. A write that throws gives the
+            // exclusion back, because the endpoint is then still saved and still served.
+            const providers = yield* runtimeIO(() =>
+              service.removeCustomProvider(id, () => customProviders.remove(id)),
+            );
+            return { providers, restart: yield* runtimeIO(() => service.reloadOpenCodeConfig()) };
+          })().pipe(Effect.uninterruptible),
+        ),
+      ),
   };
 }
 

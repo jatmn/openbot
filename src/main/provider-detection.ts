@@ -19,9 +19,10 @@ import {
   isNewCustomProviderId,
   sameCustomProviderOrigin,
 } from "@openbot/contracts/ipc";
-import { scanAcpAgents } from "../backend/acp-agent-scan";
+import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
+import { scanAcpAgentsEffect } from "../backend/acp-agent-scan";
 import type { CustomProviderConfig } from "../backend/opencode-config";
-import type { ProbeModels } from "./model-server-probe";
+import { ModelServerProbe } from "./model-server-probe";
 
 /** A server on this computer answers at once, so a slow address is not held for long. */
 const SCAN_TIMEOUT_MS = 1_500;
@@ -38,8 +39,8 @@ export interface ProviderDetectionDependencies {
   settings: { get(): ProviderDetectionSettings };
   customProviders: { configs(): readonly CustomProviderConfig[] };
   customAgents: { configs(): readonly { id: string }[] };
-  probe: ProbeModels;
-  scanAgents?: typeof scanAcpAgents;
+  probe?: Context.Service.Shape<typeof ModelServerProbe>["probe"];
+  scanAgents?: typeof scanAcpAgentsEffect;
 }
 
 export interface ProviderDetection {
@@ -96,40 +97,93 @@ function scanTargets(addresses: readonly string[]): KnownServer[] {
   return targets;
 }
 
-export function createProviderDetection({
-  settings,
-  customProviders,
-  customAgents,
-  probe,
-  scanAgents = scanAcpAgents,
-}: ProviderDetectionDependencies): ProviderDetection {
-  /** Two windows, or a Settings tab and onboarding, that scan at once share one scan. */
+export class ProviderDiscovery extends Context.Service<
+  ProviderDiscovery,
+  {
+    scanModelServers(): Effect.Effect<DetectedModelServer[]>;
+    scanAgents(): Effect.Effect<DetectedAcpAgent[]>;
+    discoverModels(input: DiscoverModelsInput): ReturnType<typeof discoverModelsEffect>;
+  }
+>()("openbot/main/ProviderDiscovery") {
+  static layer(dependencies: ProviderDetectionDependencies) {
+    return Layer.effect(
+      ProviderDiscovery,
+      Effect.gen(function* () {
+        const modelProbe = yield* ModelServerProbe;
+        const injectedProbe = dependencies.probe;
+        const injectedScanAgents = dependencies.scanAgents;
+        const probe = injectedProbe ?? modelProbe.probe;
+        const scan = Effect.fn("ProviderDiscovery.scanModelServers")(function* () {
+          const current = dependencies.settings.get();
+          if (!current.enabled) return [];
+          const targets = scanTargets(current.addresses);
+          const results = yield* Effect.forEach(
+            targets,
+            (target) =>
+              probe({ baseUrl: target.baseUrl, apiKey: null, headers: [] }, SCAN_TIMEOUT_MS).pipe(
+                Effect.map((models) => ({ target, models })),
+                Effect.catch(() => Effect.succeed(null)),
+              ),
+            { concurrency: "unbounded" },
+          );
+          const taken = new Set(dependencies.customProviders.configs().map((config) => config.id));
+          const found: DetectedModelServer[] = [];
+          for (const result of results) {
+            if (!result) continue;
+            const id = suggestServerId(result.target.id, taken);
+            taken.add(id);
+            found.push({ id, name: result.target.name, baseUrl: result.target.baseUrl, models: result.models });
+          }
+          return found;
+        });
+        const scanAgents = Effect.fn("ProviderDiscovery.scanAgents")(function* () {
+          const current = dependencies.settings.get();
+          if (!current.enabled) return [];
+          const input = {
+            folders: current.folders,
+            takenIds: new Set(dependencies.customAgents.configs().map((config) => config.id)),
+          };
+          return yield* (injectedScanAgents ?? scanAcpAgentsEffect)(input);
+        });
+        return ProviderDiscovery.of({
+          scanModelServers: scan,
+          scanAgents,
+          discoverModels: (input) => discoverModelsEffect(input, dependencies.customProviders, probe),
+        });
+      }),
+    ).pipe(Layer.provide(ModelServerProbe.layer));
+  }
+}
+
+const discoverModelsEffect = Effect.fn("ProviderDiscovery.discoverModels")(function* (
+  input: DiscoverModelsInput,
+  customProviders: ProviderDetectionDependencies["customProviders"],
+  probe: Context.Service.Shape<typeof ModelServerProbe>["probe"],
+) {
+  let apiKey = input.apiKey;
+  let headers = input.headers;
+  const saved = input.savedProviderId
+    ? customProviders.configs().find((config) => config.id === input.savedProviderId)
+    : undefined;
+  // Blank fields retain credentials only when the destination keeps the stored origin.
+  if (saved && sameCustomProviderOrigin(saved.baseUrl, input.baseUrl)) {
+    if (!apiKey) apiKey = saved.apiKey;
+    if (headers.length === 0) headers = [...saved.headers];
+  }
+  return { models: yield* probe({ baseUrl: input.baseUrl, apiKey, headers }, DISCOVER_TIMEOUT_MS) };
+});
+
+/** Owns one runtime and shares overlapping scans across desktop windows. */
+export function createProviderDetection(
+  dependencies: ProviderDetectionDependencies,
+): ProviderDetection & { close(): Promise<void> } {
+  const runtime = ManagedRuntime.make(ProviderDiscovery.layer(dependencies));
   let inFlight: Promise<DetectedModelServer[]> | null = null;
   let agentsInFlight: Promise<DetectedAcpAgent[]> | null = null;
-
-  async function scan(): Promise<DetectedModelServer[]> {
-    const current = settings.get();
-    if (!current.enabled) return [];
-    const targets = scanTargets(current.addresses);
-    const results = await Promise.allSettled(
-      targets.map((target) => probe({ baseUrl: target.baseUrl, apiKey: null, headers: [] }, SCAN_TIMEOUT_MS)),
-    );
-    const taken = new Set(customProviders.configs().map((config) => config.id));
-    const found: DetectedModelServer[] = [];
-    results.forEach((result, index) => {
-      const target = targets[index];
-      if (!target || result.status !== "fulfilled") return;
-      const id = suggestServerId(target.id, taken);
-      taken.add(id);
-      found.push({ id, name: target.name, baseUrl: target.baseUrl, models: result.value });
-    });
-    return found;
-  }
-
   return {
     scanModelServers() {
       if (!inFlight) {
-        inFlight = scan().finally(() => {
+        inFlight = runtime.runPromise(ProviderDiscovery.use((service) => service.scanModelServers())).finally(() => {
           inFlight = null;
         });
       }
@@ -137,32 +191,19 @@ export function createProviderDetection({
     },
     scanAgents() {
       if (!agentsInFlight) {
-        const current = settings.get();
-        agentsInFlight = (
-          current.enabled
-            ? scanAgents({
-                folders: current.folders,
-                takenIds: new Set(customAgents.configs().map((config) => config.id)),
-              })
-            : Promise.resolve([])
-        ).finally(() => {
+        agentsInFlight = runtime.runPromise(ProviderDiscovery.use((service) => service.scanAgents())).finally(() => {
           agentsInFlight = null;
         });
       }
       return agentsInFlight;
     },
     async discoverModels(input) {
-      let apiKey = input.apiKey;
-      let headers = input.headers;
-      const saved = input.savedProviderId
-        ? customProviders.configs().find((config) => config.id === input.savedProviderId)
-        : undefined;
-      // The same rule as `update`: a blank field keeps the stored value, and only for the same origin.
-      if (saved && sameCustomProviderOrigin(saved.baseUrl, input.baseUrl)) {
-        if (!apiKey) apiKey = saved.apiKey;
-        if (headers.length === 0) headers = [...saved.headers];
-      }
-      return { models: await probe({ baseUrl: input.baseUrl, apiKey, headers }, DISCOVER_TIMEOUT_MS) };
+      const result = await runtime.runPromise(
+        Effect.result(ProviderDiscovery.use((service) => service.discoverModels(input))),
+      );
+      if (Result.isFailure(result)) throw result.failure;
+      return result.success;
     },
+    close: () => runtime.dispose(),
   };
 }

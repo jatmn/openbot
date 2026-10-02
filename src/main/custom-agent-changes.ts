@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import { ProviderRuntimeFailure, runRuntime, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 // The user's own ACP agents: list, save, remove and check. This computer only: no Team API route
 // reaches these, because an agent is a command that runs here.
 //
@@ -54,28 +56,50 @@ export function createCustomAgentChanges({
      * later still saves, and its row shows that the command is not found.
      */
     save: (input) =>
-      serialize(async () => {
-        assertAgentArgs(input.args);
-        await service.saveCustomAgent(() => customAgents.save(input));
-        return { agents: await customAgents.list(), restart: await service.reloadCustomAgents() };
-      }),
+      serialize(() =>
+        runRuntime(
+          Effect.fn("CustomAgentChanges.save")(function* () {
+            yield* runtimeSync(() => assertAgentArgs(input.args));
+            yield* runtimeIO(() => service.saveCustomAgent(() => customAgents.save(input)));
+            return {
+              agents: yield* runtimeIO(() => customAgents.list()),
+              restart: yield* runtimeIO(() => service.reloadCustomAgents()),
+            };
+          })().pipe(Effect.uninterruptible),
+        ),
+      ),
     /** The agents on it move to another provider before the write, in the backend's chain. */
     remove: (id) =>
-      serialize(async () => {
-        customAgents.assertWritable();
-        if (!(await customAgents.list()).some((agent) => agent.id === id)) {
-          throw new Error(sourceText("error.provider.customAgentNotSaved"));
-        }
-        await service.removeCustomAgent(id, () => customAgents.remove(id));
-        return { agents: await customAgents.list(), restart: await service.reloadCustomAgents() };
-      }),
-    check: async (input) => {
-      assertAgentArgs(input.args);
-      const env = customAgents.checkEnv(input.env, input.savedAgentId);
-      const executable = await resolve(input.command);
-      if (!executable) throw new Error(sourceText("error.provider.customAgentNotFound", { command: input.command }));
-      assertWindowsScriptArgs(executable, input.args);
-      return check({ executable, args: input.args, env });
-    },
+      serialize(() =>
+        runRuntime(
+          Effect.fn("CustomAgentChanges.remove")(function* () {
+            yield* runtimeSync(() => customAgents.assertWritable());
+            if (!(yield* runtimeIO(() => customAgents.list())).some((agent) => agent.id === id)) {
+              return yield* new ProviderRuntimeFailure({
+                cause: new Error(sourceText("error.provider.customAgentNotSaved")),
+              });
+            }
+            yield* runtimeIO(() => service.removeCustomAgent(id, () => customAgents.remove(id)));
+            return {
+              agents: yield* runtimeIO(() => customAgents.list()),
+              restart: yield* runtimeIO(() => service.reloadCustomAgents()),
+            };
+          })().pipe(Effect.uninterruptible),
+        ),
+      ),
+    check: (input) =>
+      runRuntime(
+        Effect.fn("CustomAgentChanges.check")(function* () {
+          yield* runtimeSync(() => assertAgentArgs(input.args));
+          const env = yield* runtimeSync(() => customAgents.checkEnv(input.env, input.savedAgentId));
+          const executable = yield* runtimeIO(() => resolve(input.command));
+          if (!executable)
+            return yield* new ProviderRuntimeFailure({
+              cause: new Error(sourceText("error.provider.customAgentNotFound", { command: input.command })),
+            });
+          yield* runtimeSync(() => assertWindowsScriptArgs(executable, input.args));
+          return yield* runtimeIO(() => check({ executable, args: input.args, env }));
+        })().pipe(Effect.uninterruptible),
+      ),
   };
 }

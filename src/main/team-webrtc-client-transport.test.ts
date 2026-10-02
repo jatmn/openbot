@@ -152,6 +152,29 @@ function sentRequestId(send: { mock: { calls: unknown[][] } }): string | null {
 }
 
 describe("TeamWebRtcClientTransport", () => {
+  it("ends a pending mutation on stop without replaying it", async () => {
+    const bridge = new TeamWebRtcBridge();
+    vi.spyOn(bridge, "connect").mockImplementation(async ({ peerId }) => {
+      queueMicrotask(() => bridge.emit("connected", peerId, channelBinding));
+    });
+    vi.spyOn(bridge, "disconnect").mockResolvedValue();
+    const authentication = mockAuthenticatedSend(bridge);
+    const transport = createTransport(bridge);
+    transport.pinHostKey("host-1", hostKeys.publicKey);
+    try {
+      await transport.connect("host-1");
+      const pending = transport.request("host-1", "/v1/agents/research", { method: "DELETE" });
+      const failure = expect(pending).rejects.toMatchObject({ code: "remote_disconnected", status: 503 });
+      await vi.waitFor(() => expect(sentRequestId(authentication.send)).not.toBeNull());
+      const sentBeforeStop = authentication.send.mock.calls.length;
+      await transport.stop();
+      await failure;
+      expect(authentication.send.mock.calls.length).toBe(sentBeforeStop);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it("reuses the logical session after a WebRTC disconnect", async () => {
     const bridge = new TeamWebRtcBridge();
     vi.spyOn(bridge, "connect").mockImplementation(async ({ peerId }) => {

@@ -1,3 +1,5 @@
+import { Effect, Schema } from "effect";
+
 /**
  * One timeout for every routine owner. Two schedulers each holding their own `setTimeout` would
  * fight: each arms from its own store, so whichever armed last would decide when the process wakes
@@ -81,22 +83,32 @@ export class RoutineTimer {
    * Every source is asked, and one that throws must not stop the others or stop the re-arm: a
    * failure to fire an agent routine would otherwise leave the process asleep for good.
    */
-  async #fire(): Promise<void> {
+  #fire(): Promise<void> {
+    return Effect.runPromise(this.#fireEffect());
+  }
+
+  readonly #fireEffect = Effect.fn("RoutineTimer.fire")(function* (this: RoutineTimer) {
     const now = new Date();
     this.#firing = true;
-    try {
+    yield* Effect.gen({ self: this }, function* () {
       for (const source of this.sources()) {
-        // A suspend can arrive while an enqueue awaits. The rest stays due and fires on resume.
         if (this.#suspended) break;
-        try {
-          await source.processDue(now, () => !this.#suspended);
-        } catch (error) {
-          this.onError("routine_scheduler_failed", error);
-        }
+        yield* Effect.tryPromise({
+          try: () => source.processDue(now, () => !this.#suspended),
+          catch: (cause) => new RoutinePassFailed({ cause }),
+        }).pipe(Effect.catch((failure) => Effect.sync(() => this.onError("routine_scheduler_failed", failure.cause))));
       }
-    } finally {
-      this.#firing = false;
-      this.arm();
-    }
-  }
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          this.#firing = false;
+          this.arm();
+        }),
+      ),
+    );
+  }, Effect.uninterruptible);
 }
+
+class RoutinePassFailed extends Schema.TaggedError<RoutinePassFailed>()("RoutinePassFailed", {
+  cause: Schema.Defect(),
+}) {}

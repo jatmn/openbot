@@ -4,8 +4,27 @@ import { readFile, rm } from "node:fs/promises";
 import type { AgentProviderId, ProviderApiKeyStatus } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
+import { Effect, Result, Schema } from "effect";
 import { z } from "zod";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
+
+class CredentialStoreFailure extends Schema.TaggedError<CredentialStoreFailure>()("CredentialStoreFailure", {
+  cause: Schema.Defect(),
+}) {}
+
+function credentialIO<A>(operation: () => Promise<A>): Effect.Effect<A, CredentialStoreFailure> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new CredentialStoreFailure({ cause }) });
+}
+
+function credentialSync<A>(operation: () => A): Effect.Effect<A, CredentialStoreFailure> {
+  return Effect.try({ try: operation, catch: (cause) => new CredentialStoreFailure({ cause }) });
+}
+
+async function runCredential<A>(operation: Effect.Effect<A, CredentialStoreFailure>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
+}
 
 /**
  * One envelope holding every provider's key, each encrypted on its own.
@@ -55,17 +74,22 @@ export class ProviderCredentialStore {
    * key, and the file stays as it is: a keychain that refuses once must not cost the user the key,
    * so only an explicit save or removal replaces it.
    */
-  async load(): Promise<Error | null> {
-    this.#keys = new Map();
-    this.#loadError = null;
-    try {
-      this.#keys = await this.#read();
-    } catch (error) {
-      this.#loadError =
-        error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
-    }
-    this.#loaded = true;
-    return this.#loadError;
+  load(): Promise<Error | null> {
+    return runCredential(
+      Effect.gen({ self: this }, function* () {
+        this.#keys = new Map();
+        this.#loadError = null;
+        const result = yield* Effect.result(this.#read());
+        if (Result.isSuccess(result)) this.#keys = result.success;
+        else {
+          const error = result.failure.cause;
+          this.#loadError =
+            error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
+        }
+        this.#loaded = true;
+        return this.#loadError;
+      }),
+    );
   }
 
   /** The stored key, or `null`. Throws when `load` has not run, rather than reporting no key. */
@@ -102,10 +126,14 @@ export class ProviderCredentialStore {
    * previous edit committed, or the last write drops the other provider's key.
    */
   async #edit(change: (keys: Map<string, string>) => boolean): Promise<void> {
-    const operation = this.#writeChain.then(async () => {
-      const next = this.#editableKeys();
-      if (change(next)) await this.#commit(next);
-    });
+    const operation = this.#writeChain.then(() =>
+      runCredential(
+        Effect.gen({ self: this }, function* () {
+          const next = yield* credentialSync(() => this.#editableKeys());
+          if (yield* credentialSync(() => change(next))) yield* this.#commit(next);
+        }).pipe(Effect.uninterruptible),
+      ),
+    );
     this.#writeChain = operation.catch(() => undefined);
     await operation;
   }
@@ -123,43 +151,49 @@ export class ProviderCredentialStore {
    * Writes `next` and only then makes it the store's state. A failed write leaves memory and disk
    * as they were, so a spawn never reads a key the file does not hold, and a retry runs again.
    */
-  async #commit(next: Map<string, string>): Promise<void> {
-    if (next.size === 0) {
-      await rm(this.#path, { force: true });
-    } else {
-      await this.#write(next);
-    }
+  #commit = Effect.fn("ProviderCredentialStore.commit")(function* (
+    this: ProviderCredentialStore,
+    next: Map<string, string>,
+  ) {
+    if (next.size === 0) yield* credentialIO(() => rm(this.#path, { force: true }));
+    else yield* this.#write(next);
     this.#keys = next;
     this.#loadError = null;
-  }
+  });
 
-  async #read(): Promise<Map<string, string>> {
-    let source: string;
-    try {
-      source = await readFile(this.#path, "utf8");
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return new Map();
-      throw error;
-    }
-    if (source.length > MAX_ENVELOPE_BYTES) throw new Error(sourceText("error.provider.credentialFileTooLarge"));
-    const envelope = envelopeSchema.parse(JSON.parse(source));
-    const keys = new Map<string, string>();
-    for (const [provider, encrypted] of Object.entries(envelope.credentials)) {
-      const key = this.#cipher.decrypt(Buffer.from(encrypted, "base64"));
-      // A provider CLI can echo the key in an error, and no rule knows the shape of every provider's key.
-      registerSecretValue(key);
-      keys.set(provider, key);
-    }
-    return keys;
-  }
+  #read = Effect.fn("ProviderCredentialStore.read")(function* (this: ProviderCredentialStore) {
+    const source = yield* credentialIO(() => readFile(this.#path, "utf8")).pipe(
+      Effect.catch(({ cause }) =>
+        cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+          ? Effect.succeed(null)
+          : Effect.fail(new CredentialStoreFailure({ cause })),
+      ),
+    );
+    if (source === null) return new Map<string, string>();
+    return yield* credentialSync(() => {
+      if (source.length > MAX_ENVELOPE_BYTES) throw new Error(sourceText("error.provider.credentialFileTooLarge"));
+      const envelope = envelopeSchema.parse(JSON.parse(source));
+      const keys = new Map<string, string>();
+      for (const [provider, encrypted] of Object.entries(envelope.credentials)) {
+        const key = this.#cipher.decrypt(Buffer.from(encrypted, "base64"));
+        registerSecretValue(key);
+        keys.set(provider, key);
+      }
+      return keys;
+    });
+  });
 
-  async #write(keys: Map<string, string>): Promise<void> {
-    const credentials: Record<string, string> = {};
-    for (const [provider, key] of keys) {
-      credentials[provider] = this.#cipher.encrypt(key).toString("base64");
-    }
-    // Write then rename, so a crash in the middle leaves the previous envelope readable rather
-    // than a truncated one: a half-written key locks the user out of a paid account.
-    await writeJsonFileAtomically(this.#path, { version: 1, credentials }, { createDirectory: true });
-  }
+  #write = Effect.fn("ProviderCredentialStore.write")(function* (
+    this: ProviderCredentialStore,
+    keys: Map<string, string>,
+  ) {
+    const content = yield* credentialSync(() => {
+      const credentials: Record<string, string> = {};
+      for (const [provider, key] of keys) credentials[provider] = this.#cipher.encrypt(key).toString("base64");
+      return `${JSON.stringify({ version: 1, credentials })}\n`;
+    });
+    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
+      Effect.mapError(({ cause }) => new CredentialStoreFailure({ cause })),
+    );
+  });
 }

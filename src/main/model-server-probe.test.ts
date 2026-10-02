@@ -2,12 +2,14 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { MODEL_LIST_BODY_LIMIT, probeModels } from "./model-server-probe";
+import { MODEL_LIST_BODY_LIMIT, probeModels, probeModelsEffect } from "./model-server-probe";
 import { createProviderDetection } from "./provider-detection";
 
 const servers: Server[] = [];
+const detections: ReturnType<typeof createProviderDetection>[] = [];
 
 afterEach(async () => {
+  for (const detection of detections.splice(0)) await detection.close();
   await Promise.all(
     servers.splice(0).map(
       (server) =>
@@ -136,13 +138,38 @@ describe("discoverModels", () => {
     models: [],
     headers: [{ name: "X-Tenant", value: "saved-tenant" }],
   });
-  const detection = (baseUrl: string) =>
-    createProviderDetection({
+  const detection = (baseUrl: string) => {
+    const service = createProviderDetection({
       settings: { get: () => ({ enabled: true, addresses: [], folders: [], hiddenIds: [] }) },
       customProviders: { configs: () => [saved(baseUrl)] },
       customAgents: { configs: () => [] },
-      probe: probeModels,
+      probe: probeModelsEffect,
     });
+    detections.push(service);
+    return service;
+  };
+
+  it("cancels an active model request when the desktop service stops", async () => {
+    let signalArrival = () => {};
+    let signalClose = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      signalArrival = resolve;
+    });
+    const closed = new Promise<void>((resolve) => {
+      signalClose = resolve;
+    });
+    const server = await serve((_request, response) => {
+      response.on("close", () => signalClose());
+      signalArrival();
+    });
+    const service = detection(server.baseUrl);
+    const pending = service.discoverModels({ baseUrl: server.baseUrl, apiKey: null, headers: [] });
+    const rejected = expect(pending).rejects.toBeDefined();
+    await arrived;
+    await service.close();
+    await rejected;
+    await closed;
+  });
 
   it("uses the stored key and headers for the saved origin", async () => {
     const server = await serve((_request, response) => modelList(response));

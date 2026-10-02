@@ -1,7 +1,7 @@
-import { readFile } from "node:fs/promises";
 import { type AppLogoColorPreference, DEFAULT_APP_LOGO_COLOR, isAppLogoColor } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { Effect } from "effect";
+import { readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
 
 const DEFAULT_PREFERENCE: AppLogoColorPreference = { color: DEFAULT_APP_LOGO_COLOR };
 
@@ -9,25 +9,30 @@ const DEFAULT_PREFERENCE: AppLogoColorPreference = { color: DEFAULT_APP_LOGO_COL
  * The saved logo color, or the default. A file that is missing, unreadable or names a color this
  * build does not ship reads as the default: a lost color choice must not stop the app from starting.
  */
-export async function readLogoColorPreference(path: string): Promise<AppLogoColorPreference> {
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf8"));
-    if (!isDynamicRecord(parsed) || parsed.version !== 1 || !isAppLogoColor(parsed.color)) {
-      return { ...DEFAULT_PREFERENCE };
-    }
-    return { color: parsed.color };
-  } catch {
-    return { ...DEFAULT_PREFERENCE };
-  }
+export function readLogoColorPreference(path: string): Promise<AppLogoColorPreference> {
+  return runPreference(readLogoColorPreferenceEffect(path));
 }
+const readLogoColorPreferenceEffect = Effect.fn("LogoColorPreference.read")((path: string) =>
+  readPreferenceFile(path, (parsed): AppLogoColorPreference => {
+    if (!isDynamicRecord(parsed) || parsed.version !== 1 || !isAppLogoColor(parsed.color))
+      return { ...DEFAULT_PREFERENCE };
+    return { color: parsed.color };
+  }).pipe(Effect.catch(() => Effect.succeed({ ...DEFAULT_PREFERENCE }))),
+);
 
-export async function writeLogoColorPreference(
+export function writeLogoColorPreference(
   path: string,
   preference: AppLogoColorPreference,
 ): Promise<AppLogoColorPreference> {
-  await writeJsonFileAtomically(path, { version: 1, color: preference.color });
-  return { color: preference.color };
+  return runPreference(writeLogoColorPreferenceEffect(path, preference));
 }
+const writeLogoColorPreferenceEffect = Effect.fn("LogoColorPreference.write")(function* (
+  path: string,
+  preference: AppLogoColorPreference,
+) {
+  yield* writePreferenceFile(path, { version: 1, color: preference.color });
+  return { color: preference.color };
+});
 
 /**
  * The logo color the app icon and every window show. The main process holds it because it sets the
@@ -48,9 +53,13 @@ export class LogoColorService {
   }
 
   /** Read the saved preference. Called once at startup, before the first window loads. */
-  async load(): Promise<AppLogoColorPreference> {
-    this.#preference = await readLogoColorPreference(this.#path);
-    return this.preference;
+  load(): Promise<AppLogoColorPreference> {
+    return runPreference(
+      Effect.gen({ self: this }, function* () {
+        this.#preference = yield* readLogoColorPreferenceEffect(this.#path);
+        return this.preference;
+      }),
+    );
   }
 
   /**
@@ -66,10 +75,14 @@ export class LogoColorService {
     return applied;
   }
 
-  async #write(preference: AppLogoColorPreference): Promise<AppLogoColorPreference> {
-    this.#preference = await writeLogoColorPreference(this.#path, preference);
-    for (const listener of this.#listeners) listener(this.preference);
-    return this.preference;
+  #write(preference: AppLogoColorPreference): Promise<AppLogoColorPreference> {
+    return runPreference(
+      Effect.gen({ self: this }, function* () {
+        this.#preference = yield* writeLogoColorPreferenceEffect(this.#path, preference);
+        for (const listener of this.#listeners) listener(this.preference);
+        return this.preference;
+      }).pipe(Effect.uninterruptible),
+    );
   }
 
   subscribe(listener: (preference: AppLogoColorPreference) => void): () => void {

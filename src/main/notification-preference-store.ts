@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
 import type { NotificationPreference } from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord } from "@openbot/contracts/runtime-values";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { Effect, Result } from "effect";
 import { isMissingFileError } from "../backend/file-errors";
+import { readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
 
 const DEFAULT_PREFERENCE: NotificationPreference = { desktopNotifications: true };
 
@@ -28,19 +28,25 @@ export class NotificationPreferenceStore {
     this.#path = path;
   }
 
-  async load(): Promise<void> {
-    try {
-      const parsed = JSON.parse(await readFile(this.#path, "utf8"));
-      if (isDynamicRecord(parsed) && parsed.version === 1 && isBoolean(parsed.desktopNotifications)) {
-        this.#stored = {
-          desktopNotifications: parsed.desktopNotifications,
-          // Absent in files from builds before the request, which never asked.
-          permissionRequested: parsed.permissionRequested === true,
-        };
-      }
-    } catch (error) {
-      if (!isMissingFileError(error) && !(error instanceof SyntaxError)) throw error;
-    }
+  load(): Promise<void> {
+    return runPreference(
+      Effect.gen({ self: this }, function* () {
+        const loaded = yield* Effect.result(
+          readPreferenceFile(this.#path, (parsed): StoredNotificationPreference | null => {
+            if (isDynamicRecord(parsed) && parsed.version === 1 && isBoolean(parsed.desktopNotifications))
+              return {
+                desktopNotifications: parsed.desktopNotifications,
+                permissionRequested: parsed.permissionRequested === true,
+              };
+            return null;
+          }),
+        );
+        if (Result.isSuccess(loaded)) {
+          if (loaded.success) this.#stored = loaded.success;
+        } else if (!isMissingFileError(loaded.failure.cause) && !(loaded.failure.cause instanceof SyntaxError))
+          return yield* loaded.failure;
+      }),
+    );
   }
 
   get(): NotificationPreference {
@@ -71,8 +77,15 @@ export class NotificationPreferenceStore {
     return write;
   }
 
-  async #replace(stored: StoredNotificationPreference): Promise<void> {
-    await writeJsonFileAtomically(this.#path, { version: 1, ...stored });
-    this.#stored = stored;
+  #replace(stored: StoredNotificationPreference): Promise<void> {
+    return runPreference(
+      writePreferenceFile(this.#path, { version: 1, ...stored }).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            this.#stored = stored;
+          }),
+        ),
+      ),
+    );
   }
 }

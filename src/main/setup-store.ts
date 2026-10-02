@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import {
   type AgentModelId,
   type AgentProviderId,
@@ -8,8 +7,9 @@ import {
   type SaveSetupInput,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { Effect } from "effect";
 import { isMissingFileError } from "../backend/file-errors";
+import { readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
 
 interface StoredSetup {
   version: 2;
@@ -25,38 +25,46 @@ interface StoredSetup {
 
 const EMPTY_SETUP: AppSetupState = { completed: false, preferredProvider: null, preferredModel: null };
 
-export async function readSetupState(path: string): Promise<AppSetupState> {
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf8"));
-    if (
-      !isDynamicRecord(parsed) ||
-      !isNumber(parsed.version) ||
-      parsed.version !== 2 ||
-      !isAgentProvider(parsed.preferredProvider) ||
-      !isString(parsed.completedAt)
-    ) {
-      return { ...EMPTY_SETUP };
-    }
-    return {
-      completed: true,
-      preferredProvider: parsed.preferredProvider,
-      // A malformed model is dropped rather than failing the whole read: the provider is still a
-      // usable answer, and the model falls back to that provider's default.
-      preferredModel: isAgentModel(parsed.preferredModel) ? parsed.preferredModel : null,
-    };
-  } catch (error) {
-    if (isMissingFileError(error) || error instanceof SyntaxError) return { ...EMPTY_SETUP };
-    throw error;
-  }
+export function readSetupState(path: string): Promise<AppSetupState> {
+  return runPreference(
+    readPreferenceFile(path, (parsed): AppSetupState => {
+      if (
+        !isDynamicRecord(parsed) ||
+        !isNumber(parsed.version) ||
+        parsed.version !== 2 ||
+        !isAgentProvider(parsed.preferredProvider) ||
+        !isString(parsed.completedAt)
+      ) {
+        return { ...EMPTY_SETUP };
+      }
+      return {
+        completed: true,
+        preferredProvider: parsed.preferredProvider,
+        // A malformed model is dropped rather than failing the whole read: the provider is still a
+        // usable answer, and the model falls back to that provider's default.
+        preferredModel: isAgentModel(parsed.preferredModel) ? parsed.preferredModel : null,
+      };
+    }).pipe(
+      Effect.catch((failure) => {
+        const error = failure.cause;
+        if (isMissingFileError(error) || error instanceof SyntaxError) return Effect.succeed({ ...EMPTY_SETUP });
+        return Effect.fail(failure);
+      }),
+    ),
+  );
 }
 
-export async function writeSetupState(path: string, input: SaveSetupInput): Promise<AppSetupState> {
-  const stored: StoredSetup = {
-    version: 2,
-    preferredProvider: input.preferredProvider,
-    ...(input.preferredModel === null ? {} : { preferredModel: input.preferredModel }),
-    completedAt: new Date().toISOString(),
-  };
-  await writeJsonFileAtomically(path, stored);
-  return { completed: true, ...input };
+export function writeSetupState(path: string, input: SaveSetupInput): Promise<AppSetupState> {
+  return runPreference(
+    Effect.gen(function* () {
+      const stored: StoredSetup = {
+        version: 2,
+        preferredProvider: input.preferredProvider,
+        ...(input.preferredModel === null ? {} : { preferredModel: input.preferredModel }),
+        completedAt: new Date().toISOString(),
+      };
+      yield* writePreferenceFile(path, stored);
+      return { completed: true, ...input };
+    }),
+  );
 }

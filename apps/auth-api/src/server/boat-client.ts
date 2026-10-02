@@ -1,4 +1,6 @@
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { Context, Effect, Layer, Schema } from "effect";
+import { runApiEffect } from "./effect-runtime";
 
 const BOAT_API_URL = "https://boat.dev/api/v1";
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -11,20 +13,7 @@ const HOSTED_SERVER_SETUP_SCRIPT = "exec /opt/OpenBot/hosted/openbot-hosted-env\
 
 export type BoatSandboxType = "small" | "default" | "large";
 
-export type BoatSandboxState =
-  | "init"
-  | "provisioning"
-  | "provisioned"
-  | "cloning"
-  | "ready"
-  | "idle"
-  | "running"
-  | "archiving"
-  | "archived"
-  | "error"
-  | "cancelled";
-
-const BOAT_STATES: readonly BoatSandboxState[] = [
+const BoatSandboxState = Schema.Literals([
   "init",
   "provisioning",
   "provisioned",
@@ -36,22 +25,19 @@ const BOAT_STATES: readonly BoatSandboxState[] = [
   "archived",
   "error",
   "cancelled",
-];
+]);
+export type BoatSandboxState = typeof BoatSandboxState.Type;
+const BoatSandbox = Schema.Struct({ id: Schema.String, state: BoatSandboxState });
+export type BoatSandbox = typeof BoatSandbox.Type;
 
-export interface BoatSandbox {
-  id: string;
-  state: BoatSandboxState;
-}
-
-/** A boat failure with its status and code. The provider message is not kept: it can name internal data. */
-export class BoatApiError extends Error {
-  readonly status: number;
-  readonly code: string;
-
+/** Provider messages and raw causes can contain credentials and are not retained. */
+export class BoatApiError extends Schema.TaggedError<BoatApiError>()("BoatApiError", {
+  status: Schema.Number,
+  code: Schema.String,
+  message: Schema.String,
+}) {
   constructor(status: number, code: string) {
-    super(`boat request failed: ${status} ${code}`);
-    this.status = status;
-    this.code = code;
+    super({ status, code, message: `boat request failed: ${status} ${code}` });
   }
 }
 
@@ -63,134 +49,145 @@ export interface BoatClientOptions {
   baseUrl?: string;
 }
 
+class BoatTransport extends Context.Service<
+  BoatTransport,
+  {
+    fetch: BoatFetch;
+    apiKey: string;
+    baseUrl: string;
+  }
+>()("@openbot/auth-api/BoatTransport") {}
+
+const boatRequest = Effect.fn("BoatClient.request")(function* (
+  method: string,
+  path: string,
+  options: { body?: unknown; headers?: Record<string, string> } = {},
+) {
+  const transport = yield* BoatTransport;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${transport.apiKey}`,
+    Accept: "application/json",
+    ...options.headers,
+  };
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  const response = yield* Effect.tryPromise({
+    try: (signal) =>
+      transport.fetch(`${transport.baseUrl}${path}`, {
+        method,
+        headers,
+        ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+      }),
+    catch: () => new BoatApiError(503, "network_error"),
+  });
+  const text = yield* Effect.tryPromise({
+    try: () => response.text(),
+    catch: () => new BoatApiError(503, "network_error"),
+  });
+  const payload = text
+    ? yield* Effect.try({ try: (): unknown => JSON.parse(text), catch: () => null }).pipe(
+        Effect.catch(() => Effect.succeed(null)),
+      )
+    : null;
+  if (!response.ok) {
+    const code = isDynamicRecord(payload) && isString(payload.code) ? payload.code : "http_error";
+    return yield* new BoatApiError(response.status, code);
+  }
+  return payload;
+});
+
+const parseSandbox = Effect.fn("BoatClient.decodeSandbox")((value: unknown) =>
+  Schema.decodeUnknownEffect(BoatSandbox)(
+    isDynamicRecord(value) && isDynamicRecord(value.sandbox) ? value.sandbox : value,
+  ).pipe(Effect.mapError(() => new BoatApiError(502, "invalid_response"))),
+);
+
 export class BoatClient {
-  readonly #apiKey: string;
-  readonly #fetch: BoatFetch;
-  readonly #baseUrl: string;
+  readonly #transport: Layer.Layer<BoatTransport>;
 
   constructor(options: BoatClientOptions) {
-    this.#apiKey = options.apiKey;
-    // workerd throws `Illegal invocation` when global fetch runs with this object as its receiver.
-    this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
-    this.#baseUrl = options.baseUrl ?? BOAT_API_URL;
+    this.#transport = Layer.succeed(BoatTransport)({
+      apiKey: options.apiKey,
+      // A wrapped global fetch preserves its workerd receiver.
+      fetch: options.fetch ?? ((input, init) => fetch(input, init)),
+      baseUrl: options.baseUrl ?? BOAT_API_URL,
+    });
   }
 
-  async createSandbox(input: {
+  createSandbox(input: {
     type: BoatSandboxType;
     from: string;
     env: Record<string, string>;
     ttlSeconds: number;
     idempotencyKey: string;
   }): Promise<BoatSandbox> {
-    const body = await this.#request("POST", "/sandboxes", {
-      body: {
-        type: input.type,
-        from: input.from,
-        env: input.env,
-        noEnv: true,
-        ttlSeconds: input.ttlSeconds,
-        setupScript: HOSTED_SERVER_SETUP_SCRIPT,
-      },
-      headers: { "Idempotency-Key": input.idempotencyKey },
-    });
-    return parseSandbox(body);
+    return this.#run(
+      boatRequest("POST", "/sandboxes", {
+        body: {
+          type: input.type,
+          from: input.from,
+          env: input.env,
+          noEnv: true,
+          ttlSeconds: input.ttlSeconds,
+          setupScript: HOSTED_SERVER_SETUP_SCRIPT,
+        },
+        headers: { "Idempotency-Key": input.idempotencyKey },
+      }).pipe(Effect.flatMap(parseSandbox)),
+    );
   }
 
-  async getSandbox(sandboxId: string): Promise<BoatSandbox> {
-    return parseSandbox(await this.#request("GET", `/sandboxes/${encodeURIComponent(sandboxId)}`));
+  getSandbox(sandboxId: string): Promise<BoatSandbox> {
+    return this.#run(
+      boatRequest("GET", `/sandboxes/${encodeURIComponent(sandboxId)}`).pipe(Effect.flatMap(parseSandbox)),
+    );
   }
 
-  /**
-   * Resumes an archived sandbox. With a type, boat restores the disk on a machine of that size. boat
-   * refuses a smaller machine that cannot hold the data (`409 type_too_small`) and keeps the sandbox.
-   * boat stops the sandbox again `ttlSeconds` after the resume.
-   */
-  async resumeSandbox(sandboxId: string, ttlSeconds: number, type?: BoatSandboxType): Promise<void> {
-    await this.#request("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/resume`, {
-      body: type === undefined ? { ttlSeconds } : { ttlSeconds, type },
-    });
+  /** Restore the saved disk; boat refuses a smaller machine that cannot hold it. */
+  resumeSandbox(sandboxId: string, ttlSeconds: number, type?: BoatSandboxType): Promise<void> {
+    return this.#run(
+      boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/resume`, {
+        body: type === undefined ? { ttlSeconds } : { ttlSeconds, type },
+      }).pipe(Effect.asVoid),
+    );
   }
 
-  /** boat stops the sandbox `ttlSeconds` from now, in place of its earlier stop time. */
-  async extendSandbox(sandboxId: string, ttlSeconds: number): Promise<void> {
-    await this.#request("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { ttlSeconds } });
+  extendSandbox(sandboxId: string, ttlSeconds: number): Promise<void> {
+    return this.#run(
+      boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { ttlSeconds } }).pipe(Effect.asVoid),
+    );
   }
 
-  /** Sets the name that the boat dashboard shows. It is not an address and does not need to be unique. */
-  async renameSandbox(sandboxId: string, name: string): Promise<void> {
-    await this.#request("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { name } });
+  renameSandbox(sandboxId: string, name: string): Promise<void> {
+    return this.#run(
+      boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { name } }).pipe(Effect.asVoid),
+    );
   }
 
-  /**
-   * Stops and archives the sandbox. boat saves the disk first and keeps the sandbox for a resume. When
-   * that save fails, boat refuses the stop and the sandbox keeps running. This never forces a stop.
-   */
-  async stopSandbox(sandboxId: string): Promise<void> {
-    await this.#request("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/stop`, { body: {} });
+  /** Boat saves the disk before stopping. A failed save must not force a stop. */
+  stopSandbox(sandboxId: string): Promise<void> {
+    return this.#run(
+      boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/stop`, { body: {} }).pipe(Effect.asVoid),
+    );
   }
 
-  /** Deletes the sandbox and its data. A sandbox that is already gone counts as deleted. */
-  async deleteSandbox(sandboxId: string): Promise<void> {
-    try {
-      await this.#request("DELETE", `/sandboxes/${encodeURIComponent(sandboxId)}`, {
+  /** A sandbox that is already gone counts as deleted. */
+  deleteSandbox(sandboxId: string): Promise<void> {
+    return this.#run(
+      boatRequest("DELETE", `/sandboxes/${encodeURIComponent(sandboxId)}`, {
         headers: { "X-Ascii-Confirm-Delete": sandboxId },
-      });
-    } catch (error) {
-      if (error instanceof BoatApiError && error.status === 404) return;
-      throw error;
-    }
+      }).pipe(
+        Effect.asVoid,
+        Effect.catch((error) => (error.status === 404 ? Effect.void : Effect.fail(error))),
+      ),
+    );
   }
 
-  async #request(
-    method: string,
-    path: string,
-    options: { body?: unknown; headers?: Record<string, string> } = {},
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.#apiKey}`,
-      Accept: "application/json",
-      ...options.headers,
-    };
-    if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    let response: Response;
-    try {
-      response = await this.#fetch(`${this.#baseUrl}${path}`, {
-        method,
-        headers,
-        ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch {
-      throw new BoatApiError(503, "network_error");
-    }
-    const text = await response.text();
-    let payload: unknown = null;
-    if (text) {
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = null;
-      }
-    }
-    if (!response.ok) {
-      const code = isDynamicRecord(payload) && isString(payload.code) ? payload.code : "http_error";
-      throw new BoatApiError(response.status, code);
-    }
-    return payload;
+  #run<A>(operation: Effect.Effect<A, BoatApiError, BoatTransport>): Promise<A> {
+    return runApiEffect(operation.pipe(Effect.provide(this.#transport)));
   }
 }
 
-function parseSandbox(value: unknown): BoatSandbox {
-  const record = isDynamicRecord(value) && isDynamicRecord(value.sandbox) ? value.sandbox : value;
-  if (!isDynamicRecord(record) || !isString(record.id) || !isBoatState(record.state)) {
-    throw new BoatApiError(502, "invalid_response");
-  }
-  return { id: record.id, state: record.state };
-}
-
-export function isBoatState(value: unknown): value is BoatSandboxState {
-  return BOAT_STATES.some((state) => state === value);
-}
+export const isBoatState = Schema.is(BoatSandboxState);
 
 /** Checks a boat webhook signature: hex HMAC-SHA256 of `delivery.timestamp.body`. */
 export async function verifyBoatWebhookSignature(input: {

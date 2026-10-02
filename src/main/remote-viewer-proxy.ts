@@ -11,6 +11,7 @@ import { isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import { browserViewStreamSessionId } from "@openbot/contracts/team-protocol/browser-view-v1";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import type * as Ws from "ws";
 import { LifecycleGate } from "./lifecycle-gate";
 import {
@@ -19,6 +20,7 @@ import {
   encodeRemoteDesktopSignalBinary,
   encodeRemoteDesktopSignalControl,
 } from "./remote-desktop-signal";
+import { type RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 import { rawDataBytes, rawDataSize, rawDataText, sendableCloseCode } from "./ws-raw-data";
 
 const requireModule = createRequire(import.meta.url);
@@ -114,23 +116,33 @@ export class RemoteViewerProxy {
     });
   }
 
-  async #handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  #handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    return runRemoteWorkflow(this.#handleHttpEffect(request, response));
+  }
+  readonly #handleHttpEffect = Effect.fn("RemoteViewerProxy.handleHttp")(function* (
+    this: RemoteViewerProxy,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     const route = this.#route(request.url ?? "/");
     if (!route) return sendText(response, 404, "Not found");
-    try {
-      const body = request.method === "GET" || request.method === "HEAD" ? undefined : await readBody(request);
-      const upstream = await this.#options.fetchResource(route.serverId, route.upstreamPath, {
-        method: request.method === "HEAD" ? "GET" : request.method,
-        headers: { "Content-Type": request.headers["content-type"] ?? "application/octet-stream" },
-        body: body ? Uint8Array.from(body).buffer : undefined,
-      });
+    return yield* Effect.gen({ self: this }, function* () {
+      const body =
+        request.method === "GET" || request.method === "HEAD" ? undefined : yield* remoteCall(() => readBody(request));
+      const upstream = yield* remoteCall(() =>
+        this.#options.fetchResource(route.serverId, route.upstreamPath, {
+          method: request.method === "HEAD" ? "GET" : request.method,
+          headers: { "Content-Type": request.headers["content-type"] ?? "application/octet-stream" },
+          body: body ? Uint8Array.from(body).buffer : undefined,
+        }),
+      );
       if (upstream.status === 204) {
         response.writeHead(204, { "Cache-Control": "no-store" });
         response.end();
         return;
       }
       const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
-      let bytes = new Uint8Array(await upstream.arrayBuffer());
+      let bytes = new Uint8Array(yield* remoteCall(() => upstream.arrayBuffer()));
       if (contentType.includes("text/html") || contentType.includes("javascript")) {
         const prefix = this.#basePath(route.serverId);
         const escapedPrefix = prefix.replaceAll("/", "\\/");
@@ -156,10 +168,14 @@ export class RemoteViewerProxy {
       }
       response.writeHead(upstream.status, responseHeaders);
       response.end(request.method === "HEAD" ? undefined : Buffer.from(bytes));
-    } catch {
-      sendText(response, 502, "Remote viewer resource unavailable");
-    }
-  }
+    }).pipe(
+      Effect.catch(() =>
+        Effect.sync(() => {
+          sendText(response, 502, "Remote viewer resource unavailable");
+        }),
+      ),
+    );
+  });
 
   #openStream(serverId: string, upstreamPath: string, socket: Ws.WebSocket): void {
     const streamId = crypto.randomUUID();
@@ -187,47 +203,52 @@ export class RemoteViewerProxy {
     });
     socket.once("close", (code, reason) => {
       this.#streams.delete(streamId);
-      void this.#options.transport
-        .sendDesktop(
-          serverId,
-          encodeRemoteDesktopSignalControl({
-            type: "close",
-            streamId,
-            code,
-            reason: reason.toString(),
-          }),
-        )
-        .catch(() => undefined);
+      void runRemoteWorkflow(
+        remoteCall(() =>
+          this.#options.transport.sendDesktop(
+            serverId,
+            encodeRemoteDesktopSignalControl({ type: "close", streamId, code, reason: reason.toString() }),
+          ),
+        ).pipe(Effect.catch(() => Effect.void)),
+      );
     });
-    void this.#options.transport
-      .sendDesktop(
-        serverId,
-        encodeRemoteDesktopSignalControl({
-          type: "open",
-          streamId,
-          path: upstreamPath,
-        }),
-      )
-      .catch(() => socket.close(1011, "Remote desktop signal failed"));
+    void runRemoteWorkflow(
+      remoteCall(() =>
+        this.#options.transport.sendDesktop(
+          serverId,
+          encodeRemoteDesktopSignalControl({ type: "open", streamId, path: upstreamPath }),
+        ),
+      ).pipe(Effect.catch(() => Effect.sync(() => socket.close(1011, "Remote desktop signal failed")))),
+    );
   }
 
-  async #sendFrame(streamId: string, stream: ViewerStream, data: Ws.RawData, binary: boolean): Promise<void> {
+  readonly #sendFrameEffect = Effect.fn("RemoteViewerProxy.sendFrame")(function* (
+    this: RemoteViewerProxy,
+    streamId: string,
+    stream: ViewerStream,
+    data: Ws.RawData,
+    binary: boolean,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (binary) {
-      await this.#options.transport.sendDesktop(
-        stream.serverId,
-        encodeRemoteDesktopSignalBinary(streamId, rawDataBytes(data)),
+      yield* remoteCall(() =>
+        this.#options.transport.sendDesktop(
+          stream.serverId,
+          encodeRemoteDesktopSignalBinary(streamId, rawDataBytes(data)),
+        ),
       );
     } else {
-      await this.#options.transport.sendDesktop(
-        stream.serverId,
-        encodeRemoteDesktopSignalControl({
-          type: "text",
-          streamId,
-          data: rawDataText(data),
-        }),
+      yield* remoteCall(() =>
+        this.#options.transport.sendDesktop(
+          stream.serverId,
+          encodeRemoteDesktopSignalControl({
+            type: "text",
+            streamId,
+            data: rawDataText(data),
+          }),
+        ),
       );
     }
-  }
+  });
 
   #queueFrame(streamId: string, stream: ViewerStream, data: Ws.RawData, binary: boolean): void {
     const bytes = rawDataSize(data);
@@ -238,20 +259,28 @@ export class RemoteViewerProxy {
       stream.socket.close(1009, "Remote desktop signal queue is too large");
       return;
     }
-    stream.forwarding = stream.forwarding
-      .then(async () => {
-        if (this.#streams.get(streamId) !== stream || stream.socket.readyState !== webSockets.WebSocket.OPEN) return;
-        await this.#sendFrame(streamId, stream, data, binary);
-      })
-      .catch(() => {
-        if (this.#streams.get(streamId) === stream) {
-          this.#streams.delete(streamId);
-          stream.socket.close(1011, "Remote desktop signal failed");
-        }
-      })
-      .finally(() => {
-        stream.forwardingBytes -= bytes;
-      });
+    stream.forwarding = stream.forwarding.then(() =>
+      runRemoteWorkflow(
+        Effect.gen({ self: this }, function* () {
+          if (this.#streams.get(streamId) !== stream || stream.socket.readyState !== webSockets.WebSocket.OPEN) return;
+          yield* this.#sendFrameEffect(streamId, stream, data, binary);
+        }).pipe(
+          Effect.catch(() =>
+            Effect.sync(() => {
+              if (this.#streams.get(streamId) === stream) {
+                this.#streams.delete(streamId);
+                stream.socket.close(1011, "Remote desktop signal failed");
+              }
+            }),
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              stream.forwardingBytes -= bytes;
+            }),
+          ),
+        ),
+      ),
+    );
   }
 
   readonly #onDesktopData = (serverId: string, data: string | ArrayBuffer): void => {

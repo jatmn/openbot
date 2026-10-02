@@ -18,6 +18,7 @@ import {
 import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
+import { Effect, Result } from "effect";
 import type { AgentClient, AgentProvider } from "../agent-client";
 import type { AgentTables } from "../agent-data/agent-tables";
 import type { AgentStore } from "../agent-store";
@@ -31,7 +32,7 @@ import type { AgentMemories } from "./agent-memories";
 import { type ApprovalAutomationPolicy, NO_APPROVAL_AUTOMATION } from "./approval-automation";
 import type { AttachmentGateway } from "./attachment-gateway";
 import type { AttentionRegistry } from "./attention-registry";
-import { loadAvatarFile } from "./avatar-file";
+import { loadAvatarFileEffect } from "./avatar-file";
 import type { BrowserUploads } from "./browser-uploads";
 import type { ConversationRuntime } from "./conversation-runtime";
 import { handleDataTool } from "./data-tools";
@@ -58,6 +59,7 @@ import { type OpenBotToolResponse, openBotToolFailure, openBotToolResult } from 
 import { type AgentSidebar, handleSidebarTool } from "./sidebar-tools";
 import { LOCAL_SKILL_TOOL_DEFINITIONS, type LocalSkillTools, runLocalSkillTool } from "./skill-tools";
 import { isDynamicToolCall } from "./thread-items";
+import { runTool, ToolOperationFailed, toolIo, toolStep } from "./tool-operation";
 import type { AgentBrowserHost } from "./turn-lifecycle";
 
 export interface OpenBotToolRouterHooks {
@@ -266,24 +268,39 @@ export class OpenBotToolRouter {
    * the user and are shown by name and transport only: their commands, environment, URLs, and
    * headers can hold secrets.
    */
-  async #readAgent(agentId: string) {
-    const agent = this.#requireAgent(agentId);
+  #readAgent(agentId: string) {
+    return runTool(this.#readAgentEffect(agentId));
+  }
+
+  readonly #readAgentEffect = Effect.fn("OpenBotToolRouter.readAgent")(function* (
+    this: OpenBotToolRouter,
+    agentId: string,
+  ) {
+    const agent = yield* toolStep(() => this.#requireAgent(agentId));
     const computerUse = agentComputerUseEnabled(agent);
     let skills: unknown[] | undefined;
     let skillsError: string | undefined;
-    try {
-      if (!this.#localSkillTools) throw new Error("Skill tools are unavailable.");
-      skills = (await this.#localSkillTools().listInstalled(agent.id)).map((skill) => ({
-        skillId: skill.skillId,
-        name: skill.name,
-        ...(skill.description ? { description: skill.description } : {}),
-        origin: skill.origin ?? "marketplace",
-        enabled: skill.enabled !== false,
-        state: skill.state,
-        installedVersion: skill.installedVersion,
-        ...(skill.problem ? { problem: skill.problem } : {}),
-      }));
-    } catch (error) {
+    const loaded = yield* Effect.result(
+      Effect.gen({ self: this }, function* () {
+        const tools = yield* toolStep(() => {
+          if (!this.#localSkillTools) throw new Error("Skill tools are unavailable.");
+          return this.#localSkillTools();
+        });
+        return (yield* toolIo(() => tools.listInstalled(agent.id))).map((skill) => ({
+          skillId: skill.skillId,
+          name: skill.name,
+          ...(skill.description ? { description: skill.description } : {}),
+          origin: skill.origin ?? "marketplace",
+          enabled: skill.enabled !== false,
+          state: skill.state,
+          installedVersion: skill.installedVersion,
+          ...(skill.problem ? { problem: skill.problem } : {}),
+        }));
+      }),
+    );
+    if (Result.isSuccess(loaded)) skills = loaded.success;
+    else {
+      const error = loaded.failure.cause;
       // The rest of the setup stays readable when the skill folders cannot be read.
       skillsError = error instanceof Error ? error.message : String(error);
     }
@@ -312,7 +329,7 @@ export class OpenBotToolRouter {
         transport: server.transport,
       })),
     };
-  }
+  });
 
   /**
    * The provider, model and effort an `update_profile` call names, checked against what the CLIs list
@@ -487,7 +504,38 @@ export class OpenBotToolRouter {
       return { success: true, contentItems: [{ type: "inputText", text: redactText(JSON.stringify(payload)) }] };
     }
 
-    if (params.tool === "create_agent") {
+    if (params.tool === "create_agent") return runTool(this.#createAgentEffect(params, senderAgentId));
+
+    if (params.tool === "update_profile") return runTool(this.#updateProfileEffect(params, senderAgentId));
+
+    const sidebarResult = await handleSidebarTool(
+      params.tool,
+      params.arguments,
+      this.#sidebarLayout,
+      new Set(this.#hooks.listAgents().map((agent) => agent.id)),
+    );
+    if (sidebarResult) return sidebarResult;
+
+    const routineResult = await this.#routines.handleTool(params, senderAgentId);
+    if (routineResult) return routineResult;
+
+    const memoryResult = this.#memories.handleTool(params, senderAgentId);
+    if (memoryResult) return memoryResult;
+
+    const tableResult = await handleDataTool(params.tool, params.arguments, senderAgentId, this.#tables);
+    if (tableResult) return tableResult;
+
+    if (params.tool === "react_to_user_message") return runTool(this.#reactEffect(params, senderAgentId));
+
+    return runTool(this.#sendMessageEffect(params, senderAgentId));
+  }
+
+  readonly #createAgentEffect = Effect.fn("OpenBotToolRouter.createAgent")(
+    function* (
+      this: OpenBotToolRouter,
+      params: DynamicToolCallParams,
+      senderAgentId: string,
+    ): Effect.fn.Return<OpenBotToolResponse, ToolOperationFailed> {
       const args = createAgentToolSchema.parse(params.arguments);
       const hue = args.avatarHue ?? null;
       const caller = this.#requireAgent(senderAgentId);
@@ -530,42 +578,57 @@ export class OpenBotToolRouter {
                 }
               : {}),
           },
-          async (agent) => {
-            if (assign) await assign(agent.id);
-            if (lateEffort !== undefined) {
-              const models = this.#hooks.listModels();
-              const model = models.find(
-                (candidate) => candidate.provider === agent.provider && candidate.id === agent.model,
-              );
-              // The new agent can keep a stored default that its provider does not list. The error names
-              // that model and the listed ones, so the caller can name a model and try again.
-              if (!model) {
-                throw new Error(
-                  sourceText("error.agent.modelNotListed", {
-                    model: agent.model,
-                    models: modelList(models, agent.provider),
+          (agent) =>
+            runTool(
+              Effect.gen({ self: this }, function* () {
+                if (assign) yield* toolIo(() => assign(agent.id));
+                if (lateEffort !== undefined) {
+                  const models = this.#hooks.listModels();
+                  const model = models.find(
+                    (candidate) => candidate.provider === agent.provider && candidate.id === agent.model,
+                  );
+                  // The new agent can keep a stored default that its provider does not list. The error names
+                  // that model and the listed ones, so the caller can name a model and try again.
+                  if (!model) {
+                    throw new Error(
+                      sourceText("error.agent.modelNotListed", {
+                        model: agent.model,
+                        models: modelList(models, agent.provider),
+                      }),
+                    );
+                  }
+                  requireReasoningEffort(model, lateEffort);
+                }
+                if (args.title === undefined && lateEffort === undefined && Object.keys(limits).length === 0)
+                  return agent;
+                return yield* toolIo(() =>
+                  this.#store.updateAgent({
+                    agentId: agent.id,
+                    ...(args.title === undefined ? {} : { title: args.title }),
+                    ...(lateEffort === undefined ? {} : { reasoningEffort: lateEffort }),
+                    ...limits,
                   }),
                 );
-              }
-              requireReasoningEffort(model, lateEffort);
-            }
-            if (args.title === undefined && lateEffort === undefined && Object.keys(limits).length === 0) return agent;
-            return this.#store.updateAgent({
-              agentId: agent.id,
-              ...(args.title === undefined ? {} : { title: args.title }),
-              ...(lateEffort === undefined ? {} : { reasoningEffort: lateEffort }),
-              ...limits,
-            });
-          },
+              }).pipe(Effect.catchDefect((cause) => Effect.fail(new ToolOperationFailed({ cause })))),
+            ),
         );
+      const sidebar = this.#sidebarLayout;
       const created =
-        this.#sidebarLayout && sectionId !== null
-          ? await this.#sidebarLayout.withProfileAssignment(sectionId, create)
-          : await create();
+        sidebar && sectionId !== null
+          ? yield* toolIo(() => sidebar.withProfileAssignment(sectionId, create))
+          : yield* toolIo(() => create());
       return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(created) }] };
-    }
+    },
+    Effect.catchDefect((cause) => Effect.fail(new ToolOperationFailed({ cause }))),
+    Effect.uninterruptible,
+  );
 
-    if (params.tool === "update_profile") {
+  readonly #updateProfileEffect = Effect.fn("OpenBotToolRouter.updateProfile")(
+    function* (
+      this: OpenBotToolRouter,
+      params: DynamicToolCallParams,
+      senderAgentId: string,
+    ): Effect.fn.Return<OpenBotToolResponse, ToolOperationFailed> {
       const args = updateProfileToolSchema.parse(params.arguments);
       const { agentId, avatarHue, avatarPath, provider, model, reasoningEffort, access, computerUse, ...fields } = args;
       if (avatarPath !== undefined && (args.avatarSeed !== undefined || avatarHue !== undefined)) {
@@ -596,7 +659,12 @@ export class OpenBotToolRouter {
       // Checked before anything is written, so a model the provider does not list leaves the name
       // and every other field of the same call unchanged.
       const runtime = this.#requestedRuntime(agentId, runtimeRequest);
-      const image = avatarPath === undefined ? undefined : await loadAvatarFile(avatarPath, sender.workspacePath);
+      const image =
+        avatarPath === undefined
+          ? undefined
+          : yield* loadAvatarFileEffect(avatarPath, sender.workspacePath).pipe(
+              Effect.mapError((failure) => new ToolOperationFailed({ cause: failure.cause })),
+            );
       const input: UpdateAgentInput = {
         agentId,
         ...fields,
@@ -606,11 +674,11 @@ export class OpenBotToolRouter {
         ...(computerUse === false ? { computerUse } : {}),
         ...(avatarHue === undefined ? {} : { avatarHue }),
       };
-      let updated = await this.#hooks.updateAgent(input, senderAgentId);
+      let updated = yield* toolIo(() => this.#hooks.updateAgent(input, senderAgentId));
       if (image !== undefined) {
-        updated = await this.#hooks.setAvatar(agentId, image);
+        updated = yield* toolIo(() => this.#hooks.setAvatar(agentId, image));
       } else if (args.avatarSeed !== undefined || args.avatarHue !== undefined) {
-        updated = await this.#hooks.setAvatar(agentId, null);
+        updated = yield* toolIo(() => this.#hooks.setAvatar(agentId, null));
       }
       return {
         success: true,
@@ -635,26 +703,17 @@ export class OpenBotToolRouter {
           },
         ],
       };
-    }
+    },
+    Effect.catchDefect((cause) => Effect.fail(new ToolOperationFailed({ cause }))),
+    Effect.uninterruptible,
+  );
 
-    const sidebarResult = await handleSidebarTool(
-      params.tool,
-      params.arguments,
-      this.#sidebarLayout,
-      new Set(this.#hooks.listAgents().map((agent) => agent.id)),
-    );
-    if (sidebarResult) return sidebarResult;
-
-    const routineResult = await this.#routines.handleTool(params, senderAgentId);
-    if (routineResult) return routineResult;
-
-    const memoryResult = this.#memories.handleTool(params, senderAgentId);
-    if (memoryResult) return memoryResult;
-
-    const tableResult = await handleDataTool(params.tool, params.arguments, senderAgentId, this.#tables);
-    if (tableResult) return tableResult;
-
-    if (params.tool === "react_to_user_message") {
+  readonly #reactEffect = Effect.fn("OpenBotToolRouter.react")(
+    function* (
+      this: OpenBotToolRouter,
+      params: DynamicToolCallParams,
+      senderAgentId: string,
+    ): Effect.fn.Return<OpenBotToolResponse, ToolOperationFailed> {
       const args = params.arguments;
       if (!isRecord(args) || !isMessageReaction(args.emoji)) {
         throw new Error("emoji must be exactly one complete Unicode emoji.");
@@ -663,72 +722,90 @@ export class OpenBotToolRouter {
         .findDeliveriesByTurn(senderAgentId, params.turnId)
         .find((candidate) => candidate.delivery.sender.kind === "user");
       if (!delivery) throw new Error("Only the current user message can receive an agent reaction.");
-      await this.#mailbox.setReaction(
-        senderAgentId,
-        delivery.delivery.id,
-        { kind: "agent", agentId: senderAgentId },
-        args.emoji,
+      const emoji = args.emoji;
+      yield* toolIo(() =>
+        this.#mailbox.setReaction(
+          senderAgentId,
+          delivery.delivery.id,
+          { kind: "agent", agentId: senderAgentId },
+          emoji,
+        ),
       );
       const snapshot = this.#conversation.ensureSnapshot(senderAgentId, params.threadId);
       this.#mailboxSync.syncMailboxMessages(snapshot);
       this.#conversation.emitConversation(snapshot);
       return openBotToolResult({ status: "reacted", messageId: delivery.delivery.id, emoji: args.emoji });
-    }
+    },
+    Effect.catchDefect((cause) => Effect.fail(new ToolOperationFailed({ cause }))),
+    Effect.uninterruptible,
+  );
 
-    if (params.tool !== "send_message" || !isRecord(params.arguments)) {
-      throw new Error(`Unsupported OpenBot tool: ${params.tool}`);
-    }
-    const recipientValues = params.arguments.recipientAgentIds;
-    if (!Array.isArray(recipientValues) || !recipientValues.every((item) => isString(item))) {
-      throw new Error("recipientAgentIds must be an array of agent ids.");
-    }
-    if (recipientValues.length !== new Set(recipientValues).size) {
-      throw new Error("Duplicate recipients are not allowed.");
-    }
-    if (recipientValues.includes(senderAgentId)) throw new Error("An agent cannot message itself.");
-    const knownIds = new Set(this.#hooks.listAgents().map((agent) => agent.id));
-    for (const recipient of recipientValues) {
-      if (!knownIds.has(recipient)) throw new Error(`Unknown OpenBot agent: ${recipient}`);
-    }
-    const paths = params.arguments.paths ?? [];
-    if (!Array.isArray(paths) || !paths.every((item) => isString(item))) {
-      throw new Error("paths must be an array of local file paths.");
-    }
-    const replyToMessageId = params.arguments.replyToMessageId;
-    if (replyToMessageId !== undefined && replyToMessageId !== null && !isString(replyToMessageId)) {
-      throw new Error("replyToMessageId must be a message id.");
-    }
-    if (!isString(params.arguments.text)) throw new Error("text is required.");
-    const expectsReply = params.arguments.expectsReply;
-    if (expectsReply !== undefined && typeof expectsReply !== "boolean") {
-      throw new Error("expectsReply must be a boolean.");
-    }
+  readonly #sendMessageEffect = Effect.fn("OpenBotToolRouter.sendMessage")(
+    function* (
+      this: OpenBotToolRouter,
+      params: DynamicToolCallParams,
+      senderAgentId: string,
+    ): Effect.fn.Return<OpenBotToolResponse, ToolOperationFailed> {
+      if (params.tool !== "send_message" || !isRecord(params.arguments)) {
+        throw new Error(`Unsupported OpenBot tool: ${params.tool}`);
+      }
+      const recipientValues = params.arguments.recipientAgentIds;
+      if (!Array.isArray(recipientValues) || !recipientValues.every((item) => isString(item))) {
+        throw new Error("recipientAgentIds must be an array of agent ids.");
+      }
+      if (recipientValues.length !== new Set(recipientValues).size) {
+        throw new Error("Duplicate recipients are not allowed.");
+      }
+      if (recipientValues.includes(senderAgentId)) throw new Error("An agent cannot message itself.");
+      const knownIds = new Set(this.#hooks.listAgents().map((agent) => agent.id));
+      for (const recipient of recipientValues) {
+        if (!knownIds.has(recipient)) throw new Error(`Unknown OpenBot agent: ${recipient}`);
+      }
+      const paths = params.arguments.paths ?? [];
+      if (!Array.isArray(paths) || !paths.every((item) => isString(item))) {
+        throw new Error("paths must be an array of local file paths.");
+      }
+      const replyToMessageId = params.arguments.replyToMessageId;
+      if (replyToMessageId !== undefined && replyToMessageId !== null && !isString(replyToMessageId)) {
+        throw new Error("replyToMessageId must be a message id.");
+      }
+      if (!isString(params.arguments.text)) throw new Error("text is required.");
+      const expectsReply = params.arguments.expectsReply;
+      if (expectsReply !== undefined && typeof expectsReply !== "boolean") {
+        throw new Error("expectsReply must be a boolean.");
+      }
 
-    // A request from a Slack turn: the teammate's answer goes back to that Slack thread.
-    const messagingReturn = this.#mailbox
-      .findDeliveriesByTurn(senderAgentId, params.turnId)
-      .map(({ delivery }) => this.#mailbox.messagingOrigin(delivery.id))
-      .find((origin) => origin !== null);
-    const receipt = await this.#mailbox.enqueue({
-      sender: { kind: "agent", agentId: senderAgentId },
-      recipientAgentIds: recipientValues,
-      text: params.arguments.text,
-      sourcePaths: paths,
-      replyToMessageId: replyToMessageId ?? null,
-      expectsReply,
-      ...(messagingReturn ? { messagingReturn } : {}),
-      idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
-    });
-    for (const recipient of recipientValues) {
-      this.#mailboxSync.emitQueue(recipient);
-      this.#drain.scheduleDrain(recipient);
-    }
-    const snapshot = this.#conversation.ensureSnapshot(senderAgentId, params.threadId);
-    this.#mailboxSync.syncMailboxMessages(snapshot);
-    this.#conversation.emitConversation(snapshot);
-    return {
-      success: true,
-      contentItems: [{ type: "inputText", text: JSON.stringify(receipt) }],
-    };
-  }
+      // A request from a Slack turn: the teammate's answer goes back to that Slack thread.
+      const messagingReturn = this.#mailbox
+        .findDeliveriesByTurn(senderAgentId, params.turnId)
+        .map(({ delivery }) => this.#mailbox.messagingOrigin(delivery.id))
+        .find((origin) => origin !== null);
+      const text = params.arguments.text;
+      const receipt = yield* toolIo(() =>
+        this.#mailbox.enqueue({
+          sender: { kind: "agent", agentId: senderAgentId },
+          recipientAgentIds: recipientValues,
+          text,
+          sourcePaths: paths,
+          replyToMessageId: replyToMessageId ?? null,
+          expectsReply,
+          ...(messagingReturn ? { messagingReturn } : {}),
+          idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
+        }),
+      );
+      for (const recipient of recipientValues) {
+        this.#mailboxSync.emitQueue(recipient);
+        this.#drain.scheduleDrain(recipient);
+      }
+      const snapshot = this.#conversation.ensureSnapshot(senderAgentId, params.threadId);
+      this.#mailboxSync.syncMailboxMessages(snapshot);
+      this.#conversation.emitConversation(snapshot);
+      return {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify(receipt) }],
+      };
+    },
+    Effect.catchDefect((cause) => Effect.fail(new ToolOperationFailed({ cause }))),
+    Effect.uninterruptible,
+  );
 }

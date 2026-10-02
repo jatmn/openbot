@@ -10,7 +10,9 @@ import type {
   UninstallSkillInput,
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import { z } from "zod";
+import { runTool, ToolOperationFailed, toolIo, toolStep } from "./tool-operation";
 
 const sourcePath = z.string().min(1).max(INPUT_LIMITS.path);
 const skillId = z.string().regex(/^local-skill-[\da-f-]{36}$/u);
@@ -111,7 +113,18 @@ function skillToolDetail(skill: MarketplaceSkillDetail) {
  * `agentId` is the calling agent: it owns the skills it creates and revises. `targetAgent` resolves
  * the agent that an install, enable, or uninstall changes, which is the caller when `agentId` is omitted.
  */
-export async function runLocalSkillTool(
+export function runLocalSkillTool(
+  api: LocalSkillTools,
+  agentId: string,
+  tool: string,
+  args: unknown,
+  targetAgent: (agentId: string | undefined) => string,
+  onChanged?: (event: SkillConversationEvent) => void,
+) {
+  return runTool(runLocalSkillToolEffect(api, agentId, tool, args, targetAgent, onChanged));
+}
+
+export const runLocalSkillToolEffect = Effect.fn("SkillTools.run")(function* (
   api: LocalSkillTools,
   agentId: string,
   tool: string,
@@ -121,22 +134,26 @@ export async function runLocalSkillTool(
 ) {
   switch (tool) {
     case "create_skill": {
-      const skill = await api.create({ agentId, ...createSkillSchema.parse(args) });
+      const input = yield* toolStep(() => createSkillSchema.parse(args));
+      const skill = yield* toolIo(() => api.create({ agentId, ...input }));
       onChanged?.({ action: "created", skillId: skill.id, revision: skill.version, skillName: skill.name });
       return skillToolDetail(skill);
     }
     case "revise_skill": {
-      const skill = await api.revise({ agentId, ...reviseSkillSchema.parse(args) });
+      const input = yield* toolStep(() => reviseSkillSchema.parse(args));
+      const skill = yield* toolIo(() => api.revise({ agentId, ...input }));
       onChanged?.({ action: "revised", skillId: skill.id, revision: skill.version, skillName: skill.name });
       return skillToolDetail(skill);
     }
     case "read_local_skill": {
-      const skill = await api.get(readSkillSchema.parse(args));
+      const input = yield* toolStep(() => readSkillSchema.parse(args));
+      const skill = yield* toolIo(() => api.get(input));
       return { ...skillToolDetail(skill), archivePath: skill.archivePath };
     }
     case "install_local_skill": {
-      const input = installLocalSkillSchema.parse(args);
-      const skill = await api.install({ ...input, agentId: targetAgent(input.agentId) });
+      const input = yield* toolStep(() => installLocalSkillSchema.parse(args));
+      const target = yield* toolStep(() => targetAgent(input.agentId));
+      const skill = yield* toolIo(() => api.install({ ...input, agentId: target }));
       onChanged?.({
         action: "installed",
         skillId: skill.skillId,
@@ -146,24 +163,25 @@ export async function runLocalSkillTool(
       return skill;
     }
     case "list_local_skills":
-      return (await api.list()).map(skillToolSummary);
+      return (yield* toolIo(() => api.list())).map(skillToolSummary);
     case "set_skill_enabled": {
-      const input = setSkillEnabledSchema.parse(args);
-      return api.setEnabled({ ...input, agentId: targetAgent(input.agentId) });
+      const input = yield* toolStep(() => setSkillEnabledSchema.parse(args));
+      const target = yield* toolStep(() => targetAgent(input.agentId));
+      return yield* toolIo(() => api.setEnabled({ ...input, agentId: target }));
     }
     case "uninstall_skill": {
-      const input = uninstallSkillSchema.parse(args);
-      const target = targetAgent(input.agentId);
+      const input = yield* toolStep(() => uninstallSkillSchema.parse(args));
+      const target = yield* toolStep(() => targetAgent(input.agentId));
       // The service ignores an id that is not in the lock file, and workspace folder skills are never in it.
-      const installed = await api.listInstalled(target);
+      const installed = yield* toolIo(() => api.listInstalled(target));
       if (!installed.some((skill) => skill.skillId === input.skillId && skill.origin !== "workspace")) {
-        throw new Error(sourceText("error.skill.notFound"));
+        return yield* new ToolOperationFailed({ cause: new Error(sourceText("error.skill.notFound")) });
       }
       // Never `removeModified`: files the user changed are theirs to remove.
-      await api.uninstall({ agentId: target, skillId: input.skillId });
+      yield* toolIo(() => api.uninstall({ agentId: target, skillId: input.skillId }));
       return { agentId: target, skillId: input.skillId, removed: true };
     }
     default:
-      throw new Error("Unknown local skill tool.");
+      return yield* new ToolOperationFailed({ cause: new Error("Unknown local skill tool.") });
   }
-}
+});

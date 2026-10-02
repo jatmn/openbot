@@ -11,9 +11,26 @@ import { readFile } from "node:fs/promises";
 import type { CustomProviderSummary, SaveCustomProviderInput, UpdateCustomProviderInput } from "@openbot/contracts/ipc";
 import { sameCustomProviderOrigin } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import { z } from "zod";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
 import type { CustomProviderConfig } from "../backend/opencode-config";
+
+class CustomProviderFailure extends Schema.TaggedError<CustomProviderFailure>()("CustomProviderFailure", {
+  cause: Schema.Defect(),
+}) {}
+
+function providerIO<A>(operation: () => Promise<A>): Effect.Effect<A, CustomProviderFailure> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new CustomProviderFailure({ cause }) });
+}
+function providerSync<A>(operation: () => A): Effect.Effect<A, CustomProviderFailure> {
+  return Effect.try({ try: operation, catch: (cause) => new CustomProviderFailure({ cause }) });
+}
+async function runProvider<A>(operation: Effect.Effect<A, CustomProviderFailure>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
+}
 
 export interface CustomProviderCipher {
   canPersist: () => boolean;
@@ -85,22 +102,29 @@ export class CustomProviderStore {
    * app still starts, with no custom providers, and every write is refused until the file is
    * readable again.
    */
-  async load(): Promise<void> {
-    let contents: string | null = null;
-    try {
-      contents = await readFile(this.#path, "utf8");
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-    }
-    if (contents === null) return;
-    const file = parseProviderFile(contents);
-    if (!file) {
-      this.#readOnly = true;
-      this.#entries = [];
-      return;
-    }
-    this.#readOnly = false;
-    this.#entries = file.providers.map((stored) => ({ stored, secret: this.#openSecret(stored.secret) }));
+  load(): Promise<void> {
+    return runProvider(
+      Effect.gen({ self: this }, function* () {
+        const contents = yield* providerIO(() => readFile(this.#path, "utf8")).pipe(
+          Effect.catch(({ cause }) =>
+            cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+              ? Effect.succeed(null)
+              : Effect.fail(new CustomProviderFailure({ cause })),
+          ),
+        );
+        if (contents === null) return;
+        const file = parseProviderFile(contents);
+        if (!file) {
+          this.#readOnly = true;
+          this.#entries = [];
+          return;
+        }
+        this.#readOnly = false;
+        this.#entries = yield* Effect.forEach(file.providers, (stored) =>
+          this.#openSecret(stored.secret).pipe(Effect.map((secret) => ({ stored, secret }))),
+        );
+      }),
+    );
   }
 
   /** What the renderer is allowed to know. Five fields, none of which can hold a credential. */
@@ -247,13 +271,19 @@ export class CustomProviderStore {
    */
   async #mutate(build: () => Entry[] | null): Promise<CustomProviderSummary[]> {
     if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
-    const operation = this.#writeChain.then(async () => {
-      if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
-      const entries = build();
-      if (!entries) return;
-      await this.#persist(entries);
-      this.#entries = entries;
-    });
+    const operation = this.#writeChain.then(() =>
+      runProvider(
+        Effect.gen({ self: this }, function* () {
+          const entries = yield* providerSync(() => {
+            if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
+            return build();
+          });
+          if (!entries) return;
+          yield* this.#persist(entries);
+          this.#entries = entries;
+        }).pipe(Effect.uninterruptible),
+      ),
+    );
     this.#writeChain = operation.catch(() => undefined);
     await operation;
     return this.list();
@@ -265,23 +295,26 @@ export class CustomProviderStore {
    * alternative - refusing to start, or dropping the entry - loses the list to a keychain that a
    * migrated machine or a reinstalled system commonly changes.
    */
-  #openSecret(sealed: string | null | undefined): ProviderSecret | null {
+  #openSecret = Effect.fn("CustomProviderStore.openSecret")(function* (
+    this: CustomProviderStore,
+    sealed: string | null | undefined,
+  ) {
     if (!sealed) return null;
-    try {
+    return yield* providerSync(() => {
       const parsed = secretSchema.parse(JSON.parse(this.#cipher.decrypt(Buffer.from(sealed, "base64"))));
       return { apiKey: parsed.apiKey || null, headers: parsed.headers ?? [] };
-    } catch {
-      return null;
-    }
-  }
+    }).pipe(Effect.catch(() => Effect.succeed(null)));
+  });
 
-  /** The file write itself. Called inside `#mutate`, which owns the order of the whole change. */
-  async #persist(entries: readonly Entry[]): Promise<void> {
-    // The stored half only: every entry keeps the ciphertext it arrived with, so an untouched
-    // endpoint is never decrypted and encrypted again.
-    const providers = entries.map((entry) => entry.stored);
-    await writeJsonFileAtomically(this.#path, { version: 1, providers }, { createDirectory: true });
-  }
+  /** Keep ciphertext unchanged until an explicit credential edit. */
+  #persist = Effect.fn("CustomProviderStore.persist")(function* (this: CustomProviderStore, entries: readonly Entry[]) {
+    const content = yield* providerSync(
+      () => `${JSON.stringify({ version: 1, providers: entries.map((entry) => entry.stored) })}\n`,
+    );
+    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
+      Effect.mapError(({ cause }) => new CustomProviderFailure({ cause })),
+    );
+  });
 }
 
 /**

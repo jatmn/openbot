@@ -3,6 +3,13 @@ import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { redactText } from "@openbot/logging";
+import { Effect } from "effect";
+import {
+  desktopCall,
+  desktopFailure,
+  type RemoteDesktopOperationError,
+  runDesktopEffect,
+} from "./remote-desktop-effects";
 
 const MAX_LOG_BYTES = 1024 * 1024;
 const MAX_LINE_CHARACTERS = 8_000;
@@ -15,15 +22,22 @@ export function appendRemoteDiagnosticLog(
   name: string,
   message: string | Uint8Array,
 ): Promise<void> {
+  return runDesktopEffect(appendRemoteDiagnosticLogEffect(directory, name, message));
+}
+export const appendRemoteDiagnosticLogEffect = Effect.fn("RemoteDesktop.appendDiagnosticLog")(function* (
+  directory: string,
+  name: string,
+  message: string | Uint8Array,
+) {
   const safeName = name.replace(/[^a-zA-Z0-9_-]/gu, "-").slice(0, 80);
   const path = join(directory, `${safeName}.log`);
   const clean = Buffer.from(message).toString("utf8").split("\n").map(redactDiagnosticLine).join("\n");
   const queue = (queues.get(path) ?? Promise.resolve())
-    .then(() => (clean ? writeDiagnostic(directory, path, clean) : undefined))
+    .then(() => (clean ? runDesktopEffect(writeDiagnosticEffect(directory, path, clean)) : undefined))
     .catch(() => undefined);
   queues.set(path, queue);
-  return queue;
-}
+  yield* desktopCall(() => queue);
+});
 
 // The shared rules need `=` or `:` after a credential name. Sunshine and Moonlight also print
 // `token <value>`, which this log redacted before it used them.
@@ -73,38 +87,63 @@ function cutLine(line: string): string {
   return line.length > MAX_LINE_CHARACTERS ? line.slice(0, MAX_LINE_CHARACTERS).replace(/\S+$/u, "") : line;
 }
 
-async function writeDiagnostic(directory: string, path: string, clean: string): Promise<void> {
-  await mkdir(directory, { recursive: true });
-  try {
-    if ((await stat(path)).size >= MAX_LOG_BYTES) await rename(path, `${path}.1`);
-  } catch {
-    // A missing diagnostic file does not need rotation.
-  }
-  await appendFile(path, clean, { encoding: "utf8", mode: 0o600 });
-}
+const writeDiagnosticEffect = Effect.fn("RemoteDesktop.writeDiagnostic")(function* (
+  directory: string,
+  path: string,
+  clean: string,
+) {
+  yield* desktopCall(() => mkdir(directory, { recursive: true }));
+  yield* Effect.gen(function* () {
+    if ((yield* desktopCall(() => stat(path))).size >= MAX_LOG_BYTES)
+      yield* desktopCall(() => rename(path, `${path}.1`));
+  }).pipe(Effect.catch(() => Effect.void));
+  yield* desktopCall(() => appendFile(path, clean, { encoding: "utf8", mode: 0o600 }));
+});
 
 interface ManagedChildProcess {
   exitCode: number | null;
   killed: boolean;
   kill(signal?: NodeJS.Signals): boolean;
   once(event: string, listener: (...args: unknown[]) => unknown): unknown;
+  removeListener?(event: string, listener: (...args: unknown[]) => unknown): unknown;
 }
 
-export async function stopRemoteProcess(child: ManagedChildProcess, graceMs = 2_000): Promise<void> {
+export function stopRemoteProcess(child: ManagedChildProcess, graceMs = 2_000): Promise<void> {
+  return runDesktopEffect(stopRemoteProcessEffect(child, graceMs));
+}
+export const stopRemoteProcessEffect = Effect.fn("RemoteDesktop.stopProcess")(function* (
+  child: ManagedChildProcess,
+  graceMs = 2_000,
+) {
   if (child.exitCode !== null || child.killed) return;
-  await new Promise<void>((resolve) => {
+  yield* Effect.callback<void, RemoteDesktopOperationError>((resume) => {
     let complete = false;
     const finish = () => {
       if (complete) return;
       complete = true;
       clearTimeout(forceTimer);
-      resolve();
+      resume(Effect.void);
     };
     const forceTimer = setTimeout(() => {
-      if (child.exitCode === null) child.kill("SIGKILL");
-      finish();
+      try {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        finish();
+      } catch (cause) {
+        complete = true;
+        resume(Effect.fail(desktopFailure(cause)));
+      }
     }, graceMs);
     child.once("exit", finish);
-    child.kill("SIGTERM");
+    try {
+      child.kill("SIGTERM");
+    } catch (cause) {
+      complete = true;
+      resume(Effect.fail(desktopFailure(cause)));
+    }
+    return Effect.sync(() => {
+      clearTimeout(forceTimer);
+      child.removeListener?.("exit", finish);
+      if (!complete && child.exitCode === null) child.kill("SIGKILL");
+    });
   });
-}
+});

@@ -1,13 +1,16 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { isCanonicalInviteUrl } from "@openbot/contracts/invite-links";
-import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import type { DynamicRecord } from "@openbot/contracts/runtime-values";
+import { Effect, Schema } from "effect";
 import {
+  AuthOperationError,
   type AuthService,
   AuthServiceError,
   emailDeliveryFailure,
   isEmailDeliveryFailure,
   normalizeEmail,
 } from "./auth-service";
+import { runApiEffect } from "./effect-runtime";
 import type { AuthUser, TeamInviteEmailDelivery } from "./types";
 
 export interface TeamInviteEmailServices {
@@ -15,42 +18,64 @@ export interface TeamInviteEmailServices {
   delivery: () => TeamInviteEmailDelivery | null;
 }
 
-/** The desktop bearer route and the browser cookie route send an invitation email the same way. */
-export async function sendTeamInviteEmail(
+const Invitation = Schema.Struct({
+  email: Schema.String,
+  serverName: Schema.String,
+  inviteUrl: Schema.String,
+  role: Schema.Literals(["admin", "member"]),
+});
+
+const sendInvitation = Effect.fn("TeamInviteEmail.send")(function* (
+  services: TeamInviteEmailServices,
+  user: Pick<AuthUser, "id" | "email">,
+  input: DynamicRecord,
+  sourceIp: string,
+) {
+  const invalid = () => new AuthServiceError(400, "invalid_invitation", "The invitation details are invalid.");
+  const body = yield* Schema.decodeUnknownEffect(Invitation)(input).pipe(Effect.mapError(invalid));
+  if (
+    body.serverName.trim().length < INPUT_LIMITS.serverNameMin ||
+    body.serverName.trim().length > INPUT_LIMITS.serverName ||
+    /[\r\n]/u.test(body.serverName) ||
+    !isValidInviteUrl(body.inviteUrl)
+  )
+    return yield* invalid();
+  const email = yield* Effect.try({
+    try: () => normalizeEmail(body.email),
+    catch: (error) => (error instanceof AuthServiceError ? error : invalid()),
+  });
+  yield* Effect.tryPromise({
+    try: () => services.auth.enforceTeamInviteRateLimit(user.id, email, sourceIp),
+    catch: (error) =>
+      error instanceof AuthServiceError ? error : new AuthOperationError({ message: "Account operation failed." }),
+  });
+  const delivery = services.delivery();
+  if (!delivery)
+    return yield* new AuthServiceError(503, "email_delivery_not_configured", "Email delivery is unavailable.");
+  yield* Effect.tryPromise({
+    try: () =>
+      delivery.send({
+        email,
+        inviterEmail: user.email,
+        serverName: body.serverName,
+        inviteUrl: body.inviteUrl,
+        role: body.role,
+      }),
+    catch: (error) =>
+      isEmailDeliveryFailure(error)
+        ? emailDeliveryFailure(error.message, "OpenBot could not send the invitation.")
+        : new AuthOperationError({ message: "Account operation failed." }),
+  });
+});
+
+/** The bearer and cookie routes share the same invitation workflow. */
+export function sendTeamInviteEmail(
   services: TeamInviteEmailServices,
   user: Pick<AuthUser, "id" | "email">,
   body: DynamicRecord,
   sourceIp: string,
 ): Promise<void> {
-  if (
-    !isString(body.email) ||
-    !isString(body.serverName) ||
-    !isString(body.inviteUrl) ||
-    (body.role !== "admin" && body.role !== "member") ||
-    body.serverName.trim().length < INPUT_LIMITS.serverNameMin ||
-    body.serverName.trim().length > INPUT_LIMITS.serverName ||
-    /[\r\n]/u.test(body.serverName) ||
-    !isValidInviteUrl(body.inviteUrl)
-  ) {
-    throw new AuthServiceError(400, "invalid_invitation", "The invitation details are invalid.");
-  }
-  const email = normalizeEmail(body.email);
-  await services.auth.enforceTeamInviteRateLimit(user.id, email, sourceIp);
-  const delivery = services.delivery();
-  if (!delivery) throw new AuthServiceError(503, "email_delivery_not_configured", "Email delivery is unavailable.");
-  try {
-    await delivery.send({
-      email,
-      inviterEmail: user.email,
-      serverName: body.serverName,
-      inviteUrl: body.inviteUrl,
-      role: body.role,
-    });
-  } catch (error) {
-    if (isEmailDeliveryFailure(error))
-      throw emailDeliveryFailure(error.message, "OpenBot could not send the invitation.");
-    throw error;
-  }
+  return runApiEffect(sendInvitation(services, user, body, sourceIp));
 }
 
 function isValidInviteUrl(value: string): boolean {

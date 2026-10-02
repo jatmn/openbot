@@ -104,12 +104,17 @@ export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalServic
         const retryNum = Number(request.headers.get("x-slack-retry-num") ?? "");
         const retryReason = request.headers.get("x-slack-retry-reason");
         return slackResponse(
-          await signal.deliverSlack(slack.appId, slack.teamId, {
-            kind,
-            retryNum: Number.isInteger(retryNum) && retryNum >= 0 && retryNum < 100 ? retryNum : null,
-            retryReason: retryReason && SLACK_RETRY_REASON_PATTERN.test(retryReason) ? retryReason : null,
-            body,
-          }),
+          await signal.deliverSlack(
+            slack.appId,
+            slack.teamId,
+            {
+              kind,
+              retryNum: Number.isInteger(retryNum) && retryNum >= 0 && retryNum < 100 ? retryNum : null,
+              retryReason: retryReason && SLACK_RETRY_REASON_PATTERN.test(retryReason) ? retryReason : null,
+              body,
+            },
+            request.signal,
+          ),
         );
       },
       { parse: "none" },

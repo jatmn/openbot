@@ -2,7 +2,9 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import { cliSpawnTarget } from "./cli";
+import { type ProviderClientOperationError, providerFailure, runProviderClientEffect } from "./provider-client-effects";
 import { stopProcessTree } from "./windows-process-tree";
 
 /** The messages this client sends: two requests, and a refusal for each request the server makes. */
@@ -38,55 +40,64 @@ export function startAcpAuthentication(options: {
     shell: false,
     windowsHide: process.platform === "win32",
   });
-  const done = new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const settle = (error: Error | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdin.end();
-      stopProcessTree(child);
-      if (error) reject(error);
-      else resolve();
-    };
-    const fail = (error: Error) => settle(error);
-    const timer = setTimeout(() => fail(new Error(sourceText("error.provider.acpSignInTimedOut"))), options.timeoutMs);
-    timer.unref?.();
-    const send = (message: AcpMessage) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
-    child.once("error", fail);
-    child.once("exit", () => fail(new Error(sourceText("error.provider.acpSignInStopped"))));
-    child.stdin.on("error", () => undefined);
-    const lines = createInterface({ input: child.stdout });
-    lines.on("line", (line) => {
-      let message: unknown;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        return;
-      }
-      if (!isDynamicRecord(message)) return;
-      // A request from the server gets a refusal, so it does not wait on a client that has no answer.
-      if (typeof message.method === "string" && message.id !== undefined) {
-        send({ id: message.id, error: { code: -32601, message: "Method not found" } });
-        return;
-      }
-      if (message.error !== undefined && (message.id === 1 || message.id === 2)) {
-        fail(new Error(sourceText("error.provider.acpSignInFailed")));
-      } else if (message.id === 1) {
-        send({ id: 2, method: "authenticate", params: { methodId: options.methodId } });
-      } else if (message.id === 2) {
-        settle(null);
-      }
-    });
-    send({
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: 1,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        clientInfo: { name: "openbot", title: "OpenBot", version: "0.1.0" },
-      },
-    });
-  });
+  const done = runProviderClientEffect(
+    Effect.callback<void, ProviderClientOperationError>((resume) => {
+      let settled = false;
+      const settle = (error: Error | null) => {
+        if (settled) return;
+        settled = true;
+        resume(error ? Effect.fail(providerFailure(error)) : Effect.void);
+      };
+      const fail = (error: Error) => settle(error);
+      const timer = setTimeout(
+        () => fail(new Error(sourceText("error.provider.acpSignInTimedOut"))),
+        options.timeoutMs,
+      );
+      timer.unref?.();
+      const send = (message: AcpMessage) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+      child.once("error", fail);
+      const exited = () => fail(new Error(sourceText("error.provider.acpSignInStopped")));
+      child.once("exit", exited);
+      child.stdin.on("error", () => undefined);
+      const lines = createInterface({ input: child.stdout });
+      lines.on("line", (line) => {
+        let message: unknown;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (!isDynamicRecord(message)) return;
+        // A request from the server gets a refusal, so it does not wait on a client that has no answer.
+        if (typeof message.method === "string" && message.id !== undefined) {
+          send({ id: message.id, error: { code: -32601, message: "Method not found" } });
+          return;
+        }
+        if (message.error !== undefined && (message.id === 1 || message.id === 2)) {
+          fail(new Error(sourceText("error.provider.acpSignInFailed")));
+        } else if (message.id === 1) {
+          send({ id: 2, method: "authenticate", params: { methodId: options.methodId } });
+        } else if (message.id === 2) {
+          settle(null);
+        }
+      });
+      send({
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+          clientInfo: { name: "openbot", title: "OpenBot", version: "0.1.0" },
+        },
+      });
+      return Effect.sync(() => {
+        clearTimeout(timer);
+        lines.close();
+        child.removeListener("exit", exited);
+        child.stdin.end();
+        stopProcessTree(child);
+      });
+    }),
+  );
   return { child, done };
 }

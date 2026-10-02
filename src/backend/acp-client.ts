@@ -24,6 +24,7 @@ import { agentProviderName } from "@openbot/contracts/agent-providers";
 import { type DynamicRecord, isBoolean, isString } from "@openbot/contracts/runtime-values";
 import { type SourceMessages, sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
+import { Effect } from "effect";
 import { acpPlanSteps, PLAN_UPDATED_METHOD } from "./agent/plan-updates";
 import { elicitationOptions, elicitationValue, secretElicitationField } from "./agent/prompts";
 import { isUsageLimitDiagnostic } from "./agent/provider-diagnostics";
@@ -58,6 +59,14 @@ import {
   type RpcError,
   type ThreadItem,
 } from "./protocol";
+import {
+  type ProviderClientOperationError,
+  providerCall,
+  providerFailure,
+  providerResult,
+  providerSync,
+  runProviderClientEffect,
+} from "./provider-client-effects";
 import { createDiagnosticStream } from "./stderr-diagnostics";
 import { stopWindowsProcessTree } from "./windows-process-tree";
 import { withTimeout } from "./with-timeout";
@@ -402,7 +411,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     });
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return runProviderClientEffect(this.#stopOperation());
+  }
+
+  readonly #stopOperation = Effect.fn("AcpAgentClient.stop")(function* (
+    this: AcpAgentClient,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#stopping = true;
     const child = this.#process;
     // After a crash `#process` is already null, so the crash reason stays an error for the user.
@@ -413,10 +428,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     for (const thread of this.#threads.clear()) thread.mcp.close();
     this.#startingThreads.clear();
     this.#serverRequests.rejectAll("ACP session stopped.");
-    await this.#bridge.close();
-    if (!child || child.exitCode !== null) return;
-    await endProcess(child);
-  }
+    yield* providerCall(() => this.#bridge.close()).pipe(
+      Effect.ensuring(
+        Effect.suspend(() => (!child || child.exitCode !== null ? Effect.void : endProcessEffect(child))).pipe(
+          Effect.orDie,
+        ),
+      ),
+    );
+  });
 
   releaseIdleThreads(): void {
     this.#threads.releaseIdle();
@@ -428,26 +447,50 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * what ends the MCP servers it started for it. An agent that does not answer `session/close` is
    * ignored: the session is already replaced on this side.
    */
-  async releaseThread(sessionId: string): Promise<void> {
+  releaseThread(sessionId: string): Promise<void> {
+    return runProviderClientEffect(this.#releaseThreadOperation(sessionId));
+  }
+
+  readonly #releaseThreadOperation = Effect.fn("AcpAgentClient.releaseThread")(function* (
+    this: AcpAgentClient,
+    sessionId: string,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#threads.forget(sessionId);
     const thread = this.#threads.get(sessionId);
     if (!thread) return;
-    await this.#threads.close(thread);
+    yield* providerCall(() => this.#threads.close(thread));
+  });
+
+  #closeSession(thread: AcpThread): Promise<void> {
+    return runProviderClientEffect(this.#closeSessionEffect(thread));
   }
 
-  async #closeSession(thread: AcpThread): Promise<void> {
+  readonly #closeSessionEffect = Effect.fn("AcpAgentClient.closeSession")(function* (
+    this: AcpAgentClient,
+    thread: AcpThread,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     thread.mcp.close();
-    await this.#connection?.closeSession({ sessionId: thread.id }).catch(() => undefined);
+    yield* providerCall(() => this.#connection?.closeSession({ sessionId: thread.id }).catch(() => undefined));
+  });
+
+  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
+    return runProviderClientEffect(this.#requestOperation(method, params, decoder, timeoutMs));
   }
 
-  async request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
+  readonly #requestOperation = Effect.fn("AcpAgentClient.request")(function* <T>(
+    this: AcpAgentClient,
+    method: string,
+    params: unknown,
+    decoder: ResponseDecoder<T>,
+    timeoutMs?: number,
+  ): Effect.fn.Return<T, ProviderClientOperationError> {
     const ended = this.#ended;
     try {
-      return await this.#request(method, params, decoder, timeoutMs);
+      return providerResult(yield* Effect.result(this.#requestEffect(method, params, decoder, timeoutMs)));
     } catch (error) {
-      throw await this.#explainEnd(error, ended);
+      return yield* providerFailure(yield* this.#explainEndEffect(error, ended));
     }
-  }
+  });
 
   /**
    * The error to report for a request that failed. The ACP SDK rejects every open request with a
@@ -455,102 +498,137 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * exit, so a CLI that fails at start read to the user as that phrase and nothing else. When the
    * process ended on its own, this waits for its exit and reports it with the CLI's last stderr line.
    */
-  async #explainEnd(error: unknown, ended: Promise<ProcessEnd> | null): Promise<unknown> {
-    if (!ended || this.#stopping) return error;
-    const message = error instanceof Error ? error.message : "";
-    if (message !== "ACP connection closed" && message !== "ACP client is not running.") return error;
-    let timer: NodeJS.Timeout | undefined;
-    const ending = await Promise.race([
-      ended,
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), EXIT_REPORT_WAIT_MS);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (ending === null) return error;
-    return new AgentProcessExitError(`${this.#label} stopped before it answered (${ending.ending}).`, ending.detail, {
-      cause: error,
-    });
-  }
 
-  async #request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
-    if (!this.running) throw new Error("ACP client is not running.");
+  readonly #explainEndEffect = Effect.fn("AcpAgentClient.explainEnd")(function* (
+    this: AcpAgentClient,
+    error: unknown,
+    ended: Promise<ProcessEnd> | null,
+  ): Effect.fn.Return<unknown, ProviderClientOperationError> {
+    if (!ended || this.#stopping) return yield* providerCall(() => error);
+    const message = error instanceof Error ? error.message : "";
+    if (message !== "ACP connection closed" && message !== "ACP client is not running.")
+      return yield* providerCall(() => error);
+    let timer: NodeJS.Timeout | undefined;
+    const ending = yield* providerCall(() =>
+      Promise.race([
+        ended,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), EXIT_REPORT_WAIT_MS);
+        }),
+      ]).finally(() => clearTimeout(timer)),
+    );
+    if (ending === null) return yield* providerCall(() => error);
+    return yield* providerCall(
+      () =>
+        new AgentProcessExitError(`${this.#label} stopped before it answered (${ending.ending}).`, ending.detail, {
+          cause: error,
+        }),
+    );
+  });
+
+  readonly #requestEffect = Effect.fn("AcpAgentClient.request")(function* <T>(
+    this: AcpAgentClient,
+    method: string,
+    params: unknown,
+    decoder: ResponseDecoder<T>,
+    timeoutMs?: number,
+  ): Effect.fn.Return<T, ProviderClientOperationError> {
+    if (!this.running) return yield* providerFailure(new Error("ACP client is not running."));
     switch (method) {
       case "initialize":
-        await this.#ensureInitialized();
-        return decoder({});
+        yield* this.#ensureInitializedEffect();
+        return yield* providerCall(() => decoder({}));
       case "account/read": {
-        if (!this.#signedIn) return decoder({ account: null, requiresOpenaiAuth: false });
-        const account = await this.#readProviderAccount(timeoutMs);
-        return decoder({
-          account: { type: this.provider, email: account.email, planType: account.planType },
-          requiresOpenaiAuth: false,
-        });
+        if (!this.#signedIn) return yield* providerCall(() => decoder({ account: null, requiresOpenaiAuth: false }));
+        const account = yield* this.#readProviderAccountEffect(timeoutMs);
+        return yield* providerCall(() =>
+          decoder({
+            account: { type: this.provider, email: account.email, planType: account.planType },
+            requiresOpenaiAuth: false,
+          }),
+        );
       }
       case "account/rateLimits/read":
-        await this.#ensureInitialized();
-        if (!this.#signedIn) return decoder({ rateLimits: null, rateLimitsByLimitId: null });
-        return decoder(
-          this.options.readRateLimits
-            ? await withTimeout(
-                this.options.readRateLimits(this.#requireConnection()),
-                timeoutMs ?? this.#requestTimeoutMs,
-                `${this.#label} request timed out: account/rateLimits/read`,
+        yield* this.#ensureInitializedEffect();
+        if (!this.#signedIn) return yield* providerCall(() => decoder({ rateLimits: null, rateLimitsByLimitId: null }));
+        {
+          const readRateLimits = this.options.readRateLimits;
+          const response = readRateLimits
+            ? yield* providerCall(() =>
+                withTimeout(
+                  readRateLimits(this.#requireConnection()),
+                  timeoutMs ?? this.#requestTimeoutMs,
+                  `${this.#label} request timed out: account/rateLimits/read`,
+                ),
               )
-            : { rateLimits: null, rateLimitsByLimitId: null },
-        );
+            : { rateLimits: null, rateLimitsByLimitId: null };
+          return yield* providerSync(() => decoder(response));
+        }
       case "model/list":
-        await this.#ensureInitialized();
+        yield* this.#ensureInitializedEffect();
         if (this.#signedIn) {
           try {
-            this.#models = await this.#discoverModels(timeoutMs);
+            this.#models = providerResult(yield* Effect.result(this.#discoverModelsEffect(timeoutMs)));
           } catch (error) {
             // Initialization already proved that OpenCode's catalogue works. A later refresh can
             // time out while probing model options; keep the last successful list instead of making
             // a connected provider appear to have no models. Other providers report the failure.
-            if (this.provider !== "opencode" || this.#models.length === 0) throw error;
+            if (this.provider !== "opencode" || this.#models.length === 0) return yield* providerFailure(error);
           }
         }
-        return decoder({
-          data: this.#models.map((model) => ({
-            model: model.id,
-            displayName: model.name,
-            description: model.description,
-            defaultReasoningEffort: model.defaultReasoningEffort,
-            supportedReasoningEfforts: model.supportedReasoningEfforts.map((reasoningEffort) => ({ reasoningEffort })),
-          })),
-        });
+        return yield* providerCall(() =>
+          decoder({
+            data: this.#models.map((model) => ({
+              model: model.id,
+              displayName: model.name,
+              description: model.description,
+              defaultReasoningEffort: model.defaultReasoningEffort,
+              supportedReasoningEfforts: model.supportedReasoningEfforts.map((reasoningEffort) => ({
+                reasoningEffort,
+              })),
+            })),
+          }),
+        );
       case "plugin/list":
-        return decoder({ marketplaces: [] });
-      case "thread/start":
-        return decoder(await this.#startThread(params, false));
-      case "thread/resume":
-        return decoder(await this.#startThread(params, true));
+        return yield* providerCall(() => decoder({ marketplaces: [] }));
+      case "thread/start": {
+        const response = yield* this.#startThreadEffect(params, false);
+        return yield* providerSync(() => decoder(response));
+      }
+      case "thread/resume": {
+        const response = yield* this.#startThreadEffect(params, true);
+        return yield* providerSync(() => decoder(response));
+      }
       case "thread/read": {
-        const threadId = requiredString(params, "threadId");
+        const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         // A closed idle session answers from the turns it kept, so a read does not start its MCP
         // servers again.
         const released = this.#threads.has(threadId) ? undefined : this.#threads.released(threadId);
-        const thread = released ?? (await this.#readableThread(threadId, params));
-        return decoder({ thread: { id: threadId, turns: thread?.turns ?? [] } });
+        const thread = released ?? (yield* this.#readableThreadEffect(threadId, params));
+        return yield* providerCall(() => decoder({ thread: { id: threadId, turns: thread?.turns ?? [] } }));
       }
-      case "turn/start":
-        return decoder(await this.#startTurn(params, false));
-      case "turn/steer":
-        return decoder(await this.#startTurn(params, true));
+      case "turn/start": {
+        const response = yield* this.#startTurnEffect(params, false);
+        return yield* providerSync(() => decoder(response));
+      }
+      case "turn/steer": {
+        const response = yield* this.#startTurnEffect(params, true);
+        return yield* providerSync(() => decoder(response));
+      }
       case "turn/interrupt": {
-        const threadId = requiredString(params, "threadId");
+        const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         // A closed idle session has no turn to stop.
-        if (this.#threads.isReleased(threadId)) return decoder({});
-        const thread = this.#requireThread(threadId);
-        this.#requireConnection().cancel({ sessionId: thread.id });
-        return decoder({});
+        if (this.#threads.isReleased(threadId)) return yield* providerCall(() => decoder({}));
+        const thread = yield* providerSync(() => this.#requireThread(threadId));
+        (yield* providerSync(() => this.#requireConnection())).cancel({ sessionId: thread.id });
+        return yield* providerCall(() => decoder({}));
       }
       case "thread/compact/start":
-        return decoder({});
+        return yield* providerCall(() => decoder({}));
       default:
-        throw new Error(`ACP adapter does not implement ${method}.`);
+        return yield* providerFailure(new Error(`ACP adapter does not implement ${method}.`));
     }
-  }
+  });
 
   notify(): void {
     // ACP initialization is a request/response exchange without a follow-up notification.
@@ -564,40 +642,61 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#serverRequests.reject(id, error);
   }
 
-  async #ensureInitialized(): Promise<void> {
-    if (this.#initialized) return this.#initialized;
-    this.#initialized = this.#initialize();
-    return this.#initialized;
-  }
+  readonly #ensureInitializedEffect = Effect.fn("AcpAgentClient.ensureInitialized")(function* (
+    this: AcpAgentClient,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
+    const initialized = this.#initialized ?? this.#initialize();
+    this.#initialized = initialized;
+    return yield* providerCall(() => initialized);
+  });
 
-  async #readProviderAccount(timeoutMs?: number): Promise<AcpProviderAccount> {
-    if (!this.options.readAccount) return { email: null, planType: null };
+  readonly #readProviderAccountEffect = Effect.fn("AcpAgentClient.readProviderAccount")(function* (
+    this: AcpAgentClient,
+    timeoutMs?: number,
+  ): Effect.fn.Return<AcpProviderAccount, ProviderClientOperationError> {
+    const readAccount = this.options.readAccount;
+    if (!readAccount) return { email: null, planType: null };
     try {
-      const account = await withTimeout(
-        this.options.readAccount(this.#requireConnection()),
-        timeoutMs ?? this.#requestTimeoutMs,
-        `${this.#label} request timed out: account/read`,
+      const account = providerResult(
+        yield* Effect.result(
+          providerCall(() =>
+            withTimeout(
+              readAccount(this.#requireConnection()),
+              timeoutMs ?? this.#requestTimeoutMs,
+              `${this.#label} request timed out: account/read`,
+            ),
+          ),
+        ),
       );
       return { email: account.email ?? null, planType: account.planType ?? null };
     } catch {
       return { email: null, planType: null };
     }
+  });
+
+  #initialize(): Promise<void> {
+    return runProviderClientEffect(this.#initializeEffect());
   }
 
-  async #initialize(): Promise<void> {
-    const connection = this.#requireConnection();
-    this.#initialization = await withTimeout(
-      connection.initialize({
-        protocolVersion: 1,
-        clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
-        clientInfo: OPENBOT_ACP_CLIENT_INFO,
-      }),
-      this.#requestTimeoutMs,
-      "ACP initialization timed out.",
+  readonly #initializeEffect = Effect.fn("AcpAgentClient.initialize")(function* (
+    this: AcpAgentClient,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
+    const connection = yield* providerSync(() => this.#requireConnection());
+    this.#initialization = yield* providerCall(() =>
+      withTimeout(
+        connection.initialize({
+          protocolVersion: 1,
+          clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
+          clientInfo: OPENBOT_ACP_CLIENT_INFO,
+        }),
+        this.#requestTimeoutMs,
+        "ACP initialization timed out.",
+      ),
     );
+    const initialization = this.#initialization;
     try {
-      await this.options.authenticate?.(connection, this.#initialization);
-      this.#models = await this.#discoverModels();
+      providerResult(yield* Effect.result(providerCall(() => this.options.authenticate?.(connection, initialization))));
+      this.#models = providerResult(yield* Effect.result(this.#discoverModelsEffect()));
       if (this.#models.length === 0 && !this.options.allowNoModels) {
         throw new Error(sourceText("error.provider.acpNoModels"));
       }
@@ -607,34 +706,51 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         this.#signedIn = false;
         return;
       }
-      throw error;
+      return yield* providerFailure(error);
     }
-  }
+  });
 
-  async #discoverModels(timeoutMs = this.#requestTimeoutMs): Promise<AcpModel[]> {
-    const connection = this.#requireConnection();
+  readonly #discoverModelsEffect = Effect.fn("AcpAgentClient.discoverModels")(function* (
+    this: AcpAgentClient,
+    timeoutMs = this.#requestTimeoutMs,
+  ): Effect.fn.Return<AcpModel[], ProviderClientOperationError> {
+    const connection = yield* providerSync(() => this.#requireConnection());
     // One deadline for the whole discovery, read before the session opens and held short of the
     // caller's own timeout: what the sweep may spend is what a slow `session/new` left of the time
     // the caller gave `model/list`. A sweep that timed the caller out would return no catalog at all.
     const deadline = Date.now() + timeoutMs - MODEL_DISCOVERY_RETURN_MS;
-    return withTimeout(
-      (async () => {
-        const cwd = this.options.discoveryCwd?.() ?? process.cwd();
-        const probe = await connection.newSession({ cwd, mcpServers: [] });
-        try {
-          return await this.#modelReasoningEfforts(connection, probe, modelsFromSessionSetup(probe), deadline);
-        } finally {
-          // Sent always, and not awaited. An agent can run one process per session, so a probe left
-          // open after a slow `session/new` used the deadline, or after `model/list` timed out, is one
-          // idle process until the app quits. Not awaited, because the catalog is complete by now, and
-          // an agent that is slow to close a session must not take it away.
-          void connection.closeSession({ sessionId: probe.sessionId }).catch(() => undefined);
-        }
-      })(),
-      timeoutMs,
-      `${this.#label} request timed out: model/list`,
+    return yield* providerCall(() =>
+      withTimeout(
+        (() =>
+          runProviderClientEffect(
+            Effect.gen({ self: this }, function* () {
+              const cwd = this.options.discoveryCwd?.() ?? process.cwd();
+              const probe = yield* providerCall(() => connection.newSession({ cwd, mcpServers: [] }));
+              return yield* Effect.gen({ self: this }, function* () {
+                return yield* this.#modelReasoningEffortsEffect(
+                  connection,
+                  probe,
+                  modelsFromSessionSetup(probe),
+                  deadline,
+                );
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    // Sent always, and not awaited. An agent can run one process per session, so a probe left
+                    // open after a slow `session/new` used the deadline, or after `model/list` timed out, is one
+                    // idle process until the app quits. Not awaited, because the catalog is complete by now, and
+                    // an agent that is slow to close a session must not take it away.
+                    void connection.closeSession({ sessionId: probe.sessionId }).catch(() => undefined);
+                  }),
+                ),
+              );
+            }),
+          ))(),
+        timeoutMs,
+        `${this.#label} request timed out: model/list`,
+      ),
     );
-  }
+  });
 
   /**
    * A discovery request that gives up at `until`, and reports any failure as `null`.
@@ -643,11 +759,19 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * request made anyway would still reach the agent and still change the session the sweep is about
    * to give back, and its own failure would have nobody left to read it.
    */
-  async #requestBefore<T>(request: () => Promise<T>, until: number, method: string): Promise<T | null> {
+
+  readonly #requestBeforeEffect = Effect.fn("AcpAgentClient.requestBefore")(function* <T>(
+    this: AcpAgentClient,
+    request: () => Promise<T>,
+    until: number,
+    method: string,
+  ): Effect.fn.Return<T | null, ProviderClientOperationError> {
     const remaining = until - Date.now();
     if (remaining <= 0) return null;
-    return withTimeout(request(), remaining, `${this.#label} request timed out: ${method}`).catch(() => null);
-  }
+    return yield* providerCall(() =>
+      withTimeout(request(), remaining, `${this.#label} request timed out: ${method}`).catch(() => null),
+    );
+  });
 
   /**
    * The reasoning efforts of each model, asked one model at a time on the session that listed them.
@@ -667,17 +791,19 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * times out: a sweep that ran past it would leave the user with no models at all, rather than with
    * imprecise efforts.
    */
-  async #modelReasoningEfforts(
+
+  readonly #modelReasoningEffortsEffect = Effect.fn("AcpAgentClient.modelReasoningEfforts")(function* (
+    this: AcpAgentClient,
     connection: ClientSideConnection,
     probe: SessionSetupResponse & { sessionId: string },
     models: AcpModel[],
     deadline: number,
-  ): Promise<AcpModel[]> {
+  ): Effect.fn.Return<AcpModel[], ProviderClientOperationError> {
     const option = (probe.configOptions ?? []).find(
       (candidate): candidate is Extract<SessionConfigOption, { type: "select" }> =>
         candidate.category === "model" && candidate.type === "select",
     );
-    if (!option || availableModels(probe).length > 0) return models;
+    if (!option || availableModels(probe).length > 0) return yield* providerCall(() => models);
     // The sweep, and each request in it, ends at whichever comes first: its own budget, or the point
     // where the caller's deadline still holds the cleanup. One agent that never answers then costs
     // its own model's efforts, and not the whole catalog.
@@ -685,7 +811,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     const probed: AcpModel[] = [];
     let selected = option.currentValue;
     for (const model of models) {
-      const response = await this.#requestBefore(
+      const response = yield* this.#requestBeforeEffect(
         () => connection.setSessionConfigOption({ sessionId: probe.sessionId, configId: option.id, value: model.id }),
         Math.min(sweepEnd, Date.now() + MODEL_REASONING_PROBE_TIMEOUT_MS),
         "session/set_config_option",
@@ -697,7 +823,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // "last used model" outside the session would otherwise remember the end of this sweep, and the
     // user's own next CLI session would start on a model they never chose.
     if (selected !== option.currentValue) {
-      await this.#requestBefore(
+      yield* this.#requestBeforeEffect(
         () =>
           connection.setSessionConfigOption({
             sessionId: probe.sessionId,
@@ -708,8 +834,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         "session/set_config_option",
       );
     }
-    return probed;
-  }
+    return yield* providerCall(() => probed);
+  });
 
   /**
    * The thread a `thread/read` can answer from, loading the session when it is not held here.
@@ -721,16 +847,21 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * loaded - the agent does not support `session/load`, the caller sent no `cwd`, or the load
    * failed - because a read is advisory: its callers treat an absent turn as an unsettled one.
    */
-  async #readableThread(id: string, params: unknown): Promise<AcpThread | null> {
+
+  readonly #readableThreadEffect = Effect.fn("AcpAgentClient.readableThread")(function* (
+    this: AcpAgentClient,
+    id: string,
+    params: unknown,
+  ): Effect.fn.Return<AcpThread | null, ProviderClientOperationError> {
     const held = this.#threads.get(id);
-    if (held) return held;
+    if (held) return yield* providerCall(() => held);
     if (!getString(params, "cwd")) return null;
     // A resume that is already loading this session opens it for a turn, not for this read.
     const resuming = this.#startingThreads.has(id);
     try {
-      await this.#ensureInitialized();
+      providerResult(yield* Effect.result(this.#ensureInitializedEffect()));
       if (!this.#loadsSessions) return null;
-      await this.#startThread(params, true);
+      providerResult(yield* Effect.result(this.#startThreadEffect(params, true)));
     } catch (error) {
       // The next turn replaces the missing session, so the user has nothing to act on.
       if (!(error instanceof MissingOpenCodeSessionError)) {
@@ -743,127 +874,170 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // user's MCP servers. A session loaded only for a read is idle from the start, so the idle limit
     // counts it and keeps only the most recent ones warm for a first turn.
     if (thread && !resuming && thread.idleSince === 0 && !thread.activeTurn) this.#threads.markIdle(thread);
-    return thread;
-  }
+    return yield* providerCall(() => thread);
+  });
 
   /** Whether the agent answers `session/load`, which it advertises in its initialization. */
   get #loadsSessions(): boolean {
     return this.#initialization?.agentCapabilities?.loadSession === true;
   }
 
-  async #startThread(params: unknown, resume: boolean): Promise<{ thread: { id: string } }> {
-    await this.#ensureInitialized();
-    if (!this.#signedIn) throw new Error(this.options.signInMessage);
+  #startThread(params: unknown, resume: boolean): Promise<{ thread: { id: string } }> {
+    return runProviderClientEffect(this.#startThreadEffect(params, resume));
+  }
+
+  readonly #startThreadEffect = Effect.fn("AcpAgentClient.startThread")(function* (
+    this: AcpAgentClient,
+    params: unknown,
+    resume: boolean,
+  ): Effect.fn.Return<{ thread: { id: string } }, ProviderClientOperationError> {
+    yield* this.#ensureInitializedEffect();
+    if (!this.#signedIn) return yield* providerFailure(new Error(this.options.signInMessage));
     const requestedThreadId = getString(params, "threadId");
-    if (!resume || !requestedThreadId) return this.#openThread(params, false);
+    if (!resume || !requestedThreadId) return yield* this.#openThreadEffect(params, false);
     const held = this.#threads.get(requestedThreadId);
     let turns: AcpThread["turns"] | undefined;
     // The MCP servers are fixed when a session opens, so a changed Computer Use switch loads the
     // session again. A session with a turn keeps its servers until a later resume.
     if (held && !held.activeTurn && held.computerUse !== computerUseParam(params)) {
       turns = held.turns;
-      await this.#threads.close(held);
+      yield* providerCall(() => this.#threads.close(held));
     }
     // A thread this client already holds takes the caller's settings even though no session is
     // opened for them: the loader may have been a `thread/read`, which carries none of its own, and
     // the turn that follows must not run on the settings of whoever loaded the session first.
     else if (held) {
       held.developerInstructions = getString(params, "developerInstructions") ?? held.developerInstructions;
-      await this.#applyConfig(held, getString(params, "model"), getString(params, "effort"));
+      yield* this.#applyConfigEffect(held, getString(params, "model"), getString(params, "effort"));
       return { thread: { id: requestedThreadId } };
     }
     // One load per session id, however many callers ask for it. Boot recovery reads a session while
     // the first drain resumes it, and two `session/load` calls would leave two threads and two MCP
     // bridge sessions under one id, of which only the last is reachable.
     const starting = this.#startingThreads.get(requestedThreadId);
-    if (starting) return starting;
+    if (starting) return yield* providerCall(() => starting);
     const start = this.#openThread(params, true, turns).finally(() => {
       this.#startingThreads.delete(requestedThreadId);
     });
     this.#startingThreads.set(requestedThreadId, start);
-    return start;
+    return yield* providerCall(() => start);
+  });
+
+  #openThread(params: unknown, resume: boolean, heldTurns?: AcpThread["turns"]): Promise<{ thread: { id: string } }> {
+    return runProviderClientEffect(this.#openThreadEffect(params, resume, heldTurns));
   }
 
-  async #openThread(
+  readonly #openThreadEffect = Effect.fn("AcpAgentClient.openThread")(function* (
+    this: AcpAgentClient,
     params: unknown,
     resume: boolean,
     heldTurns?: AcpThread["turns"],
-  ): Promise<{ thread: { id: string } }> {
+  ): Effect.fn.Return<{ thread: { id: string } }, ProviderClientOperationError> {
     const requestedThreadId = getString(params, "threadId");
     if (resume && requestedThreadId && !this.#loadsSessions) {
       // Reported as a missing session, which is what it is for the caller: the agent cannot give
       // this session back, so the recovery that replaces it runs now rather than after a protocol
       // error the user would have to read.
-      throw new Error(`Unknown ACP session: ${requestedThreadId}`);
+      return yield* providerFailure(new Error(`Unknown ACP session: ${requestedThreadId}`));
     }
-    const cwd = requiredString(params, "cwd");
+    const cwd = yield* providerSync(() => requiredString(params, "cwd"));
     const dynamicTools = getArray(params, "dynamicTools").filter(isDynamicToolNamespace);
     const computerUse = computerUseParam(params);
     let threadRef: AcpThread | null = null;
-    const mcp = await this.#bridge.createSession(
-      requestedThreadId ?? randomUUID(),
-      dynamicTools,
-      () => threadRef?.activeTurn?.id ?? null,
-      (call, signal) => this.#callDynamicTool(call, signal),
-    );
-    try {
-      const connection = this.#requireConnection();
-      const additionalDirectories = getArray(params, "runtimeWorkspaceRoots").filter(isString);
-      let id: string;
-      let configOptions: SessionConfigOption[];
-      let currentModelId: string | null;
-      // OpenBot's bridge servers last: all providers key MCP servers by name, so a user
-      // configuration that reached one of those names would take the agent's own tools away.
-      const handoff = acpMcpServers(
-        await usableMcpServers(
-          agentMcpServers(this.options.mcpServers?.() ?? [], computerUse),
-          this.options.mcpToolRuntimes?.(),
-          this.options.mcpAuthorization,
+    let retained = false;
+    return yield* Effect.acquireUseRelease(
+      providerCall(() =>
+        this.#bridge.createSession(
+          requestedThreadId ?? randomUUID(),
+          dynamicTools,
+          () => threadRef?.activeTurn?.id ?? null,
+          (call, signal) => this.#callDynamicTool(call, signal),
         ),
-      );
-      this.options.reportMcpDrops?.(this.provider, handoff.dropped);
-      const mcpServers = [...handoff.servers, ...mcp.servers];
-      if (resume && requestedThreadId) {
-        const response = await this.#loadSession(connection, {
-          sessionId: requestedThreadId,
-          cwd,
-          additionalDirectories,
-          mcpServers,
-        });
-        id = requestedThreadId;
-        configOptions = response.configOptions ?? [];
-        currentModelId = currentModelFromSessionSetup(response);
-      } else {
-        const response = await connection.newSession({ cwd, additionalDirectories, mcpServers });
-        id = response.sessionId;
-        configOptions = response.configOptions ?? [];
-        currentModelId = currentModelFromSessionSetup(response);
-      }
-      mcp.setThreadId(id);
-      const thread: AcpThread = {
-        id,
-        cwd,
-        developerInstructions: getString(params, "developerInstructions") ?? "",
-        configOptions,
-        currentModelId,
-        mcp,
-        activeTurn: null,
-        turns: heldTurns ?? this.#threads.released(id)?.turns ?? [],
-        dynamicTools,
-        workspaceRoots: additionalDirectories,
-        computerUse,
-        idleRelease: null,
-        idleSince: 0,
-      };
-      threadRef = thread;
-      this.#threads.add(thread);
-      await this.#applyConfig(thread, getString(params, "model"), getString(params, "effort"));
-      return { thread: { id } };
-    } catch (error) {
-      mcp.close();
-      throw error;
-    }
-  }
+      ),
+      (mcp) =>
+        Effect.gen({ self: this }, function* () {
+          try {
+            const connection = providerResult(yield* Effect.result(providerSync(() => this.#requireConnection())));
+            const additionalDirectories = getArray(params, "runtimeWorkspaceRoots").filter(isString);
+            let id: string;
+            let configOptions: SessionConfigOption[];
+            let currentModelId: string | null;
+            // OpenBot's bridge servers last: all providers key MCP servers by name, so a user
+            // configuration that reached one of those names would take the agent's own tools away.
+            const handoff = acpMcpServers(
+              providerResult(
+                yield* Effect.result(
+                  providerCall(() =>
+                    usableMcpServers(
+                      agentMcpServers(this.options.mcpServers?.() ?? [], computerUse),
+                      this.options.mcpToolRuntimes?.(),
+                      this.options.mcpAuthorization,
+                    ),
+                  ),
+                ),
+              ),
+            );
+            this.options.reportMcpDrops?.(this.provider, handoff.dropped);
+            const mcpServers = [...handoff.servers, ...mcp.servers];
+            if (resume && requestedThreadId) {
+              const response = providerResult(
+                yield* Effect.result(
+                  this.#loadSessionEffect(connection, {
+                    sessionId: requestedThreadId,
+                    cwd,
+                    additionalDirectories,
+                    mcpServers,
+                  }),
+                ),
+              );
+              id = requestedThreadId;
+              configOptions = response.configOptions ?? [];
+              currentModelId = currentModelFromSessionSetup(response);
+            } else {
+              const response = providerResult(
+                yield* Effect.result(
+                  providerCall(() => connection.newSession({ cwd, additionalDirectories, mcpServers })),
+                ),
+              );
+              id = response.sessionId;
+              configOptions = response.configOptions ?? [];
+              currentModelId = currentModelFromSessionSetup(response);
+            }
+            mcp.setThreadId(id);
+            const thread: AcpThread = {
+              id,
+              cwd,
+              developerInstructions: getString(params, "developerInstructions") ?? "",
+              configOptions,
+              currentModelId,
+              mcp,
+              activeTurn: null,
+              turns: heldTurns ?? this.#threads.released(id)?.turns ?? [],
+              dynamicTools,
+              workspaceRoots: additionalDirectories,
+              computerUse,
+              idleRelease: null,
+              idleSince: 0,
+            };
+            threadRef = thread;
+            this.#threads.add(thread);
+            providerResult(
+              yield* Effect.result(
+                this.#applyConfigEffect(thread, getString(params, "model"), getString(params, "effort")),
+              ),
+            );
+            retained = true;
+            return { thread: { id } };
+          } catch (error) {
+            return yield* providerFailure(error);
+          }
+        }),
+      (mcp) =>
+        Effect.sync(() => {
+          if (!retained) mcp.close();
+        }),
+    );
+  });
 
   /**
    * OpenCode answers a session missing from its store with the same `-32603` "OpenCode service
@@ -872,36 +1046,48 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * session that is listed, a list that fails, or an OpenCode without `session/list` leaves the
    * session kept: one more attempt, then the fault is reported.
    */
-  async #loadSession(connection: ClientSideConnection, request: LoadSessionRequest): Promise<LoadSessionResponse> {
-    let failure: unknown;
-    try {
-      return await connection.loadSession(request);
-    } catch (error) {
-      if (this.provider !== "opencode" || !isOpenCodeServiceFailure(error)) throw error;
-      failure = error;
-    }
-    const listing = await this.#sessionListing(connection, request);
-    if (listing === "absent") throw new MissingOpenCodeSessionError(request.sessionId, failure);
-    await new Promise((resolve) => setTimeout(resolve, OPENCODE_LOAD_RETRY_MS));
-    try {
-      // The process can have stopped during the wait; this reports that instead of a closed stream.
-      return await this.#requireConnection().loadSession(request);
-    } catch (error) {
-      if (!isOpenCodeServiceFailure(error)) throw error;
-      throw new Error(sourceText("error.provider.opencodeServiceFailure"), { cause: error });
-    }
-  }
 
-  /** Whether the agent's `session/list` for the session's directory holds the session. */
-  async #sessionListing(
+  readonly #loadSessionEffect = Effect.fn("AcpAgentClient.loadSession")(function* (
+    this: AcpAgentClient,
     connection: ClientSideConnection,
     request: LoadSessionRequest,
-  ): Promise<"listed" | "absent" | "unknown"> {
+  ): Effect.fn.Return<LoadSessionResponse, ProviderClientOperationError> {
+    let failure: unknown;
+    try {
+      return providerResult(yield* Effect.result(providerCall(() => connection.loadSession(request))));
+    } catch (error) {
+      if (this.provider !== "opencode" || !isOpenCodeServiceFailure(error)) return yield* providerFailure(error);
+      failure = error;
+    }
+    const listing = yield* this.#sessionListingEffect(connection, request);
+    if (listing === "absent")
+      return yield* providerFailure(new MissingOpenCodeSessionError(request.sessionId, failure));
+    yield* providerCall(() => new Promise((resolve) => setTimeout(resolve, OPENCODE_LOAD_RETRY_MS)));
+    try {
+      // The process can have stopped during the wait; this reports that instead of a closed stream.
+      return providerResult(yield* Effect.result(providerCall(() => this.#requireConnection().loadSession(request))));
+    } catch (error) {
+      if (!isOpenCodeServiceFailure(error)) return yield* providerFailure(error);
+      return yield* providerFailure(new Error(sourceText("error.provider.opencodeServiceFailure"), { cause: error }));
+    }
+  });
+
+  /** Whether the agent's `session/list` for the session's directory holds the session. */
+
+  readonly #sessionListingEffect = Effect.fn("AcpAgentClient.sessionListing")(function* (
+    this: AcpAgentClient,
+    connection: ClientSideConnection,
+    request: LoadSessionRequest,
+  ): Effect.fn.Return<"listed" | "absent" | "unknown", ProviderClientOperationError> {
     if (!this.#initialization?.agentCapabilities?.sessionCapabilities?.list) return "unknown";
     let cursor: string | undefined;
     try {
       for (let page = 0; page < OPENCODE_SESSION_LIST_PAGES; page += 1) {
-        const response = await connection.listSessions({ cwd: request.cwd, ...(cursor ? { cursor } : {}) });
+        const response = providerResult(
+          yield* Effect.result(
+            providerCall(() => connection.listSessions({ cwd: request.cwd, ...(cursor ? { cursor } : {}) })),
+          ),
+        );
         if (response.sessions.some((session) => session.sessionId === request.sessionId)) return "listed";
         cursor = response.nextCursor ?? undefined;
         if (!cursor) return "absent";
@@ -910,9 +1096,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       return "unknown";
     }
     return "unknown";
-  }
+  });
 
-  async #applyConfig(thread: AcpThread, model: string | null, effort: string | null): Promise<void> {
+  readonly #applyConfigEffect = Effect.fn("AcpAgentClient.applyConfig")(function* (
+    this: AcpAgentClient,
+    thread: AcpThread,
+    model: string | null,
+    effort: string | null,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     for (const [category, value] of [
       ["model", model],
       ["thought_level", effort],
@@ -922,11 +1113,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         const currentModel = this.#models.find((candidate) => candidate.id === thread.currentModelId);
         if (currentModel && currentModel.usesModelReasoningEffort !== null) {
           if (currentModel.usesModelReasoningEffort && currentModel.supportedReasoningEfforts.includes(value)) {
-            await this.#requireConnection().request("session/set_model", {
-              sessionId: thread.id,
-              modelId: thread.currentModelId,
-              _meta: { reasoningEffort: currentModel.reasoningEffortWireValues.get(value) ?? value },
-            });
+            yield* providerCall(() =>
+              this.#requireConnection().request("session/set_model", {
+                sessionId: thread.id,
+                modelId: thread.currentModelId,
+                _meta: { reasoningEffort: currentModel.reasoningEffortWireValues.get(value) ?? value },
+              }),
+            );
           }
           continue;
         }
@@ -937,10 +1130,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       );
       if (!option) {
         if (category === "model" && thread.currentModelId !== value) {
-          await this.#requireConnection().request("session/set_model", {
-            sessionId: thread.id,
-            modelId: value,
-          });
+          yield* providerCall(() =>
+            this.#requireConnection().request("session/set_model", {
+              sessionId: thread.id,
+              modelId: value,
+            }),
+          );
           thread.currentModelId = value;
         }
         continue;
@@ -952,48 +1147,62 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         category === "thought_level" ? reasoningEffortWireValues(values.map((entry) => entry.value)).get(value) : value;
       const selected = values.find((candidate) => candidate.value === wanted);
       if (!selected) continue;
-      const response = await this.#requireConnection().setSessionConfigOption({
-        sessionId: thread.id,
-        configId: option.id,
-        value: selected.value,
-      });
+      const response = yield* providerCall(() =>
+        this.#requireConnection().setSessionConfigOption({
+          sessionId: thread.id,
+          configId: option.id,
+          value: selected.value,
+        }),
+      );
       thread.configOptions = response.configOptions;
       if (category === "model") thread.currentModelId = selected.value;
     }
-  }
+  });
 
-  async #startTurn(
+  readonly #startTurnEffect = Effect.fn("AcpAgentClient.startTurn")(function* (
+    this: AcpAgentClient,
     params: unknown,
     steer: boolean,
-  ): Promise<{ turn: { id: string; status: string }; turnId?: string }> {
-    const threadId = requiredString(params, "threadId");
-    return this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params, steer));
-  }
+  ): Effect.fn.Return<{ turn: { id: string; status: string }; turnId?: string }, ProviderClientOperationError> {
+    const threadId = yield* providerSync(() => requiredString(params, "threadId"));
+    return yield* providerCall(() => this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params, steer)));
+  });
 
-  async #openTurn(
+  #openTurn(
     threadId: string,
     params: unknown,
     steer: boolean,
   ): Promise<{ turn: { id: string; status: string }; turnId?: string }> {
-    await this.#threads.wake(threadId);
-    const thread = this.#requireThread(threadId);
-    if (!steer && thread.activeTurn) throw new Error("The ACP thread already has an active turn.");
-    if (steer && !thread.activeTurn) throw new Error("The ACP thread has no active turn to steer.");
-    await this.#applyConfig(thread, getString(params, "model"), getString(params, "effort"));
+    return runProviderClientEffect(this.#openTurnEffect(threadId, params, steer));
+  }
+
+  readonly #openTurnEffect = Effect.fn("AcpAgentClient.openTurn")(function* (
+    this: AcpAgentClient,
+    threadId: string,
+    params: unknown,
+    steer: boolean,
+  ): Effect.fn.Return<{ turn: { id: string; status: string }; turnId?: string }, ProviderClientOperationError> {
+    yield* providerCall(() => this.#threads.wake(threadId));
+    const thread = yield* providerSync(() => this.#requireThread(threadId));
+    if (!steer && thread.activeTurn)
+      return yield* providerFailure(new Error("The ACP thread already has an active turn."));
+    if (steer && !thread.activeTurn)
+      return yield* providerFailure(new Error("The ACP thread has no active turn to steer."));
+    yield* this.#applyConfigEffect(thread, getString(params, "model"), getString(params, "effort"));
     const activeTurn = thread.activeTurn;
     const turnId = steer && activeTurn ? activeTurn.id : (getString(params, "clientUserMessageId") ?? randomUUID());
-    const blocks = await promptBlocks(params);
+    const blocks = yield* promptBlocksEffect(params);
     if (!steer && thread.developerInstructions) {
       blocks.unshift({
         type: "text",
         text: `<openbot-developer-instructions>\n${thread.developerInstructions}\n</openbot-developer-instructions>`,
       });
     }
-    this.#requireServedModel(thread);
+    yield* providerSync(() => this.#requireServedModel(thread));
     if (steer) {
       // A steered message can want an answer, so an empty turn is again a failure to report.
       if (activeTurn) activeTurn.answerOptional = false;
-      void this.#requireConnection()
+      void (yield* providerSync(() => this.#requireConnection()))
         .prompt({ sessionId: thread.id, prompt: blocks })
         .catch((error) => {
           this.emit("diagnostic", this.#redact(`ACP steer failed: ${String(error)}`));
@@ -1022,7 +1231,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     });
     turn.task = this.#consumePrompt(thread, turn, blocks);
     return { turn: { id: turn.id, status: "inProgress" } };
-  }
+  });
 
   /** Refuses a prompt whose endpoint was taken out while this turn was prepared. */
   #requireServedModel(thread: AcpThread): void {
@@ -1033,9 +1242,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
   }
 
-  async #consumePrompt(thread: AcpThread, turn: AcpTurn, prompt: ContentBlock[]): Promise<void> {
+  #consumePrompt(thread: AcpThread, turn: AcpTurn, prompt: ContentBlock[]): Promise<void> {
+    return runProviderClientEffect(this.#consumePromptEffect(thread, turn, prompt));
+  }
+
+  readonly #consumePromptEffect = Effect.fn("AcpAgentClient.consumePrompt")(function* (
+    this: AcpAgentClient,
+    thread: AcpThread,
+    turn: AcpTurn,
+    prompt: ContentBlock[],
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     try {
-      const response = await this.#requireConnection().prompt({ sessionId: thread.id, prompt });
+      const response = providerResult(
+        yield* Effect.result(providerCall(() => this.#requireConnection().prompt({ sessionId: thread.id, prompt }))),
+      );
       if (response.usage)
         this.emit("notification", {
           method: "openbot/usage",
@@ -1068,7 +1288,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     } catch (error) {
       this.#completeTurn(thread, turn, "failed", error);
     }
-  }
+  });
 
   #sessionUpdate(notification: SessionNotification): void {
     const thread = this.#threads.get(notification.sessionId);
@@ -1213,7 +1433,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return sourceText(key, { detail: shown });
   }
 
-  async #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+  #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    return runProviderClientEffect(this.#requestPermissionEffect(params));
+  }
+
+  readonly #requestPermissionEffect = Effect.fn("AcpAgentClient.requestPermission")(function* (
+    this: AcpAgentClient,
+    params: RequestPermissionRequest,
+  ): Effect.fn.Return<RequestPermissionResponse, ProviderClientOperationError> {
     if (this.options.profileGeneration) return { outcome: { outcome: "cancelled" } };
     const thread = this.#threads.get(params.sessionId);
     const turnId = thread?.activeTurn?.id ?? randomUUID();
@@ -1224,16 +1451,18 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           ? "file-change"
           : "permissions";
     const requestedPermissions = kind === "permissions" ? { [params.toolCall.kind ?? "file-system"]: true } : null;
-    const result = await this.#serverRequests.call(
-      `item/${kind === "command" ? "commandExecution" : kind === "file-change" ? "fileChange" : "permissions"}/requestApproval`,
-      {
-        threadId: params.sessionId,
-        turnId,
-        command: params.toolCall.kind === "execute" ? printableInput(params.toolCall.rawInput) : null,
-        reason: params.toolCall.title ?? null,
-        permissions: requestedPermissions,
-        acpOptions: params.options,
-      },
+    const result = yield* providerCall(() =>
+      this.#serverRequests.call(
+        `item/${kind === "command" ? "commandExecution" : kind === "file-change" ? "fileChange" : "permissions"}/requestApproval`,
+        {
+          threadId: params.sessionId,
+          turnId,
+          command: params.toolCall.kind === "execute" ? printableInput(params.toolCall.rawInput) : null,
+          reason: params.toolCall.title ?? null,
+          permissions: requestedPermissions,
+          acpOptions: params.options,
+        },
+      ),
     );
     const accepted =
       isRecord(result) &&
@@ -1244,21 +1473,38 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return option
       ? { outcome: { outcome: "selected", optionId: option.optionId } }
       : { outcome: { outcome: "cancelled" } };
+  });
+
+  #requestUserInput(method: string, params: DynamicRecord): Promise<DynamicRecord> {
+    return runProviderClientEffect(this.#requestUserInputEffect(method, params));
   }
 
-  async #requestUserInput(method: string, params: DynamicRecord): Promise<DynamicRecord> {
+  readonly #requestUserInputEffect = Effect.fn("AcpAgentClient.requestUserInput")(function* (
+    this: AcpAgentClient,
+    method: string,
+    params: DynamicRecord,
+  ): Effect.fn.Return<DynamicRecord, ProviderClientOperationError> {
     const sessionId = getString(params, "sessionId") ?? [...this.#threads.ids()][0];
     const thread = sessionId ? this.#threads.get(sessionId) : undefined;
-    const result = await this.#serverRequests.call("item/tool/requestUserInput", {
-      ...params,
-      threadId: sessionId,
-      turnId: thread?.activeTurn?.id ?? randomUUID(),
-      sourceMethod: method,
-    });
-    return isRecord(result) ? result : {};
+    const result = yield* providerCall(() =>
+      this.#serverRequests.call("item/tool/requestUserInput", {
+        ...params,
+        threadId: sessionId,
+        turnId: thread?.activeTurn?.id ?? randomUUID(),
+        sourceMethod: method,
+      }),
+    );
+    return yield* providerCall(() => (isRecord(result) ? result : {}));
+  });
+
+  #createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    return runProviderClientEffect(this.#createElicitationEffect(params));
   }
 
-  async #createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+  readonly #createElicitationEffect = Effect.fn("AcpAgentClient.createElicitation")(function* (
+    this: AcpAgentClient,
+    params: CreateElicitationRequest,
+  ): Effect.fn.Return<CreateElicitationResponse, ProviderClientOperationError> {
     const schema = getRecord(params, "requestedSchema");
     const properties = getRecord(schema, "properties") ?? {};
     const questions = Object.entries(properties).flatMap(([id, rawProperty]) => {
@@ -1283,7 +1529,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         options: null,
       });
     }
-    const result = await this.#requestUserInput("session/elicitation", { ...params, questions });
+    const result = yield* this.#requestUserInputEffect("session/elicitation", { ...params, questions });
     const answers = isRecord(result.answers) ? result.answers : null;
     if (!answers) return { action: "decline" };
     const content: Record<string, ElicitationContentValue> = {};
@@ -1292,10 +1538,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       if (answer.length === 0) continue;
       content[id] = elicitationValue(isRecord(properties[id]) ? properties[id] : undefined, answer);
     }
-    return Object.keys(content).length > 0 ? { action: "accept", content } : { action: "decline" };
-  }
+    return yield* providerCall(() =>
+      Object.keys(content).length > 0 ? { action: "accept", content } : { action: "decline" },
+    );
+  });
 
-  async #callDynamicTool(
+  #callDynamicTool(
     params: {
       threadId: string;
       turnId: string;
@@ -1306,10 +1554,26 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     },
     signal: AbortSignal,
   ): Promise<DynamicToolResult> {
-    const result = await this.#serverRequests.call("item/tool/call", params, signal);
-    if (!isDynamicToolResult(result)) throw new Error("OpenBot returned an invalid dynamic tool result.");
-    return result;
+    return runProviderClientEffect(this.#callDynamicToolEffect(params, signal));
   }
+
+  readonly #callDynamicToolEffect = Effect.fn("AcpAgentClient.callDynamicTool")(function* (
+    this: AcpAgentClient,
+    params: {
+      threadId: string;
+      turnId: string;
+      callId: string;
+      namespace: string;
+      tool: string;
+      arguments: unknown;
+    },
+    signal: AbortSignal,
+  ): Effect.fn.Return<DynamicToolResult, ProviderClientOperationError> {
+    const result = yield* providerCall(() => this.#serverRequests.call("item/tool/call", params, signal));
+    if (!isDynamicToolResult(result))
+      return yield* providerFailure(new Error("OpenBot returned an invalid dynamic tool result."));
+    return yield* providerCall(() => result);
+  });
 
   #requireThread(id: string): AcpThread {
     const thread = this.#threads.get(id);
@@ -1330,21 +1594,25 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
 }
 
 /** Ends the agent process with SIGTERM, and with SIGKILL when it is still running after 2 seconds. */
-async function endProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+function endProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return runProviderClientEffect(endProcessEffect(child));
+}
+const endProcessEffect = Effect.fn("AcpAgentClient.endProcess")(function* (child: ChildProcessWithoutNullStreams) {
   child.stdin.end();
   // A `.cmd` agent runs under `cmd.exe`; a kill of the wrapper alone leaves the agent running.
-  if (process.platform === "win32") return stopWindowsProcessTree(child);
-  await new Promise<void>((resolve) => {
+  if (process.platform === "win32") return yield* providerCall(() => stopWindowsProcessTree(child));
+  yield* Effect.callback<void>((resume) => {
     const forceKill = setTimeout(() => {
       if (child.exitCode === null) child.kill("SIGKILL");
     }, 2_000);
     child.once("exit", () => {
       clearTimeout(forceKill);
-      resolve();
+      resume(Effect.void);
     });
     child.kill("SIGTERM");
+    return Effect.sync(() => clearTimeout(forceKill));
   });
-}
+});
 
 function isDynamicToolNamespace(value: unknown): value is DynamicToolNamespace {
   return (
@@ -1520,7 +1788,7 @@ function normalizeEffort(value: string): string | null {
   return null;
 }
 
-async function promptBlocks(params: unknown): Promise<ContentBlock[]> {
+const promptBlocksEffect = Effect.fn("AcpAgentClient.promptBlocks")(function* (params: unknown) {
   const blocks: ContentBlock[] = [];
   for (const item of getArray(params, "input")) {
     if (!isRecord(item)) continue;
@@ -1529,12 +1797,13 @@ async function promptBlocks(params: unknown): Promise<ContentBlock[]> {
       blocks.push({ type: "text", text: `Attached local file: ${item.path}` });
     }
     if (item.type === "localImage" && isString(item.path)) {
-      const data = await readFile(item.path);
+      const path = item.path;
+      const data = yield* providerCall(() => readFile(path));
       blocks.push({ type: "image", data: data.toString("base64"), mimeType: imageMimeType(item.path), uri: item.path });
     }
   }
   return blocks;
-}
+});
 
 function imageMimeType(path: string): "image/jpeg" | "image/webp" | "image/png" {
   if (/\.jpe?g$/i.test(path)) return "image/jpeg";

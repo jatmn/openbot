@@ -15,7 +15,9 @@ import {
   TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
 } from "@openbot/contracts/team-protocol/browser-view-v1";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import type { RemoteServerManager } from "./remote-server-manager";
+import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 
 export interface BrowserViewClientOptions {
   servers: Pick<
@@ -42,41 +44,44 @@ export class BrowserViewClient {
     this.#options = options;
   }
 
-  async start(tabId: string): Promise<void> {
-    return this.#queue(async () => {
-      const serverId = this.#options.servers.activeServerId;
-      if (!serverId) throw new Error(sourceText("error.backend.browserViewRemoteOnly"));
-      if (!this.#options.servers.supportsCapability(serverId, TEAM_BROWSER_VIEW_CAPABILITY)) {
-        throw new Error(sourceText("error.backend.browserViewUnsupported"));
-      }
-      await this.#closeView();
-      const stream = await this.#options.servers.openBrowserViewStream(serverId, tabId);
-      const url = new URL(stream.url);
-      // The host keeps a frame's size only for a client that will say when that frame is on screen.
-      // An older client never does, and the host must not retain every frame for the whole session.
-      if (this.#options.servers.supportsCapability(serverId, TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY)) {
-        url.searchParams.set(BROWSER_VIEW_FRAME_ACK_QUERY, "1");
-      }
-      const socket = new WebSocket(url, stream.protocols);
-      socket.binaryType = "arraybuffer";
-      const view: ActiveView = { serverId, sessionId: stream.sessionId, tabId, socket };
-      this.#view = view;
-      socket.addEventListener("message", (message) => {
-        if (this.#view !== view || typeof message.data === "string") return;
-        try {
-          const frame = decodeBrowserViewFrame(new Uint8Array(message.data));
-          this.#options.onEvent({ type: "frame", tabId, ...frame });
-        } catch {
-          socket.close(1000, "Invalid browser view frame");
-        }
-      });
-      socket.addEventListener("close", () => this.#viewEnded(view, sourceText("error.backend.browserViewEnded")));
-      socket.addEventListener("error", () => this.#viewEnded(view, sourceText("error.backend.browserViewFailed")));
-    });
+  start(tabId: string): Promise<void> {
+    return this.#queue(() => runRemoteWorkflow(this.startEffect(tabId)));
   }
 
-  async stop(): Promise<void> {
-    return this.#queue(() => this.#closeView());
+  readonly startEffect = Effect.fn("BrowserViewClient.start")(function* (this: BrowserViewClient, tabId: string) {
+    const serverId = this.#options.servers.activeServerId;
+    if (!serverId)
+      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.backend.browserViewRemoteOnly")) });
+    if (!this.#options.servers.supportsCapability(serverId, TEAM_BROWSER_VIEW_CAPABILITY)) {
+      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.backend.browserViewUnsupported")) });
+    }
+    yield* this.#closeViewEffect();
+    const stream = yield* remoteCall(() => this.#options.servers.openBrowserViewStream(serverId, tabId));
+    const url = new URL(stream.url);
+    // The host keeps a frame's size only for a client that will say when that frame is on screen.
+    // An older client never does, and the host must not retain every frame for the whole session.
+    if (this.#options.servers.supportsCapability(serverId, TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY)) {
+      url.searchParams.set(BROWSER_VIEW_FRAME_ACK_QUERY, "1");
+    }
+    const socket = new WebSocket(url, stream.protocols);
+    socket.binaryType = "arraybuffer";
+    const view: ActiveView = { serverId, sessionId: stream.sessionId, tabId, socket };
+    this.#view = view;
+    socket.addEventListener("message", (message) => {
+      if (this.#view !== view || typeof message.data === "string") return;
+      try {
+        const frame = decodeBrowserViewFrame(new Uint8Array(message.data));
+        this.#options.onEvent({ type: "frame", tabId, ...frame });
+      } catch {
+        socket.close(1000, "Invalid browser view frame");
+      }
+    });
+    socket.addEventListener("close", () => this.#viewEnded(view, sourceText("error.backend.browserViewEnded")));
+    socket.addEventListener("error", () => this.#viewEnded(view, sourceText("error.backend.browserViewFailed")));
+  });
+
+  stop(): Promise<void> {
+    return this.#queue(() => runRemoteWorkflow(this.#closeViewEffect()));
   }
 
   /**
@@ -108,15 +113,21 @@ export class BrowserViewClient {
   #viewEnded(view: ActiveView, reason: string): void {
     if (this.#view !== view) return;
     this.#view = null;
-    void this.#options.servers.closeBrowserViewSession(view.serverId, view.sessionId).catch(() => undefined);
+    void runRemoteWorkflow(this.#releaseEffect(view));
     this.#options.onEvent({ type: "stopped", tabId: view.tabId, reason });
   }
 
-  async #closeView(): Promise<void> {
+  readonly #closeViewEffect = Effect.fn("BrowserViewClient.closeView")(function* (this: BrowserViewClient) {
     const view = this.#view;
     if (!view) return;
     this.#view = null;
     view.socket.close(1000, "The live view was closed");
-    await this.#options.servers.closeBrowserViewSession(view.serverId, view.sessionId).catch(() => undefined);
-  }
+    yield* this.#releaseEffect(view);
+  });
+
+  readonly #releaseEffect = Effect.fn("BrowserViewClient.release")((view: ActiveView) =>
+    remoteCall(() => this.#options.servers.closeBrowserViewSession(view.serverId, view.sessionId)).pipe(
+      Effect.catch(() => Effect.void),
+    ),
+  );
 }

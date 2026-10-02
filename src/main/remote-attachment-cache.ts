@@ -1,3 +1,6 @@
+import { Effect } from "effect";
+import { remoteCall, runRemoteWorkflow } from "./remote-service-effects";
+
 // Remote attachments that this computer already downloaded, held in memory for a short time.
 //
 // A chat image reaches the renderer through `openbot-remote-attachment`, which answers `no-store`,
@@ -48,17 +51,30 @@ export class RemoteAttachmentCache {
     const pending = this.#pending.get(key);
     if (pending) return pending.request;
     const generation = this.#generation(serverId);
-    const request = download()
-      .then((attachment) => {
-        if (this.#generation(serverId) === generation) this.#store(key, serverId, attachment);
-        return attachment;
-      })
-      .finally(() => {
-        if (this.#pending.get(key)?.request === request) this.#pending.delete(key);
-      });
+    const request = runRemoteWorkflow(
+      this.#downloadEffect(serverId, key, generation, download).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (this.#pending.get(key)?.request === request) this.#pending.delete(key);
+          }),
+        ),
+      ),
+    );
     this.#pending.set(key, { serverId, request });
     return request;
   }
+
+  readonly #downloadEffect = Effect.fn("RemoteAttachments.download")(function* (
+    this: RemoteAttachmentCache,
+    serverId: string,
+    key: string,
+    generation: string,
+    download: () => Promise<RemoteAttachment>,
+  ) {
+    const attachment = yield* remoteCall(download);
+    if (this.#generation(serverId) === generation) this.#store(key, serverId, attachment);
+    return attachment;
+  });
 
   forget(serverId: string): void {
     this.#generations.set(serverId, (this.#generations.get(serverId) ?? 0) + 1);

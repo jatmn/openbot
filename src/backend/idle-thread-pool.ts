@@ -1,3 +1,5 @@
+import { Effect, Result, Schema } from "effect";
+
 /** What a pool holds of a thread. The client owns the turn; the pool owns the timer and the time. */
 export interface IdleThread {
   readonly id: string;
@@ -75,11 +77,18 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
   }
 
   /** Stops holding the thread and ends it. No snapshot is kept. */
-  async close(thread: Thread): Promise<void> {
+  close(thread: Thread): Promise<void> {
+    return runPool(this.closeEffect(thread));
+  }
+
+  readonly closeEffect = Effect.fn("IdleThreadPool.close")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    thread: Thread,
+  ) {
     this.#threads.delete(thread.id);
     this.#disarm(thread);
-    await this.#options.dispose(thread);
-  }
+    yield* poolIo(() => this.#options.dispose(thread));
+  }, Effect.uninterruptible);
 
   /** Stops every timer and forgets every thread. The caller ends the threads it gets back. */
   clear(): Thread[] {
@@ -94,18 +103,26 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
    * Runs `open` with the thread marked as starting a turn. Opening the thread again yields, and
    * another thread going idle in that gap must not close this one.
    */
-  async startTurn<T>(threadId: string, open: () => Promise<T>): Promise<T> {
-    this.#startingTurns.add(threadId);
-    try {
-      return await open();
-    } finally {
-      this.#startingTurns.delete(threadId);
-      // A timer that fired while the turn was starting found the thread busy and did nothing. If the
-      // turn then failed to start, nothing else would arm it again, and the thread would stay open.
-      const thread = this.#threads.get(threadId);
-      if (thread && !thread.activeTurn && thread.idleRelease === null) this.#arm(thread);
-    }
+  startTurn<T>(threadId: string, open: () => Promise<T>): Promise<T> {
+    return runPool(this.startTurnEffect(threadId, open));
   }
+
+  readonly startTurnEffect = Effect.fn("IdleThreadPool.startTurn")(function* <T>(
+    this: IdleThreadPool<Thread, Released>,
+    threadId: string,
+    open: () => Promise<T>,
+  ) {
+    return yield* Effect.acquireUseRelease(
+      Effect.sync(() => this.#startingTurns.add(threadId)),
+      () => poolIo(open),
+      () =>
+        Effect.sync(() => {
+          this.#startingTurns.delete(threadId);
+          const thread = this.#threads.get(threadId);
+          if (thread && !thread.activeTurn && thread.idleRelease === null) this.#arm(thread);
+        }),
+    );
+  }, Effect.uninterruptible);
 
   /** Stops the idle timer of a thread whose turn has begun. */
   holdForTurn(thread: Thread): void {
@@ -120,16 +137,23 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
   }
 
   /** Opens a released thread again. One reopen per thread, however many callers ask for it. */
-  async wake(threadId: string): Promise<void> {
+  wake(threadId: string): Promise<void> {
+    return runPool(this.wakeEffect(threadId));
+  }
+
+  readonly wakeEffect = Effect.fn("IdleThreadPool.wake")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    threadId: string,
+  ) {
     const released = this.#released.get(threadId);
     if (released === undefined || this.#threads.has(threadId)) return;
     const waking = this.#waking.get(threadId);
     if (waking) {
-      await waking;
+      yield* poolIo(() => waking);
       return;
     }
-    await this.opening(threadId, () => this.#options.reopen(threadId, released));
-  }
+    yield* poolIo(() => this.opening(threadId, () => this.#options.reopen(threadId, released)));
+  }, Effect.uninterruptible);
 
   /** Waits for an open of the thread that is in flight, whether it succeeds or not. */
   async opened(threadId: string): Promise<void> {
@@ -197,4 +221,16 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
     this.#released.set(thread.id, this.#options.snapshot(thread));
     void this.close(thread);
   }
+}
+
+export class ThreadPoolFailed extends Schema.TaggedError<ThreadPoolFailed>()("ThreadPoolFailed", {
+  cause: Schema.Defect(),
+}) {}
+function poolIo<A>(run: () => Promise<A>): Effect.Effect<A, ThreadPoolFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new ThreadPoolFailed({ cause }) });
+}
+async function runPool<A>(effect: Effect.Effect<A, ThreadPoolFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

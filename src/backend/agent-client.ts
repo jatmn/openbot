@@ -40,6 +40,10 @@ export interface AgentClient {
    */
   on(event: "diagnostic", listener: (message: string, origin?: DiagnosticOrigin) => void): this;
   once(event: "exit", listener: (error: Error) => void): this;
+  /** Removes listeners when an owning operation completes or is interrupted. */
+  off(event: "notification", listener: (notification: AppServerNotification) => void): this;
+  off(event: "request", listener: (request: AppServerRequest) => void): this;
+  off(event: "exit", listener: (error: Error) => void): this;
 }
 
 /**

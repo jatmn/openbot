@@ -33,10 +33,10 @@ import {
   TEAM_APP_VERSION_HEADER,
   TEAM_CAPABILITIES_HEADER,
   TEAM_PROTOCOL_VERSION_HEADER,
-  type TeamProtocolSupportV1,
   teamProtocolUpdateDirection,
 } from "@openbot/contracts/team-protocol/v1";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result } from "effect";
 import { decodeRemoteDesktopCapabilities } from "./remote-device-decoding";
 import type { ResponseDecoder } from "./remote-host-decoding";
 import {
@@ -46,9 +46,15 @@ import {
   webRtcCompatibility,
 } from "./remote-server-connection-status";
 import { RemoteProtocolError, RemoteRequestError } from "./remote-server-errors";
-import { remoteFetch, requestJson, throwRemoteResponseError, webRtcRequestBody } from "./remote-server-http";
+import {
+  remoteFetchEffect,
+  remoteResponseErrorEffect,
+  requestJsonEffect,
+  webRtcRequestBody,
+} from "./remote-server-http";
 import type { StoredRemoteServerView } from "./remote-server-store";
 import { addRemotePreviewUrls } from "./remote-server-urls";
+import { RemoteWorkflowError, remoteCall, remoteDecode, runRemoteWorkflow } from "./remote-service-effects";
 import { decodeIdentityProof } from "./remote-team-decoding";
 import { fingerprint } from "./team-store";
 import { TeamWebRtcRequestError } from "./team-webrtc-client-transport";
@@ -132,17 +138,21 @@ export class RemoteServerClient {
   }
 
   /** One decoded Team API call. Every failure is reported to the registry before it is rethrown. */
-  async request<T>(
+  request<T>(serverId: string, path: string, decoder: ResponseDecoder<T>, init: RemoteRequestInit = {}): Promise<T> {
+    return runRemoteWorkflow(this.requestEffect(serverId, path, decoder, init));
+  }
+  readonly requestEffect = Effect.fn("RemoteClient.request")(function* <T>(
+    this: RemoteServerClient,
     serverId: string,
     path: string,
     decoder: ResponseDecoder<T>,
     init: RemoteRequestInit = {},
-  ): Promise<T> {
-    const server = this.#servers.require(serverId);
-    try {
+  ): Effect.fn.Return<T, RemoteWorkflowError> {
+    const server = yield* remoteDecode(() => this.#servers.require(serverId));
+    return yield* Effect.gen({ self: this }, function* () {
       if (server.transport === "webrtc-v2") {
-        const compatibility = await this.ensureCompatibility(server);
-        const value = await this.#hostRequest(server.id, path, {
+        const compatibility = yield* this.ensureCompatibilityEffect(server);
+        const value = yield* this.#hostRequestEffect(server.id, path, {
           ...init,
           preserveSemanticTags: supportsTeamSemanticTags(compatibility.capabilities),
           agentCreateModel: this.supportsAgentCreateModel(path, init, compatibility.capabilities),
@@ -152,10 +162,10 @@ export class RemoteServerClient {
         // only `RemoteProtocolError` makes the classifier stop reconnecting to a host talking
         // nonsense. `requestJson` draws the same line for the HTTPS arm; a plain error here left
         // the server looking healthy.
-        return addRemotePreviewUrls(decodeOrProtocolError(decoder, value), server.id);
+        return yield* remoteDecode(() => addRemotePreviewUrls(decodeOrProtocolError(decoder, value), server.id));
       }
-      const compatibility = await this.ensureCompatibility(server);
-      const value = await requestJson(server.apiUrl, path, decoder, {
+      const compatibility = yield* this.ensureCompatibilityEffect(server);
+      const value = yield* requestJsonEffect(server.apiUrl, path, decoder, {
         ...init,
         token: this.#servers.token(server),
         timeoutMs: init.timeoutMs,
@@ -163,13 +173,27 @@ export class RemoteServerClient {
         // agent on its own default, so the pair is only encoded for hosts that read it.
         agentCreateModel: this.supportsAgentCreateModel(path, init, compatibility.capabilities),
         ...this.requestProtocol(compatibility),
-      });
+      }).pipe(
+        Effect.mapError(
+          (failure) =>
+            new RemoteWorkflowError({
+              cause:
+                failure instanceof RemoteRequestError || failure instanceof RemoteProtocolError
+                  ? failure
+                  : failure.cause,
+            }),
+        ),
+      );
       return addRemotePreviewUrls(value, server.id);
-    } catch (error) {
-      this.#connections.reportError(server.id, error);
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          this.#connections.reportError(server.id, error);
+          return yield* new RemoteWorkflowError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   /**
    * The undecoded form, for bytes: attachments, avatars, logos and the remote viewer. The WebRTC arm
@@ -180,26 +204,39 @@ export class RemoteServerClient {
    *
    * `timeoutMs` applies to HTTP only. A WebRTC request has the transport's own limit.
    */
-  async fetch(
+  fetch(
     server: StoredRemoteServerView,
     input: string | URL,
     init: RequestInit = {},
     affectsConnection = true,
     timeoutMs?: number,
   ): Promise<Response> {
-    try {
+    return runRemoteWorkflow(this.fetchEffect(server, input, init, affectsConnection, timeoutMs));
+  }
+  readonly fetchEffect = Effect.fn("RemoteClient.fetch")(function* (
+    this: RemoteServerClient,
+    server: StoredRemoteServerView,
+    input: string | URL,
+    init: RequestInit = {},
+    affectsConnection = true,
+    timeoutMs?: number,
+  ): Effect.fn.Return<Response, RemoteWorkflowError> {
+    return yield* Effect.gen({ self: this }, function* () {
       if (server.transport === "webrtc-v2") {
-        const transport = this.#requireTransport();
+        const transport = yield* remoteDecode(() => this.#requireTransport());
         const url = new URL(input);
-        try {
-          const compatibility = await this.ensureCompatibility(server);
+        const attempt2 = yield* Effect.gen({ self: this }, function* () {
+          const compatibility = yield* this.ensureCompatibilityEffect(server);
           const contentType = new Headers(init.headers).get("Content-Type") ?? undefined;
-          const response = await transport.requestResponse(server.id, `${url.pathname}${url.search}`, {
-            method: init.method,
-            body: webRtcRequestBody(init.body, contentType),
-            contentType,
-            preserveSemanticTags: supportsTeamSemanticTags(compatibility.capabilities),
-          });
+          const requestBody = yield* remoteDecode(() => webRtcRequestBody(init.body, contentType));
+          const response = yield* remoteCall(() =>
+            transport.requestResponse(server.id, `${url.pathname}${url.search}`, {
+              method: init.method,
+              body: requestBody,
+              contentType,
+              preserveSemanticTags: supportsTeamSemanticTags(compatibility.capabilities),
+            }),
+          );
           const headers = new Headers();
           if (response.file) {
             headers.set("Content-Type", response.file.mimeType);
@@ -214,11 +251,13 @@ export class RemoteServerClient {
             status: response.status,
             headers,
           });
-        } catch (error) {
-          rethrowAsRemoteRequestError(error);
-        }
+        }).pipe(Effect.result);
+        if (Result.isFailure(attempt2)) {
+          const error = attempt2.failure.cause;
+          return yield* remoteDecode(() => rethrowAsRemoteRequestError(error));
+        } else return attempt2.success;
       }
-      const compatibility = await this.ensureCompatibility(server);
+      const compatibility = yield* this.ensureCompatibilityEffect(server);
       const headers = new Headers(init.headers);
       headers.set("Authorization", `Bearer ${this.#servers.token(server)}`);
       headers.set(TEAM_PROTOCOL_VERSION_HEADER, String(compatibility.negotiatedProtocol));
@@ -226,16 +265,32 @@ export class RemoteServerClient {
         headers.set(TEAM_APP_VERSION_HEADER, this.#appVersion);
         headers.set(TEAM_CAPABILITIES_HEADER, TEAM_CURRENT_CAPABILITIES.join(","));
       }
-      const response = await remoteFetch(input, { ...init, headers }, timeoutMs);
+      const response = yield* remoteFetchEffect(input, { ...init, headers }, timeoutMs).pipe(
+        Effect.mapError(
+          (failure) =>
+            new RemoteWorkflowError({
+              cause:
+                failure instanceof RemoteRequestError || failure instanceof RemoteProtocolError
+                  ? failure
+                  : failure.cause,
+            }),
+        ),
+      );
       if (!response.ok) {
-        await throwRemoteResponseError(response, init.method ?? "GET", new URL(input).pathname);
+        yield* remoteResponseErrorEffect(response, init.method ?? "GET", new URL(input).pathname).pipe(
+          Effect.mapError((cause) => new RemoteWorkflowError({ cause })),
+        );
       }
       return response;
-    } catch (error) {
-      if (affectsConnection) this.#connections.reportError(server.id, error);
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          if (affectsConnection) this.#connections.reportError(server.id, error);
+          return yield* new RemoteWorkflowError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   /** The negotiated protocol and this app's capabilities, as `requestJson` wants them. */
   requestProtocol(compatibility: ServerCompatibility): {
@@ -259,7 +314,14 @@ export class RemoteServerClient {
    * agreed they cannot talk, and re-asking on every call would turn one incompatibility into a
    * request storm. `refresh` is how an explicit reconnect gets past that.
    */
-  async ensureCompatibility(server: StoredRemoteServerView, refresh = false): Promise<ServerCompatibility> {
+  ensureCompatibility(server: StoredRemoteServerView, refresh = false): Promise<ServerCompatibility> {
+    return runRemoteWorkflow(this.ensureCompatibilityEffect(server, refresh));
+  }
+  readonly ensureCompatibilityEffect = Effect.fn("RemoteClient.ensureCompatibility")(function* (
+    this: RemoteServerClient,
+    server: StoredRemoteServerView,
+    refresh = false,
+  ): Effect.fn.Return<ServerCompatibility, RemoteWorkflowError> {
     const current = this.#connections.compatibilityFor(server.id);
     const issue = this.#connections.issueFor(server.id);
     if (
@@ -268,17 +330,19 @@ export class RemoteServerClient {
         issue?.code === "host_update_required" ||
         issue?.code === "protocol_error")
     ) {
-      throw new RemoteProtocolError(
-        issue.code,
-        issue.message,
-        current?.hostAppVersion && current.hostProtocol
-          ? {
-              appVersion: current.hostAppVersion,
-              protocol: current.hostProtocol,
-              capabilities: current.capabilities,
-            }
-          : null,
-      );
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteProtocolError(
+          issue.code,
+          issue.message,
+          current?.hostAppVersion && current.hostProtocol
+            ? {
+                appVersion: current.hostAppVersion,
+                protocol: current.hostProtocol,
+                capabilities: current.capabilities,
+              }
+            : null,
+        ),
+      });
     }
     if (!this.#appVersion) {
       const compatibility = assumedCompatibility(this.#appVersion);
@@ -287,89 +351,128 @@ export class RemoteServerClient {
     }
     if (!refresh && current?.negotiatedProtocol) return current;
     const pending = this.#compatibilityRequests.get(server.id);
-    if (pending) return pending;
+    if (pending) return yield* remoteCall(() => pending);
     // What the server was complaining about when this negotiation started. Only that complaint is
     // this answer's to withdraw: a caller reusing the compatibility already on record -- the desktop
     // probe does -- can record a protocol failure while this request is still out, and clearing it
     // unconditionally on the way back is how a host that failed closed comes back healthy.
     const issueAtStart = this.#connections.issueFor(server.id);
-    const request = (
-      server.transport === "webrtc-v2"
-        ? this.#negotiateWebRtcCompatibility(server.id)
-        : this.negotiateCompatibility(server.apiUrl)
-    )
-      .then((compatibility) => {
+    const request = runRemoteWorkflow(
+      Effect.gen({ self: this }, function* () {
+        const compatibility = yield* server.transport === "webrtc-v2"
+          ? this.#negotiateWebRtcCompatibilityEffect(server.id)
+          : this.negotiateCompatibilityEffect(server.apiUrl);
         this.#connections.setCompatibility(server.id, compatibility);
         this.#connections.clearStaleIssue(server.id, issueAtStart);
         return compatibility;
-      })
-      .finally(() => {
-        if (this.#compatibilityRequests.get(server.id) === request) this.#compatibilityRequests.delete(server.id);
-      });
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (this.#compatibilityRequests.get(server.id) === request) this.#compatibilityRequests.delete(server.id);
+          }),
+        ),
+      ),
+    );
     this.#compatibilityRequests.set(server.id, request);
-    return request;
-  }
+    return yield* remoteCall(() => request);
+  });
 
   /**
    * Re-reads what a WebRTC host supports and records it. Unlike the pinned V2 framing the WebRTC arm
    * always uses, this reports the host's real protocol range, so the user is told to update the end
    * that is actually behind.
    */
-  async refreshWebRtcCompatibility(serverId: string): Promise<void> {
+  refreshWebRtcCompatibility(serverId: string): Promise<void> {
+    return runRemoteWorkflow(this.refreshWebRtcCompatibilityEffect(serverId));
+  }
+  readonly refreshWebRtcCompatibilityEffect = Effect.fn("RemoteClient.refreshWebRtcCompatibility")(function* (
+    this: RemoteServerClient,
+    serverId: string,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (!this.#transport) return;
-    let host: TeamProtocolSupportV1;
-    try {
+    const attempt3 = yield* Effect.gen({ self: this }, function* () {
       // The request is inside the reporting `try`, not before it: the transport itself raises
       // `protocol_error` for a frame the released adapter refuses, and that is the same failure as a
       // compatibility body that will not decode. The caller of this one is a `connected` handler
       // with nowhere to put an error, so recording it here is the only thing that stops the app
       // treating a host talking nonsense as healthy.
-      const value = await this.#hostRequest(serverId, TEAM_API_ROUTES.compatibility);
-      host = decodeOrProtocolError(decodeTeamProtocolSupportV1, value, sourceText("error.remote.invalidCompatibility"));
-    } catch (error) {
+      const value = yield* this.#hostRequestEffect(serverId, TEAM_API_ROUTES.compatibility);
+      return yield* remoteDecode(() =>
+        decodeOrProtocolError(decodeTeamProtocolSupportV1, value, sourceText("error.remote.invalidCompatibility")),
+      );
+    }).pipe(Effect.result);
+    if (Result.isFailure(attempt3)) {
+      const error = attempt3.failure.cause;
       this.#connections.reportError(serverId, error);
-      throw error;
+      return yield* new RemoteWorkflowError({ cause: error });
     }
+    const host = attempt3.success;
     this.#connections.setCompatibility(
       serverId,
       negotiatedCompatibility(this.#appVersion, host, highestCommonTeamProtocol(LOCAL_TEAM_PROTOCOL, host.protocol)),
     );
-  }
+  });
 
   /**
    * Negotiation against a bare URL, for a server not stored yet -- joining, or verifying an
    * identity. Nothing here is recorded, because there is no connection to record it against.
    */
-  async negotiateCompatibility(apiUrl: string): Promise<ServerCompatibility> {
+  negotiateCompatibility(apiUrl: string): Promise<ServerCompatibility> {
+    return runRemoteWorkflow(this.negotiateCompatibilityEffect(apiUrl));
+  }
+  readonly negotiateCompatibilityEffect = Effect.fn("RemoteClient.negotiateCompatibility")(function* (
+    this: RemoteServerClient,
+    apiUrl: string,
+  ): Effect.fn.Return<ServerCompatibility, RemoteWorkflowError> {
     if (!this.#appVersion) return assumedCompatibility(this.#appVersion);
-    let host: TeamProtocolSupportV1;
-    try {
-      host = await requestJson(apiUrl, TEAM_API_ROUTES.compatibility, decodeTeamProtocolSupportV1);
-    } catch (error) {
+    const attempt4 = yield* Effect.gen({ self: this }, function* () {
+      return yield* requestJsonEffect(apiUrl, TEAM_API_ROUTES.compatibility, decodeTeamProtocolSupportV1).pipe(
+        Effect.mapError(
+          (failure) =>
+            new RemoteWorkflowError({
+              cause:
+                failure instanceof RemoteRequestError || failure instanceof RemoteProtocolError
+                  ? failure
+                  : failure.cause,
+            }),
+        ),
+      );
+    }).pipe(Effect.result);
+    if (Result.isFailure(attempt4)) {
+      const error = attempt4.failure.cause;
       if (error instanceof RemoteRequestError && error.status === 404) {
-        throw new RemoteProtocolError("host_update_required", sourceText("error.team.hostUpdateRequired"));
+        return yield* new RemoteWorkflowError({
+          cause: new RemoteProtocolError("host_update_required", sourceText("error.team.hostUpdateRequired")),
+        });
       }
       if (error instanceof SyntaxError || (error instanceof RemoteProtocolError && error.code === "protocol_error")) {
-        throw new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidCompatibility"));
+        return yield* new RemoteWorkflowError({
+          cause: new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidCompatibility")),
+        });
       }
-      throw error;
+      return yield* new RemoteWorkflowError({ cause: error });
     }
+    const host = attempt4.success;
     const negotiatedProtocol = highestCommonTeamProtocol(LOCAL_TEAM_PROTOCOL, host.protocol);
     if (negotiatedProtocol === null) {
       if (teamProtocolUpdateDirection(LOCAL_TEAM_PROTOCOL, host.protocol) === "client_update_required") {
-        throw new RemoteProtocolError("client_update_required", sourceText("error.remote.appUpdateRequired"), host);
+        return yield* new RemoteWorkflowError({
+          cause: new RemoteProtocolError("client_update_required", sourceText("error.remote.appUpdateRequired"), host),
+        });
       }
-      throw new RemoteProtocolError("host_update_required", sourceText("error.team.hostUpdateRequired"), host);
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteProtocolError("host_update_required", sourceText("error.team.hostUpdateRequired"), host),
+      });
     }
     return negotiatedCompatibility(this.#appVersion, host, negotiatedProtocol);
-  }
+  });
 
   /**
    * Proves the host at `apiUrl` holds the key behind `expectedFingerprint`, by making it sign a
    * challenge this app just generated. This is what an invite link's fingerprint is for, and it runs
    * before any token is ever sent -- so a host that fails it never learns anything.
    */
-  async verifyIdentity(
+  verifyIdentity(
     apiUrl: string,
     serverId: string,
     expectedFingerprint: string,
@@ -379,71 +482,116 @@ export class RemoteServerClient {
     logoVersion: string | null;
     compatibility: ServerCompatibility;
   }> {
-    const compatibility = await this.negotiateCompatibility(apiUrl);
+    return runRemoteWorkflow(this.verifyIdentityEffect(apiUrl, serverId, expectedFingerprint));
+  }
+  readonly verifyIdentityEffect = Effect.fn("RemoteClient.verifyIdentity")(function* (
+    this: RemoteServerClient,
+    apiUrl: string,
+    serverId: string,
+    expectedFingerprint: string,
+  ): Effect.fn.Return<
+    {
+      publicKey: string;
+      serverName: string;
+      logoVersion: string | null;
+      compatibility: ServerCompatibility;
+    },
+    RemoteWorkflowError
+  > {
+    const compatibility = yield* this.negotiateCompatibilityEffect(apiUrl);
     const challenge = randomBytes(24).toString("base64url");
-    const proof = await requestJson(
+    const proof = yield* requestJsonEffect(
       apiUrl,
       `${TEAM_API_ROUTES.identity}?challenge=${encodeURIComponent(challenge)}`,
       decodeIdentityProof,
       { ...this.requestProtocol(compatibility) },
+    ).pipe(
+      Effect.mapError(
+        (failure) =>
+          new RemoteWorkflowError({
+            cause:
+              failure instanceof RemoteRequestError || failure instanceof RemoteProtocolError ? failure : failure.cause,
+          }),
+      ),
     );
-    const valid =
-      proof.serverId === serverId &&
-      proof.challenge === challenge &&
-      proof.fingerprint === expectedFingerprint &&
-      fingerprint(proof.publicKey) === expectedFingerprint &&
-      verify(null, Buffer.from(challenge), proof.publicKey, Buffer.from(proof.signature, "base64url"));
-    if (!valid) throw new Error(sourceText("error.remote.identityNotVerified"));
+    const valid = yield* remoteDecode(
+      () =>
+        proof.serverId === serverId &&
+        proof.challenge === challenge &&
+        proof.fingerprint === expectedFingerprint &&
+        fingerprint(proof.publicKey) === expectedFingerprint &&
+        verify(null, Buffer.from(challenge), proof.publicKey, Buffer.from(proof.signature, "base64url")),
+    );
+    if (!valid)
+      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.identityNotVerified")) });
     return {
       publicKey: proof.publicKey,
       serverName: proof.serverName,
       logoVersion: proof.logoVersion,
       compatibility,
     };
-  }
+  });
 
   /**
    * Whether this server can share a screen right now. A host that has never heard of the route
    * answers 404, 426 or 503; those mean "no", not "the connection is broken".
    */
-  async probeRemoteDesktop(server: StoredRemoteServerView): Promise<boolean> {
-    try {
-      const compatibility = await this.ensureCompatibility(server);
+  probeRemoteDesktop(server: StoredRemoteServerView): Promise<boolean> {
+    return runRemoteWorkflow(this.probeRemoteDesktopEffect(server));
+  }
+  readonly probeRemoteDesktopEffect = Effect.fn("RemoteClient.probeRemoteDesktop")(function* (
+    this: RemoteServerClient,
+    server: StoredRemoteServerView,
+  ): Effect.fn.Return<boolean, RemoteWorkflowError> {
+    return yield* Effect.gen({ self: this }, function* () {
+      const compatibility = yield* this.ensureCompatibilityEffect(server);
       if (!compatibility.capabilities.includes("remote-desktop")) return false;
       let capabilities: RemoteDesktopCapabilities;
       if (server.transport === "webrtc-v2") {
-        capabilities = decodeOrProtocolError(
-          decodeRemoteDesktopCapabilities,
-          await this.#hostRequest(server.id, TEAM_API_ROUTES.remoteScreen.capabilities, {
-            preserveSemanticTags: supportsTeamSemanticTags(compatibility.capabilities),
-          }),
-        );
+        const value = yield* this.#hostRequestEffect(server.id, TEAM_API_ROUTES.remoteScreen.capabilities, {
+          preserveSemanticTags: supportsTeamSemanticTags(compatibility.capabilities),
+        });
+        capabilities = yield* remoteDecode(() => decodeOrProtocolError(decodeRemoteDesktopCapabilities, value));
       } else {
-        capabilities = await requestJson(
+        capabilities = yield* requestJsonEffect(
           server.apiUrl,
           TEAM_API_ROUTES.remoteScreen.capabilities,
           decodeRemoteDesktopCapabilities,
           { token: this.#servers.token(server), ...this.requestProtocol(compatibility) },
+        ).pipe(
+          Effect.mapError(
+            (failure) =>
+              new RemoteWorkflowError({
+                cause:
+                  failure instanceof RemoteRequestError || failure instanceof RemoteProtocolError
+                    ? failure
+                    : failure.cause,
+              }),
+          ),
         );
       }
       return capabilities.ready;
-    } catch (error) {
-      if (error instanceof RemoteRequestError && [404, 426, 503].includes(error.status)) return false;
-      // A host answering the probe with something no build can read is not a host without screen
-      // sharing. Every caller of this turns a rejection into `false` or `null`, so a protocol failure
-      // that is not recorded here is a host that stays healthy and reconnectable. Both error classes
-      // appear here and neither extends the other: the HTTPS arm's `requestJson` raises
-      // `RemoteProtocolError` for a body it cannot decode, the WebRTC arm's transport raises a
-      // `protocol_error` `RemoteRequestError` -- so checking one of them records half the failures.
-      if (
-        error instanceof RemoteProtocolError ||
-        (error instanceof RemoteRequestError && error.code === "protocol_error")
-      ) {
-        this.#connections.reportError(server.id, error);
-      }
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          if (error instanceof RemoteRequestError && [404, 426, 503].includes(error.status)) return false;
+          // A host answering the probe with something no build can read is not a host without screen
+          // sharing. Every caller of this turns a rejection into `false` or `null`, so a protocol failure
+          // that is not recorded here is a host that stays healthy and reconnectable. Both error classes
+          // appear here and neither extends the other: the HTTPS arm's `requestJson` raises
+          // `RemoteProtocolError` for a body it cannot decode, the WebRTC arm's transport raises a
+          // `protocol_error` `RemoteRequestError` -- so checking one of them records half the failures.
+          if (
+            error instanceof RemoteProtocolError ||
+            (error instanceof RemoteRequestError && error.code === "protocol_error")
+          ) {
+            this.#connections.reportError(server.id, error);
+          }
+          return yield* new RemoteWorkflowError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   /** Forgets an in-flight negotiation. Called when a server is removed or the app stops. */
   forget(serverId: string): void {
@@ -454,13 +602,18 @@ export class RemoteServerClient {
     this.#compatibilityRequests.clear();
   }
 
-  async #negotiateWebRtcCompatibility(serverId: string): Promise<ServerCompatibility> {
-    const value = await this.#hostRequest(serverId, TEAM_API_ROUTES.compatibility);
-    return webRtcCompatibility(
-      this.#appVersion,
-      decodeOrProtocolError(decodeTeamProtocolSupportV1, value, sourceText("error.remote.invalidCompatibility")),
+  readonly #negotiateWebRtcCompatibilityEffect = Effect.fn("RemoteClient.negotiateWebRtcCompatibility")(function* (
+    this: RemoteServerClient,
+    serverId: string,
+  ): Effect.fn.Return<ServerCompatibility, RemoteWorkflowError> {
+    const value = yield* this.#hostRequestEffect(serverId, TEAM_API_ROUTES.compatibility);
+    return yield* remoteDecode(() =>
+      webRtcCompatibility(
+        this.#appVersion,
+        decodeOrProtocolError(decodeTeamProtocolSupportV1, value, sourceText("error.remote.invalidCompatibility")),
+      ),
     );
-  }
+  });
 
   /**
    * One WebRTC call, with the transport's own failures translated. Every direct `transport.request`
@@ -468,17 +621,22 @@ export class RemoteServerClient {
    * is invisible to the classifier, so the status codes below and the `protocol_error` the transport
    * raises for a frame it cannot decode both stop meaning anything.
    */
-  async #hostRequest(
+  readonly #hostRequestEffect = Effect.fn("RemoteClient.hostRequest")(function* (
+    this: RemoteServerClient,
     serverId: string,
     path: string,
     init: { method?: string; body?: unknown; preserveSemanticTags?: boolean; agentCreateModel?: boolean } = {},
-  ): Promise<unknown> {
-    try {
-      return await this.#requireTransport().request(serverId, path, init);
-    } catch (error) {
-      rethrowAsRemoteRequestError(error);
-    }
-  }
+  ): Effect.fn.Return<unknown, RemoteWorkflowError> {
+    return yield* Effect.gen({ self: this }, function* () {
+      return yield* remoteCall(() => this.#requireTransport().request(serverId, path, init));
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          return yield* remoteDecode(() => rethrowAsRemoteRequestError(error));
+        }),
+      ),
+    );
+  });
 
   /**
    * Whether the chosen pair may ride an agent creation request to this host: only the create

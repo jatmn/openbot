@@ -20,6 +20,7 @@ import type {
 import { routineConversationEventItemType, routineRunConversationEventItemType } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isBoolean } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import { AgentRoutineStore } from "../agent-routine-store";
 import type { AgentStore } from "../agent-store";
 import type { MailboxStore } from "../mailbox-store";
@@ -189,78 +190,102 @@ export class RoutineScheduler implements RoutineDueSource {
     return routine;
   }
 
-  async delete(input: DeleteRoutineInput, options: RoutineMutationOptions = {}): Promise<void> {
-    this.#conversation.requireKnownAgent(input.agentId);
-    const routine = this.#routines.get(input.agentId, input.routineId);
-    if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
-    if (this.#deletionAgents.has(input.agentId)) {
-      throw new RoutineInputError(sourceText("error.backend.routineDeletionBusy"));
-    }
-    this.#deletionAgents.add(input.agentId);
-    try {
-      const activeRuns = await this.#interruptRunsBeforeDeletion(
-        input.agentId,
-        this.#routines.activeRuns(input.agentId, input.routineId),
-      );
-      if (options.recordConversationEvent === false) {
-        withDatabaseTransaction(
-          this.#store.database,
-          () => {
-            for (const run of activeRuns) {
-              if (run.status === "queued" && run.deliveryId) {
-                if (this.#mailbox.getDelivery(run.deliveryId)?.delivery.status === "queued") {
-                  this.#mailbox.cancelNow(input.agentId, run.deliveryId);
-                }
-              }
-              this.#routines.updateRunStatus(run.id, "cancelled");
-            }
-            this.#routines.delete(input.agentId, input.routineId);
-          },
-          // Deliberately narrower than the conversation variants: this branch records no
-          // conversation event, so there is no snapshot to restore — only the mailbox.
-          () => this.#mailbox.restorePersistedState(),
-        );
-      } else {
-        this.#mutateWithConversation(
-          input.agentId,
-          "deleted",
-          () => this.#routines.delete(input.agentId, input.routineId),
-          () => routine,
-          options.turnId,
-          {
-            beforeMutate: (snapshot) => {
-              for (const run of activeRuns) {
-                if (run.status === "queued" && run.deliveryId) {
-                  if (this.#mailbox.getDelivery(run.deliveryId)?.delivery.status === "queued") {
-                    this.#mailbox.cancelNow(input.agentId, run.deliveryId);
-                  }
-                }
-                this.#appendRunTransition(snapshot, run, "cancelled");
-              }
-            },
-            onRollback: () => this.#mailbox.restorePersistedState(),
-          },
-        );
-      }
-      this.#hooks.emitQueue(input.agentId);
-      this.stateChanged(input.agentId);
-      this.arm();
-    } finally {
-      this.#deletionAgents.delete(input.agentId);
-      if (this.#mailbox.nextQueued(input.agentId)) this.#hooks.scheduleDrain(input.agentId);
-    }
+  delete(input: DeleteRoutineInput, options: RoutineMutationOptions = {}): Promise<void> {
+    return runRoutine(this.deleteEffect(input, options));
   }
 
-  async test(input: TestRoutineInput): Promise<RoutineRun> {
-    if (!this.mayDrain(input.agentId)) throw new RoutineInputError(sourceText("error.backend.routineWaitForAgent"));
-    this.#conversation.requireKnownAgent(input.agentId);
-    const routine = this.#routines.get(input.agentId, input.routineId);
-    if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
-    const run = this.#routines.createRun(routine, null, "manual", new Date().toISOString());
-    await this.#enqueueRun(run);
-    this.stateChanged(input.agentId);
-    return this.#routines.listRuns(input.agentId, input.routineId, 1)[0] ?? run;
+  readonly deleteEffect = Effect.fn("RoutineScheduler.delete")(function* (
+    this: RoutineScheduler,
+    input: DeleteRoutineInput,
+    options: RoutineMutationOptions = {},
+  ) {
+    const routine = yield* routineStep(() => {
+      this.#conversation.requireKnownAgent(input.agentId);
+      const routine = this.#routines.get(input.agentId, input.routineId);
+      if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
+      if (this.#deletionAgents.has(input.agentId)) {
+        throw new RoutineInputError(sourceText("error.backend.routineDeletionBusy"));
+      }
+      return routine;
+    });
+    yield* Effect.acquireUseRelease(
+      Effect.sync(() => this.#deletionAgents.add(input.agentId)),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          const activeRuns = yield* this.#interruptRunsBeforeDeletionEffect(
+            input.agentId,
+            this.#routines.activeRuns(input.agentId, input.routineId),
+          );
+          yield* routineStep(() => {
+            if (options.recordConversationEvent === false) {
+              withDatabaseTransaction(
+                this.#store.database,
+                () => {
+                  for (const run of activeRuns) {
+                    if (run.status === "queued" && run.deliveryId) {
+                      if (this.#mailbox.getDelivery(run.deliveryId)?.delivery.status === "queued") {
+                        this.#mailbox.cancelNow(input.agentId, run.deliveryId);
+                      }
+                    }
+                    this.#routines.updateRunStatus(run.id, "cancelled");
+                  }
+                  this.#routines.delete(input.agentId, input.routineId);
+                },
+                // Deliberately narrower than the conversation variants: this branch records no
+                // conversation event, so there is no snapshot to restore — only the mailbox.
+                () => this.#mailbox.restorePersistedState(),
+              );
+            } else {
+              this.#mutateWithConversation(
+                input.agentId,
+                "deleted",
+                () => this.#routines.delete(input.agentId, input.routineId),
+                () => routine,
+                options.turnId,
+                {
+                  beforeMutate: (snapshot) => {
+                    for (const run of activeRuns) {
+                      if (run.status === "queued" && run.deliveryId) {
+                        if (this.#mailbox.getDelivery(run.deliveryId)?.delivery.status === "queued") {
+                          this.#mailbox.cancelNow(input.agentId, run.deliveryId);
+                        }
+                      }
+                      this.#appendRunTransition(snapshot, run, "cancelled");
+                    }
+                  },
+                  onRollback: () => this.#mailbox.restorePersistedState(),
+                },
+              );
+            }
+            this.#hooks.emitQueue(input.agentId);
+            this.stateChanged(input.agentId);
+            this.arm();
+          });
+        }),
+      () =>
+        Effect.sync(() => {
+          this.#deletionAgents.delete(input.agentId);
+          if (this.#mailbox.nextQueued(input.agentId)) this.#hooks.scheduleDrain(input.agentId);
+        }),
+    );
+  }, Effect.uninterruptible);
+
+  test(input: TestRoutineInput): Promise<RoutineRun> {
+    return runRoutine(this.testEffect(input));
   }
+
+  readonly testEffect = Effect.fn("RoutineScheduler.test")(function* (this: RoutineScheduler, input: TestRoutineInput) {
+    const run = yield* routineStep(() => {
+      if (!this.mayDrain(input.agentId)) throw new RoutineInputError(sourceText("error.backend.routineWaitForAgent"));
+      this.#conversation.requireKnownAgent(input.agentId);
+      const routine = this.#routines.get(input.agentId, input.routineId);
+      if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
+      return this.#routines.createRun(routine, null, "manual", new Date().toISOString());
+    });
+    yield* this.#enqueueRunEffect(run);
+    this.stateChanged(input.agentId);
+    return yield* routineStep(() => this.#routines.listRuns(input.agentId, input.routineId, 1)[0] ?? run);
+  }, Effect.uninterruptible);
 
   listRuns(input: ListRoutineRunsInput): RoutineRun[] {
     this.#conversation.requireKnownAgent(input.agentId);
@@ -416,13 +441,21 @@ export class RoutineScheduler implements RoutineDueSource {
     return null;
   }
 
-  async resumePendingRuns(): Promise<void> {
-    for (const run of this.#routines.pendingRuns()) {
-      await this.#enqueueRun(run).catch((error) => {
-        this.#hooks.emitError("routine_delivery_recovery_failed", error, run.agentId);
-      });
-    }
+  resumePendingRuns(): Promise<void> {
+    return runRoutine(this.resumePendingRunsEffect());
   }
+
+  readonly resumePendingRunsEffect = Effect.fn("RoutineScheduler.resumePendingRuns")(function* (
+    this: RoutineScheduler,
+  ) {
+    const pending = yield* routineStep(() => this.#routines.pendingRuns());
+    for (const run of pending)
+      yield* this.#enqueueRunEffect(run).pipe(
+        Effect.catch((failure) =>
+          Effect.sync(() => this.#hooks.emitError("routine_delivery_recovery_failed", failure.cause, run.agentId)),
+        ),
+      );
+  });
 
   /**
    * Reconciles one queue delivery with the run it belongs to. Returns whether anything changed, so
@@ -477,39 +510,52 @@ export class RoutineScheduler implements RoutineDueSource {
     return this.#routines.nextDueAt(this.#hooks.excludedAgents());
   }
 
-  async processDue(now = new Date(), active: () => boolean = () => true): Promise<void> {
-    const changedAgents = new Set<string>();
-    try {
-      for (const due of this.#routines.due(now, this.#hooks.excludedAgents())) {
-        if (!active()) break;
-        // A previous enqueue can yield while another agent starts deletion.
-        if (this.#hooks.excludedAgents().has(due.routine.agentId)) continue;
-        const { scheduledFor, nextRunAt } = collapseMissedOccurrences(
-          due.schedule,
-          due.routine.timezone,
-          new Date(due.nextRunAt),
-          now,
-        );
-        // A run that has not finished already does this routine's work. Another one would only
-        // queue behind it, and after a sleep the queue drains as a burst of identical runs.
-        const run = this.#hasLiveRun(due.routine.agentId, due.routine.id)
-          ? null
-          : this.#routines.createRun(due.routine, due.triggerId, "scheduled", scheduledFor.toISOString());
-        this.#routines.advanceTrigger(due.routine.id, due.triggerId, nextRunAt.toISOString());
-        changedAgents.add(due.routine.agentId);
-        if (run && !run.deliveryId) {
-          await this.#enqueueRun(run).catch((error) => {
-            this.#hooks.emitError("routine_delivery_failed", error, due.routine.agentId);
-          });
-        }
-      }
-    } catch (error) {
-      this.#hooks.emitError("routine_scheduler_failed", error);
-    } finally {
-      // The shared timer re-arms after every source has run, so this must not arm on its own.
-      for (const agentId of changedAgents) this.stateChanged(agentId);
-    }
+  processDue(now = new Date(), active: () => boolean = () => true): Promise<void> {
+    return runRoutine(this.processDueEffect(now, active));
   }
+
+  readonly processDueEffect = Effect.fn("RoutineScheduler.processDue")(function* (
+    this: RoutineScheduler,
+    now = new Date(),
+    active: () => boolean = () => true,
+  ) {
+    const changedAgents = new Set<string>();
+    yield* Effect.gen({ self: this }, function* () {
+      const dueRoutines = yield* routineStep(() => this.#routines.due(now, this.#hooks.excludedAgents()));
+      for (const due of dueRoutines) {
+        if (!active()) break;
+        if (this.#hooks.excludedAgents().has(due.routine.agentId)) continue;
+        const run = yield* routineStep(() => {
+          const { scheduledFor, nextRunAt } = collapseMissedOccurrences(
+            due.schedule,
+            due.routine.timezone,
+            new Date(due.nextRunAt),
+            now,
+          );
+          // A live delivery already owns this routine's work, including after a wake.
+          const queued = this.#hasLiveRun(due.routine.agentId, due.routine.id)
+            ? null
+            : this.#routines.createRun(due.routine, due.triggerId, "scheduled", scheduledFor.toISOString());
+          this.#routines.advanceTrigger(due.routine.id, due.triggerId, nextRunAt.toISOString());
+          changedAgents.add(due.routine.agentId);
+          return queued;
+        });
+        if (run && !run.deliveryId)
+          yield* this.#enqueueRunEffect(run).pipe(
+            Effect.catch((failure) =>
+              Effect.sync(() => this.#hooks.emitError("routine_delivery_failed", failure.cause, due.routine.agentId)),
+            ),
+          );
+      }
+    }).pipe(
+      Effect.catch((failure) => Effect.sync(() => this.#hooks.emitError("routine_scheduler_failed", failure.cause))),
+      Effect.ensuring(
+        Effect.sync(() => {
+          for (const agentId of changedAgents) this.stateChanged(agentId);
+        }),
+      ),
+    );
+  });
 
   /**
    * Whether an earlier run of this routine still holds a delivery in the queue. The run row alone is
@@ -523,50 +569,75 @@ export class RoutineScheduler implements RoutineDueSource {
     });
   }
 
-  async #enqueueRun(run: RoutineRun): Promise<void> {
+  readonly #enqueueRunEffect = Effect.fn("RoutineScheduler.enqueueRun")(function* (
+    this: RoutineScheduler,
+    run: RoutineRun,
+  ) {
     recordRestartActivity();
-    const validateRecipient = this.#mailbox.prepareDelivery([run.agentId]);
-    const agent = await this.#store.getOrCreate(run.agentId);
-    try {
-      validateRecipient();
-      const receipt = await this.#mailbox.enqueue({
-        sender: {
-          kind: "routine",
+    const validateRecipient = yield* routineStep(() => this.#mailbox.prepareDelivery([run.agentId]));
+    const agent = yield* routineIo(() => this.#store.getOrCreate(run.agentId));
+    yield* Effect.gen({ self: this }, function* () {
+      yield* routineStep(validateRecipient);
+      const receipt = yield* routineIo(() =>
+        this.#mailbox.enqueue({
+          sender: {
+            kind: "routine",
+            routineId: run.routineId,
+            runId: run.id,
+            routineName: run.routineName,
+            scheduledFor: run.scheduledFor,
+          },
+          recipientAgentIds: [agent.id],
+          text: run.instruction,
+          draftIds: [],
+          replyToMessageId: null,
+          idempotencyKey: run.triggerId ? `routine:${run.triggerId}:${run.scheduledFor}` : `routine:manual:${run.id}`,
+        }),
+      );
+      const deliveryId = receipt.deliveries[0]?.id;
+      if (!deliveryId)
+        return yield* new RoutineOperationFailed({ cause: new Error("Unable to create the routine delivery.") });
+      const snapshot = yield* routineStep(() => {
+        this.#routines.attachDelivery(run.id, deliveryId);
+        const current = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
+        this.#hooks.syncMailboxMessages(current);
+        return current;
+      });
+      yield* routineIo(() => this.#store.updatePreview(agent.id, run.instruction));
+      yield* routineStep(() => {
+        this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
+        this.#conversation.emitConversation(snapshot, "routine.run-queued", {
           routineId: run.routineId,
           runId: run.id,
-          routineName: run.routineName,
-          scheduledFor: run.scheduledFor,
-        },
-        recipientAgentIds: [agent.id],
-        text: run.instruction,
-        draftIds: [],
-        replyToMessageId: null,
-        idempotencyKey: run.triggerId ? `routine:${run.triggerId}:${run.scheduledFor}` : `routine:manual:${run.id}`,
+        });
+        this.#hooks.emitQueue(agent.id);
+        this.#hooks.scheduleDrain(agent.id);
       });
-      const deliveryId = receipt.deliveries[0]?.id;
-      if (!deliveryId) throw new Error("Unable to create the routine delivery.");
-      this.#routines.attachDelivery(run.id, deliveryId);
-      const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
-      this.#hooks.syncMailboxMessages(snapshot);
-      await this.#store.updatePreview(agent.id, run.instruction);
-      this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
-      this.#conversation.emitConversation(snapshot, "routine.run-queued", { routineId: run.routineId, runId: run.id });
-      this.#hooks.emitQueue(agent.id);
-      this.#hooks.scheduleDrain(agent.id);
-    } catch (error) {
-      this.#transitionRunWithConversation(run, "failed", error instanceof Error ? error.message : String(error));
-      this.stateChanged(run.agentId);
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.tapError((failure) =>
+        routineStep(() => {
+          const error = failure.cause;
+          this.#transitionRunWithConversation(run, "failed", error instanceof Error ? error.message : String(error));
+          this.stateChanged(run.agentId);
+        }),
+      ),
+    );
+  }, Effect.uninterruptible);
 
-  async #interruptRunsBeforeDeletion(agentId: string, runs: RoutineRun[]): Promise<RoutineRun[]> {
+  readonly #interruptRunsBeforeDeletionEffect = Effect.fn("RoutineScheduler.interruptRunsBeforeDeletion")(function* (
+    this: RoutineScheduler,
+    agentId: string,
+    runs: RoutineRun[],
+  ) {
     const startingRun = runs.find((run) => {
       if (!run.deliveryId) return false;
       const delivery = this.#mailbox.getDelivery(run.deliveryId)?.delivery;
       return delivery?.status === "starting" && !delivery.turnId;
     });
-    if (startingRun) await this.#hooks.awaitDrain(agentId);
+    if (startingRun) {
+      const drain = this.#hooks.awaitDrain(agentId);
+      if (drain) yield* routineIo(() => drain);
+    }
 
     const cancellableRuns: RoutineRun[] = [];
     const activeTurnIds = new Set<string>();
@@ -583,18 +654,18 @@ export class RoutineScheduler implements RoutineDueSource {
       }
       if (delivery.status !== "starting" && delivery.status !== "running") continue;
       if (!delivery.turnId) {
-        throw new Error(sourceText("error.backend.routineRunStarting"));
+        return yield* new RoutineOperationFailed({ cause: new Error(sourceText("error.backend.routineRunStarting")) });
       }
       cancellableRuns.push(run);
       activeTurnIds.add(delivery.turnId);
     }
     if (activeTurnIds.size === 0) return cancellableRuns;
     if (!this.#store.activeProviderSession(agentId)) {
-      throw new Error(sourceText("error.backend.routineRunNoSession"));
+      return yield* new RoutineOperationFailed({ cause: new Error(sourceText("error.backend.routineRunNoSession")) });
     }
-    for (const turnId of activeTurnIds) await this.#hooks.interrupt(agentId, turnId);
+    for (const turnId of activeTurnIds) yield* routineIo(() => this.#hooks.interrupt(agentId, turnId));
     return cancellableRuns;
-  }
+  });
 
   #transitionInteractionWithReconciliation(run: RoutineRun, status: "needs-attention" | "running"): void {
     try {
@@ -700,4 +771,22 @@ export class RoutineScheduler implements RoutineDueSource {
       transactionHooks?.onRollback,
     );
   }
+}
+
+export class RoutineOperationFailed extends Schema.TaggedError<RoutineOperationFailed>()("RoutineOperationFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+function routineIo<A>(run: () => Promise<A>): Effect.Effect<A, RoutineOperationFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new RoutineOperationFailed({ cause }) });
+}
+
+function routineStep<A>(run: () => A): Effect.Effect<A, RoutineOperationFailed> {
+  return Effect.try({ try: run, catch: (cause) => new RoutineOperationFailed({ cause }) });
+}
+
+async function runRoutine<A>(operation: Effect.Effect<A, RoutineOperationFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

@@ -1,6 +1,8 @@
 import { type AppLanguagePreference, DEFAULT_APP_LANGUAGE } from "@openbot/contracts/ipc";
 import { type AppTranslate, resolveLocale, type TranslatedLocale, translateFor } from "@openbot/i18n";
-import { readLanguagePreference, writeLanguagePreference } from "./language-preference-store";
+import { Effect } from "effect";
+import { readLanguagePreferenceEffect, writeLanguagePreferenceEffect } from "./language-preference-store";
+import { runPreference } from "./preference-file";
 
 /**
  * The language every native surface draws in: the application menu, desktop notifications, the file
@@ -44,9 +46,13 @@ export class LanguageService {
   }
 
   /** Read the saved preference. Called once at startup, before the first window opens. */
-  async load(): Promise<AppLanguagePreference> {
-    this.#apply(await readLanguagePreference(this.#path));
-    return this.preference;
+  load(): Promise<AppLanguagePreference> {
+    return runPreference(
+      Effect.gen({ self: this }, function* () {
+        this.#apply(yield* readLanguagePreferenceEffect(this.#path));
+        return this.preference;
+      }),
+    );
   }
 
   /**
@@ -66,11 +72,15 @@ export class LanguageService {
     return applied;
   }
 
-  async #write(preference: AppLanguagePreference): Promise<AppLanguagePreference> {
-    const saved = await writeLanguagePreference(this.#path, preference);
-    this.#apply(saved);
-    for (const listener of this.#listeners) listener(this.preference);
-    return this.preference;
+  #write(preference: AppLanguagePreference): Promise<AppLanguagePreference> {
+    return runPreference(
+      Effect.gen({ self: this }, function* () {
+        const saved = yield* writeLanguagePreferenceEffect(this.#path, preference);
+        this.#apply(saved);
+        for (const listener of this.#listeners) listener(this.preference);
+        return this.preference;
+      }).pipe(Effect.uninterruptible),
+    );
   }
 
   subscribe(listener: (preference: AppLanguagePreference) => void): () => void {

@@ -17,6 +17,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { defaultProviderModel } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import {
   type ClaudePlanState,
   foldClaudePlanCall,
@@ -32,8 +33,8 @@ import {
   CLAUDE_WORKSPACE_MANAGED_SETTINGS,
   claudeWorkspaceHooks,
   claudeWorkspaceSandbox,
-  claudeWorkspaceSkillPlugin,
-  claudeWriteOutsideRoots,
+  claudeWorkspaceSkillPluginEffect,
+  claudeWriteOutsideRootsEffect,
 } from "./claude-workspace-sandbox";
 import { type ClaudeCliInfo, claudeTakesPromptSnapshotFlag, cliSpawnTarget } from "./cli";
 import { IdleThreadPool } from "./idle-thread-pool";
@@ -64,6 +65,14 @@ import {
   type ThreadResponse,
   type TurnResponse,
 } from "./protocol";
+import {
+  type ProviderClientOperationError,
+  providerCall,
+  providerFailure,
+  providerResult,
+  providerSync,
+  runProviderClientEffect,
+} from "./provider-client-effects";
 
 const execFileAsync = promisify(execFile);
 const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -237,16 +246,22 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     this.#running = true;
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return runProviderClientEffect(this.#stopOperation());
+  }
+
+  readonly #stopOperation = Effect.fn("ClaudeAgentClient.stop")(function* (
+    this: ClaudeAgentClient,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#running = false;
     const runtimes = this.#threads.clear();
     for (const runtime of runtimes) {
       runtime.input.close();
       runtime.query.close();
     }
-    await Promise.allSettled(runtimes.map((runtime) => runtime.consume));
+    yield* providerCall(() => Promise.allSettled(runtimes.map((runtime) => runtime.consume)));
     this.#serverRequests.rejectAll("Claude session stopped.");
-  }
+  });
 
   releaseIdleThreads(): void {
     this.#threads.releaseIdle();
@@ -257,75 +272,115 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
    * of that thread, so the close is what ends those child processes. The caller releases an idle
    * thread: a turn that still runs would end with the query that carries it.
    */
-  async releaseThread(threadId: string): Promise<void> {
+  releaseThread(threadId: string): Promise<void> {
+    return runProviderClientEffect(this.#releaseThreadOperation(threadId));
+  }
+
+  readonly #releaseThreadOperation = Effect.fn("ClaudeAgentClient.releaseThread")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#threads.forget(threadId);
     const runtime = this.#threads.get(threadId);
     if (!runtime) return;
-    await this.#threads.close(runtime);
+    yield* providerCall(() => this.#threads.close(runtime));
+  });
+
+  #closeRuntime(runtime: ThreadRuntime): Promise<void> {
+    return runProviderClientEffect(this.#closeRuntimeEffect(runtime));
   }
 
-  async #closeRuntime(runtime: ThreadRuntime): Promise<void> {
+  readonly #closeRuntimeEffect = Effect.fn("ClaudeAgentClient.closeRuntime")(function* (
+    this: ClaudeAgentClient,
+    runtime: ThreadRuntime,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     runtime.input.close();
     runtime.query.close();
     // The consumer rejects when the query ends in the middle of a turn. The runtime is already gone
     // from the map, so there is nothing left to report it against.
-    await runtime.consume.catch(() => undefined);
-  }
+    yield* providerCall(() => runtime.consume.catch(() => undefined));
+  });
 
   request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T>;
-  async request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
-    if (!this.#running) throw new Error("Claude Agent SDK is not running.");
+  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
+    return runProviderClientEffect(this.#requestOperation(method, params, decoder, timeoutMs));
+  }
+
+  readonly #requestOperation = Effect.fn("ClaudeAgentClient.request")(function* <T>(
+    this: ClaudeAgentClient,
+    method: string,
+    params: unknown,
+    decoder: ResponseDecoder<T>,
+    timeoutMs?: number,
+  ): Effect.fn.Return<T, ProviderClientOperationError> {
+    if (!this.#running) return yield* providerFailure(new Error("Claude Agent SDK is not running."));
 
     switch (method) {
       case "initialize":
-        return decoder({});
-      case "account/read":
-        return decoder(await this.#readAccount());
-      case "account/rateLimits/read":
-        return decoder(await this.#readUsage(getString(params, "model"), timeoutMs ?? this.#requestTimeoutMs));
-      case "model/list":
-        return decoder({ data: await this.#listModels(timeoutMs) });
+        return yield* providerCall(() => decoder({}));
+      case "account/read": {
+        const response = yield* this.#readAccountEffect();
+        return yield* providerSync(() => decoder(response));
+      }
+      case "account/rateLimits/read": {
+        const response = yield* this.#readUsageEffect(getString(params, "model"), timeoutMs ?? this.#requestTimeoutMs);
+        return yield* providerSync(() => decoder(response));
+      }
+      case "model/list": {
+        const response = { data: yield* this.#listModelsEffect(timeoutMs) };
+        return yield* providerSync(() => decoder(response));
+      }
       case "plugin/list":
-        return decoder({ marketplaces: [] });
+        return yield* providerCall(() => decoder({ marketplaces: [] }));
       case "thread/start": {
         const threadId = randomUUID();
-        await this.#startThread(threadId, readThreadConfig(params), false);
-        return decoder({ thread: { id: threadId } });
+        yield* this.#startThreadEffect(threadId, readThreadConfig(params), false);
+        return yield* providerCall(() => decoder({ thread: { id: threadId } }));
       }
       case "thread/resume": {
-        const threadId = requiredString(params, "threadId");
+        const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         const config = readThreadConfig(params);
         const previous = this.#threadResumes.get(threadId) ?? Promise.resolve();
         const resume = previous.catch(() => undefined).then(() => this.#resumeThread(threadId, config));
         this.#threadResumes.set(threadId, resume);
-        try {
-          await resume;
-        } finally {
-          if (this.#threadResumes.get(threadId) === resume) this.#threadResumes.delete(threadId);
-        }
-        return decoder({ thread: { id: threadId } });
+        yield* Effect.gen({ self: this }, function* () {
+          yield* providerCall(() => resume);
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (this.#threadResumes.get(threadId) === resume) this.#threadResumes.delete(threadId);
+            }),
+          ),
+        );
+        return yield* providerCall(() => decoder({ thread: { id: threadId } }));
       }
-      case "thread/read":
-        return decoder(await this.#readThread(requiredString(params, "threadId")));
-      case "turn/start":
-        return decoder(await this.#startTurn(params));
-      case "turn/steer":
-        return decoder(await this.#steerTurn(params));
+      case "thread/read": {
+        const response = yield* this.#readThreadEffect(requiredString(params, "threadId"));
+        return yield* providerSync(() => decoder(response));
+      }
+      case "turn/start": {
+        const response = yield* this.#startTurnEffect(params);
+        return yield* providerSync(() => decoder(response));
+      }
+      case "turn/steer": {
+        const response = yield* this.#steerTurnEffect(params);
+        return yield* providerSync(() => decoder(response));
+      }
       case "turn/interrupt": {
-        const threadId = requiredString(params, "threadId");
+        const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         // A released thread has no turn to stop.
-        if (this.#threads.isReleased(threadId)) return decoder({});
-        const runtime = this.#requireThread(threadId);
-        await runtime.query.interrupt();
-        return decoder({});
+        if (this.#threads.isReleased(threadId)) return yield* providerCall(() => decoder({}));
+        const runtime = yield* providerSync(() => this.#requireThread(threadId));
+        yield* providerCall(() => runtime.query.interrupt());
+        return yield* providerCall(() => decoder({}));
       }
       case "thread/compact/start":
         // Claude Code manages its own context compaction.
-        return decoder({});
+        return yield* providerCall(() => decoder({}));
       default:
-        throw new Error(`Claude adapter does not implement ${method}.`);
+        return yield* providerFailure(new Error(`Claude adapter does not implement ${method}.`));
     }
-  }
+  });
 
   notify(): void {
     // Claude Agent SDK has no initialize notification.
@@ -356,28 +411,35 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     };
   }
 
-  async #listModels(timeoutMs?: number): Promise<unknown[]> {
+  readonly #listModelsEffect = Effect.fn("ClaudeAgentClient.listModels")(function* (
+    this: ClaudeAgentClient,
+    timeoutMs?: number,
+  ): Effect.fn.Return<unknown[], ProviderClientOperationError> {
     const input = new AsyncMessageQueue();
-    const claudeQuery = this.#createQuery({
-      prompt: input,
-      options: this.#probeOptions(),
-    });
+    const claudeQuery = yield* providerSync(() =>
+      this.#createQuery({
+        prompt: input,
+        options: this.#probeOptions(),
+      }),
+    );
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
+    return yield* Effect.gen({ self: this }, function* () {
       const discovery = claudeQuery.supportedModels();
       const discovered =
         timeoutMs === undefined
-          ? await discovery
-          : await Promise.race([
-              discovery,
-              new Promise<ModelInfo[]>((_, reject) => {
-                timeout = setTimeout(() => {
-                  input.close();
-                  claudeQuery.close();
-                  reject(new RequestTimeoutError("Claude", "model/list"));
-                }, timeoutMs);
-              }),
-            ]);
+          ? yield* providerCall(() => discovery)
+          : yield* providerCall(() =>
+              Promise.race([
+                discovery,
+                new Promise<ModelInfo[]>((_, reject) => {
+                  timeout = setTimeout(() => {
+                    input.close();
+                    claudeQuery.close();
+                    reject(new RequestTimeoutError("Claude", "model/list"));
+                  }, timeoutMs);
+                }),
+              ]),
+            );
       const models = new Map<string, (typeof discovered)[number]>();
       for (const model of discovered) {
         const id = model.resolvedModel?.trim() || model.value.trim();
@@ -413,44 +475,62 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       this.#modelSdkValues.clear();
       for (const [id, capability] of effortCapabilities) this.#modelEffortCapabilities.set(id, capability);
       for (const [id, value] of sdkValues) this.#modelSdkValues.set(id, value);
-      return result;
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      input.close();
-      claudeQuery.close();
-    }
-  }
+      return yield* providerCall(() => result);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (timeout) clearTimeout(timeout);
+          input.close();
+          claudeQuery.close();
+        }),
+      ),
+    );
+  });
 
-  async #readUsage(model: string | null, timeoutMs: number): Promise<AccountRateLimitsReadResult> {
+  readonly #readUsageEffect = Effect.fn("ClaudeAgentClient.readUsage")(function* (
+    this: ClaudeAgentClient,
+    model: string | null,
+    timeoutMs: number,
+  ): Effect.fn.Return<AccountRateLimitsReadResult, ProviderClientOperationError> {
     const input = new AsyncMessageQueue();
-    const claudeQuery = this.#createQuery({
-      prompt: input,
-      options: this.#probeOptions(),
-    });
+    const claudeQuery = yield* providerSync(() =>
+      this.#createQuery({
+        prompt: input,
+        options: this.#probeOptions(),
+      }),
+    );
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
+    return yield* Effect.gen({ self: this }, function* () {
       const readUsage = claudeQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
       if (!readUsage) return { rateLimits: null, rateLimitsByLimitId: null };
-      const usage = await Promise.race([
-        readUsage.call(claudeQuery),
-        new Promise<unknown>((_, reject) => {
-          timeout = setTimeout(() => {
-            input.close();
-            claudeQuery.close();
-            reject(new RequestTimeoutError("Claude", "account/rateLimits/read"));
-          }, timeoutMs);
+      const usage = yield* providerCall(() =>
+        Promise.race([
+          readUsage.call(claudeQuery),
+          new Promise<unknown>((_, reject) => {
+            timeout = setTimeout(() => {
+              input.close();
+              claudeQuery.close();
+              reject(new RequestTimeoutError("Claude", "account/rateLimits/read"));
+            }, timeoutMs);
+          }),
+        ]),
+      );
+      return yield* providerCall(() => claudeRateLimits(usage, model));
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (timeout) clearTimeout(timeout);
+          input.close();
+          claudeQuery.close();
         }),
-      ]);
-      return claudeRateLimits(usage, model);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      input.close();
-      claudeQuery.close();
-    }
-  }
+      ),
+    );
+  });
 
-  async #readAccount(): Promise<AccountReadResult> {
-    const status = await this.#readAuthStatus();
+  readonly #readAccountEffect = Effect.fn("ClaudeAgentClient.readAccount")(function* (
+    this: ClaudeAgentClient,
+  ): Effect.fn.Return<AccountReadResult, ProviderClientOperationError> {
+    const status = yield* this.#readAuthStatusEffect();
     if (status.loggedIn !== true) return { account: null, requiresOpenaiAuth: false };
     return {
       account: {
@@ -460,137 +540,192 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       },
       requiresOpenaiAuth: false,
     };
-  }
+  });
 
   /**
    * `claude auth status` exits 1 when signed out and still prints its status. Only a status says
    * signed out: a timeout, a failed spawn or unreadable output throws, so an account refresh keeps
    * the working client instead of stopping it as signed out.
    */
-  async #readAuthStatus(): Promise<DynamicRecord> {
+
+  readonly #readAuthStatusEffect = Effect.fn("ClaudeAgentClient.readAuthStatus")(function* (
+    this: ClaudeAgentClient,
+  ): Effect.fn.Return<DynamicRecord, ProviderClientOperationError> {
     let stdout: unknown;
     let failure: unknown = null;
     const target = cliSpawnTarget(this.#cli.executable, ["auth", "status", "--json"]);
     try {
-      ({ stdout } = await execFileAsync(target.command, target.args, {
-        timeout: 5_000,
-        maxBuffer: 64 * 1024,
-        windowsVerbatimArguments: target.windowsVerbatimArguments,
-        env: claudeEnvironment(this.#cli),
-      }));
+      ({ stdout } = providerResult(
+        yield* Effect.result(
+          providerCall(() =>
+            execFileAsync(target.command, target.args, {
+              timeout: 5_000,
+              maxBuffer: 64 * 1024,
+              windowsVerbatimArguments: target.windowsVerbatimArguments,
+              env: claudeEnvironment(this.#cli),
+            }),
+          ),
+        ),
+      ));
     } catch (error) {
       failure = error;
       stdout = isRecord(error) ? error.stdout : undefined;
     }
     const status = parseAuthStatus(stdout);
-    if (status && (failure === null || status.loggedIn === false)) return status;
+    if (status && (failure === null || status.loggedIn === false)) return yield* providerCall(() => status);
     // `execFile` marks a child it stopped at its timeout: a busy computer, not a failed check.
-    if (isDynamicRecord(failure) && failure.killed === true) throw new RequestTimeoutError("Claude", "account/read");
-    throw failure ?? new Error("Claude returned an unreadable sign-in status.");
+    if (isDynamicRecord(failure) && failure.killed === true)
+      return yield* providerFailure(new RequestTimeoutError("Claude", "account/read"));
+    return yield* providerFailure(failure ?? new Error("Claude returned an unreadable sign-in status."));
+  });
+
+  #resumeThread(threadId: string, config: ThreadConfig): Promise<void> {
+    return runProviderClientEffect(this.#resumeThreadEffect(threadId, config));
   }
 
-  async #resumeThread(threadId: string, config: ThreadConfig): Promise<void> {
+  readonly #resumeThreadEffect = Effect.fn("ClaudeAgentClient.resumeThread")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+    config: ThreadConfig,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     // A turn can open a released thread again at each await here: that query is the one to
     // compare, not a second one, so the check runs again until this resume opens the thread.
     for (;;) {
-      await this.#threads.opened(threadId);
+      yield* providerCall(() => this.#threads.opened(threadId));
       const current = this.#threads.get(threadId);
       if (current && JSON.stringify(current.config) === JSON.stringify(config)) return;
       if (current) {
-        if (current.activeTurn) throw new Error(sourceText("error.provider.claudeTurnActive"));
-        await this.#threads.close(current);
+        if (current.activeTurn) return yield* providerFailure(new Error(sourceText("error.provider.claudeTurnActive")));
+        yield* providerCall(() => this.#threads.close(current));
         continue;
       }
-      if (await this.#threads.opening(threadId, () => this.#startThread(threadId, config, true))) return;
+      if (yield* providerCall(() => this.#threads.opening(threadId, () => this.#startThread(threadId, config, true))))
+        return;
     }
+  });
+
+  #startThread(threadId: string, config: ThreadConfig, resume: boolean): Promise<void> {
+    return runProviderClientEffect(this.#startThreadEffect(threadId, config, resume));
   }
 
-  async #startThread(threadId: string, config: ThreadConfig, resume: boolean): Promise<void> {
+  readonly #startThreadEffect = Effect.fn("ClaudeAgentClient.startThread")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+    config: ThreadConfig,
+    resume: boolean,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     const input = new AsyncMessageQueue();
     const appliedEffort = this.#resolveEffort(config.model, config.effort);
-    const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
-      if (config.profileGeneration) return { behavior: "deny", message: "Profile generation has no tools." };
-      if (config.workspaceOnly) {
-        const outside = await claudeWriteOutsideRoots(toolName, toolInput, config.cwd, config.additionalDirectories);
-        if (outside) return this.#requestWriteApproval(threadId, outside, toolInput, options.toolUseID ?? randomUUID());
-      }
-      if (toolName !== "AskUserQuestion") {
-        return { behavior: "allow", updatedInput: toolInput } satisfies PermissionResult;
-      }
-      return this.#requestUserInput(threadId, toolInput, options.toolUseID ?? randomUUID());
-    };
+    const canUseTool: CanUseTool = (toolName, toolInput, options) =>
+      runProviderClientEffect(
+        Effect.gen({ self: this }, function* () {
+          if (config.profileGeneration) return { behavior: "deny", message: "Profile generation has no tools." };
+          if (config.workspaceOnly) {
+            const outside = yield* claudeWriteOutsideRootsEffect(
+              toolName,
+              toolInput,
+              config.cwd,
+              config.additionalDirectories,
+            );
+            if (outside)
+              return yield* this.#requestWriteApprovalEffect(
+                threadId,
+                outside,
+                toolInput,
+                options.toolUseID ?? randomUUID(),
+              );
+          }
+          if (toolName !== "AskUserQuestion") {
+            return yield* providerCall(
+              () => ({ behavior: "allow", updatedInput: toolInput }) satisfies PermissionResult,
+            );
+          }
+          return yield* this.#requestUserInputEffect(threadId, toolInput, options.toolUseID ?? randomUUID());
+        }),
+      );
     // OpenBot's own servers spread last: Claude keys this record by name, so a user configuration
     // that reached one of those names would take the agent's own tools away. Profile generation
     // asks one question and must not act, so it gets neither set.
     const handoff = config.profileGeneration
       ? null
       : claudeMcpServers(
-          await usableMcpServers(
-            agentMcpServers(this.#mcpServers(), config.computerUse),
-            this.#mcpToolRuntimes?.(),
-            this.#mcpAuthorization,
+          yield* providerCall(() =>
+            usableMcpServers(
+              agentMcpServers(this.#mcpServers(), config.computerUse),
+              this.#mcpToolRuntimes?.(),
+              this.#mcpAuthorization,
+            ),
           ),
         );
+    const stateDirectory = this.#stateDirectory;
     const skillPlugin =
-      config.workspaceOnly && this.#stateDirectory
-        ? await claudeWorkspaceSkillPlugin(this.#stateDirectory, config.cwd)
+      config.workspaceOnly && stateDirectory
+        ? yield* claudeWorkspaceSkillPluginEffect(stateDirectory, config.cwd)
         : null;
     // `stop()` may have run during the await: a query created now would outlive the client.
-    if (!this.#running) throw new Error("Claude Agent SDK is not running.");
+    if (!this.#running) return yield* providerFailure(new Error("Claude Agent SDK is not running."));
     if (handoff) this.#reportMcpDrops?.(this.provider, handoff.dropped);
     const mcpServers = handoff ? { ...handoff.servers, ...this.#createOpenBotServers(threadId) } : {};
-    const claudeQuery = this.#createQuery({
-      prompt: input,
-      options: {
-        cwd: config.cwd,
-        pathToClaudeCodeExecutable: this.#cli.executable,
-        ...(config.model ? { model: this.#sdkModel(config.model) } : {}),
-        ...(appliedEffort ? { effort: appliedEffort } : {}),
-        ...(resume ? { resume: threadId } : { sessionId: threadId }),
-        systemPrompt: {
-          type: "preset",
-          preset: "claude_code",
-          append: config.developerInstructions,
+    const claudeQuery = yield* providerSync(() =>
+      this.#createQuery({
+        prompt: input,
+        options: {
+          cwd: config.cwd,
+          pathToClaudeCodeExecutable: this.#cli.executable,
+          ...(config.model ? { model: this.#sdkModel(config.model) } : {}),
+          ...(appliedEffort ? { effort: appliedEffort } : {}),
+          ...(resume ? { resume: threadId } : { sessionId: threadId }),
+          systemPrompt: {
+            type: "preset",
+            preset: "claude_code",
+            append: config.developerInstructions,
+          },
+          // The developer instructions carry the profile and the memories, and `thread/resume` above
+          // restarts the query when they change. A recorded prompt would be sent instead of them on
+          // every later request and resume, so the agent kept an edited profile's old text. The CLI
+          // flag, not the SDK's `systemPromptSnapshot` option: the CLI records by default and ignores
+          // that option.
+          ...(claudeTakesPromptSnapshotFlag(this.#cli.version)
+            ? { extraArgs: { "system-prompt-snapshot": "off" } }
+            : {}),
+          ...(config.profileGeneration ? { tools: [] } : {}),
+          settingSources: config.profileGeneration
+            ? []
+            : config.workspaceOnly
+              ? ["user"]
+              : ["user", "project", "local"],
+          // The MCP panel is the only door. Without this, Claude merges project `.mcp.json`, user
+          // settings, plugin and agent-frontmatter servers into the record above, so two computers
+          // with the same OpenBot settings give their agents different tools and "which servers does
+          // my agent have" has no answer. The flag takes away MCP and nothing else, so permissions and
+          // hooks still load from those files. Workspace only loads the user settings alone: see
+          // `claude-workspace-sandbox.ts`.
+          strictMcpConfig: true,
+          permissionMode: "default",
+          includePartialMessages: true,
+          persistSession: config.persistSession,
+          additionalDirectories: config.additionalDirectories,
+          canUseTool,
+          ...(config.workspaceOnly
+            ? {
+                sandbox: claudeWorkspaceSandbox(config.additionalDirectories),
+                hooks: claudeWorkspaceHooks(config.cwd, config.additionalDirectories),
+                managedSettings: CLAUDE_WORKSPACE_MANAGED_SETTINGS,
+                plugins: skillPlugin ? [skillPlugin] : [],
+              }
+            : {}),
+          mcpServers,
+          env: {
+            ...claudeEnvironment(this.#cli),
+            ...this.#agentEnvironment?.(),
+            CLAUDE_AGENT_SDK_CLIENT_APP: "openbot/0.1.0",
+            // Without a terminal, the CLI gives the newer models no TodoWrite or task tools, so the
+            // agent has no plan for OpenBot to show as a task list.
+            CLAUDE_CODE_ENABLE_TODO_TOOLS: "1",
+          },
         },
-        // The developer instructions carry the profile and the memories, and `thread/resume` above
-        // restarts the query when they change. A recorded prompt would be sent instead of them on
-        // every later request and resume, so the agent kept an edited profile's old text. The CLI
-        // flag, not the SDK's `systemPromptSnapshot` option: the CLI records by default and ignores
-        // that option.
-        ...(claudeTakesPromptSnapshotFlag(this.#cli.version) ? { extraArgs: { "system-prompt-snapshot": "off" } } : {}),
-        ...(config.profileGeneration ? { tools: [] } : {}),
-        settingSources: config.profileGeneration ? [] : config.workspaceOnly ? ["user"] : ["user", "project", "local"],
-        // The MCP panel is the only door. Without this, Claude merges project `.mcp.json`, user
-        // settings, plugin and agent-frontmatter servers into the record above, so two computers
-        // with the same OpenBot settings give their agents different tools and "which servers does
-        // my agent have" has no answer. The flag takes away MCP and nothing else, so permissions and
-        // hooks still load from those files. Workspace only loads the user settings alone: see
-        // `claude-workspace-sandbox.ts`.
-        strictMcpConfig: true,
-        permissionMode: "default",
-        includePartialMessages: true,
-        persistSession: config.persistSession,
-        additionalDirectories: config.additionalDirectories,
-        canUseTool,
-        ...(config.workspaceOnly
-          ? {
-              sandbox: claudeWorkspaceSandbox(config.additionalDirectories),
-              hooks: claudeWorkspaceHooks(config.cwd, config.additionalDirectories),
-              managedSettings: CLAUDE_WORKSPACE_MANAGED_SETTINGS,
-              plugins: skillPlugin ? [skillPlugin] : [],
-            }
-          : {}),
-        mcpServers,
-        env: {
-          ...claudeEnvironment(this.#cli),
-          ...this.#agentEnvironment?.(),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "openbot/0.1.0",
-          // Without a terminal, the CLI gives the newer models no TodoWrite or task tools, so the
-          // agent has no plan for OpenBot to show as a task list.
-          CLAUDE_CODE_ENABLE_TODO_TOOLS: "1",
-        },
-      },
-    });
+      }),
+    );
     const runtime: ThreadRuntime = {
       id: threadId,
       usageCounterId: randomUUID(),
@@ -607,32 +742,44 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     };
     runtime.consume = this.#consume(runtime);
     this.#threads.add(runtime);
+  });
+
+  readonly #startTurnEffect = Effect.fn("ClaudeAgentClient.startTurn")(function* (
+    this: ClaudeAgentClient,
+    params: unknown,
+  ): Effect.fn.Return<TurnResponse, ProviderClientOperationError> {
+    const threadId = yield* providerSync(() => requiredString(params, "threadId"));
+    return yield* providerCall(() => this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params)));
+  });
+
+  #openTurn(threadId: string, params: unknown): Promise<TurnResponse> {
+    return runProviderClientEffect(this.#openTurnEffect(threadId, params));
   }
 
-  async #startTurn(params: unknown): Promise<TurnResponse> {
-    const threadId = requiredString(params, "threadId");
-    return this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params));
-  }
-
-  async #openTurn(threadId: string, params: unknown): Promise<TurnResponse> {
-    await this.#threads.wake(threadId);
-    const runtime = this.#requireThread(threadId);
-    if (runtime.activeTurn) throw new Error("The Claude thread already has an active turn.");
+  readonly #openTurnEffect = Effect.fn("ClaudeAgentClient.openTurn")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+    params: unknown,
+  ): Effect.fn.Return<TurnResponse, ProviderClientOperationError> {
+    yield* providerCall(() => this.#threads.wake(threadId));
+    const runtime = yield* providerSync(() => this.#requireThread(threadId));
+    if (runtime.activeTurn) return yield* providerFailure(new Error("The Claude thread already has an active turn."));
 
     const requestedModel = getString(params, "model");
     const modelChanged = Boolean(requestedModel && requestedModel !== runtime.config.model);
     if (requestedModel && modelChanged) {
-      await runtime.query.setModel(this.#sdkModel(requestedModel));
+      yield* providerCall(() => runtime.query.setModel(this.#sdkModel(requestedModel)));
       runtime.config.model = requestedModel;
     }
     const requestedEffort = getString(params, "effort");
     const selectedEffort = requestedEffort ?? runtime.config.effort;
     const appliedEffort = this.#resolveEffort(runtime.config.model, selectedEffort);
     if (!appliedEffort) {
-      if (runtime.appliedEffort !== undefined) await runtime.query.applyFlagSettings({ effortLevel: null });
+      if (runtime.appliedEffort !== undefined)
+        yield* providerCall(() => runtime.query.applyFlagSettings({ effortLevel: null }));
       runtime.appliedEffort = undefined;
     } else if (modelChanged || appliedEffort !== runtime.appliedEffort) {
-      await runtime.query.applyFlagSettings({ effortLevel: appliedEffort });
+      yield* providerCall(() => runtime.query.applyFlagSettings({ effortLevel: appliedEffort }));
       runtime.appliedEffort = appliedEffort;
     }
     if (requestedEffort) runtime.config.effort = requestedEffort;
@@ -673,14 +820,17 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       session_id: threadId,
     });
     return { turn: { id: turnId, status: "inProgress" } };
-  }
+  });
 
-  async #steerTurn(params: unknown): Promise<{ turnId: string }> {
-    const threadId = requiredString(params, "threadId");
-    const runtime = this.#requireThread(threadId);
-    const expectedTurnId = requiredString(params, "expectedTurnId");
+  readonly #steerTurnEffect = Effect.fn("ClaudeAgentClient.steerTurn")(function* (
+    this: ClaudeAgentClient,
+    params: unknown,
+  ): Effect.fn.Return<{ turnId: string }, ProviderClientOperationError> {
+    const threadId = yield* providerSync(() => requiredString(params, "threadId"));
+    const runtime = yield* providerSync(() => this.#requireThread(threadId));
+    const expectedTurnId = yield* providerSync(() => requiredString(params, "expectedTurnId"));
     if (!runtime.activeTurn || runtime.activeTurn.id !== expectedTurnId) {
-      throw new Error("The active Claude turn changed before steering was accepted.");
+      return yield* providerFailure(new Error("The active Claude turn changed before steering was accepted."));
     }
     const clientId = getString(params, "clientUserMessageId");
     const messageId = clientId && isUuid(clientId) ? clientId : randomUUID();
@@ -692,11 +842,37 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       session_id: threadId,
     });
     return { turnId: runtime.activeTurn.id };
+  });
+
+  #consume(runtime: ThreadRuntime): Promise<void> {
+    return runProviderClientEffect(this.#consumeEffect(runtime));
   }
 
-  async #consume(runtime: ThreadRuntime): Promise<void> {
+  readonly #consumeEffect = Effect.fn("ClaudeAgentClient.consume")(function* (
+    this: ClaudeAgentClient,
+    runtime: ThreadRuntime,
+  ): Effect.fn.Return<void, ProviderClientOperationError> {
     try {
-      for await (const message of runtime.query) this.#handleMessage(runtime, message);
+      let complete = false;
+      providerResult(
+        yield* Effect.result(
+          Effect.acquireUseRelease(
+            providerSync(() => runtime.query[Symbol.asyncIterator]()),
+            (iterator) =>
+              Effect.gen({ self: this }, function* () {
+                for (;;) {
+                  const next = yield* providerCall(() => iterator.next());
+                  if (next.done) {
+                    complete = true;
+                    break;
+                  }
+                  yield* providerSync(() => this.#handleMessage(runtime, next.value));
+                }
+              }),
+            (iterator) => (complete ? Effect.void : providerCall(() => iterator.return?.()).pipe(Effect.asVoid)),
+          ),
+        ),
+      );
       if (this.#running && this.#threads.get(runtime.id) === runtime) {
         this.#fail(new Error("Claude session stream ended unexpectedly."));
       }
@@ -706,7 +882,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       if (activeTurn) this.#completeTurn(runtime, "failed", error);
       this.#fail(error instanceof Error ? error : new Error(String(error)));
     }
-  }
+  });
 
   #fail(error: Error): void {
     if (!this.#running) return;
@@ -1000,9 +1176,12 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     this.#threads.markIdle(runtime);
   }
 
-  async #readThread(threadId: string): Promise<ThreadResponse> {
+  readonly #readThreadEffect = Effect.fn("ClaudeAgentClient.readThread")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+  ): Effect.fn.Return<ThreadResponse, ProviderClientOperationError> {
     const cwd = this.#threads.get(threadId)?.config.cwd ?? this.#threads.released(threadId)?.cwd;
-    const messages = await this.#readSessionMessages(threadId, cwd ? { dir: cwd } : undefined);
+    const messages = yield* providerCall(() => this.#readSessionMessages(threadId, cwd ? { dir: cwd } : undefined));
     const turns: NonNullable<ThreadResponse["thread"]["turns"]> = [];
     let current: (typeof turns)[number] | null = null;
     let currentThinking: ThreadItem | null = null;
@@ -1087,7 +1266,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       }
     }
     return { thread: { id: threadId, turns } };
-  }
+  });
 
   #createOpenBotServers(threadId: string) {
     const call = (namespace: string, name: string, args: unknown) =>
@@ -1115,26 +1294,43 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     };
   }
 
-  async #callDynamicTool(threadId: string, namespace: string, name: string, args: unknown): Promise<CallToolResult> {
-    const runtime = this.#requireThread(threadId);
-    const result = await this.#serverRequests.call("item/tool/call", {
-      threadId,
-      turnId: runtime.activeTurn?.id ?? randomUUID(),
-      callId: randomUUID(),
-      namespace,
-      tool: name,
-      arguments: args,
-    });
+  #callDynamicTool(threadId: string, namespace: string, name: string, args: unknown): Promise<CallToolResult> {
+    return runProviderClientEffect(this.#callDynamicToolEffect(threadId, namespace, name, args));
+  }
+
+  readonly #callDynamicToolEffect = Effect.fn("ClaudeAgentClient.callDynamicTool")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+    namespace: string,
+    name: string,
+    args: unknown,
+  ): Effect.fn.Return<CallToolResult, ProviderClientOperationError> {
+    const runtime = yield* providerSync(() => this.#requireThread(threadId));
+    const result = yield* providerCall(() =>
+      this.#serverRequests.call("item/tool/call", {
+        threadId,
+        turnId: runtime.activeTurn?.id ?? randomUUID(),
+        callId: randomUUID(),
+        namespace,
+        tool: name,
+        arguments: args,
+      }),
+    );
     if (!isRecord(result)) return { content: [{ type: "text" as const, text: String(result) }] };
     const content: CallToolResult["content"] = [];
     if (Array.isArray(result.contentItems)) {
       for (const item of result.contentItems) content.push(...dynamicContent(item));
     }
     return { content, isError: result.success === false };
-  }
+  });
 
-  async #requestUserInput(threadId: string, input: DynamicRecord, toolUseId: string): Promise<PermissionResult> {
-    const runtime = this.#requireThread(threadId);
+  readonly #requestUserInputEffect = Effect.fn("ClaudeAgentClient.requestUserInput")(function* (
+    this: ClaudeAgentClient,
+    threadId: string,
+    input: DynamicRecord,
+    toolUseId: string,
+  ): Effect.fn.Return<PermissionResult, ProviderClientOperationError> {
+    const runtime = yield* providerSync(() => this.#requireThread(threadId));
     const rawQuestions = Array.isArray(input.questions) ? input.questions.filter(isRecord) : [];
     const questions = rawQuestions.map((question, index) => ({
       id: `question-${index}`,
@@ -1142,12 +1338,14 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       question: isString(question.question) ? question.question : "Claude needs more information.",
       options: Array.isArray(question.options) ? question.options : undefined,
     }));
-    const result = await this.#serverRequests.call("item/tool/requestUserInput", {
-      threadId,
-      turnId: runtime.activeTurn?.id ?? randomUUID(),
-      itemId: toolUseId,
-      questions,
-    });
+    const result = yield* providerCall(() =>
+      this.#serverRequests.call("item/tool/requestUserInput", {
+        threadId,
+        turnId: runtime.activeTurn?.id ?? randomUUID(),
+        itemId: toolUseId,
+        questions,
+      }),
+    );
     const responseAnswers = isRecord(result) && isRecord(result.answers) ? result.answers : {};
     const answers = Object.fromEntries(
       questions.map((question) => {
@@ -1157,27 +1355,31 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       }),
     );
     return { behavior: "allow", updatedInput: { questions: input.questions, answers } };
-  }
+  });
 
   /**
    * A Workspace only agent's file write outside its roots, shown as a file-change approval. The
    * approval registry never answers it without the user, as for a Codex write outside the sandbox.
    */
-  async #requestWriteApproval(
+
+  readonly #requestWriteApprovalEffect = Effect.fn("ClaudeAgentClient.requestWriteApproval")(function* (
+    this: ClaudeAgentClient,
     threadId: string,
     path: string,
     toolInput: DynamicRecord,
     toolUseId: string,
-  ): Promise<PermissionResult> {
-    const result = await this.#serverRequests.call("item/fileChange/requestApproval", {
-      threadId,
-      turnId: this.#threads.get(threadId)?.activeTurn?.id ?? randomUUID(),
-      itemId: toolUseId,
-      reason: sourceText("status.agent.claudeWriteOutside", { path }),
-    });
+  ): Effect.fn.Return<PermissionResult, ProviderClientOperationError> {
+    const result = yield* providerCall(() =>
+      this.#serverRequests.call("item/fileChange/requestApproval", {
+        threadId,
+        turnId: this.#threads.get(threadId)?.activeTurn?.id ?? randomUUID(),
+        itemId: toolUseId,
+        reason: sourceText("status.agent.claudeWriteOutside", { path }),
+      }),
+    );
     if (isRecord(result) && result.decision === "accept") return { behavior: "allow", updatedInput: toolInput };
     return { behavior: "deny", message: "The user did not allow this write outside the workspace." };
-  }
+  });
 
   #requireThread(threadId: string): ThreadRuntime {
     const runtime = this.#threads.get(threadId);

@@ -1,6 +1,8 @@
+import { Effect } from "effect";
 import type { SendCommand } from "./browser-cdp-values";
+import { browserCall, browserFailure, browserSync, runBrowserEffect } from "./browser-effects";
 
-export async function dispatchMouseClick(
+export function dispatchMouseClick(
   send: SendCommand,
   coordinates: { x: number; y: number },
   button: "left" | "middle" | "right",
@@ -8,36 +10,61 @@ export async function dispatchMouseClick(
   modifiers: number,
   sessionId?: string,
 ): Promise<void> {
-  await send("Input.dispatchMouseEvent", { type: "mouseMoved", ...coordinates, modifiers }, sessionId);
-  for (let clickCount = 1; clickCount <= totalClicks; clickCount += 1) {
-    await send(
-      "Input.dispatchMouseEvent",
-      { type: "mousePressed", ...coordinates, button, clickCount, modifiers },
-      sessionId,
-    );
-    await send(
-      "Input.dispatchMouseEvent",
-      { type: "mouseReleased", ...coordinates, button, clickCount, modifiers },
-      sessionId,
-    );
-  }
+  return runBrowserEffect(dispatchMouseClickEffect(send, coordinates, button, totalClicks, modifiers, sessionId));
 }
 
-export async function dispatchShortcut(send: SendCommand, shortcut: string, sessionId?: string): Promise<void> {
+export const dispatchMouseClickEffect = Effect.fn("Browser.dispatchMouseClick")(function* (
+  send: SendCommand,
+  coordinates: { x: number; y: number },
+  button: "left" | "middle" | "right",
+  totalClicks: number,
+  modifiers: number,
+  sessionId?: string,
+) {
+  yield* browserCall(() =>
+    send("Input.dispatchMouseEvent", { type: "mouseMoved", ...coordinates, modifiers }, sessionId),
+  );
+  for (let clickCount = 1; clickCount <= totalClicks; clickCount += 1) {
+    yield* browserCall(() =>
+      send(
+        "Input.dispatchMouseEvent",
+        { type: "mousePressed", ...coordinates, button, clickCount, modifiers },
+        sessionId,
+      ),
+    );
+    yield* browserCall(() =>
+      send(
+        "Input.dispatchMouseEvent",
+        { type: "mouseReleased", ...coordinates, button, clickCount, modifiers },
+        sessionId,
+      ),
+    );
+  }
+});
+
+export function dispatchShortcut(send: SendCommand, shortcut: string, sessionId?: string): Promise<void> {
+  return runBrowserEffect(dispatchShortcutEffect(send, shortcut, sessionId));
+}
+
+export const dispatchShortcutEffect = Effect.fn("Browser.dispatchShortcut")(function* (
+  send: SendCommand,
+  shortcut: string,
+  sessionId?: string,
+) {
   const parts = shortcut
     .split("+")
     .map((part) => part.trim())
     .filter(Boolean);
-  if (parts.length === 0 || parts.length > 5) throw new Error("Invalid browser shortcut.");
+  if (parts.length === 0 || parts.length > 5) return yield* browserFailure(new Error("Invalid browser shortcut."));
   const key = parts.pop();
-  if (!key) throw new Error("Invalid browser shortcut.");
+  if (!key) return yield* browserFailure(new Error("Invalid browser shortcut."));
   const modifierNames: string[] = [];
   for (const part of parts) {
     const modifier = normalizeModifier(part);
-    if (!modifier) throw new Error(`Invalid browser shortcut: ${shortcut}`);
+    if (!modifier) return yield* browserFailure(new Error(`Invalid browser shortcut: ${shortcut}`));
     modifierNames.push(modifier);
   }
-  const { text: keyText, ...normalized } = normalizeKey(key);
+  const { text: keyText, ...normalized } = yield* browserSync(() => normalizeKey(key));
   const modifiers = modifierMask(modifierNames);
   const shiftOnly = modifiers === SHIFT_MODIFIER;
   // A named key gets its character from the alias table; a single-character shortcut is its own.
@@ -53,42 +80,54 @@ export async function dispatchShortcut(send: SendCommand, shortcut: string, sess
   const keyInfo = shiftOnly && keyText === undefined && character ? { ...normalized, key: character } : normalized;
   const pressedModifiers: string[] = [];
   let keyPressed = false;
-  try {
+  yield* Effect.gen(function* () {
     for (const modifier of modifierNames) {
-      await send(
-        "Input.dispatchKeyEvent",
-        {
-          type: "rawKeyDown",
-          key: modifier,
-          code: `${modifier}Left`,
-          modifiers: modifierMask([...pressedModifiers, modifier]),
-        },
-        sessionId,
+      yield* browserCall(() =>
+        send(
+          "Input.dispatchKeyEvent",
+          {
+            type: "rawKeyDown",
+            key: modifier,
+            code: `${modifier}Left`,
+            modifiers: modifierMask([...pressedModifiers, modifier]),
+          },
+          sessionId,
+        ),
       );
       pressedModifiers.push(modifier);
     }
-    await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...keyInfo, modifiers }, sessionId);
+    yield* browserCall(() => send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...keyInfo, modifiers }, sessionId));
     keyPressed = true;
     if (character !== undefined && (modifiers === 0 || shiftOnly))
       // The keypress has to agree with the keydown around it. Without the mask CDP defaults it to
       // zero, so `Shift+Enter` arrives at the page as an unshifted Enter -- and a composer that
       // decides between "send" and "line break" in its keypress handler sends the message.
-      await send("Input.dispatchKeyEvent", { type: "char", ...keyInfo, modifiers, text: character }, sessionId);
-    await send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId);
+      yield* browserCall(() =>
+        send("Input.dispatchKeyEvent", { type: "char", ...keyInfo, modifiers, text: character }, sessionId),
+      );
+    yield* browserCall(() => send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId));
     keyPressed = false;
-  } finally {
-    if (keyPressed) {
-      await send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId).catch(() => undefined);
-    }
-    for (const modifier of [...pressedModifiers].reverse()) {
-      await send(
-        "Input.dispatchKeyEvent",
-        { type: "keyUp", key: modifier, code: `${modifier}Left`, modifiers: 0 },
-        sessionId,
-      ).catch(() => undefined);
-    }
-  }
-}
+  }).pipe(
+    Effect.ensuring(
+      Effect.gen(function* () {
+        if (keyPressed) {
+          yield* browserCall(() =>
+            send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId).catch(() => undefined),
+          );
+        }
+        for (const modifier of [...pressedModifiers].reverse()) {
+          yield* browserCall(() =>
+            send(
+              "Input.dispatchKeyEvent",
+              { type: "keyUp", key: modifier, code: `${modifier}Left`, modifiers: 0 },
+              sessionId,
+            ).catch(() => undefined),
+          );
+        }
+      }).pipe(Effect.orDie),
+    ),
+  );
+});
 
 function normalizeModifier(value: string) {
   const lower = value.toLowerCase();
@@ -99,21 +138,33 @@ function normalizeModifier(value: string) {
   return null;
 }
 
-export async function dispatchTextKey(send: SendCommand, character: string, sessionId?: string): Promise<void> {
+export function dispatchTextKey(send: SendCommand, character: string, sessionId?: string): Promise<void> {
+  return runBrowserEffect(dispatchTextKeyEffect(send, character, sessionId));
+}
+
+export const dispatchTextKeyEffect = Effect.fn("Browser.dispatchTextKey")(function* (
+  send: SendCommand,
+  character: string,
+  sessionId?: string,
+) {
   const upper = character.toUpperCase();
   const code = /^[a-z]$/i.test(character) ? `Key${upper}` : "Unidentified";
-  await send(
-    "Input.dispatchKeyEvent",
-    { type: "rawKeyDown", key: character, code, text: character, unmodifiedText: character },
-    sessionId,
+  yield* browserCall(() =>
+    send(
+      "Input.dispatchKeyEvent",
+      { type: "rawKeyDown", key: character, code, text: character, unmodifiedText: character },
+      sessionId,
+    ),
   );
-  await send(
-    "Input.dispatchKeyEvent",
-    { type: "char", key: character, code, text: character, unmodifiedText: character },
-    sessionId,
+  yield* browserCall(() =>
+    send(
+      "Input.dispatchKeyEvent",
+      { type: "char", key: character, code, text: character, unmodifiedText: character },
+      sessionId,
+    ),
   );
-  await send("Input.dispatchKeyEvent", { type: "keyUp", key: character, code }, sessionId);
-}
+  yield* browserCall(() => send("Input.dispatchKeyEvent", { type: "keyUp", key: character, code }, sessionId));
+});
 
 // `text` is the character the key produces, and only the keys that produce one carry it. Chromium
 // decides implicit form submission and text insertion from the character event, not the key event:

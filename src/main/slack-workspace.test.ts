@@ -217,7 +217,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await messaging?.stop();
   messaging = null;
-  ingress?.dispose();
+  await ingress?.dispose();
   ingress = null;
   await slack.stop();
   await signal.stop();

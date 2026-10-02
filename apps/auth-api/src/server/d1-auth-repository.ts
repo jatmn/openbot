@@ -1,5 +1,7 @@
 import type { AccountSession, MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
+import { Context, Effect, Layer, Schema } from "effect";
 import { sha256 } from "./crypto";
+import { runApiEffect } from "./effect-runtime";
 import type {
   AuthRepository,
   AuthUser,
@@ -38,35 +40,69 @@ interface MobileSessionUserRow extends UserRow {
 
 const SESSION_ACTIVITY_UPDATE_INTERVAL_MS = 15 * 60_000;
 
+class AuthDatabase extends Context.Service<AuthDatabase, D1Database>()("auth-api/D1AuthRepository/Database") {}
+class AuthStoreError extends Schema.TaggedError<AuthStoreError>()("AuthStoreError", { message: Schema.String }) {}
+function storeCall<A>(operation: () => Promise<A>): Effect.Effect<A, AuthStoreError> {
+  return Effect.tryPromise({
+    try: operation,
+    catch: () => new AuthStoreError({ message: "Account store operation failed." }),
+  });
+}
 export class D1AuthRepository implements AuthRepository {
-  constructor(private readonly database: D1Database) {}
-
-  async latestEmailChallengeAt(email: string): Promise<number | null> {
-    const row = await this.database
-      .prepare(
-        `SELECT created_at FROM email_login_challenges
-         WHERE email = ? AND delivery_state IN ('pending', 'sent')
-         ORDER BY created_at DESC LIMIT 1`,
-      )
-      .bind(email)
-      .first<{ created_at: number }>();
-    return row?.created_at ?? null;
+  readonly #layer: Layer.Layer<AuthDatabase>;
+  constructor(database: D1Database) {
+    this.#layer = Layer.succeed(AuthDatabase, database);
+  }
+  #run<A>(operation: Effect.Effect<A, AuthStoreError, AuthDatabase>): Promise<A> {
+    return runApiEffect(operation.pipe(Effect.provide(this.#layer)));
   }
 
-  async findEmailChallenge(idHash: string): Promise<EmailChallengeRecord | null> {
-    const row = await this.database
-      .prepare(
-        `SELECT email, created_at, expires_at, consumed_at, delivery_state
+  latestEmailChallengeAt(email: string): Promise<number | null> {
+    return this.#run(this.#latestEmailChallengeAtEffect(email));
+  }
+
+  readonly #latestEmailChallengeAtEffect = Effect.fn("D1AuthRepository.latestEmailChallengeAt")(function* (
+    this: D1AuthRepository,
+    email: string,
+  ): Effect.fn.Return<number | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT created_at FROM email_login_challenges
+         WHERE email = ? AND delivery_state IN ('pending', 'sent')
+         ORDER BY created_at DESC LIMIT 1`,
+        )
+        .bind(email)
+        .first<{ created_at: number }>(),
+    );
+    return row?.created_at ?? null;
+  });
+
+  findEmailChallenge(idHash: string): Promise<EmailChallengeRecord | null> {
+    return this.#run(this.#findEmailChallengeEffect(idHash));
+  }
+
+  readonly #findEmailChallengeEffect = Effect.fn("D1AuthRepository.findEmailChallenge")(function* (
+    this: D1AuthRepository,
+    idHash: string,
+  ): Effect.fn.Return<EmailChallengeRecord | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT email, created_at, expires_at, consumed_at, delivery_state
          FROM email_login_challenges WHERE id_hash = ?`,
-      )
-      .bind(idHash)
-      .first<{
-        email: string;
-        created_at: number;
-        expires_at: number;
-        consumed_at: number | null;
-        delivery_state: EmailChallengeDeliveryState;
-      }>();
+        )
+        .bind(idHash)
+        .first<{
+          email: string;
+          created_at: number;
+          expires_at: number;
+          consumed_at: number | null;
+          delivery_state: EmailChallengeDeliveryState;
+        }>(),
+    );
     return row
       ? {
           email: row.email,
@@ -76,9 +112,9 @@ export class D1AuthRepository implements AuthRepository {
           deliveryState: row.delivery_state,
         }
       : null;
-  }
+  });
 
-  async createEmailChallenge(input: {
+  createEmailChallenge(input: {
     idHash: string;
     email: string;
     codeHash: string;
@@ -87,58 +123,107 @@ export class D1AuthRepository implements AuthRepository {
     expiresAt: number;
     maxAttempts: number;
   }): Promise<boolean> {
-    const result = await this.database
-      .prepare(
-        `INSERT INTO email_login_challenges(
+    return this.#run(this.#createEmailChallengeEffect(input));
+  }
+
+  readonly #createEmailChallengeEffect = Effect.fn("D1AuthRepository.createEmailChallenge")(function* (
+    this: D1AuthRepository,
+    input: {
+      idHash: string;
+      email: string;
+      codeHash: string;
+      sourceIpHash: string;
+      createdAt: number;
+      expiresAt: number;
+      maxAttempts: number;
+    },
+  ): Effect.fn.Return<boolean, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const result = yield* storeCall(() =>
+      database
+        .prepare(
+          `INSERT INTO email_login_challenges(
           id_hash, email, code_hash, source_ip_hash, created_at, expires_at, max_attempts, delivery_state
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         ON CONFLICT(id_hash) DO NOTHING`,
-      )
-      .bind(
-        input.idHash,
-        input.email,
-        input.codeHash,
-        input.sourceIpHash,
-        input.createdAt,
-        input.expiresAt,
-        input.maxAttempts,
-      )
-      .run();
-    return result.meta.changes === 1;
-  }
-
-  async completeEmailChallengeDelivery(idHash: string, state: "sent" | "failed", now: number): Promise<void> {
-    if (state === "sent") {
-      await this.database
-        .prepare(
-          "UPDATE email_login_challenges SET delivery_state = 'sent' WHERE id_hash = ? AND delivery_state = 'pending'",
         )
-        .bind(idHash)
-        .run();
-      return;
-    }
-    await this.database
-      .prepare(
-        `UPDATE email_login_challenges SET delivery_state = 'failed', consumed_at = COALESCE(consumed_at, ?)
-         WHERE id_hash = ? AND delivery_state = 'pending'`,
-      )
-      .bind(now, idHash)
-      .run();
+        .bind(
+          input.idHash,
+          input.email,
+          input.codeHash,
+          input.sourceIpHash,
+          input.createdAt,
+          input.expiresAt,
+          input.maxAttempts,
+        )
+        .run(),
+    );
+    return result.meta.changes === 1;
+  });
+
+  completeEmailChallengeDelivery(idHash: string, state: "sent" | "failed", now: number): Promise<void> {
+    return this.#run(this.#completeEmailChallengeDeliveryEffect(idHash, state, now));
   }
 
-  async verifyEmailChallenge(input: {
+  readonly #completeEmailChallengeDeliveryEffect = Effect.fn("D1AuthRepository.completeEmailChallengeDelivery")(
+    function* (
+      this: D1AuthRepository,
+      idHash: string,
+      state: "sent" | "failed",
+      now: number,
+    ): Effect.fn.Return<void, AuthStoreError, AuthDatabase> {
+      const database = yield* AuthDatabase;
+      if (state === "sent") {
+        yield* storeCall(() =>
+          database
+            .prepare(
+              "UPDATE email_login_challenges SET delivery_state = 'sent' WHERE id_hash = ? AND delivery_state = 'pending'",
+            )
+            .bind(idHash)
+            .run(),
+        );
+        return;
+      }
+      yield* storeCall(() =>
+        database
+          .prepare(
+            `UPDATE email_login_challenges SET delivery_state = 'failed', consumed_at = COALESCE(consumed_at, ?)
+         WHERE id_hash = ? AND delivery_state = 'pending'`,
+          )
+          .bind(now, idHash)
+          .run(),
+      );
+    },
+  );
+
+  verifyEmailChallenge(input: {
     idHash: string;
     codeHash: string;
     now: number;
     session: { id: string; token: string; expiresAt: number };
   }): Promise<EmailVerificationResult> {
-    const challenge = await this.database
-      .prepare(
-        `SELECT email, code_hash, expires_at, failed_attempts, max_attempts, consumed_at, delivery_state
+    return this.#run(this.#verifyEmailChallengeEffect(input));
+  }
+
+  readonly #verifyEmailChallengeEffect = Effect.fn("D1AuthRepository.verifyEmailChallenge")(function* (
+    this: D1AuthRepository,
+    input: {
+      idHash: string;
+      codeHash: string;
+      now: number;
+      session: { id: string; token: string; expiresAt: number };
+    },
+  ): Effect.fn.Return<EmailVerificationResult, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const challenge = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT email, code_hash, expires_at, failed_attempts, max_attempts, consumed_at, delivery_state
          FROM email_login_challenges WHERE id_hash = ?`,
-      )
-      .bind(input.idHash)
-      .first<ChallengeRow>();
+        )
+        .bind(input.idHash)
+        .first<ChallengeRow>(),
+    );
     if (!challenge || challenge.delivery_state === "failed" || challenge.consumed_at !== null) {
       return { status: "invalid" };
     }
@@ -147,84 +232,124 @@ export class D1AuthRepository implements AuthRepository {
       return { status: "too_many_attempts" };
     }
     if (!constantTimeEqual(challenge.code_hash, input.codeHash)) {
-      const result = await this.database
-        .prepare(
-          `UPDATE email_login_challenges
+      const result = yield* storeCall(() =>
+        database
+          .prepare(
+            `UPDATE email_login_challenges
            SET failed_attempts = failed_attempts + 1
            WHERE id_hash = ? AND delivery_state != 'failed' AND consumed_at IS NULL AND failed_attempts < max_attempts`,
-        )
-        .bind(input.idHash)
-        .run();
+          )
+          .bind(input.idHash)
+          .run(),
+      );
       return result.meta.changes > 0 && challenge.failed_attempts + 1 >= challenge.max_attempts
         ? { status: "too_many_attempts" }
         : { status: "invalid" };
     }
 
-    const consumed = await this.database
-      .prepare(
-        `UPDATE email_login_challenges SET consumed_at = ?
+    const consumed = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE email_login_challenges SET consumed_at = ?
          WHERE id_hash = ? AND delivery_state != 'failed' AND consumed_at IS NULL
            AND expires_at > ? AND failed_attempts < max_attempts`,
-      )
-      .bind(input.now, input.idHash, input.now)
-      .run();
+        )
+        .bind(input.now, input.idHash, input.now)
+        .run(),
+    );
     if (consumed.meta.changes !== 1) return { status: "invalid" };
 
-    const user = await this.upsertEmailUser(challenge.email, input.now);
-    await this.database
-      .prepare(
-        `INSERT INTO auth_sessions(
+    const user = yield* this.#upsertEmailUserEffect(challenge.email, input.now);
+    const tokenHash = yield* storeCall(() => sha256(input.session.token));
+    yield* storeCall(() =>
+      database
+        .prepare(
+          `INSERT INTO auth_sessions(
           id, user_id, token_hash, expires_at, created_at, last_used_at
         ) VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(input.session.id, user.id, await sha256(input.session.token), input.session.expiresAt, input.now, input.now)
-      .run();
+        )
+        .bind(input.session.id, user.id, tokenHash, input.session.expiresAt, input.now, input.now)
+        .run(),
+    );
     return {
       status: "verified",
       session: { sessionToken: input.session.token, user },
     };
-  }
+  });
 
-  async incrementRateLimit(
+  incrementRateLimit(
     keyHash: string,
     windowStart: number,
     limit: number,
   ): Promise<{ allowed: boolean; count: number; windowStart: number }> {
-    const row = await this.database
-      .prepare(
-        `INSERT INTO auth_rate_limits(key_hash, window_start, attempts) VALUES (?, ?, 1)
-         ON CONFLICT(key_hash, window_start) DO UPDATE SET attempts = attempts + 1
-         RETURNING attempts`,
-      )
-      .bind(keyHash, windowStart)
-      .first<{ attempts: number }>();
-    const count = row?.attempts ?? limit + 1;
-    return { allowed: count <= limit, count, windowStart };
+    return this.#run(this.#incrementRateLimitEffect(keyHash, windowStart, limit));
   }
 
-  async authenticate(sessionToken: string, now: number): Promise<AuthUser | null> {
-    const tokenHash = await sha256(sessionToken);
-    const row = await this.database
-      .prepare(
-        `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
+  readonly #incrementRateLimitEffect = Effect.fn("D1AuthRepository.incrementRateLimit")(function* (
+    this: D1AuthRepository,
+    keyHash: string,
+    windowStart: number,
+    limit: number,
+  ): Effect.fn.Return<{ allowed: boolean; count: number; windowStart: number }, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `INSERT INTO auth_rate_limits(key_hash, window_start, attempts) VALUES (?, ?, 1)
+         ON CONFLICT(key_hash, window_start) DO UPDATE SET attempts = attempts + 1
+         RETURNING attempts`,
+        )
+        .bind(keyHash, windowStart)
+        .first<{ attempts: number }>(),
+    );
+    const count = row?.attempts ?? limit + 1;
+    return { allowed: count <= limit, count, windowStart };
+  });
+
+  authenticate(sessionToken: string, now: number): Promise<AuthUser | null> {
+    return this.#run(this.#authenticateEffect(sessionToken, now));
+  }
+
+  readonly #authenticateEffect = Effect.fn("D1AuthRepository.authenticate")(function* (
+    this: D1AuthRepository,
+    sessionToken: string,
+    now: number,
+  ): Effect.fn.Return<AuthUser | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(sessionToken));
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
          FROM auth_sessions
          JOIN users ON users.id = auth_sessions.user_id
          WHERE auth_sessions.token_hash = ?
            AND auth_sessions.revoked_at IS NULL
            AND auth_sessions.expires_at > ?`,
-      )
-      .bind(tokenHash, now)
-      .first<AuthenticatedUserRow>();
+        )
+        .bind(tokenHash, now)
+        .first<AuthenticatedUserRow>(),
+    );
     if (!row) return null;
-    await this.updateSessionActivity(tokenHash, row.last_used_at, now);
+    yield* this.#updateSessionActivityEffect(tokenHash, row.last_used_at, now);
     return mapUser(row);
+  });
+
+  authenticateDesktopSession(sessionToken: string, now: number): Promise<AuthUser | null> {
+    return this.#run(this.#authenticateDesktopSessionEffect(sessionToken, now));
   }
 
-  async authenticateDesktopSession(sessionToken: string, now: number): Promise<AuthUser | null> {
-    const tokenHash = await sha256(sessionToken);
-    const row = await this.database
-      .prepare(
-        `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
+  readonly #authenticateDesktopSessionEffect = Effect.fn("D1AuthRepository.authenticateDesktopSession")(function* (
+    this: D1AuthRepository,
+    sessionToken: string,
+    now: number,
+  ): Effect.fn.Return<AuthUser | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(sessionToken));
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
          FROM auth_sessions
          JOIN users ON users.id = auth_sessions.user_id
          WHERE auth_sessions.token_hash = ?
@@ -234,82 +359,145 @@ export class D1AuthRepository implements AuthRepository {
              SELECT 1 FROM mobile_auth_sessions
              WHERE mobile_auth_sessions.session_id = auth_sessions.id
            )`,
-      )
-      .bind(tokenHash, now)
-      .first<AuthenticatedUserRow>();
+        )
+        .bind(tokenHash, now)
+        .first<AuthenticatedUserRow>(),
+    );
     if (!row) return null;
-    await this.updateSessionActivity(tokenHash, row.last_used_at, now);
+    yield* this.#updateSessionActivityEffect(tokenHash, row.last_used_at, now);
     return mapUser(row);
+  });
+
+  revokeSession(sessionToken: string, now: number): Promise<void> {
+    return this.#run(this.#revokeSessionEffect(sessionToken, now));
   }
 
-  async revokeSession(sessionToken: string, now: number): Promise<void> {
-    await this.database
-      .prepare("UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ?")
-      .bind(now, await sha256(sessionToken))
-      .run();
+  readonly #revokeSessionEffect = Effect.fn("D1AuthRepository.revokeSession")(function* (
+    this: D1AuthRepository,
+    sessionToken: string,
+    now: number,
+  ): Effect.fn.Return<void, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(sessionToken));
+    yield* storeCall(() =>
+      database.prepare("UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ?").bind(now, tokenHash).run(),
+    );
+  });
+
+  revokeMobileSession(sessionToken: string, now: number): Promise<boolean> {
+    return this.#run(this.#revokeMobileSessionEffect(sessionToken, now));
   }
 
-  async revokeMobileSession(sessionToken: string, now: number): Promise<boolean> {
-    const result = await this.database
-      .prepare(
-        `UPDATE auth_sessions SET revoked_at = ?
+  readonly #revokeMobileSessionEffect = Effect.fn("D1AuthRepository.revokeMobileSession")(function* (
+    this: D1AuthRepository,
+    sessionToken: string,
+    now: number,
+  ): Effect.fn.Return<boolean, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(sessionToken));
+    const result = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE auth_sessions SET revoked_at = ?
          WHERE token_hash = ? AND revoked_at IS NULL
            AND id IN (SELECT session_id FROM mobile_auth_sessions)
          RETURNING id`,
-      )
-      .bind(now, await sha256(sessionToken))
-      .first<{ id: string }>();
+        )
+        .bind(now, tokenHash)
+        .first<{ id: string }>(),
+    );
     return result !== null;
+  });
+
+  updateUserName(userId: string, name: string, now: number): Promise<AuthUser> {
+    return this.#run(this.#updateUserNameEffect(userId, name, now));
   }
 
-  async updateUserName(userId: string, name: string, now: number): Promise<AuthUser> {
-    const row = await this.database
-      .prepare(
-        `UPDATE users SET name = ?, updated_at = ?
+  readonly #updateUserNameEffect = Effect.fn("D1AuthRepository.updateUserName")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    name: string,
+    now: number,
+  ): Effect.fn.Return<AuthUser, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE users SET name = ?, updated_at = ?
          WHERE id = ?
          RETURNING id, email, name, avatar_url`,
-      )
-      .bind(name, now, userId)
-      .first<UserRow>();
-    if (!row) throw new Error("User not found.");
+        )
+        .bind(name, now, userId)
+        .first<UserRow>(),
+    );
+    if (!row) return yield* new AuthStoreError({ message: "User not found." });
     return mapUser(row);
-  }
+  });
 
-  async updateUserAvatar(
+  updateUserAvatar(
     userId: string,
     avatarUrl: string | null,
     expectedAvatarUrl: string | null,
     now: number,
   ): Promise<AuthUser | null> {
-    const row = await this.database
-      .prepare(
-        `UPDATE users SET avatar_url = ?, updated_at = ?
-         WHERE id = ? AND avatar_url IS ?
-         RETURNING id, email, name, avatar_url`,
-      )
-      .bind(avatarUrl, now, userId, expectedAvatarUrl)
-      .first<UserRow>();
-    return row ? mapUser(row) : null;
+    return this.#run(this.#updateUserAvatarEffect(userId, avatarUrl, expectedAvatarUrl, now));
   }
 
-  async createTeamAuthTicket(input: {
+  readonly #updateUserAvatarEffect = Effect.fn("D1AuthRepository.updateUserAvatar")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    avatarUrl: string | null,
+    expectedAvatarUrl: string | null,
+    now: number,
+  ): Effect.fn.Return<AuthUser | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE users SET avatar_url = ?, updated_at = ?
+         WHERE id = ? AND avatar_url IS ?
+         RETURNING id, email, name, avatar_url`,
+        )
+        .bind(avatarUrl, now, userId, expectedAvatarUrl)
+        .first<UserRow>(),
+    );
+    return row ? mapUser(row) : null;
+  });
+
+  createTeamAuthTicket(input: {
     ticketHash: string;
     userId: string;
     serverId: string;
     createdAt: number;
     expiresAt: number;
   }): Promise<void> {
-    await this.database
-      .prepare(
-        `INSERT INTO team_auth_tickets(
-          ticket_hash, user_id, server_id, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?)`,
-      )
-      .bind(input.ticketHash, input.userId, input.serverId, input.createdAt, input.expiresAt)
-      .run();
+    return this.#run(this.#createTeamAuthTicketEffect(input));
   }
 
-  async replaceMobileAuthTicket(input: {
+  readonly #createTeamAuthTicketEffect = Effect.fn("D1AuthRepository.createTeamAuthTicket")(function* (
+    this: D1AuthRepository,
+    input: {
+      ticketHash: string;
+      userId: string;
+      serverId: string;
+      createdAt: number;
+      expiresAt: number;
+    },
+  ): Effect.fn.Return<void, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    yield* storeCall(() =>
+      database
+        .prepare(
+          `INSERT INTO team_auth_tickets(
+          ticket_hash, user_id, server_id, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+        )
+        .bind(input.ticketHash, input.userId, input.serverId, input.createdAt, input.expiresAt)
+        .run(),
+    );
+  });
+
+  replaceMobileAuthTicket(input: {
     host?: MobileConnectHostBinding;
     ticketHash: string;
     userId: string;
@@ -317,86 +505,133 @@ export class D1AuthRepository implements AuthRepository {
     createdAt: number;
     expiresAt: number;
   }): Promise<void> {
-    await this.database.batch([
-      this.database
-        .prepare(
-          `UPDATE team_auth_tickets SET consumed_at = ?
-           WHERE user_id = ? AND server_id = ? AND consumed_at IS NULL`,
-        )
-        .bind(input.createdAt, input.userId, input.serverId),
-      this.database
-        .prepare(
-          `INSERT INTO team_auth_tickets(
-            ticket_hash, user_id, server_id, created_at, expires_at, mobile_host_id, mobile_host_fingerprint
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(
-          input.ticketHash,
-          input.userId,
-          input.serverId,
-          input.createdAt,
-          input.expiresAt,
-          input.host?.hostId ?? null,
-          input.host?.fingerprint ?? null,
-        ),
-    ]);
+    return this.#run(this.#replaceMobileAuthTicketEffect(input));
   }
 
-  async redeemTeamAuthTicket(input: { ticketHash: string; serverId: string; now: number }): Promise<AuthUser | null> {
-    const consumed = await this.database
-      .prepare(
-        `UPDATE team_auth_tickets SET consumed_at = ?
+  readonly #replaceMobileAuthTicketEffect = Effect.fn("D1AuthRepository.replaceMobileAuthTicket")(function* (
+    this: D1AuthRepository,
+    input: {
+      host?: MobileConnectHostBinding;
+      ticketHash: string;
+      userId: string;
+      serverId: string;
+      createdAt: number;
+      expiresAt: number;
+    },
+  ): Effect.fn.Return<void, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    yield* storeCall(() =>
+      database.batch([
+        database
+          .prepare(
+            `UPDATE team_auth_tickets SET consumed_at = ?
+           WHERE user_id = ? AND server_id = ? AND consumed_at IS NULL`,
+          )
+          .bind(input.createdAt, input.userId, input.serverId),
+        database
+          .prepare(
+            `INSERT INTO team_auth_tickets(
+            ticket_hash, user_id, server_id, created_at, expires_at, mobile_host_id, mobile_host_fingerprint
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(
+            input.ticketHash,
+            input.userId,
+            input.serverId,
+            input.createdAt,
+            input.expiresAt,
+            input.host?.hostId ?? null,
+            input.host?.fingerprint ?? null,
+          ),
+      ]),
+    );
+  });
+
+  redeemTeamAuthTicket(input: { ticketHash: string; serverId: string; now: number }): Promise<AuthUser | null> {
+    return this.#run(this.#redeemTeamAuthTicketEffect(input));
+  }
+
+  readonly #redeemTeamAuthTicketEffect = Effect.fn("D1AuthRepository.redeemTeamAuthTicket")(function* (
+    this: D1AuthRepository,
+    input: { ticketHash: string; serverId: string; now: number },
+  ): Effect.fn.Return<AuthUser | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const consumed = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE team_auth_tickets SET consumed_at = ?
          WHERE ticket_hash = ? AND server_id = ? AND consumed_at IS NULL AND expires_at > ?`,
-      )
-      .bind(input.now, input.ticketHash, input.serverId, input.now)
-      .run();
+        )
+        .bind(input.now, input.ticketHash, input.serverId, input.now)
+        .run(),
+    );
     if (consumed.meta.changes !== 1) return null;
-    const row = await this.database
-      .prepare(
-        `SELECT users.id, users.email, users.name, users.avatar_url
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT users.id, users.email, users.name, users.avatar_url
          FROM team_auth_tickets
          JOIN users ON users.id = team_auth_tickets.user_id
          WHERE team_auth_tickets.ticket_hash = ?`,
-      )
-      .bind(input.ticketHash)
-      .first<UserRow>();
+        )
+        .bind(input.ticketHash)
+        .first<UserRow>(),
+    );
     return row ? mapUser(row) : null;
-  }
+  });
 
-  async redeemMobileAuthTicket(input: {
+  redeemMobileAuthTicket(input: {
     ticketHash: string;
     serverId: string;
     now: number;
     session: { id: string; token: string; expiresAt: number };
     device: MobileAuthDeviceIdentity;
   }): Promise<MobileAuthSessionResult | null> {
-    const binding = await this.database
-      .prepare(
-        `SELECT t.mobile_host_id, t.mobile_host_fingerprint, h.device_public_key, h.owner_user_id, t.user_id
+    return this.#run(this.#redeemMobileAuthTicketEffect(input));
+  }
+
+  readonly #redeemMobileAuthTicketEffect = Effect.fn("D1AuthRepository.redeemMobileAuthTicket")(function* (
+    this: D1AuthRepository,
+    input: {
+      ticketHash: string;
+      serverId: string;
+      now: number;
+      session: { id: string; token: string; expiresAt: number };
+      device: MobileAuthDeviceIdentity;
+    },
+  ): Effect.fn.Return<MobileAuthSessionResult | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const binding = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT t.mobile_host_id, t.mobile_host_fingerprint, h.device_public_key, h.owner_user_id, t.user_id
        FROM team_auth_tickets t LEFT JOIN remote_hosts h ON h.host_id = t.mobile_host_id
        WHERE t.ticket_hash = ? AND t.server_id = ? AND t.consumed_at IS NULL AND t.expires_at > ?`,
-      )
-      .bind(input.ticketHash, input.serverId, input.now)
-      .first<{
-        mobile_host_id: string | null;
-        mobile_host_fingerprint: string | null;
-        device_public_key: string | null;
-        owner_user_id: string | null;
-        user_id: string;
-      }>();
+        )
+        .bind(input.ticketHash, input.serverId, input.now)
+        .first<{
+          mobile_host_id: string | null;
+          mobile_host_fingerprint: string | null;
+          device_public_key: string | null;
+          owner_user_id: string | null;
+          user_id: string;
+        }>(),
+    );
     if (!binding) return null;
+    const devicePublicKey = binding.device_public_key;
     if (
       binding.mobile_host_id &&
-      (!binding.device_public_key ||
+      (!devicePublicKey ||
         binding.owner_user_id !== binding.user_id ||
-        (await sha256(binding.device_public_key)) !== binding.mobile_host_fingerprint)
+        (yield* storeCall(() => sha256(devicePublicKey))) !== binding.mobile_host_fingerprint)
     )
       return null;
-    const tokenHash = await sha256(input.session.token);
-    const [created, registered, , , consumed] = await this.database.batch([
-      this.database
-        .prepare(
-          `INSERT INTO auth_sessions(id, user_id, token_hash, expires_at, created_at, last_used_at)
+    const tokenHash = yield* storeCall(() => sha256(input.session.token));
+    const [created, registered, , , consumed] = yield* storeCall(() =>
+      database.batch([
+        database
+          .prepare(
+            `INSERT INTO auth_sessions(id, user_id, token_hash, expires_at, created_at, last_used_at)
            SELECT ?, user_id, ?, ?, ?, ?
            FROM team_auth_tickets
            WHERE ticket_hash = ? AND server_id = ? AND consumed_at IS NULL AND expires_at > ?
@@ -405,52 +640,53 @@ export class D1AuthRepository implements AuthRepository {
                WHERE h.host_id = team_auth_tickets.mobile_host_id
                  AND h.owner_user_id = team_auth_tickets.user_id AND h.device_public_key = ?
              ))`,
-        )
-        .bind(
-          input.session.id,
-          tokenHash,
-          input.session.expiresAt,
-          input.now,
-          input.now,
-          input.ticketHash,
-          input.serverId,
-          input.now,
-          binding.device_public_key,
-        ),
-      this.database
-        .prepare(
-          `INSERT INTO mobile_auth_sessions(session_id, user_id, device_id, device_name, platform, created_at)
+          )
+          .bind(
+            input.session.id,
+            tokenHash,
+            input.session.expiresAt,
+            input.now,
+            input.now,
+            input.ticketHash,
+            input.serverId,
+            input.now,
+            binding.device_public_key,
+          ),
+        database
+          .prepare(
+            `INSERT INTO mobile_auth_sessions(session_id, user_id, device_id, device_name, platform, created_at)
            SELECT id, user_id, ?, ?, ?, ? FROM auth_sessions WHERE id = ?`,
-        )
-        .bind(input.device.id, input.device.name, input.device.platform, input.now, input.session.id),
-      this.database
-        .prepare(
-          `UPDATE auth_sessions SET revoked_at = ?
+          )
+          .bind(input.device.id, input.device.name, input.device.platform, input.now, input.session.id),
+        database
+          .prepare(
+            `UPDATE auth_sessions SET revoked_at = ?
            WHERE id <> ? AND revoked_at IS NULL
              AND id IN (
                SELECT session_id FROM mobile_auth_sessions
                WHERE user_id = (SELECT user_id FROM mobile_auth_sessions WHERE session_id = ?)
                  AND device_id = ?
              )`,
-        )
-        .bind(input.now, input.session.id, input.session.id, input.device.id),
-      this.database
-        .prepare(
-          `DELETE FROM mobile_auth_sessions
+          )
+          .bind(input.now, input.session.id, input.session.id, input.device.id),
+        database
+          .prepare(
+            `DELETE FROM mobile_auth_sessions
            WHERE session_id <> ?
              AND user_id = (SELECT user_id FROM mobile_auth_sessions WHERE session_id = ?)
              AND device_id = ?`,
-        )
-        .bind(input.session.id, input.session.id, input.device.id),
-      this.database
-        .prepare(
-          `UPDATE team_auth_tickets SET consumed_at = ?
+          )
+          .bind(input.session.id, input.session.id, input.device.id),
+        database
+          .prepare(
+            `UPDATE team_auth_tickets SET consumed_at = ?
            WHERE ticket_hash = ? AND server_id = ? AND consumed_at IS NULL AND expires_at > ?`,
-        )
-        .bind(input.now, input.ticketHash, input.serverId, input.now),
-    ]);
+          )
+          .bind(input.now, input.ticketHash, input.serverId, input.now),
+      ]),
+    );
     if (created?.meta.changes !== 1 || registered?.meta.changes !== 1 || consumed?.meta.changes !== 1) return null;
-    const user = await this.authenticate(input.session.token, input.now);
+    const user = yield* this.#authenticateEffect(input.session.token, input.now);
     return user
       ? {
           sessionToken: input.session.token,
@@ -460,31 +696,52 @@ export class D1AuthRepository implements AuthRepository {
             : {}),
         }
       : null;
+  });
+
+  authenticateMobileSession(sessionToken: string, now: number): Promise<AuthUser | null> {
+    return this.#run(this.#authenticateMobileSessionEffect(sessionToken, now));
   }
 
-  async authenticateMobileSession(sessionToken: string, now: number): Promise<AuthUser | null> {
-    const tokenHash = await sha256(sessionToken);
-    const row = await this.database
-      .prepare(
-        `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
+  readonly #authenticateMobileSessionEffect = Effect.fn("D1AuthRepository.authenticateMobileSession")(function* (
+    this: D1AuthRepository,
+    sessionToken: string,
+    now: number,
+  ): Effect.fn.Return<AuthUser | null, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(sessionToken));
+    const row = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT users.id, users.email, users.name, users.avatar_url, auth_sessions.last_used_at
          FROM auth_sessions
          JOIN mobile_auth_sessions ON mobile_auth_sessions.session_id = auth_sessions.id
          JOIN users ON users.id = auth_sessions.user_id
          WHERE auth_sessions.token_hash = ?
            AND auth_sessions.revoked_at IS NULL
            AND auth_sessions.expires_at > ?`,
-      )
-      .bind(tokenHash, now)
-      .first<MobileSessionUserRow>();
+        )
+        .bind(tokenHash, now)
+        .first<MobileSessionUserRow>(),
+    );
     if (!row) return null;
-    await this.updateSessionActivity(tokenHash, row.last_used_at, now);
+    yield* this.#updateSessionActivityEffect(tokenHash, row.last_used_at, now);
     return mapUser(row);
+  });
+
+  listMobileAuthDevices(userId: string, now: number): Promise<MobileAuthDevice[]> {
+    return this.#run(this.#listMobileAuthDevicesEffect(userId, now));
   }
 
-  async listMobileAuthDevices(userId: string, now: number): Promise<MobileAuthDevice[]> {
-    const result = await this.database
-      .prepare(
-        `SELECT mobile_auth_sessions.session_id, mobile_auth_sessions.device_name,
+  readonly #listMobileAuthDevicesEffect = Effect.fn("D1AuthRepository.listMobileAuthDevices")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    now: number,
+  ): Effect.fn.Return<MobileAuthDevice[], AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const result = yield* storeCall(() =>
+      database
+        .prepare(
+          `SELECT mobile_auth_sessions.session_id, mobile_auth_sessions.device_name,
                 mobile_auth_sessions.platform, auth_sessions.created_at, auth_sessions.last_used_at
          FROM mobile_auth_sessions
          JOIN auth_sessions ON auth_sessions.id = mobile_auth_sessions.session_id
@@ -492,15 +749,16 @@ export class D1AuthRepository implements AuthRepository {
            AND auth_sessions.revoked_at IS NULL
            AND auth_sessions.expires_at > ?
          ORDER BY auth_sessions.last_used_at DESC, auth_sessions.created_at DESC`,
-      )
-      .bind(userId, now)
-      .all<{
-        session_id: string;
-        device_name: string;
-        platform: MobileAuthDevice["platform"];
-        created_at: number;
-        last_used_at: number;
-      }>();
+        )
+        .bind(userId, now)
+        .all<{
+          session_id: string;
+          device_name: string;
+          platform: MobileAuthDevice["platform"];
+          created_at: number;
+          last_used_at: number;
+        }>(),
+    );
     return result.results.map((row) => ({
       sessionId: row.session_id,
       name: row.device_name,
@@ -508,11 +766,23 @@ export class D1AuthRepository implements AuthRepository {
       connectedAt: row.created_at,
       lastActiveAt: row.last_used_at,
     }));
+  });
+
+  listAccountSessions(userId: string, currentToken: string, now: number): Promise<AccountSession[]> {
+    return this.#run(this.#listAccountSessionsEffect(userId, currentToken, now));
   }
 
-  async listAccountSessions(userId: string, currentToken: string, now: number): Promise<AccountSession[]> {
-    const result = await this.database
-      .prepare(`
+  readonly #listAccountSessionsEffect = Effect.fn("D1AuthRepository.listAccountSessions")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    currentToken: string,
+    now: number,
+  ): Effect.fn.Return<AccountSession[], AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const tokenHash = yield* storeCall(() => sha256(currentToken));
+    const result = yield* storeCall(() =>
+      database
+        .prepare(`
       SELECT a.id AS sessionId, COALESCE(m.device_name, 'Desktop') AS name,
         CASE WHEN m.session_id IS NULL THEN 'desktop' ELSE 'mobile' END AS kind,
         a.token_hash = ? AS is_current, a.created_at AS connectedAt, a.last_used_at AS lastActiveAt
@@ -520,62 +790,101 @@ export class D1AuthRepository implements AuthRepository {
       WHERE a.user_id = ? AND a.revoked_at IS NULL AND a.expires_at > ?
       ORDER BY a.last_used_at DESC, a.created_at DESC
     `)
-      .bind(await sha256(currentToken), userId, now)
-      .all<Omit<AccountSession, "current"> & { is_current: number }>();
+        .bind(tokenHash, userId, now)
+        .all<Omit<AccountSession, "current"> & { is_current: number }>(),
+    );
     return result.results.map(({ is_current, ...session }) => ({ ...session, current: is_current === 1 }));
+  });
+
+  revokeAccountSession(userId: string, sessionId: string, now: number): Promise<boolean> {
+    return this.#run(this.#revokeAccountSessionEffect(userId, sessionId, now));
   }
 
-  async revokeAccountSession(userId: string, sessionId: string, now: number): Promise<boolean> {
+  readonly #revokeAccountSessionEffect = Effect.fn("D1AuthRepository.revokeAccountSession")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    sessionId: string,
+    now: number,
+  ): Effect.fn.Return<boolean, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
     // The migration's trigger ends remote sessions and enqueues their disconnect atomically.
     // RETURNING, not meta.changes: D1 also counts the rows that the trigger changes.
-    const result = await this.database
-      .prepare(
-        "UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id",
-      )
-      .bind(now, sessionId, userId)
-      .first<{ id: string }>();
+    const result = yield* storeCall(() =>
+      database
+        .prepare(
+          "UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id",
+        )
+        .bind(now, sessionId, userId)
+        .first<{ id: string }>(),
+    );
     return result !== null;
+  });
+
+  revokeMobileAuthDevice(userId: string, sessionId: string, now: number): Promise<boolean> {
+    return this.#run(this.#revokeMobileAuthDeviceEffect(userId, sessionId, now));
   }
 
-  async revokeMobileAuthDevice(userId: string, sessionId: string, now: number): Promise<boolean> {
-    const result = await this.database
-      .prepare(
-        `UPDATE auth_sessions SET revoked_at = ?
+  readonly #revokeMobileAuthDeviceEffect = Effect.fn("D1AuthRepository.revokeMobileAuthDevice")(function* (
+    this: D1AuthRepository,
+    userId: string,
+    sessionId: string,
+    now: number,
+  ): Effect.fn.Return<boolean, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const result = yield* storeCall(() =>
+      database
+        .prepare(
+          `UPDATE auth_sessions SET revoked_at = ?
          WHERE id = ? AND user_id = ? AND revoked_at IS NULL
            AND id IN (SELECT session_id FROM mobile_auth_sessions)
          RETURNING id`,
-      )
-      .bind(now, sessionId, userId)
-      .first<{ id: string }>();
+        )
+        .bind(now, sessionId, userId)
+        .first<{ id: string }>(),
+    );
     return result !== null;
-  }
+  });
 
-  private async updateSessionActivity(tokenHash: string, lastUsedAt: number, now: number): Promise<void> {
+  readonly #updateSessionActivityEffect = Effect.fn("D1AuthRepository.updateSessionActivity")(function* (
+    this: D1AuthRepository,
+    tokenHash: string,
+    lastUsedAt: number,
+    now: number,
+  ): Effect.fn.Return<void, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
     const activityCutoff = now - SESSION_ACTIVITY_UPDATE_INTERVAL_MS;
     if (lastUsedAt > activityCutoff) return;
-    await this.database
-      .prepare("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ? AND last_used_at <= ?")
-      .bind(now, tokenHash, activityCutoff)
-      .run();
-  }
+    yield* storeCall(() =>
+      database
+        .prepare("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ? AND last_used_at <= ?")
+        .bind(now, tokenHash, activityCutoff)
+        .run(),
+    );
+  });
 
-  private async upsertEmailUser(email: string, now: number): Promise<AuthUser> {
-    const existing = await this.database
-      .prepare("SELECT id, email, name, avatar_url FROM users WHERE email = ?")
-      .bind(email)
-      .first<UserRow>();
+  readonly #upsertEmailUserEffect = Effect.fn("D1AuthRepository.upsertEmailUser")(function* (
+    this: D1AuthRepository,
+    email: string,
+    now: number,
+  ): Effect.fn.Return<AuthUser, AuthStoreError, AuthDatabase> {
+    const database = yield* AuthDatabase;
+    const existing = yield* storeCall(() =>
+      database.prepare("SELECT id, email, name, avatar_url FROM users WHERE email = ?").bind(email).first<UserRow>(),
+    );
     if (existing) return mapUser(existing);
     const id = crypto.randomUUID();
-    await this.database
-      .prepare(
-        `INSERT INTO users(
+    yield* storeCall(() =>
+      database
+        .prepare(
+          `INSERT INTO users(
           id, identity_key, email, name, avatar_url, created_at, updated_at
         ) VALUES (?, ?, ?, NULL, NULL, ?, ?)`,
-      )
-      .bind(id, `email:${email}`, email, now, now)
-      .run();
+        )
+        .bind(id, `email:${email}`, email, now, now)
+        .run(),
+    );
     return { id, email, name: null, avatarUrl: null };
-  }
+  });
 }
 
 function mapUser(row: UserRow): AuthUser {

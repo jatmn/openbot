@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import type { AgentClient } from "../agent-client";
 
 /** How many disposable generations may run at once. */
@@ -19,14 +20,22 @@ export class ProfileClients {
   }
 
   /** Runs one generation on `client`, and forgets the client when it ends. */
-  async run<T>(client: AgentClient, generate: (cancelled: () => boolean) => Promise<T>): Promise<T> {
-    const generation = { cancelled: false };
-    this.#clients.set(client, generation);
-    try {
-      return await generate(() => generation.cancelled);
-    } finally {
-      this.#clients.delete(client);
-    }
+  runEffect<A, E, R>(
+    client: AgentClient,
+    generate: (cancelled: () => boolean) => Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E, R> {
+    return Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const generation = { cancelled: false };
+        this.#clients.set(client, generation);
+        return generation;
+      }),
+      (generation) => generate(() => generation.cancelled),
+      () =>
+        Effect.sync(() => {
+          this.#clients.delete(client);
+        }),
+    );
   }
 
   /** Ends every disposable generation that may reach an endpoint the user has taken out. */

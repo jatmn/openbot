@@ -15,10 +15,12 @@ import type {
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import { sourceText } from "@openbot/i18n/source";
+import { Context, Effect, Layer, ManagedRuntime, Result, Schema } from "effect";
 import type * as Ws from "ws";
 import { z } from "zod";
 import { recordRestartActivity } from "../backend/restart-activity";
 import type { RemoteDesktopRuntimePaths } from "./remote-desktop-runtime-artifact";
+import { RemoteWorkflowError, remoteCall } from "./remote-service-effects";
 import {
   SunshineApiError,
   SunshineMoonlightRuntime,
@@ -105,6 +107,24 @@ interface CancellableTimer {
   cancel: () => void;
 }
 
+class ScreenDependencies extends Context.Service<
+  ScreenDependencies,
+  {
+    credentials(): Effect.Effect<{ username: string; password: string }, RemoteWorkflowError>;
+    iceServers(): Effect.Effect<RemoteDesktopIceServer[], RemoteWorkflowError>;
+  }
+>()("openbot/main/ScreenDependencies") {
+  static layer(options: RemoteScreenGatewayOptions) {
+    return Layer.succeed(
+      ScreenDependencies,
+      ScreenDependencies.of({
+        credentials: () => remoteCall(options.getRuntimeCredentials),
+        iceServers: () => remoteCall(options.getIceServers),
+      }),
+    );
+  }
+}
+
 export class RemoteScreenGateway {
   readonly #options: Required<Pick<RemoteScreenGatewayOptions, "createRuntime" | "audit" | "now">> &
     Omit<RemoteScreenGatewayOptions, "createRuntime" | "audit" | "now">;
@@ -112,6 +132,10 @@ export class RemoteScreenGateway {
   readonly #localTestServers = new Map<string, Server>();
   readonly #sessions = new Map<string, ManagedRemoteScreenSession>();
   readonly #pendingStreamStarts: Array<{ sessionId: string; start: () => void }> = [];
+  #effects: ManagedRuntime.ManagedRuntime<ScreenDependencies, never> | null = null;
+  readonly #operations = new Set<Promise<unknown>>();
+  readonly #httpRequests = new Set<IncomingMessage>();
+  #stopping: Promise<void> | null = null;
   #runtime: RemoteScreenRuntime | null = null;
   #runtimeState: SunshineMoonlightRuntimeState | null = null;
   #runtimeStarting: Promise<SunshineMoonlightRuntimeState> | null = null;
@@ -153,14 +177,20 @@ export class RemoteScreenGateway {
    * itself -- Sunshine reads the grant when it starts -- so this leaves the host as it found it, and
    * a runtime a live session owns is asked rather than replaced.
    */
-  async recheckScreenRecording(): Promise<boolean> {
+  recheckScreenRecording(): Promise<boolean> {
+    return this.#run(this.recheckScreenRecordingEffect());
+  }
+  readonly recheckScreenRecordingEffect = Effect.fn("RemoteScreenGateway.recheckScreenRecording")(function* (
+    this: RemoteScreenGateway,
+  ): Effect.fn.Return<boolean, RemoteWorkflowError> {
     if (this.#linuxWithoutX11 || !this.#options.runtimePaths) return this.#screenRecordingDenied;
-    await this.#ensureRuntime();
+    yield* remoteCall(() => this.#ensureRuntime());
     const denied = Boolean(this.#runtime?.screenCaptureDenied?.());
     this.#reportScreenRecordingDenied(denied);
-    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
+    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0)
+      yield* remoteCall(() => this.#stopRuntime());
     return denied;
-  }
+  });
 
   checkSetup(): Promise<RemoteDesktopSetupStatus> {
     if (this.#setupCheck) return this.#setupCheck;
@@ -170,7 +200,12 @@ export class RemoteScreenGateway {
     return this.#setupCheck;
   }
 
-  async #checkSetup(): Promise<RemoteDesktopSetupStatus> {
+  #checkSetup(): Promise<RemoteDesktopSetupStatus> {
+    return this.#run(this.#checkSetupEffect());
+  }
+  readonly #checkSetupEffect = Effect.fn("RemoteScreenGateway.checkSetup")(function* (
+    this: RemoteScreenGateway,
+  ): Effect.fn.Return<RemoteDesktopSetupStatus, RemoteWorkflowError> {
     const result: RemoteDesktopSetupStatus = {
       platform: this.#options.platform,
       hostName: hostname(),
@@ -192,53 +227,76 @@ export class RemoteScreenGateway {
           : sourceText("status.remote.setupInstallHost");
       return result;
     }
-    try {
-      await this.#ensureRuntime();
-      result.service = "allowed";
-      if (!this.#runtime?.checkSetup) {
-        result.message = sourceText("status.remote.setupUpdateRuntime");
-        return result;
-      }
-      try {
-        Object.assign(result, await this.#runtime.checkSetup());
-        this.#reportScreenRecordingDenied(result.screenRecording === "blocked");
-      } catch (error) {
-        const unavailable = error instanceof SunshineApiError && error.status === 404;
-        result.screenRecording =
-          result.accessibility =
-          result.guiSession =
-          result.displays =
-            unavailable ? "unavailable" : "failed";
-        result.message = unavailable
-          ? sourceText("status.remote.setupUpdateRuntime")
-          : sourceText("status.remote.setupCheckFailed");
-      }
-    } catch {
-      result.service = "failed";
-      result.message = sourceText("status.remote.setupServiceFailed");
-    } finally {
-      result.activeSessions = this.#sessions.size;
-      if (this.#sessions.size === 0 && this.#startingSessions === 0) await this.#stopRuntime();
-    }
+    yield* Effect.acquireUseRelease(
+      Effect.void,
+      () =>
+        Effect.gen({ self: this }, function* () {
+          const attempt0 = yield* Effect.gen({ self: this }, function* () {
+            yield* remoteCall(() => this.#ensureRuntime());
+            result.service = "allowed";
+            if (!this.#runtime?.checkSetup) {
+              result.message = sourceText("status.remote.setupUpdateRuntime");
+              return result;
+            }
+            const attempt1 = yield* Effect.gen({ self: this }, function* () {
+              const runtime = this.#runtime;
+              const check = runtime?.checkSetup;
+              if (check) Object.assign(result, yield* remoteCall(() => check.call(runtime)));
+              this.#reportScreenRecordingDenied(result.screenRecording === "blocked");
+            }).pipe(Effect.result);
+            if (Result.isFailure(attempt1)) {
+              const error = attempt1.failure.cause;
+              const unavailable = error instanceof SunshineApiError && error.status === 404;
+              result.screenRecording =
+                result.accessibility =
+                result.guiSession =
+                result.displays =
+                  unavailable ? "unavailable" : "failed";
+              result.message = unavailable
+                ? sourceText("status.remote.setupUpdateRuntime")
+                : sourceText("status.remote.setupCheckFailed");
+            }
+          }).pipe(Effect.result);
+          if (Result.isFailure(attempt0)) {
+            result.service = "failed";
+            result.message = sourceText("status.remote.setupServiceFailed");
+          } else if (attempt0.success !== undefined) return attempt0.success;
+        }),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          result.activeSessions = this.#sessions.size;
+          if (this.#sessions.size === 0 && this.#startingSessions === 0) yield* remoteCall(() => this.#stopRuntime());
+        }),
+    );
     return result;
-  }
+  });
 
-  async test(
+  test(sessionId: string, memberId: string, action: "start" | "status" | "stop"): Promise<RemoteDesktopTestStatus> {
+    return this.#run(this.testEffect(sessionId, memberId, action));
+  }
+  readonly testEffect = Effect.fn("RemoteScreenGateway.test")(function* (
+    this: RemoteScreenGateway,
     sessionId: string,
     memberId: string,
     action: "start" | "status" | "stop",
-  ): Promise<RemoteDesktopTestStatus> {
+  ): Effect.fn.Return<RemoteDesktopTestStatus, RemoteWorkflowError> {
     const session = this.#sessions.get(sessionId);
     if (!session || session.memberId !== memberId)
-      throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionNotFound"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionNotFound")),
+      });
     if (this.#options.platform !== "darwin" || !this.#runtime?.test)
-      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testRuntimeUpdate"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testRuntimeUpdate")),
+      });
     if (action === "start") {
       if (this.#sessions.size !== 1 || this.#startingSessions > 0 || this.#displaySwitching || this.#testSessionId)
-        throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testOtherSessions"));
+        return yield* new RemoteWorkflowError({
+          cause: new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testOtherSessions")),
+        });
       this.#testSessionId = sessionId;
-      try {
-        const permissions = await this.#runtime.checkSetup?.();
+      const attempt2 = yield* Effect.gen({ self: this }, function* () {
+        const permissions = yield* remoteCall(() => this.#runtime?.checkSetup?.() ?? Promise.resolve(undefined));
         if (
           permissions?.screenRecording !== "allowed" ||
           permissions.accessibility !== "allowed" ||
@@ -246,32 +304,52 @@ export class RemoteScreenGateway {
           permissions.displays !== "allowed" ||
           permissions.restartRequired
         ) {
-          throw new RemoteScreenError(503, "host_permissions_required", sourceText("error.remote.testPermissions"));
+          return yield* new RemoteWorkflowError({
+            cause: new RemoteScreenError(503, "host_permissions_required", sourceText("error.remote.testPermissions")),
+          });
         }
-        const status = await this.#runtime?.test?.("start");
+        const status = yield* remoteCall(() => this.#runtime?.test?.("start") ?? Promise.resolve(undefined));
         if (!status)
-          throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded"));
+          return yield* new RemoteWorkflowError({
+            cause: new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded")),
+          });
         if (!status.active)
-          throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testPanelFailed"));
+          return yield* new RemoteWorkflowError({
+            cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testPanelFailed")),
+          });
         if (!this.#sessions.has(sessionId)) {
-          await this.#runtime?.test?.("stop");
+          yield* remoteCall(() => this.#runtime?.test?.("stop") ?? Promise.resolve(undefined));
           this.#testSessionId = null;
-          throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded"));
+          return yield* new RemoteWorkflowError({
+            cause: new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded")),
+          });
         }
         return status;
-      } catch (error) {
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt2)) {
+        const error = attempt2.failure.cause;
         // The request can fail after the panel opened. Keep input contained until cleanup succeeds.
-        await this.#runtime?.test?.("stop").then(() => {
-          this.#testSessionId = null;
-        });
-        throw error;
-      }
+        yield* remoteCall(() => this.#runtime?.test?.("stop") ?? Promise.resolve(undefined)).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              this.#testSessionId = null;
+            }),
+          ),
+        );
+        return yield* new RemoteWorkflowError({ cause: error });
+      } else if (attempt2.success !== undefined) return attempt2.success;
     }
     if (this.#testSessionId !== sessionId) return { active: false, mouse: false, keyboard: false, code: "" };
-    const result = await this.#runtime.test(action);
+    const runtime = this.#runtime;
+    const test = runtime?.test;
+    if (!test)
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testRuntimeUpdate")),
+      });
+    const result = yield* remoteCall(() => test.call(runtime, action));
     if (action === "stop") this.#testSessionId = null;
     return result;
-  }
+  });
 
   capabilities(): RemoteDesktopCapabilities {
     const displays = this.#availableDisplays();
@@ -292,7 +370,12 @@ export class RemoteScreenGateway {
     return [...this.#sessions.values()].map((session) => structuredClone(session.snapshot));
   }
 
-  async createLocalTestSession(): Promise<RemoteDesktopSession> {
+  createLocalTestSession(): Promise<RemoteDesktopSession> {
+    return this.#run(this.createLocalTestSessionEffect());
+  }
+  readonly createLocalTestSessionEffect = Effect.fn("RemoteScreenGateway.createLocalTestSession")(function* (
+    this: RemoteScreenGateway,
+  ): Effect.fn.Return<RemoteDesktopSession, RemoteWorkflowError> {
     const server = createServer((request, response) => {
       let url: URL;
       try {
@@ -320,15 +403,20 @@ export class RemoteScreenGateway {
       }
       this.handleUpgrade(request, socket, head, url);
     });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(0, "127.0.0.1", resolve);
-      });
+    return yield* Effect.gen({ self: this }, function* () {
+      yield* remoteCall(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "127.0.0.1", resolve);
+          }),
+      );
       const address = server.address();
       if (!address || typeof address === "string")
-        throw new Error(sourceText("error.remote.localTestListenerUnavailable"));
-      const session = await this.createSession({
+        return yield* new RemoteWorkflowError({
+          cause: new Error(sourceText("error.remote.localTestListenerUnavailable")),
+        });
+      const session = yield* this.createSessionEffect({
         serverId: "local",
         memberId: "local-setup",
         teamSessionId: randomUUID(),
@@ -337,60 +425,106 @@ export class RemoteScreenGateway {
       });
       this.#localTestServers.set(session.id, server);
       return session;
-    } catch (error) {
-      server.close();
-      throw error;
-    }
-  }
+    }).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.gen({ self: this }, function* () {
+          server.close();
+          return yield* new RemoteWorkflowError({ cause: error });
+        }),
+      ),
+    );
+  });
 
   testLocalSession(sessionId: string, action: "start" | "status" | "stop") {
     if (!this.#localTestServers.has(sessionId)) throw new Error(sourceText("error.remote.localTestNotFound"));
     return this.test(sessionId, "local-setup", action);
   }
 
-  async closeLocalTestSession(sessionId: string): Promise<void> {
+  closeLocalTestSession(sessionId: string): Promise<void> {
+    return this.#run(this.closeLocalTestSessionEffect(sessionId));
+  }
+  readonly closeLocalTestSessionEffect = Effect.fn("RemoteScreenGateway.closeLocalTestSession")(function* (
+    this: RemoteScreenGateway,
+    sessionId: string,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (!this.#localTestServers.has(sessionId)) return;
-    await this.closeSession(sessionId);
-  }
+    yield* this.closeSessionEffect(sessionId);
+  });
 
-  async createSession(input: {
+  createSession(input: {
     serverId: string;
     memberId: string;
     teamSessionId: string;
     teamSessionExpiresAt: string;
     publicHttpBaseUrl: string;
   }): Promise<RemoteDesktopSession> {
+    return this.#run(this.createSessionEffect(input));
+  }
+  readonly createSessionEffect = Effect.fn("RemoteScreenGateway.createSession")(function* (
+    this: RemoteScreenGateway,
+    input: {
+      serverId: string;
+      memberId: string;
+      teamSessionId: string;
+      teamSessionExpiresAt: string;
+      publicHttpBaseUrl: string;
+    },
+  ): Effect.fn.Return<RemoteDesktopSession, RemoteWorkflowError> {
+    if (this.#stopping)
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.runtimeUnavailable")),
+      });
     this.#startingSessions += 1;
-    try {
-      return await this.#createSession(input);
-    } finally {
-      this.#startingSessions -= 1;
-      if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
-    }
-  }
+    return yield* Effect.acquireUseRelease(
+      Effect.void,
+      () =>
+        Effect.gen({ self: this }, function* () {
+          return yield* this.#createSessionEffect(input);
+        }),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          this.#startingSessions -= 1;
+          if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0)
+            yield* remoteCall(() => this.#stopRuntime());
+        }),
+    );
+  });
 
-  async #createSession(input: {
-    serverId: string;
-    memberId: string;
-    teamSessionId: string;
-    teamSessionExpiresAt: string;
-    publicHttpBaseUrl: string;
-  }): Promise<RemoteDesktopSession> {
+  readonly #createSessionEffect = Effect.fn("RemoteScreenGateway.createSession")(function* (
+    this: RemoteScreenGateway,
+    input: {
+      serverId: string;
+      memberId: string;
+      teamSessionId: string;
+      teamSessionExpiresAt: string;
+      publicHttpBaseUrl: string;
+    },
+  ): Effect.fn.Return<RemoteDesktopSession, RemoteWorkflowError> {
     this.#pruneExpiredGrants();
     if (this.#sessions.size >= REMOTE_DESKTOP_MAX_SESSIONS) {
-      throw new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity")),
+      });
     }
     if (this.#linuxWithoutX11) {
-      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.linuxNeedsX11"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.linuxNeedsX11")),
+      });
     }
     if (!this.#options.runtimePaths) {
-      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.runtimeMissing"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.runtimeMissing")),
+      });
     }
     if (this.#testSessionId)
-      throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive"));
-    await this.#ensureRuntime();
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive")),
+      });
+    yield* remoteCall(() => this.#ensureRuntime());
     if (this.#testSessionId)
-      throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive")),
+      });
     // The runtime starts and answers either way, so this is the only place the refusal can become a
     // failure the member sees. Without it the session is created, the stream never starts, and the
     // viewer sits at "connecting" until the member gives up.
@@ -398,20 +532,30 @@ export class RemoteScreenGateway {
       // The createSession lease releases an idle runtime after pending creates settle, so a new
       // grant is read by the next process without stopping an existing member's session.
       this.#reportScreenRecordingDenied(true);
-      throw new RemoteScreenError(503, "host_permissions_required", sourceText("error.remote.screenRecordingDenied"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(
+          503,
+          "host_permissions_required",
+          sourceText("error.remote.screenRecordingDenied"),
+        ),
+      });
     }
     this.#reportScreenRecordingDenied(false);
     const id = randomUUID();
     const usedStreamerSlots = new Set([...this.#sessions.values()].map((session) => session.streamerSlot));
     const streamerSlot = [1, 2, 3, 4].find((slot) => !usedStreamerSlots.has(slot));
     if (!streamerSlot) {
-      throw new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity")),
+      });
     }
     const viewerGrant = randomBytes(32).toString("base64url");
     const now = this.#options.now();
     const teamSessionExpiresAt = Date.parse(input.teamSessionExpiresAt);
     if (!Number.isFinite(teamSessionExpiresAt) || teamSessionExpiresAt <= now) {
-      throw new RemoteScreenError(401, "session_expired", sourceText("error.remote.teamSessionExpired"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(401, "session_expired", sourceText("error.remote.teamSessionExpired")),
+      });
     }
     const createdAt = new Date(now).toISOString();
     const snapshot: RemoteDesktopSession = {
@@ -451,33 +595,51 @@ export class RemoteScreenGateway {
       upstreamSocket: null,
     });
     return structuredClone(snapshot);
-  }
+  });
 
-  async selectDisplay(displayId: string): Promise<void> {
+  selectDisplay(displayId: string): Promise<void> {
+    return this.#run(this.selectDisplayEffect(displayId));
+  }
+  readonly selectDisplayEffect = Effect.fn("RemoteScreenGateway.selectDisplay")(function* (
+    this: RemoteScreenGateway,
+    displayId: string,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (this.#testSessionId)
-      throw new RemoteScreenError(409, "connection_failed", sourceText("error.remote.finishTestBeforeSwitch"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(409, "connection_failed", sourceText("error.remote.finishTestBeforeSwitch")),
+      });
     if (!this.#availableDisplays().some((display) => display.id === displayId)) {
-      throw new RemoteScreenError(400, "host_unavailable", sourceText("error.remote.displayNotFound"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(400, "host_unavailable", sourceText("error.remote.displayNotFound")),
+      });
     }
     if (this.#displaySwitching)
-      throw new RemoteScreenError(409, "connection_failed", sourceText("error.remote.displaySwitchInProgress"));
+      return yield* new RemoteWorkflowError({
+        cause: new RemoteScreenError(409, "connection_failed", sourceText("error.remote.displaySwitchInProgress")),
+      });
     if (displayId === this.#selectedDisplayId) return;
     this.#displaySwitching = true;
-    try {
-      for (const session of this.#sessions.values()) {
-        session.snapshot.phase = "connecting";
-        session.snapshot.message = sourceText("status.remote.switchingMonitor");
-      }
-      await this.#runtime?.selectDisplay(displayId);
-      this.#selectedDisplayId = displayId;
-      for (const session of this.#sessions.values()) {
-        session.snapshot.selectedDisplayId = displayId;
-        session.clientSocket?.close(4410, "display changed");
-      }
-    } finally {
-      this.#displaySwitching = false;
-    }
-  }
+    return yield* Effect.acquireUseRelease(
+      Effect.void,
+      () =>
+        Effect.gen({ self: this }, function* () {
+          for (const session of this.#sessions.values()) {
+            session.snapshot.phase = "connecting";
+            session.snapshot.message = sourceText("status.remote.switchingMonitor");
+          }
+          yield* remoteCall(() => this.#runtime?.selectDisplay(displayId) ?? Promise.resolve());
+          this.#selectedDisplayId = displayId;
+          for (const session of this.#sessions.values()) {
+            session.snapshot.selectedDisplayId = displayId;
+            session.clientSocket?.close(4410, "display changed");
+          }
+        }),
+      () =>
+        Effect.sync(() => {
+          this.#displaySwitching = false;
+        }),
+    );
+  });
 
   handlesHttp(url: URL): boolean {
     return /^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/(?:viewer|authorize|viewer-state|moonlight(?:\/.*)?)$/.test(
@@ -485,7 +647,16 @@ export class RemoteScreenGateway {
     );
   }
 
-  async handleHttp(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+  handleHttp(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    this.#httpRequests.add(request);
+    return this.#run(this.handleHttpEffect(request, response, url)).finally(() => this.#httpRequests.delete(request));
+  }
+  readonly handleHttpEffect = Effect.fn("RemoteScreenGateway.handleHttp")(function* (
+    this: RemoteScreenGateway,
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     const [, sessionId, route] =
       /^\/v1\/remote-screen\/sessions\/([A-Za-z0-9-]+)\/(viewer|authorize|viewer-state|moonlight(?:\/.*)?)$/.exec(
         url.pathname,
@@ -498,7 +669,7 @@ export class RemoteScreenGateway {
     }
     if (request.method === "POST" && route === "viewer-state") {
       if (!this.#viewerAuthorized(request, session)) return sendText(response, 401, "Remote viewer is not authorized.");
-      const update = await readSmallJson(request, viewerStateSchema);
+      const update = yield* remoteCall(() => readSmallJson(request, viewerStateSchema));
       if (!update || update.sessionId !== session.snapshot.id) {
         return sendText(response, 400, "Remote viewer state is invalid.");
       }
@@ -521,7 +692,7 @@ export class RemoteScreenGateway {
       return;
     }
     if (request.method === "POST" && route === "authorize") {
-      const body = await readSmallJson(request, viewerGrantSchema);
+      const body = yield* remoteCall(() => readSmallJson(request, viewerGrantSchema));
       const grant = body?.grant ?? "";
       if (
         session.viewerGrantUsed ||
@@ -550,8 +721,8 @@ export class RemoteScreenGateway {
     if (!route.startsWith("moonlight")) return sendText(response, 404, "Remote route not found.");
     const upstreamPath = route.slice("moonlight".length) || "/";
     if (!allowedMoonlightPath(upstreamPath)) return sendText(response, 404, "Moonlight route is not exposed.");
-    await this.#proxyHttp(request, response, session, upstreamPath, url.search);
-  }
+    yield* this.#proxyHttpEffect(request, response, session, upstreamPath, url.search);
+  });
 
   handlesUpgrade(url: URL): boolean {
     return /^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/.test(url.pathname);
@@ -650,10 +821,17 @@ export class RemoteScreenGateway {
     });
   }
 
-  async closeSession(
+  closeSession(
     id: string,
     reason: "session_revoked" | "session_expired" | "connection_failed" = "session_revoked",
   ): Promise<void> {
+    return this.#run(this.closeSessionEffect(id, reason));
+  }
+  readonly closeSessionEffect = Effect.fn("RemoteScreenGateway.closeSession")(function* (
+    this: RemoteScreenGateway,
+    id: string,
+    reason: "session_revoked" | "session_expired" | "connection_failed" = "session_revoked",
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     const session = this.#sessions.get(id);
     if (!session) return;
     this.#sessions.delete(id);
@@ -662,7 +840,9 @@ export class RemoteScreenGateway {
     localServer?.close();
     localServer?.closeAllConnections();
     if (this.#testSessionId === id) {
-      await this.#runtime?.test?.("stop").catch(() => undefined);
+      yield* remoteCall(() => this.#runtime?.test?.("stop") ?? Promise.resolve(undefined)).pipe(
+        Effect.catch(() => Effect.void),
+      );
       this.#testSessionId = null;
     }
     this.#finishStreamStart(id);
@@ -672,39 +852,83 @@ export class RemoteScreenGateway {
     session.clientSocket?.close(4403, reason);
     session.upstreamSocket?.close();
     this.#audit(session, "ended", reason);
-    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
-  }
+    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0)
+      yield* remoteCall(() => this.#stopRuntime());
+  });
 
-  async closeMemberSession(id: string, memberId: string): Promise<boolean> {
+  closeMemberSession(id: string, memberId: string): Promise<boolean> {
+    return this.#run(this.closeMemberSessionEffect(id, memberId));
+  }
+  readonly closeMemberSessionEffect = Effect.fn("RemoteScreenGateway.closeMemberSession")(function* (
+    this: RemoteScreenGateway,
+    id: string,
+    memberId: string,
+  ): Effect.fn.Return<boolean, RemoteWorkflowError> {
     const session = this.#sessions.get(id);
     if (!session || session.memberId !== memberId) return false;
-    await this.closeSession(id, "session_revoked");
+    yield* this.closeSessionEffect(id, "session_revoked");
     return true;
-  }
+  });
 
-  async revokeTeamSession(teamSessionId: string): Promise<void> {
-    await Promise.all(
+  revokeTeamSession(teamSessionId: string): Promise<void> {
+    return this.#run(this.revokeTeamSessionEffect(teamSessionId));
+  }
+  readonly revokeTeamSessionEffect = Effect.fn("RemoteScreenGateway.revokeTeamSession")(function* (
+    this: RemoteScreenGateway,
+    teamSessionId: string,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    yield* Effect.all(
       [...this.#sessions.entries()]
         .filter(([, session]) => session.teamSessionId === teamSessionId)
-        .map(([id]) => this.closeSession(id, "session_revoked")),
+        .map(([id]) => this.closeSessionEffect(id, "session_revoked")),
+      { concurrency: "unbounded" },
     );
-  }
+  });
 
-  async revokeMember(memberId: string): Promise<void> {
-    await Promise.all(
+  revokeMember(memberId: string): Promise<void> {
+    return this.#run(this.revokeMemberEffect(memberId));
+  }
+  readonly revokeMemberEffect = Effect.fn("RemoteScreenGateway.revokeMember")(function* (
+    this: RemoteScreenGateway,
+    memberId: string,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    yield* Effect.all(
       [...this.#sessions.entries()]
         .filter(([, session]) => session.memberId === memberId)
-        .map(([id]) => this.closeSession(id, "session_revoked")),
+        .map(([id]) => this.closeSessionEffect(id, "session_revoked")),
+      { concurrency: "unbounded" },
     );
-  }
+  });
 
-  async stop(): Promise<void> {
-    await Promise.all([...this.#sessions.keys()].map((id) => this.closeSession(id, "session_revoked")));
-    await this.#stopRuntime();
+  stop(): Promise<void> {
+    if (this.#stopping) return this.#stopping;
+    this.#stopping = (async () => {
+      try {
+        await this.#run(this.stopEffect());
+        for (const request of this.#httpRequests) request.destroy();
+        await Promise.allSettled([...this.#operations]);
+        // A create already admitted before stop can finish after the first close pass.
+        await this.#run(this.stopEffect());
+      } finally {
+        await this.#effects?.dispose();
+        this.#effects = null;
+        this.#stopping = null;
+      }
+    })();
+    return this.#stopping;
+  }
+  readonly stopEffect = Effect.fn("RemoteScreenGateway.stop")(function* (
+    this: RemoteScreenGateway,
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    yield* Effect.all(
+      [...this.#sessions.keys()].map((id) => this.closeSessionEffect(id, "session_revoked")),
+      { concurrency: "unbounded" },
+    );
+    yield* remoteCall(() => this.#stopRuntime());
     this.#pendingStreamStarts.splice(0);
     if (this.#activeStreamStart) clearTimeout(this.#activeStreamStart.timeout);
     this.#activeStreamStart = null;
-  }
+  });
 
   #queueStreamStart(sessionId: string, start: () => void): void {
     const existing = this.#pendingStreamStarts.findIndex((entry) => entry.sessionId === sessionId);
@@ -740,7 +964,7 @@ export class RemoteScreenGateway {
     this.#runtime = null;
     this.#runtimeState = null;
     this.#testSessionId = null;
-    this.#runtimeStopping = runtime?.stop() ?? Promise.resolve();
+    this.#runtimeStopping = this.#run(remoteCall(() => runtime?.stop() ?? Promise.resolve()));
     try {
       await this.#runtimeStopping;
     } finally {
@@ -758,30 +982,41 @@ export class RemoteScreenGateway {
     }
   }
 
-  async #startRuntime(): Promise<SunshineMoonlightRuntimeState> {
-    if (this.#runtimeStopping) await this.#runtimeStopping;
+  #startRuntime(): Promise<SunshineMoonlightRuntimeState> {
+    return this.#run(this.#startRuntimeEffect());
+  }
+  readonly #startRuntimeEffect = Effect.fn("RemoteScreenGateway.startRuntime")(function* (
+    this: RemoteScreenGateway,
+  ): Effect.fn.Return<SunshineMoonlightRuntimeState, RemoteWorkflowError, ScreenDependencies> {
+    const stopping = this.#runtimeStopping;
+    if (stopping) yield* remoteCall(() => stopping);
     if (this.#runtimeState) return this.#runtimeState;
     const paths = this.#options.runtimePaths;
-    if (!paths || this.#linuxWithoutX11) throw new Error(sourceText("error.remote.runtimeUnavailable"));
+    if (!paths || this.#linuxWithoutX11)
+      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.runtimeUnavailable")) });
     this.#runtime ??= this.#options.createRuntime({
       paths,
       stateDirectory: this.#options.runtimeStateDirectory,
       platform: this.#options.platform,
-      credentials: await this.#options.getRuntimeCredentials(),
+      credentials: yield* (yield* ScreenDependencies).credentials(),
       getDisplays: () => this.#options.getDisplays?.() ?? [],
-      getIceServers: async () => {
-        // Loopback tests need no account or Signal service. Keep remote ICE configuration
-        // whenever a remote session shares this runtime.
-        if (this.#sessions.size > 0 && [...this.#sessions.keys()].every((id) => this.#localTestServers.has(id)))
-          return [];
-        return this.#options.getIceServers();
-      },
+      getIceServers: () =>
+        this.#run(
+          Effect.gen({ self: this }, function* () {
+            // Loopback tests need no account or Signal service. Keep remote ICE configuration
+            // whenever a remote session shares this runtime.
+            if (this.#sessions.size > 0 && [...this.#sessions.keys()].every((id) => this.#localTestServers.has(id)))
+              return [];
+            return yield* (yield* ScreenDependencies).iceServers();
+          }),
+        ),
       onDiagnostic: this.#options.onDiagnostic,
     });
-    this.#runtimeState = await this.#runtime.start();
+    const runtime = this.#runtime;
+    this.#runtimeState = yield* remoteCall(() => runtime.start());
     this.#selectedDisplayId = this.#runtimeState.selectedDisplayId;
     return this.#runtimeState;
-  }
+  });
 
   #reportScreenRecordingDenied(denied: boolean): void {
     if (this.#screenRecordingDenied === denied) return;
@@ -793,13 +1028,14 @@ export class RemoteScreenGateway {
     return this.#runtimeState?.displays ?? this.#options.getDisplays?.() ?? [];
   }
 
-  async #proxyHttp(
+  readonly #proxyHttpEffect = Effect.fn("RemoteScreenGateway.proxyHttp")(function* (
+    this: RemoteScreenGateway,
     request: IncomingMessage,
     response: ServerResponse,
     session: ManagedRemoteScreenSession,
     upstreamPath: string,
     search: string,
-  ): Promise<void> {
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (!this.#runtimeState) return sendText(response, 503, "Moonlight runtime is unavailable.");
     if (upstreamPath === "/config.js") {
       response.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-store" });
@@ -810,7 +1046,8 @@ export class RemoteScreenGateway {
     }
     const target = new URL(`${upstreamPath}${search}`, this.#runtimeState.baseUrl);
     const authHeader = this.#runtimeState.authHeader;
-    await new Promise<void>((resolve) => {
+    yield* Effect.callback<void>((resume) => {
+      const resolve = () => resume(Effect.void);
       const upstream = httpRequest(
         target,
         {
@@ -827,14 +1064,44 @@ export class RemoteScreenGateway {
           response.writeHead(upstreamResponse.statusCode ?? 502, headers);
           upstreamResponse.pipe(response);
           upstreamResponse.once("end", resolve);
+          upstreamResponse.once("error", () => {
+            response.destroy();
+            resolve();
+          });
         },
       );
       upstream.once("error", () => {
         sendText(response, 502, "Moonlight runtime request failed.");
         resolve();
       });
+      const closed = () => {
+        upstream.destroy();
+        resolve();
+      };
+      request.once("aborted", closed);
+      response.once("close", closed);
       request.pipe(upstream);
+      return Effect.sync(() => {
+        request.off("aborted", closed);
+        response.off("close", closed);
+        request.unpipe(upstream);
+        upstream.destroy();
+      });
     });
+  });
+
+  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, ScreenDependencies>): Promise<A> {
+    this.#effects ??= ManagedRuntime.make(ScreenDependencies.layer(this.#options));
+    const pending = this.#effects.runPromise(Effect.result(operation)).then((result) => {
+      if (Result.isFailure(result)) throw result.failure.cause;
+      return result.success;
+    });
+    this.#operations.add(pending);
+    const clear = () => {
+      this.#operations.delete(pending);
+    };
+    void pending.then(clear, clear);
+    return pending;
   }
 
   #viewerAuthorized(request: IncomingMessage, session: ManagedRemoteScreenSession): boolean {
@@ -866,13 +1133,13 @@ export class RemoteScreenGateway {
   }
 }
 
-export class RemoteScreenError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
+export class RemoteScreenError extends Schema.TaggedError<RemoteScreenError>()("RemoteScreenError", {
+  status: Schema.Number,
+  code: Schema.String,
+  message: Schema.String,
+}) {
+  constructor(status: number, code: string, message: string) {
+    super({ status, code, message });
   }
 }
 

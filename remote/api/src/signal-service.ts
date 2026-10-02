@@ -1,4 +1,5 @@
 import { SLACK_ROUTE_TTL_SECONDS, type SlackRouteTeam } from "@openbot/contracts/signal-protocol/slack-route";
+import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
 import {
   decodeSignalClientMessage,
   encodeSignalServerMessage,
@@ -11,6 +12,7 @@ import {
   type SlackDeliveryKind,
   type SlackDeliveryStatus,
 } from "./protocol";
+import { RemoteTokenError } from "./tokens";
 
 /** The workspaces a verified route ticket names, each with the time it was linked to the host. */
 export interface SlackRoute {
@@ -18,17 +20,22 @@ export interface SlackRoute {
 }
 
 export interface RemoteTokenProvider {
-  verifyTicket(token: string): Promise<RemoteTicketClaims>;
-  verifyResumeToken(token: string): Promise<RemoteTicketClaims>;
-  validateClaims(claims: RemoteTicketClaims): Promise<boolean>;
-  issueResumeToken(claims: RemoteTicketClaims): Promise<string>;
+  verifyTicket(token: string): Effect.Effect<RemoteTicketClaims, RemoteTokenError>;
+  verifyResumeToken(token: string): Effect.Effect<RemoteTicketClaims, RemoteTokenError>;
+  validateClaims(claims: RemoteTicketClaims): Effect.Effect<boolean, RemoteTokenError>;
+  issueResumeToken(claims: RemoteTicketClaims): Effect.Effect<string, RemoteTokenError>;
   iceServers(claims: RemoteTicketClaims): IceServer[];
-  /** The Slack workspaces a route ticket links to the host. Without it, no `ingress` socket connects. */
-  verifySlackRoute?(token: string, hostId: string): Promise<SlackRoute>;
-  /** The workspaces of a route that the account service still links to the host, with the same link. */
-  validateSlackRoute?(hostId: string, teams: SlackRouteTeam[]): Promise<string[]>;
+  /** Without a route verifier, no ingress socket connects. */
+  verifySlackRoute?(token: string, hostId: string): Effect.Effect<SlackRoute, RemoteTokenError>;
+  validateSlackRoute?(hostId: string, teams: SlackRouteTeam[]): Effect.Effect<string[], RemoteTokenError>;
   revokeHost?(hostId: string, authEpoch: number): void;
   revokeSession?(sessionId: string): void;
+}
+
+class SignalTokens extends Context.Service<SignalTokens, RemoteTokenProvider>()("@openbot/remote-api/SignalTokens") {
+  static layer(provider: RemoteTokenProvider) {
+    return Layer.succeed(SignalTokens, provider);
+  }
 }
 
 export interface SignalSocket {
@@ -160,6 +167,8 @@ export class SignalService {
     slackDeliveriesUnavailable: 0,
   };
 
+  readonly #runtime: ManagedRuntime.ManagedRuntime<SignalTokens, never>;
+
   constructor(
     tokens: RemoteTokenProvider,
     maximumConnectionsPerUser: number,
@@ -168,10 +177,19 @@ export class SignalService {
     slackLimits: SlackDeliveryLimits = DEFAULT_SLACK_DELIVERY_LIMITS,
   ) {
     this.#tokens = tokens;
+    this.#runtime = ManagedRuntime.make(SignalTokens.layer(tokens));
     this.#maximumConnectionsPerUser = maximumConnectionsPerUser;
     this.#maximumConnectionsPerIp = maximumConnectionsPerIp;
     this.#maximumMessagesPerMinute = maximumMessagesPerMinute;
     this.#slackLimits = slackLimits;
+  }
+
+  async close(): Promise<void> {
+    await this.#runtime.dispose();
+    for (const timer of this.#connectionDropTimers.values()) clearTimeout(timer);
+    for (const timer of this.#peerExpirationTimers.values()) clearTimeout(timer);
+    this.#connectionDropTimers.clear();
+    this.#peerExpirationTimers.clear();
   }
 
   connect(socket: SignalSocket): boolean {
@@ -185,78 +203,85 @@ export class SignalService {
     return true;
   }
 
-  async receive(socket: SignalSocket, input: string | Uint8Array): Promise<void> {
-    if (!this.#acceptMessage(socket)) {
-      this.#fail(socket, "rate_limited", "Too many signal messages.", 1008);
-      return;
-    }
-    const text = input instanceof Uint8Array ? new TextDecoder().decode(input) : input;
-    if (new TextEncoder().encode(text).byteLength > SIGNAL_MESSAGE_BYTES_LIMIT) {
-      this.#fail(socket, "invalid_message", "Signal message is too large.", 1009);
-      return;
-    }
-    let message: SignalClientMessage;
-    try {
-      message = decodeSignalClientMessage(JSON.parse(text));
-    } catch {
-      this.#metrics.protocolFailures += 1;
-      this.#fail(socket, "invalid_message", "Signal message is invalid.", 1003);
-      return;
-    }
-    if (message.type === "hello") {
-      await this.#authenticate(socket, message);
-      return;
-    }
-    const peer = this.#peers.get(socket.id);
-    if (!peer) {
-      this.#fail(socket, "authentication_required", "Authenticate before sending signal messages.", 1008);
-      return;
-    }
-    if (message.type === "turn-refresh") {
-      if (peer.claims.sessionExpiresAt <= Math.floor(Date.now() / 1_000)) {
-        this.#fail(socket, "authentication_required", "The remote session expired.", 1008);
+  receive(socket: SignalSocket, input: string | Uint8Array): Promise<void> {
+    return this.#runtime.runPromise(this.receiveEffect(socket, input));
+  }
+
+  readonly receiveEffect = Effect.fn("Signal.receiveEffect")((socket: SignalSocket, input: string | Uint8Array) =>
+    Effect.gen({ self: this }, function* () {
+      const tokens = yield* SignalTokens;
+      if (!this.#acceptMessage(socket)) {
+        this.#fail(socket, "rate_limited", "Too many signal messages.", 1008);
         return;
       }
-      if (message.connectionId !== null && !this.#ownsConnection(peer, message.connectionId)) {
+      const text = input instanceof Uint8Array ? new TextDecoder().decode(input) : input;
+      if (new TextEncoder().encode(text).byteLength > SIGNAL_MESSAGE_BYTES_LIMIT) {
+        this.#fail(socket, "invalid_message", "Signal message is too large.", 1009);
+        return;
+      }
+      let message: SignalClientMessage;
+      try {
+        message = decodeSignalClientMessage(JSON.parse(text));
+      } catch {
+        this.#metrics.protocolFailures += 1;
+        this.#fail(socket, "invalid_message", "Signal message is invalid.", 1003);
+        return;
+      }
+      if (message.type === "hello") {
+        yield* this.#authenticate(socket, message);
+        return;
+      }
+      const peer = this.#peers.get(socket.id);
+      if (!peer) {
+        this.#fail(socket, "authentication_required", "Authenticate before sending signal messages.", 1008);
+        return;
+      }
+      if (message.type === "turn-refresh") {
+        if (peer.claims.sessionExpiresAt <= Math.floor(Date.now() / 1_000)) {
+          this.#fail(socket, "authentication_required", "The remote session expired.", 1008);
+          return;
+        }
+        if (message.connectionId !== null && !this.#ownsConnection(peer, message.connectionId)) {
+          this.#fail(socket, "permission_denied", "The connection does not belong to this peer.");
+          return;
+        }
+        this.#send(socket, {
+          type: "ready",
+          version: 1,
+          connectionId: message.connectionId,
+          resumeToken: yield* tokens.issueResumeToken(peer.claims),
+          iceServers: this.#tokens.iceServers(peer.claims),
+        });
+        return;
+      }
+      if (message.type === "disconnect") {
+        if (this.#ownsConnection(peer, message.connectionId)) this.#dropConnection(message.connectionId, socket.id);
+        return;
+      }
+      if (message.type === "slack-delivery-result") {
+        const pending = this.#pendingDeliveries.get(message.requestId);
+        if (!pending || pending.socketId !== socket.id) {
+          this.#fail(socket, "permission_denied", "The delivery does not belong to this peer.");
+          return;
+        }
+        this.#settleDelivery(message.requestId, {
+          status: message.status,
+          ...(message.contentType && message.body !== undefined
+            ? { contentType: message.contentType, body: message.body }
+            : {}),
+        });
+        return;
+      }
+      const connection = this.#connections.get(message.connectionId);
+      if (!connection || (connection.client.id !== socket.id && connection.host.id !== socket.id)) {
         this.#fail(socket, "permission_denied", "The connection does not belong to this peer.");
         return;
       }
-      this.#send(socket, {
-        type: "ready",
-        version: 1,
-        connectionId: message.connectionId,
-        resumeToken: await this.#tokens.issueResumeToken(peer.claims),
-        iceServers: this.#tokens.iceServers(peer.claims),
-      });
-      return;
-    }
-    if (message.type === "disconnect") {
-      if (this.#ownsConnection(peer, message.connectionId)) this.#dropConnection(message.connectionId, socket.id);
-      return;
-    }
-    if (message.type === "slack-delivery-result") {
-      const pending = this.#pendingDeliveries.get(message.requestId);
-      if (!pending || pending.socketId !== socket.id) {
-        this.#fail(socket, "permission_denied", "The delivery does not belong to this peer.");
-        return;
-      }
-      this.#settleDelivery(message.requestId, {
-        status: message.status,
-        ...(message.contentType && message.body !== undefined
-          ? { contentType: message.contentType, body: message.body }
-          : {}),
-      });
-      return;
-    }
-    const connection = this.#connections.get(message.connectionId);
-    if (!connection || (connection.client.id !== socket.id && connection.host.id !== socket.id)) {
-      this.#fail(socket, "permission_denied", "The connection does not belong to this peer.");
-      return;
-    }
-    const target = connection.client.id === socket.id ? connection.host : connection.client;
-    this.#send(target, message);
-    this.#metrics.relayedMessages += 1;
-  }
+      const target = connection.client.id === socket.id ? connection.host : connection.client;
+      this.#send(target, message);
+      this.#metrics.relayedMessages += 1;
+    }),
+  );
 
   disconnect(socket: SignalSocket): void {
     this.#sockets.delete(socket.id);
@@ -293,7 +318,7 @@ export class SignalService {
     }
     if (peer.peer === "host") {
       const replacement = this.#currentHost(peer.claims.hostId);
-      if (replacement) void this.#restoreWaitingClients(replacement);
+      if (replacement) void this.#runtime.runPromise(this.#restoreWaitingClients(replacement));
     }
     this.#metrics.activePeerConnections = this.#connections.size;
     this.#metrics.activeSockets = this.#sockets.size;
@@ -365,47 +390,70 @@ export class SignalService {
    * its answer. It resolves 503 when no host holds the workspace, the host is too busy, or it does
    * not answer in time: Slack then sends the request again, so nothing needs to be kept here.
    */
-  deliverSlack(appId: string, teamId: string, delivery: SlackDelivery): Promise<SlackDeliveryResponse> {
-    const socketId = this.#slackTeams.get(slackRouteKey(appId, teamId));
-    const ingress = socketId ? this.#peers.get(socketId) : undefined;
-    if (!ingress) return Promise.resolve(this.#unavailable());
-    const hostId = ingress.claims.hostId;
-    let hostPending = 0;
-    let hostBytes = 0;
-    for (const pending of this.#pendingDeliveries.values()) {
-      if (pending.hostId !== hostId) continue;
-      hostPending += 1;
-      hostBytes += pending.bytes;
-    }
-    const bytes = Math.ceil(delivery.body.byteLength / 3) * 4;
-    if (
-      this.#pendingDeliveries.size >= this.#slackLimits.maximumPending ||
-      hostPending >= this.#slackLimits.maximumPendingPerHost ||
-      hostBytes + bytes > this.#slackLimits.maximumPendingBytesPerHost
-    ) {
-      return Promise.resolve(this.#unavailable());
-    }
-    const requestId = randomIdentifier();
-    return new Promise((resolve) => {
-      const timer = setTimeout(
-        () => this.#settleDelivery(requestId, this.#unavailable()),
-        this.#slackLimits.timeoutMilliseconds,
-      );
-      timer.unref?.();
-      this.#pendingDeliveries.set(requestId, { socketId: ingress.socket.id, hostId, bytes, timer, resolve });
-      this.#metrics.slackDeliveries += 1;
-      this.#send(ingress.socket, {
-        type: "slack-delivery",
-        version: 1,
-        requestId,
-        teamId,
-        kind: delivery.kind,
-        retryNum: delivery.retryNum,
-        retryReason: delivery.retryReason,
-        bodyBase64: Buffer.from(delivery.body).toString("base64"),
-      });
-    });
+  deliverSlack(
+    appId: string,
+    teamId: string,
+    delivery: SlackDelivery,
+    signal?: AbortSignal,
+  ): Promise<SlackDeliveryResponse> {
+    return this.#runtime.runPromise(this.deliverSlackEffect(appId, teamId, delivery), { signal });
   }
+
+  readonly deliverSlackEffect = Effect.fn("Signal.deliverSlack")(
+    (appId: string, teamId: string, delivery: SlackDelivery) =>
+      Effect.gen({ self: this }, function* () {
+        const socketId = this.#slackTeams.get(slackRouteKey(appId, teamId));
+        const ingress = socketId ? this.#peers.get(socketId) : undefined;
+        if (!ingress) return this.#unavailable();
+        const hostId = ingress.claims.hostId;
+        let hostPending = 0;
+        let hostBytes = 0;
+        for (const pending of this.#pendingDeliveries.values()) {
+          if (pending.hostId !== hostId) continue;
+          hostPending += 1;
+          hostBytes += pending.bytes;
+        }
+        const bytes = Math.ceil(delivery.body.byteLength / 3) * 4;
+        if (
+          this.#pendingDeliveries.size >= this.#slackLimits.maximumPending ||
+          hostPending >= this.#slackLimits.maximumPendingPerHost ||
+          hostBytes + bytes > this.#slackLimits.maximumPendingBytesPerHost
+        ) {
+          return this.#unavailable();
+        }
+        const requestId = randomIdentifier();
+        return yield* Effect.callback<SlackDeliveryResponse>((resume) => {
+          const resolve = (response: SlackDeliveryResponse) => resume(Effect.succeed(response));
+          const timer = setTimeout(
+            () => this.#settleDelivery(requestId, this.#unavailable()),
+            this.#slackLimits.timeoutMilliseconds,
+          );
+          timer.unref?.();
+          this.#pendingDeliveries.set(requestId, { socketId: ingress.socket.id, hostId, bytes, timer, resolve });
+          this.#metrics.slackDeliveries += 1;
+          this.#send(ingress.socket, {
+            type: "slack-delivery",
+            version: 1,
+            requestId,
+            teamId,
+            kind: delivery.kind,
+            retryNum: delivery.retryNum,
+            retryReason: delivery.retryReason,
+            bodyBase64: Buffer.from(delivery.body).toString("base64"),
+          });
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              const pending = this.#pendingDeliveries.get(requestId);
+              if (pending) {
+                clearTimeout(pending.timer);
+                this.#pendingDeliveries.delete(requestId);
+              }
+            }),
+          ),
+        );
+      }),
+  );
 
   /**
    * The rate limit for the Slack route: by workspace for a signed request, by address for a refused
@@ -434,146 +482,161 @@ export class SignalService {
     return { ...this.#metrics, activeSockets: this.#sockets.size, activePeerConnections: this.#connections.size };
   }
 
-  async #authenticate(socket: SignalSocket, message: Extract<SignalClientMessage, { type: "hello" }>): Promise<void> {
-    if (this.#peers.has(socket.id)) {
-      this.#fail(socket, "protocol_error", "This socket is already authenticated.", 1008);
-      return;
-    }
-    let claims: RemoteTicketClaims;
-    let usedInitialTicket = true;
-    let slackRoute: SlackRoute = { teams: [] };
-    try {
-      try {
-        claims = await this.#tokens.verifyTicket(message.token);
-        if (Date.now() < this.#validateInitialTicketsUntil && !(await this.#tokens.validateClaims(claims))) {
-          throw new Error("The remote session is not active.");
+  readonly #authenticate = Effect.fn("Signal.authenticate")(
+    (socket: SignalSocket, message: Extract<SignalClientMessage, { type: "hello" }>) =>
+      Effect.gen({ self: this }, function* () {
+        if (this.#peers.has(socket.id)) {
+          this.#fail(socket, "protocol_error", "This socket is already authenticated.", 1008);
+          return;
         }
-      } catch {
-        usedInitialTicket = false;
-        claims = await this.#tokens.verifyResumeToken(message.token);
-      }
-      if ((this.#revokedEpochs.get(claims.hostId) ?? 0) > claims.authEpoch) {
-        throw new Error("Revoked ticket.");
-      }
-      if (claims.role !== "host" && this.#revokedSessions.has(claims.sessionId)) throw new Error("Ended session.");
-      if (message.peer !== "client" && claims.role !== "host") throw new Error("Host role required.");
-      if (message.peer === "client" && claims.role === "host") throw new Error("Member role required.");
-      if (message.peer === "ingress") {
-        if (!message.slackRoute || !this.#tokens.verifySlackRoute) throw new Error("Slack route required.");
-        slackRoute = await this.#tokens.verifySlackRoute(message.slackRoute, claims.hostId);
-        if (Date.now() < this.#validateSlackRoutesUntil) {
-          if (!this.#tokens.validateSlackRoute) throw new Error("Slack route validation required.");
-          const linked = new Set(await this.#tokens.validateSlackRoute(claims.hostId, slackRoute.teams));
-          slackRoute = { teams: slackRoute.teams.filter((team) => linked.has(team.id)) };
+        const tokens = yield* SignalTokens;
+        let usedInitialTicket = true;
+        const authentication = yield* Effect.gen({ self: this }, function* () {
+          const initial = yield* Effect.gen({ self: this }, function* () {
+            const claims = yield* tokens.verifyTicket(message.token);
+            if (Date.now() < this.#validateInitialTicketsUntil && !(yield* tokens.validateClaims(claims))) {
+              return yield* new RemoteTokenError({ message: "The remote session is not active." });
+            }
+            return claims;
+          }).pipe(Effect.result);
+          let claims: RemoteTicketClaims;
+          if (Result.isFailure(initial)) {
+            usedInitialTicket = false;
+            claims = yield* tokens.verifyResumeToken(message.token);
+          } else claims = initial.success;
+          if ((this.#revokedEpochs.get(claims.hostId) ?? 0) > claims.authEpoch) {
+            return yield* new RemoteTokenError({ message: "Revoked ticket." });
+          }
+          if (claims.role !== "host" && this.#revokedSessions.has(claims.sessionId))
+            return yield* new RemoteTokenError({ message: "Ended session." });
+          if (message.peer !== "client" && claims.role !== "host")
+            return yield* new RemoteTokenError({ message: "Host role required." });
+          if (message.peer === "client" && claims.role === "host")
+            return yield* new RemoteTokenError({ message: "Member role required." });
+          let slackRoute: SlackRoute = { teams: [] };
+          if (message.peer === "ingress") {
+            if (!message.slackRoute || !tokens.verifySlackRoute)
+              return yield* new RemoteTokenError({ message: "Slack route required." });
+            slackRoute = yield* tokens.verifySlackRoute(message.slackRoute, claims.hostId);
+            if (Date.now() < this.#validateSlackRoutesUntil) {
+              if (!tokens.validateSlackRoute)
+                return yield* new RemoteTokenError({ message: "Slack route validation required." });
+              const linked = new Set(yield* tokens.validateSlackRoute(claims.hostId, slackRoute.teams));
+              slackRoute = { teams: slackRoute.teams.filter((team) => linked.has(team.id)) };
+            }
+          }
+          this.#pruneReplayCache();
+          if (usedInitialTicket && this.#usedTicketIds.has(claims.jti))
+            return yield* new RemoteTokenError({ message: "Ticket was already used." });
+          return { claims, slackRoute };
+        }).pipe(Effect.result);
+        if (Result.isFailure(authentication)) {
+          this.#metrics.authenticationFailures += 1;
+          this.#fail(socket, "authentication_required", "Remote ticket is invalid or expired.", 1008);
+          return;
         }
-      }
-      this.#pruneReplayCache();
-      if (usedInitialTicket && this.#usedTicketIds.has(claims.jti)) throw new Error("Ticket was already used.");
-      if (message.peer !== "ingress" && this.#userConnectionCount(claims.userId) >= this.#maximumConnectionsPerUser) {
-        this.#fail(socket, "rate_limited", "Too many active remote connections.", 1008);
-        return;
-      }
-    } catch {
-      this.#metrics.authenticationFailures += 1;
-      this.#fail(socket, "authentication_required", "Remote ticket is invalid or expired.", 1008);
-      return;
-    }
-    if (usedInitialTicket) this.#usedTicketIds.set(claims.jti, claims.exp);
-    const peer: AuthenticatedPeer = {
-      socket,
-      claims,
-      peer: message.peer,
-      connectionId: null,
-      resumed: !usedInitialTicket,
-      multiplex: message.peer === "host" && message.multiplex === true,
-      slackTeams: slackRoute.teams.map((team) => slackRouteKey(team.appId, team.id)),
-    };
-    this.#peers.set(socket.id, peer);
-    this.#schedulePeerExpiration(peer);
-    this.#metrics.acceptedConnections += 1;
-    this.#metrics.activeSockets = this.#sockets.size;
-    const resumeToken = await this.#tokens.issueResumeToken(claims);
-    if (message.peer === "ingress") {
-      for (const team of slackRoute.teams) {
-        const route = slackRouteKey(team.appId, team.id);
-        if (team.linkedAt < (this.#slackRouteFloor.get(route) ?? 0)) continue;
-        this.#slackRouteFloor.set(route, team.linkedAt);
-        this.#slackTeams.set(route, socket.id);
-      }
-      this.#send(socket, {
-        type: "ready",
-        version: 1,
-        connectionId: null,
-        resumeToken,
-        iceServers: this.#tokens.iceServers(claims),
-      });
-      return;
-    }
-    if (message.peer === "host") {
-      const hostSockets = this.#hosts.get(claims.hostId) ?? new Set<string>();
-      hostSockets.add(socket.id);
-      this.#hosts.set(claims.hostId, hostSockets);
-      this.#send(socket, {
-        type: "ready",
-        version: 1,
-        connectionId: null,
-        resumeToken,
-        iceServers: this.#tokens.iceServers(claims),
-      });
-      await this.#restoreWaitingClients(peer);
-      return;
-    }
-    const host = this.#currentHost(claims.hostId);
-    if (!host) {
-      this.#peers.delete(socket.id);
-      this.#metrics.activeSockets = this.#sockets.size;
-      this.#fail(socket, "host_unavailable", "The host is offline.", 1013);
-      return;
-    }
-    // A desktop serves multiple devices. Only a reconnect of the SAME logical
-    // session replaces a socket; other sessions must retain their connections.
-    const existing = this.#connectionForSession(claims.hostId, claims.sessionId);
-    if (
-      !host.multiplex &&
-      [...this.#connections.values()].some(
-        (connection) => connection.hostId === claims.hostId && connection !== existing,
-      )
-    ) {
-      this.#peers.delete(socket.id);
-      this.#clearPeerExpiration(socket.id);
-      this.#fail(socket, "host_busy", "The host already has an active remote session.", 1013);
-      return;
-    }
-    if (existing) this.#replaceClientSignal(existing);
-    const connectionId = randomIdentifier();
-    peer.connectionId = connectionId;
-    this.#connections.set(connectionId, {
-      id: connectionId,
-      hostId: claims.hostId,
-      sessionId: claims.sessionId,
-      client: socket,
-      host: host.socket,
-    });
-    this.#metrics.activePeerConnections = this.#connections.size;
-    this.#send(socket, {
-      type: "ready",
-      version: 1,
-      connectionId,
-      resumeToken,
-      iceServers: this.#tokens.iceServers(claims),
-    });
-    this.#send(host.socket, {
-      type: "peer-ready",
-      version: 1,
-      connectionId,
-      sessionId: claims.sessionId,
-      userId: claims.userId,
-      membershipId: claims.membershipId,
-      role: memberRole(claims.role),
-      sessionExpiresAt: claims.sessionExpiresAt,
-      resumed: peer.resumed,
-    });
-  }
+        const { claims, slackRoute } = authentication.success;
+        if (message.peer !== "ingress" && this.#userConnectionCount(claims.userId) >= this.#maximumConnectionsPerUser) {
+          this.#fail(socket, "rate_limited", "Too many active remote connections.", 1008);
+          return;
+        }
+        if (usedInitialTicket) this.#usedTicketIds.set(claims.jti, claims.exp);
+        const peer: AuthenticatedPeer = {
+          socket,
+          claims,
+          peer: message.peer,
+          connectionId: null,
+          resumed: !usedInitialTicket,
+          multiplex: message.peer === "host" && message.multiplex === true,
+          slackTeams: slackRoute.teams.map((team) => slackRouteKey(team.appId, team.id)),
+        };
+        this.#peers.set(socket.id, peer);
+        this.#schedulePeerExpiration(peer);
+        this.#metrics.acceptedConnections += 1;
+        this.#metrics.activeSockets = this.#sockets.size;
+        const resumeToken = yield* tokens.issueResumeToken(claims);
+        if (message.peer === "ingress") {
+          for (const team of slackRoute.teams) {
+            const route = slackRouteKey(team.appId, team.id);
+            if (team.linkedAt < (this.#slackRouteFloor.get(route) ?? 0)) continue;
+            this.#slackRouteFloor.set(route, team.linkedAt);
+            this.#slackTeams.set(route, socket.id);
+          }
+          this.#send(socket, {
+            type: "ready",
+            version: 1,
+            connectionId: null,
+            resumeToken,
+            iceServers: this.#tokens.iceServers(claims),
+          });
+          return;
+        }
+        if (message.peer === "host") {
+          const hostSockets = this.#hosts.get(claims.hostId) ?? new Set<string>();
+          hostSockets.add(socket.id);
+          this.#hosts.set(claims.hostId, hostSockets);
+          this.#send(socket, {
+            type: "ready",
+            version: 1,
+            connectionId: null,
+            resumeToken,
+            iceServers: this.#tokens.iceServers(claims),
+          });
+          yield* this.#restoreWaitingClients(peer);
+          return;
+        }
+        const host = this.#currentHost(claims.hostId);
+        if (!host) {
+          this.#peers.delete(socket.id);
+          this.#metrics.activeSockets = this.#sockets.size;
+          this.#fail(socket, "host_unavailable", "The host is offline.", 1013);
+          return;
+        }
+        // A desktop serves multiple devices. Only a reconnect of the SAME logical
+        // session replaces a socket; other sessions must retain their connections.
+        const existing = this.#connectionForSession(claims.hostId, claims.sessionId);
+        if (
+          !host.multiplex &&
+          [...this.#connections.values()].some(
+            (connection) => connection.hostId === claims.hostId && connection !== existing,
+          )
+        ) {
+          this.#peers.delete(socket.id);
+          this.#clearPeerExpiration(socket.id);
+          this.#fail(socket, "host_busy", "The host already has an active remote session.", 1013);
+          return;
+        }
+        if (existing) this.#replaceClientSignal(existing);
+        const connectionId = randomIdentifier();
+        peer.connectionId = connectionId;
+        this.#connections.set(connectionId, {
+          id: connectionId,
+          hostId: claims.hostId,
+          sessionId: claims.sessionId,
+          client: socket,
+          host: host.socket,
+        });
+        this.#metrics.activePeerConnections = this.#connections.size;
+        this.#send(socket, {
+          type: "ready",
+          version: 1,
+          connectionId,
+          resumeToken,
+          iceServers: this.#tokens.iceServers(claims),
+        });
+        this.#send(host.socket, {
+          type: "peer-ready",
+          version: 1,
+          connectionId,
+          sessionId: claims.sessionId,
+          userId: claims.userId,
+          membershipId: claims.membershipId,
+          role: memberRole(claims.role),
+          sessionExpiresAt: claims.sessionExpiresAt,
+          resumed: peer.resumed,
+        });
+      }),
+  );
 
   /**
    * The host socket that said hello last. A host that stops with no close, such as a hosted server
@@ -593,49 +656,52 @@ export class SignalService {
     return null;
   }
 
-  async #restoreWaitingClients(host: AuthenticatedPeer): Promise<void> {
-    const clients = [...this.#peers.values()].filter(
-      (peer) => peer.peer === "client" && peer.claims.hostId === host.claims.hostId && peer.connectionId === null,
-    );
-    for (const client of clients) {
-      if (
-        !host.multiplex &&
-        [...this.#connections.values()].some((connection) => connection.hostId === host.claims.hostId)
-      )
-        return;
-      const resumeToken = await this.#tokens.issueResumeToken(client.claims);
-      if (this.#peers.get(host.socket.id) !== host) return;
-      if (this.#peers.get(client.socket.id) !== client || client.connectionId !== null) continue;
-      const connectionId = randomIdentifier();
-      client.connectionId = connectionId;
-      this.#connections.set(connectionId, {
-        id: connectionId,
-        hostId: host.claims.hostId,
-        sessionId: client.claims.sessionId,
-        client: client.socket,
-        host: host.socket,
-      });
-      this.#metrics.activePeerConnections = this.#connections.size;
-      this.#send(client.socket, {
-        type: "ready",
-        version: 1,
-        connectionId,
-        resumeToken,
-        iceServers: this.#tokens.iceServers(client.claims),
-      });
-      this.#send(host.socket, {
-        type: "peer-ready",
-        version: 1,
-        connectionId,
-        sessionId: client.claims.sessionId,
-        userId: client.claims.userId,
-        membershipId: client.claims.membershipId,
-        role: memberRole(client.claims.role),
-        sessionExpiresAt: client.claims.sessionExpiresAt,
-        resumed: host.resumed || client.resumed,
-      });
-    }
-  }
+  readonly #restoreWaitingClients = Effect.fn("Signal.restoreWaitingClients")((host: AuthenticatedPeer) =>
+    Effect.gen({ self: this }, function* () {
+      const tokens = yield* SignalTokens;
+      const clients = [...this.#peers.values()].filter(
+        (peer) => peer.peer === "client" && peer.claims.hostId === host.claims.hostId && peer.connectionId === null,
+      );
+      for (const client of clients) {
+        if (
+          !host.multiplex &&
+          [...this.#connections.values()].some((connection) => connection.hostId === host.claims.hostId)
+        )
+          return;
+        const resumeToken = yield* tokens.issueResumeToken(client.claims);
+        if (this.#peers.get(host.socket.id) !== host) return;
+        if (this.#peers.get(client.socket.id) !== client || client.connectionId !== null) continue;
+        const connectionId = randomIdentifier();
+        client.connectionId = connectionId;
+        this.#connections.set(connectionId, {
+          id: connectionId,
+          hostId: host.claims.hostId,
+          sessionId: client.claims.sessionId,
+          client: client.socket,
+          host: host.socket,
+        });
+        this.#metrics.activePeerConnections = this.#connections.size;
+        this.#send(client.socket, {
+          type: "ready",
+          version: 1,
+          connectionId,
+          resumeToken,
+          iceServers: this.#tokens.iceServers(client.claims),
+        });
+        this.#send(host.socket, {
+          type: "peer-ready",
+          version: 1,
+          connectionId,
+          sessionId: client.claims.sessionId,
+          userId: client.claims.userId,
+          membershipId: client.claims.membershipId,
+          role: memberRole(client.claims.role),
+          sessionExpiresAt: client.claims.sessionExpiresAt,
+          resumed: host.resumed || client.resumed,
+        });
+      }
+    }),
+  );
 
   #replaceClientSignal(connection: ActiveConnection): void {
     this.#clearConnectionDrop(connection.id);

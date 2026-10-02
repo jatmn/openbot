@@ -83,6 +83,7 @@ import { ContextResetBusyError } from "@openbot/contracts/team-protocol/context-
 import type { QueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger } from "@openbot/logging";
+import { Effect, Fiber, Result, Schema } from "effect";
 import { AgentMemories } from "./agent/agent-memories";
 import { AgentRemoval } from "./agent/agent-removal";
 import type { ApprovalAutomationPolicy } from "./agent/approval-automation";
@@ -112,7 +113,11 @@ import {
 } from "./agent/model-choice";
 import { OpenBotToolRouter } from "./agent/openbot-tool-router";
 import { ProfileClients } from "./agent/profile-clients";
-import { generateProfile, generateTextWithoutTools } from "./agent/profile-generation";
+import {
+  generateProfileEffect,
+  generateTextWithoutToolsEffect,
+  ProfileGenerationFailed,
+} from "./agent/profile-generation";
 import { ProfileSave } from "./agent/profile-save";
 import { type AgentClientFactory, ProviderRuntime } from "./agent/provider-runtime";
 import { QueueControls } from "./agent/queue-controls";
@@ -603,21 +608,33 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.channels = new ChannelService(store.database, mailbox, {
       agents: () => this.listAgents(),
       generate: async (lead, prompt) => {
-        await this.#providers.ensureProvider(lead.provider);
-        const model = this.#endpoints
-          .available()
-          .find((item) => item.provider === lead.provider && item.id === lead.model);
-        if (!model) throw new Error(sourceText("error.backend.channelLeadModelUnavailable"));
-        const client = this.#providers.createProfileClient(lead.provider);
-        return this.#profileClients.run(client, (cancelled) =>
-          generateTextWithoutTools(
-            client,
-            { ...model, defaultReasoningEffort: lead.reasoningEffort },
-            prompt,
-            cancelled,
+        const result = await Effect.runPromise(
+          Effect.result(
+            Effect.gen({ self: this }, function* () {
+              yield* this.#providers.ensureProviderEffect(lead.provider);
+              const model = this.#endpoints
+                .available()
+                .find((item) => item.provider === lead.provider && item.id === lead.model);
+              if (!model)
+                return yield* new ProfileGenerationFailed({
+                  cause: new Error(sourceText("error.backend.channelLeadModelUnavailable")),
+                });
+              const client = this.#providers.createProfileClient(lead.provider);
+              return yield* this.#profileClients.runEffect(client, (cancelled) =>
+                generateTextWithoutToolsEffect(
+                  client,
+                  { ...model, defaultReasoningEffort: lead.reasoningEffort },
+                  prompt,
+                  cancelled,
+                ),
+              );
+            }),
           ),
         );
+        if (Result.isFailure(result)) throw result.failure.cause;
+        return result.success;
       },
+
       schedule: (agentId) => this.#drain.scheduleDrain(agentId),
       awaitDrain: (agentId) => this.#drain.taskFor(agentId),
       contextCharacters: (agentId, threadId) => {
@@ -1112,22 +1129,39 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   async generateProfile(input: GenerateAgentProfileInput, sections: SidebarSection[]): Promise<AgentProfileDraft> {
+    const result = await Effect.runPromise(Effect.result(this.generateProfileEffect(input, sections)));
+    if (Result.isFailure(result)) throw result.failure.cause;
+    return result.success;
+  }
+
+  readonly generateProfileEffect = Effect.fn("AgentService.generateProfile")(function* (
+    this: AgentService,
+    input: GenerateAgentProfileInput,
+    sections: SidebarSection[],
+  ) {
     const agent = input.agentId ? this.listAgents().find((candidate) => candidate.id === input.agentId) : null;
-    if (input.agentId && !agent) throw new Error(sourceText("error.agent.gone"));
-    if (this.#stopping) throw new Error(sourceText("error.backend.shuttingDown"));
-    if (this.#profileClients.busy()) throw new Error(sourceText("error.agent.profileGenerationBusy"));
+    if (input.agentId && !agent)
+      return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.agent.gone")) });
+    if (this.#stopping)
+      return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.backend.shuttingDown")) });
+    if (this.#profileClients.busy())
+      return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.agent.profileGenerationBusy")) });
     const provider = agent?.provider ?? this.#providers.preferredProvider();
-    await this.ensureProvider(provider);
+    yield* this.#providers.ensureProviderEffect(provider);
     const models = this.#endpoints.available();
     const model = agent
       ? models.find((candidate) => candidate.id === agent.model && candidate.provider === provider)
       : startingModel(provider, models, this.#preference());
-    if (!model) throw new Error(sourceText("error.provider.noModel"));
-    if (this.#stopping) throw new Error(sourceText("error.backend.shuttingDown"));
-    if (this.#profileClients.busy()) throw new Error(sourceText("error.agent.profileGenerationBusy"));
+    if (!model) return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.provider.noModel")) });
+    if (this.#stopping)
+      return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.backend.shuttingDown")) });
+    if (this.#profileClients.busy())
+      return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.agent.profileGenerationBusy")) });
     const client = this.#providers.createProfileClient(provider);
-    return this.#profileClients.run(client, (cancelled) => generateProfile(client, model, input, sections, cancelled));
-  }
+    return yield* this.#profileClients.runEffect(client, (cancelled) =>
+      generateProfileEffect(client, model, input, sections, cancelled),
+    );
+  });
 
   saveProfile(
     input: SaveAgentProfileInput,
@@ -1156,60 +1190,79 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   /** `sender` is the person who writes the first message, as `sendMessage` takes it. */
-  async createAgent(
+  createAgent(
     input: CreateAgentInput,
     configure?: (agent: AgentSummary) => Promise<AgentSummary>,
     profileOperationId?: string,
     sender?: ConversationMessageSender,
   ): Promise<AgentSummary> {
-    const initialMessage = input.initialMessage.trim();
-    if (!initialMessage) throw new Error(sourceText("error.agent.initialMessageRequired"));
-    if (input.initialMessage.length > INPUT_LIMITS.messageText)
-      throw new Error(sourceText("error.agent.initialMessageTooLong"));
-    let agent = await this.#store.createAgent(input, profileOperationId);
-    try {
-      await this.#prepareAgentWorkspace(agent);
-      // A named pair lands before the initial message is queued: a provider change afterwards is
-      // rejected while the delivery or turn is active, so a follow-up update could never apply it.
-      const requested = creationModel(input, this.#endpoints.available());
-      if (requested) {
-        agent = await this.#store.updateAgent({
-          agentId: agent.id,
-          provider: requested.provider,
-          model: requested.model.id,
-          reasoningEffort:
-            input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
-              ? input.reasoningEffort
-              : requested.model.defaultReasoningEffort,
-        });
-      } else {
-        const starting = this.#startingChoice();
-        // No provider lists a model, the preferred one included, so the agent could never answer.
-        // The error names the provider the user chose, because that is the one they expected.
-        if (!starting) {
-          throw new Error(
-            sourceText("error.agent.noStartingModel", { provider: providerLabel(this.#preference().provider) }),
-          );
-        }
-        agent = await this.#landOnStartingChoice(agent, starting);
-      }
-      if (configure) agent = await configure(agent);
-      await this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
-      return this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent;
-    } catch (error) {
-      let rollbackError: unknown;
-      try {
-        await this.#removal.deleteData(agent);
-      } catch (caught) {
-        rollbackError = caught;
-      }
-      this.#emit({ type: "agents-changed", agents: this.listAgents() });
-      if (rollbackError) {
-        throw new AggregateError([error, rollbackError], sourceText("error.agent.setupCleanupFailed"));
-      }
-      throw error;
-    }
+    return runAgentOperation(this.createAgentEffect(input, configure, profileOperationId, sender));
   }
+
+  readonly createAgentEffect = Effect.fn("AgentService.createAgent")(function* (
+    this: AgentService,
+    input: CreateAgentInput,
+    configure?: (agent: AgentSummary) => Promise<AgentSummary>,
+    profileOperationId?: string,
+    sender?: ConversationMessageSender,
+  ) {
+    const initialMessage = yield* lifecycleStep("validate initial message", () => {
+      const text = input.initialMessage.trim();
+      if (!text) throw new Error(sourceText("error.agent.initialMessageRequired"));
+      if (input.initialMessage.length > INPUT_LIMITS.messageText)
+        throw new Error(sourceText("error.agent.initialMessageTooLong"));
+      return text;
+    });
+    let agent = yield* lifecycleIo("create agent", () => this.#store.createAgent(input, profileOperationId));
+    const result = yield* Effect.result(
+      Effect.gen({ self: this }, function* () {
+        yield* lifecycleIo("prepare agent workspace", () => this.#prepareAgentWorkspace(agent));
+        const requested = yield* lifecycleStep("select requested model", () =>
+          creationModel(input, this.#endpoints.available()),
+        );
+        if (requested) {
+          agent = yield* lifecycleIo("set agent model", () =>
+            this.#store.updateAgent({
+              agentId: agent.id,
+              provider: requested.provider,
+              model: requested.model.id,
+              reasoningEffort:
+                input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
+                  ? input.reasoningEffort
+                  : requested.model.defaultReasoningEffort,
+            }),
+          );
+        } else {
+          const starting = yield* lifecycleStep("select starting model", () => {
+            const choice = this.#startingChoice();
+            if (!choice)
+              throw new Error(
+                sourceText("error.agent.noStartingModel", { provider: providerLabel(this.#preference().provider) }),
+              );
+            return choice;
+          });
+          agent = yield* this.#landOnStartingChoiceEffect(agent, starting);
+        }
+        if (configure) agent = yield* lifecycleIo("configure agent", () => configure(agent));
+        yield* this.sendMessageEffect({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
+        return this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent;
+      }).pipe(
+        Effect.catchDefect((cause) => Effect.fail(new AgentLifecycleFailed({ operation: "create agent", cause }))),
+      ),
+    );
+    if (Result.isSuccess(result)) return result.success;
+    const rollback = yield* Effect.result(this.#removal.deleteDataEffect(agent));
+    this.#emit({ type: "agents-changed", agents: this.listAgents() });
+    return yield* new AgentLifecycleFailed({
+      operation: "create agent",
+      cause: Result.isFailure(rollback)
+        ? new AggregateError(
+            [result.failure.cause, rollback.failure.cause],
+            sourceText("error.agent.setupCleanupFailed"),
+          )
+        : result.failure.cause,
+    });
+  }, Effect.uninterruptible);
 
   /** Where a new agent that names no model starts: the saved choice, else its provider default (Luna 6 for ChatGPT). */
   #startingChoice(): ModelChoice | null {
@@ -1226,46 +1279,73 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * provider. A record already on the chosen model keeps its effort, which is the low one a new agent
    * leads with rather than the one the CLI reports.
    */
-  async #landOnStartingChoice(agent: AgentSummary, starting: ModelChoice): Promise<AgentSummary> {
+  readonly #landOnStartingChoiceEffect = Effect.fn("AgentService.landOnStartingChoice")(function* (
+    this: AgentService,
+    agent: AgentSummary,
+    starting: ModelChoice,
+  ) {
     if (starting.provider === agent.provider && starting.model.id === agent.model) return agent;
-    return this.#store.updateAgent({
-      agentId: agent.id,
-      provider: starting.provider,
-      model: starting.model.id,
-      reasoningEffort: starting.model.defaultReasoningEffort,
-    });
+    return yield* lifecycleIo("set starting model", () =>
+      this.#store.updateAgent({
+        agentId: agent.id,
+        provider: starting.provider,
+        model: starting.model.id,
+        reasoningEffort: starting.model.defaultReasoningEffort,
+      }),
+    );
+  });
+
+  createAgentProfile(input: Omit<CreateAgentInput, "initialMessage"> & { title?: string }): Promise<AgentSummary> {
+    return runAgentOperation(this.createAgentProfileEffect(input));
   }
 
-  async createAgentProfile(
+  readonly createAgentProfileEffect = Effect.fn("AgentService.createAgentProfile")(function* (
+    this: AgentService,
     input: Omit<CreateAgentInput, "initialMessage"> & { title?: string },
-  ): Promise<AgentSummary> {
-    let agent = await this.#store.createAgent(input);
-    try {
-      await this.#prepareAgentWorkspace(agent);
-      // A template, a marketplace agent and an imported one name no model. They start where a new
-      // agent does; with nothing listed yet they keep the record's own, because no message waits.
-      // The Slack orchestrator names the model the user picked.
-      const requested = creationModel(input, this.#endpoints.available());
-      const starting = requested ? null : this.#startingChoice();
-      if (requested)
-        agent = await this.#store.updateAgent({
-          agentId: agent.id,
-          provider: requested.provider,
-          model: requested.model.id,
-          reasoningEffort:
-            input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
-              ? input.reasoningEffort
-              : requested.model.defaultReasoningEffort,
-        });
-      else if (starting) agent = await this.#landOnStartingChoice(agent, starting);
-      if (input.title) agent = await this.#store.updateAgent({ agentId: agent.id, title: input.title });
-      this.#emit({ type: "agents-changed", agents: this.listAgents() });
-      return agent;
-    } catch (error) {
-      await this.#removal.deleteData(agent);
-      throw error;
-    }
-  }
+  ) {
+    let agent = yield* lifecycleIo("create agent profile", () => this.#store.createAgent(input));
+    const result = yield* Effect.result(
+      Effect.gen({ self: this }, function* () {
+        yield* lifecycleIo("prepare agent workspace", () => this.#prepareAgentWorkspace(agent));
+        const requested = yield* lifecycleStep("select profile model", () =>
+          creationModel(input, this.#endpoints.available()),
+        );
+        const starting = requested ? null : this.#startingChoice();
+        if (requested)
+          agent = yield* lifecycleIo("set profile model", () =>
+            this.#store.updateAgent({
+              agentId: agent.id,
+              provider: requested.provider,
+              model: requested.model.id,
+              reasoningEffort:
+                input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
+                  ? input.reasoningEffort
+                  : requested.model.defaultReasoningEffort,
+            }),
+          );
+        else if (starting) agent = yield* this.#landOnStartingChoiceEffect(agent, starting);
+        if (input.title)
+          agent = yield* lifecycleIo("set profile title", () =>
+            this.#store.updateAgent({ agentId: agent.id, title: input.title }),
+          );
+        this.#emit({ type: "agents-changed", agents: this.listAgents() });
+        return agent;
+      }).pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(new AgentLifecycleFailed({ operation: "create agent profile", cause })),
+        ),
+      ),
+    );
+    if (Result.isSuccess(result)) return result.success;
+    yield* this.#removal
+      .deleteDataEffect(agent)
+      .pipe(
+        Effect.mapError(
+          (failure) => new AgentLifecycleFailed({ operation: "rollback agent profile", cause: failure.cause }),
+        ),
+      );
+    return yield* result.failure;
+  }, Effect.uninterruptible);
 
   committedAgentDuplication(operationId: string, sourceAgentId: string): DuplicateAgentResult | null {
     return this.#store.committedAgentDuplication(operationId, sourceAgentId);
@@ -1290,33 +1370,52 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#endpoints.runExclusive(() => this.#applyAgentUpdate(input, initiatingAgentId));
   }
 
-  async #applyAgentUpdate(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
-    this.#conversation.requireKnownAgent(input.agentId);
-    const previous = this.#store.list().find((agent) => agent.id === input.agentId);
-    const requestedModel = input.model
-      ? this.#endpoints
-          .available()
-          .find((model) => model.id === input.model && (!input.provider || model.provider === input.provider))
-      : undefined;
-    if (input.model && !requestedModel) throw new Error(sourceText("error.agent.modelUnavailable"));
-    const requestedProvider = input.provider ?? requestedModel?.provider ?? previous?.provider;
-    if (input.provider && requestedModel && requestedModel.provider !== input.provider) {
-      throw new Error(sourceText("error.agent.modelProviderMismatch"));
-    }
+  #applyAgentUpdate(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
+    return runAgentOperation(this.#applyAgentUpdateEffect(input, initiatingAgentId));
+  }
+
+  readonly #applyAgentUpdateEffect = Effect.fn("AgentService.updateAgent")(function* (
+    this: AgentService,
+    input: UpdateAgentInput,
+    initiatingAgentId?: string,
+  ) {
+    const { previous, requestedModel, requestedProvider } = yield* lifecycleStep("validate agent update", () => {
+      this.#conversation.requireKnownAgent(input.agentId);
+      const previous = this.#store.list().find((agent) => agent.id === input.agentId);
+      const requestedModel = input.model
+        ? this.#endpoints
+            .available()
+            .find((model) => model.id === input.model && (!input.provider || model.provider === input.provider))
+        : undefined;
+      if (input.model && !requestedModel) throw new Error(sourceText("error.agent.modelUnavailable"));
+      const requestedProvider = input.provider ?? requestedModel?.provider ?? previous?.provider;
+      if (input.provider && requestedModel && requestedModel.provider !== input.provider) {
+        throw new Error(sourceText("error.agent.modelProviderMismatch"));
+      }
+      if (requestedProvider && previous && requestedProvider !== providerForAgent(previous)) {
+        if (!input.model || !input.provider) {
+          throw new Error("Changing provider requires an atomic provider and model selection.");
+        }
+        const hasPendingWork = this.#mailbox.hasUnfinishedDelivery(input.agentId);
+        const activeTurn =
+          this.#conversation.workingSnapshot(input.agentId)?.activeTurnId ??
+          (previous.threadId
+            ? this.#store.database.readConversation(input.agentId, previous.threadId).activeTurnId
+            : null);
+        if (hasPendingWork || activeTurn) {
+          throw new Error(sourceText("error.agent.waitBeforeProviderChange"));
+        }
+      }
+      return { previous, requestedModel, requestedProvider };
+    });
     if (requestedProvider && previous && requestedProvider !== providerForAgent(previous)) {
-      if (!input.model || !input.provider) {
-        throw new Error("Changing provider requires an atomic provider and model selection.");
-      }
-      const hasPendingWork = this.#mailbox.hasUnfinishedDelivery(input.agentId);
-      const activeTurn =
-        this.#conversation.workingSnapshot(input.agentId)?.activeTurnId ??
-        (previous.threadId
-          ? this.#store.database.readConversation(input.agentId, previous.threadId).activeTurnId
-          : null);
-      if (hasPendingWork || activeTurn) {
-        throw new Error(sourceText("error.agent.waitBeforeProviderChange"));
-      }
-      await this.ensureProvider(requestedProvider);
+      yield* this.#providers
+        .ensureProviderEffect(requestedProvider)
+        .pipe(
+          Effect.mapError(
+            (failure) => new AgentLifecycleFailed({ operation: "ensure updated provider", cause: failure.cause }),
+          ),
+        );
     }
     const profileChanged =
       input.name !== undefined ||
@@ -1326,9 +1425,11 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       input.reasoningEffort !== undefined ||
       input.access !== undefined ||
       input.computerUse !== undefined;
-    const agent = await this.#store.updateAgent(
-      { ...input, ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}) },
-      initiatingAgentId,
+    const agent = yield* lifecycleIo("update agent", () =>
+      this.#store.updateAgent(
+        { ...input, ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}) },
+        initiatingAgentId,
+      ),
     );
     const activeSession = this.#store.activeProviderSession(agent.id);
     if (previous?.threadId && requestedProvider && requestedProvider !== providerForAgent(previous)) {
@@ -1349,7 +1450,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     if (profileChanged) this.#conversation.unloadAgentThreads(agent.id);
     this.#emit({ type: "agents-changed", agents: this.listAgents() });
     return agent;
-  }
+  }, Effect.uninterruptible);
 
   async setAvatar(agentId: string, image: AvatarImageInput | null): Promise<AgentSummary> {
     const agent = await this.#store.setAvatar(agentId, image);
@@ -1439,26 +1540,59 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   async initialize(): Promise<void> {
-    this.#stopping = false;
-    await this.#store.initialize();
-    await this.#mailbox.initialize();
-    this.#mcp.migrateCatalogBridgesToHttp();
-    this.channels.restoreDeliveryLinks();
-    this.channels.removeDeletedMembers(new Set(this.#store.list().map((agent) => agent.id)));
-    await this.#threads.reconcileProviderSessionFiles();
-    this.#boot.recoverPersistedTurns();
-    this.#hostedSites.restore();
-    this.#routines.skipMissed(new Date());
-    this.#channelRoutines.skipMissed(new Date());
-    this.#initialized = true;
-    this.#memoryHold.start();
-    await this.#providers.start();
-    for (const agent of this.#store.list()) this.#mailboxSync.emitQueue(agent.id);
-    await this.#routines.resumePendingRuns();
-    await this.#channelRoutines.resumePendingRuns();
-    this.#channelRoutines.reconcileAll();
-    this.#routineTimer.arm();
+    const result = await Effect.runPromise(Effect.result(this.initializeEffect()));
+    if (Result.isFailure(result)) throw result.failure.cause;
   }
+
+  readonly initializeEffect = Effect.fn("AgentService.initialize")(function* (this: AgentService) {
+    this.#stopping = false;
+    yield* lifecycleIo("initialize agent store", () => this.#store.initialize());
+    yield* lifecycleIo("initialize mailbox", () => this.#mailbox.initialize());
+    yield* lifecycleStep("restore channel links", () => {
+      this.#mcp.migrateCatalogBridgesToHttp();
+      this.channels.restoreDeliveryLinks();
+      this.channels.removeDeletedMembers(new Set(this.#store.list().map((agent) => agent.id)));
+    });
+    yield* this.#threads
+      .reconcileProviderSessionFilesEffect()
+      .pipe(
+        Effect.mapError(
+          (failure) => new AgentLifecycleFailed({ operation: "reconcile provider sessions", cause: failure.cause }),
+        ),
+      );
+    yield* lifecycleStep("recover agent state", () => {
+      this.#boot.recoverPersistedTurns();
+      this.#hostedSites.restore();
+      this.#routines.skipMissed(new Date());
+      this.#channelRoutines.skipMissed(new Date());
+      this.#initialized = true;
+      this.#memoryHold.start();
+    });
+    yield* this.#providers
+      .startEffect()
+      .pipe(Effect.mapError((error) => new AgentLifecycleFailed({ operation: "start providers", cause: error.cause })));
+    yield* lifecycleStep("publish queues", () => {
+      for (const agent of this.#store.list()) this.#mailboxSync.emitQueue(agent.id);
+    });
+    yield* this.#routines
+      .resumePendingRunsEffect()
+      .pipe(
+        Effect.mapError(
+          (failure) => new AgentLifecycleFailed({ operation: "resume agent routines", cause: failure.cause }),
+        ),
+      );
+    yield* this.#channelRoutines
+      .resumePendingRunsEffect()
+      .pipe(
+        Effect.mapError(
+          (failure) => new AgentLifecycleFailed({ operation: "resume channel routines", cause: failure.cause }),
+        ),
+      );
+    yield* lifecycleStep("arm routines", () => {
+      this.#channelRoutines.reconcileAll();
+      this.#routineTimer.arm();
+    });
+  });
 
   setPreferredProvider(provider: AgentProvider, model: AgentModelId | null = null): Promise<void> {
     return this.#providers.setPreferredProvider(provider, this.#initialized, model);
@@ -1561,8 +1695,16 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   async stop(): Promise<void> {
+    const result = await Effect.runPromise(Effect.result(this.stopEffect()));
+    if (Result.isFailure(result)) throw result.failure.cause;
+  }
+
+  readonly stopEffect = Effect.fn("AgentService.stop")(function* (this: AgentService) {
     this.#stopping = true;
-    const channelStop = this.channels.stop();
+    const channelStop = yield* Effect.forkChild(
+      lifecycleIo("stop channels", () => this.channels.stop()),
+      { startImmediately: true },
+    );
     this.#initialized = false;
     this.#routineTimer.dispose();
     this.#memoryHold.dispose();
@@ -1589,16 +1731,20 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.#turn.dispose();
     this.#drain.dispose();
     this.#browser.clearControls();
-    await Promise.all(clients.map((client) => client.stop().catch(() => undefined)));
-    await channelStop;
-    await Promise.allSettled(this.#drain.pendingTasks());
-    await Promise.allSettled(this.#images.pendingPromises());
+    yield* Effect.forEach(
+      clients,
+      (client) => lifecycleIo("stop provider client", () => client.stop()).pipe(Effect.catch(() => Effect.void)),
+      { concurrency: "unbounded", discard: true },
+    );
+    yield* Fiber.join(channelStop);
+    yield* settleLifecycleTasks("finish drain", this.#drain.pendingTasks());
+    yield* settleLifecycleTasks("finish image requests", this.#images.pendingPromises());
     this.#images.dispose();
-    await Promise.allSettled(this.#attachments.pendingCommands());
+    yield* settleLifecycleTasks("finish attachment commands", this.#attachments.pendingCommands());
     this.#attachments.dispose();
-    await this.#browserUploads.dispose();
+    yield* lifecycleIo("stop browser uploads", () => this.#browserUploads.dispose());
     this.#providers.markStopped();
-  }
+  });
 
   readConversation(agentId: string): Promise<ConversationSnapshot> {
     return this.#reader.read(agentId);
@@ -1699,55 +1845,94 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * `sender` is the person the host saw send it. It is not part of `SendMessageInput`: the caller of
    * that input, a renderer or a Team API body, never names who it is.
    */
-  async sendMessage(input: SendMessageInput, sender?: ConversationMessageSender): Promise<QueuedMessageReceipt> {
-    const validateRecipient = this.#mailbox.prepareDelivery([input.agentId]);
+  sendMessage(input: SendMessageInput, sender?: ConversationMessageSender): Promise<QueuedMessageReceipt> {
+    return runAgentOperation(this.sendMessageEffect(input, sender));
+  }
+
+  readonly sendMessageEffect = Effect.fn("AgentService.sendMessage")(function* (
+    this: AgentService,
+    input: SendMessageInput,
+    sender?: ConversationMessageSender,
+  ) {
+    const validateRecipient = yield* lifecycleStep("prepare message delivery", () =>
+      this.#mailbox.prepareDelivery([input.agentId]),
+    );
     if (this.#duplication.isPending(input.agentId))
-      throw new Error(sourceText("error.agent.unknown", { id: input.agentId }));
-    const agent = await this.#store.getOrCreate(input.agentId);
-    await this.ensureProvider(providerForAgent(agent));
-    validateRecipient();
-    const receipt = await this.#mailbox.enqueue({
-      sender: { kind: "user" },
-      ...(sender ? { senderMember: sender } : {}),
-      recipientAgentIds: [agent.id],
-      text: input.text,
-      draftIds: input.attachmentDraftIds ?? [],
-      replyToMessageId: input.replyToMessageId ?? null,
-    });
+      return yield* new AgentLifecycleFailed({
+        operation: "send message",
+        cause: new Error(sourceText("error.agent.unknown", { id: input.agentId })),
+      });
+    const agent = yield* lifecycleIo("load message agent", () => this.#store.getOrCreate(input.agentId));
+    yield* this.#providers
+      .ensureProviderEffect(providerForAgent(agent))
+      .pipe(
+        Effect.mapError(
+          (failure) => new AgentLifecycleFailed({ operation: "ensure message provider", cause: failure.cause }),
+        ),
+      );
+    yield* lifecycleStep("validate message recipient", validateRecipient);
+    const receipt = yield* lifecycleIo("enqueue message", () =>
+      this.#mailbox.enqueue({
+        sender: { kind: "user" },
+        ...(sender ? { senderMember: sender } : {}),
+        recipientAgentIds: [agent.id],
+        text: input.text,
+        draftIds: input.attachmentDraftIds ?? [],
+        replyToMessageId: input.replyToMessageId ?? null,
+      }),
+    );
     const [queued] = receipt.deliveries;
     const delivery = queued ? this.#mailbox.getDelivery(queued.id) : null;
-    if (!delivery) throw new Error(sourceText("error.agent.queuedMessageCreateFailed"));
+    if (!delivery)
+      return yield* new AgentLifecycleFailed({
+        operation: "send message",
+        cause: new Error(sourceText("error.agent.queuedMessageCreateFailed")),
+      });
     const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     this.#mailboxSync.syncMailboxMessages(snapshot);
-    await this.#store.updatePreview(
-      agent.id,
-      displayMessageReferences(
-        delivery.delivery.text,
-        delivery.delivery.attachments,
-        agentNamesById(this.#store.list()),
-      ) || delivery.delivery.attachments.map((item) => item.name).join(", "),
+    yield* lifecycleIo("update message preview", () =>
+      this.#store.updatePreview(
+        agent.id,
+        displayMessageReferences(
+          delivery.delivery.text,
+          delivery.delivery.attachments,
+          agentNamesById(this.#store.list()),
+        ) || delivery.delivery.attachments.map((item) => item.name).join(", "),
+      ),
     );
     this.#emit({ type: "agents-changed", agents: this.listAgents() });
     this.#conversation.emitConversation(snapshot);
     this.#mailboxSync.emitQueue(agent.id);
     this.#drain.scheduleDrain(agent.id);
     return receipt;
+  }, Effect.uninterruptible);
+
+  setMessageReaction(input: SetMessageReactionInput): Promise<void> {
+    return runAgentOperation(this.setMessageReactionEffect(input));
   }
 
-  async setMessageReaction(input: SetMessageReactionInput): Promise<void> {
-    const agent = await this.#store.getOrCreate(input.agentId);
+  readonly setMessageReactionEffect = Effect.fn("AgentService.setMessageReaction")(function* (
+    this: AgentService,
+    input: SetMessageReactionInput,
+  ) {
+    const agent = yield* lifecycleIo("load reaction agent", () => this.#store.getOrCreate(input.agentId));
     const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     if (!snapshot.messages.some((message) => message.id === input.messageId)) {
-      await this.readConversation(agent.id);
+      yield* lifecycleIo("read reaction conversation", () => this.readConversation(agent.id));
     }
     const current = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     if (!current.messages.some((message) => message.id === input.messageId)) {
-      throw new Error(sourceText("error.agent.messageUnavailable"));
+      return yield* new AgentLifecycleFailed({
+        operation: "set message reaction",
+        cause: new Error(sourceText("error.agent.messageUnavailable")),
+      });
     }
-    await this.#mailbox.setReaction(agent.id, input.messageId, { kind: "user" }, input.emoji);
+    yield* lifecycleIo("set message reaction", () =>
+      this.#mailbox.setReaction(agent.id, input.messageId, { kind: "user" }, input.emoji),
+    );
     this.#mailboxSync.syncMailboxMessages(current);
     this.#conversation.emitConversation(current);
-  }
+  }, Effect.uninterruptible);
 
   async interrupt(agentId: string, turnId: string, executionThreadId?: string): Promise<void> {
     await this.#interruptTurn(agentId, turnId, executionThreadId);
@@ -1760,14 +1945,26 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * must still run, and `mayStop` is asked again, just before the stop is sent. `false` means no
    * stop was sent.
    */
-  async #interruptTurn(
+  #interruptTurn(
     agentId: string,
     turnId: string,
     executionThreadId?: string,
     mayStop?: () => boolean,
   ): Promise<boolean> {
-    const agent = await this.#store.getOrCreate(agentId);
-    const client = this.#providers.requireReadyClientForAgent(agent);
+    return runAgentOperation(this.#interruptTurnEffect(agentId, turnId, executionThreadId, mayStop));
+  }
+
+  readonly #interruptTurnEffect = Effect.fn("AgentService.interruptTurn")(function* (
+    this: AgentService,
+    agentId: string,
+    turnId: string,
+    executionThreadId?: string,
+    mayStop?: () => boolean,
+  ) {
+    const agent = yield* lifecycleIo("load interrupted agent", () => this.#store.getOrCreate(agentId));
+    const client = yield* lifecycleStep("find interrupt provider", () =>
+      this.#providers.requireReadyClientForAgent(agent),
+    );
     const snapshot = [...this.#conversation.activeSnapshots()].find(
       ([id, snapshot]) => id === agentId && snapshot.activeTurnId === turnId,
     )?.[1];
@@ -1778,35 +1975,44 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       : this.#store.activeProviderSession(agentId);
     if (!session) return false;
     this.#images.interrupt(agentId, session.externalSessionId, turnId);
-    await client.request("turn/interrupt", { threadId: session.externalSessionId, turnId }, decodeRecordResponse);
+    yield* lifecycleIo("interrupt turn", () =>
+      client.request("turn/interrupt", { threadId: session.externalSessionId, turnId }, decodeRecordResponse),
+    );
     return true;
+  }, Effect.uninterruptible);
+
+  interruptAll(): Promise<void> {
+    return runAgentOperation(this.interruptAllEffect());
   }
 
-  async interruptAll(): Promise<void> {
+  readonly interruptAllEffect = Effect.fn("AgentService.interruptAll")(function* (this: AgentService) {
     if (!this.#providers.isReady()) return;
-    const requests: Promise<unknown>[] = [];
+    const requests: Effect.Effect<unknown>[] = [];
     for (const [agentId, snapshot] of this.#conversation.activeSnapshots()) {
-      if (!snapshot.threadId || !snapshot.activeTurnId) continue;
+      const turnId = snapshot.activeTurnId;
+      if (!snapshot.threadId || !turnId) continue;
       const agent = this.#store.list().find((candidate) => candidate.id === agentId);
       const client = agent ? this.#providers.clientForAgent(agent) : null;
       const session = agent ? this.#store.database.activeProviderSession(snapshot.threadId, agent.provider) : null;
       if (!client || !session) continue;
-      this.#images.interrupt(agentId, session.externalSessionId, snapshot.activeTurnId);
+      this.#images.interrupt(agentId, session.externalSessionId, turnId);
       requests.push(
-        client
-          .request(
+        lifecycleIo("interrupt active turn", () =>
+          client.request(
             "turn/interrupt",
             {
               threadId: session.externalSessionId,
-              turnId: snapshot.activeTurnId,
+              turnId,
             },
             decodeRecordResponse,
-          )
-          .catch((error) => this.#emitError("interrupt_failed", error, agentId)),
+          ),
+        ).pipe(
+          Effect.catch((failure) => Effect.sync(() => this.#emitError("interrupt_failed", failure.cause, agentId))),
+        ),
       );
     }
-    await Promise.all(requests);
-  }
+    yield* Effect.all(requests, { concurrency: "unbounded", discard: true });
+  }, Effect.uninterruptible);
 
   async respondToPrompt(input: RespondToPromptInput): Promise<void> {
     await this.#attention.respondToPrompt(input);
@@ -1847,14 +2053,58 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   /** Removes live provider state for an execution thread before its durable rows are deleted. */
-  async #forgetExecutionThread(threadId: string): Promise<void> {
-    const sessions = this.#store.database.listProviderSessions(threadId);
-    for (const session of sessions) await this.#threads.deleteProviderSessionFiles(session.externalSessionId);
+  #forgetExecutionThread(threadId: string): Promise<void> {
+    return runAgentOperation(this.#forgetExecutionThreadEffect(threadId));
+  }
+
+  readonly #forgetExecutionThreadEffect = Effect.fn("AgentService.forgetExecutionThread")(function* (
+    this: AgentService,
+    threadId: string,
+  ) {
+    const sessions = yield* lifecycleStep("list execution sessions", () =>
+      this.#store.database.listProviderSessions(threadId),
+    );
+    for (const session of sessions)
+      yield* this.#threads
+        .deleteProviderSessionFilesEffect(session.externalSessionId)
+        .pipe(
+          Effect.mapError(
+            (failure) =>
+              new AgentLifecycleFailed({ operation: "delete execution session files", cause: failure.cause }),
+          ),
+        );
     for (const session of sessions) {
       this.#conversation.unbindThread(session.externalSessionId);
       this.#conversation.unloadThread(session.externalSessionId);
       this.#compaction.forgetThread(session.externalSessionId);
     }
     this.#conversation.forgetExecutionThread(threadId);
-  }
+  }, Effect.uninterruptible);
+}
+
+export class AgentLifecycleFailed extends Schema.TaggedError<AgentLifecycleFailed>()("AgentLifecycleFailed", {
+  operation: Schema.String,
+  cause: Schema.Defect(),
+}) {}
+
+function lifecycleIo<A>(operation: string, run: () => Promise<A>): Effect.Effect<A, AgentLifecycleFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new AgentLifecycleFailed({ operation, cause }) });
+}
+
+function lifecycleStep<A>(operation: string, run: () => A): Effect.Effect<A, AgentLifecycleFailed> {
+  return Effect.try({ try: run, catch: (cause) => new AgentLifecycleFailed({ operation, cause }) });
+}
+
+/** These tasks already run; stopping the service joins them without starting new work. */
+function settleLifecycleTasks<A>(operation: string, tasks: readonly Promise<A>[]): Effect.Effect<void> {
+  return Effect.forEach(tasks, (task) => lifecycleIo(operation, () => task).pipe(Effect.result), {
+    concurrency: "unbounded",
+    discard: true,
+  });
+}
+
+async function runAgentOperation<A>(effect: Effect.Effect<A, AgentLifecycleFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
+import { Effect, Result, Schema } from "effect";
 import { waitForSuccessfulProcess } from "./provider-status";
 
 /**
@@ -62,37 +63,17 @@ export function startCliCodeLogin(options: {
   let submitted = false;
   // After a pasted code, an exit with a failure code is the provider refusing it. A timeout is a
   // signal, so it keeps its own message.
-  const done = waitForSuccessfulProcess(child, options.timeoutMs).catch((error: unknown) => {
-    if (submitted && child.exitCode !== null) throw new Error(sourceText("error.provider.codeLoginRefused"));
-    throw error;
-  });
-  const prompt = new Promise<CliCodePrompt>((resolve, reject) => {
-    let output = "";
-    let settled = false;
-    const settle = (result: CliCodePrompt | Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdout?.off("data", read);
-      child.stderr?.off("data", read);
-      if (result instanceof Error) {
-        if (child.exitCode === null) child.kill("SIGTERM");
-        reject(result);
-      } else resolve(result);
-    };
-    const read = (chunk: Buffer) => {
-      if (output.length >= MAX_OUTPUT_CHARS) return;
-      output += chunk.toString("utf8").slice(0, MAX_OUTPUT_CHARS - output.length);
-      const parsed = parseCliCodePrompt(options.flow, output);
-      if (parsed) settle(parsed);
-    };
-    const timer = setTimeout(() => settle(new Error(sourceText("error.provider.codeLoginNoLink"))), PROMPT_TIMEOUT_MS);
-    timer.unref?.();
-    child.stdout?.on("data", read);
-    child.stderr?.on("data", read);
-    child.once("error", () => settle(new Error(sourceText("error.provider.codeLoginNoLink"))));
-    child.once("exit", () => settle(new Error(sourceText("error.provider.codeLoginNoLink"))));
-  });
+  const done = runCodeLogin(
+    Effect.tryPromise({
+      try: () => waitForSuccessfulProcess(child, options.timeoutMs),
+      catch: (cause) =>
+        new CliCodeLoginFailed({
+          cause:
+            submitted && child.exitCode !== null ? new Error(sourceText("error.provider.codeLoginRefused")) : cause,
+        }),
+    }),
+  );
+  const prompt = runCodeLogin(readCodePrompt(child, options.flow));
   // Both are awaited by the caller; this only keeps an early exit from being unhandled.
   done.catch(() => undefined);
   prompt.catch(() => undefined);
@@ -110,6 +91,59 @@ export function startCliCodeLogin(options: {
       child.stdin.write(`${value}\r`);
     },
   };
+}
+
+export class CliCodeLoginFailed extends Schema.TaggedError<CliCodeLoginFailed>()("CliCodeLoginFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+// Output contains credentials and must not become a trace payload.
+const readCodePrompt = Effect.fnUntraced(function* (child: ChildProcess, flow: CliCodePrompt["flow"]) {
+  return yield* Effect.callback<CliCodePrompt, CliCodeLoginFailed>((resume) => {
+    let output = "";
+    let settled = false;
+    const cleanup = () => {
+      child.stdout?.off("data", read);
+      child.stderr?.off("data", read);
+      child.off("error", unavailable);
+      child.off("exit", unavailable);
+    };
+    const settle = (result: CliCodePrompt | Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resume(result instanceof Error ? Effect.fail(new CliCodeLoginFailed({ cause: result })) : Effect.succeed(result));
+    };
+    const unavailable = () => settle(new Error(sourceText("error.provider.codeLoginNoLink")));
+    const read = (chunk: Buffer) => {
+      if (output.length >= MAX_OUTPUT_CHARS) return;
+      output += chunk.toString("utf8").slice(0, MAX_OUTPUT_CHARS - output.length);
+      const parsed = parseCliCodePrompt(flow, output);
+      if (parsed) settle(parsed);
+    };
+    child.stdout?.on("data", read);
+    child.stderr?.on("data", read);
+    child.once("error", unavailable);
+    child.once("exit", unavailable);
+    return Effect.sync(cleanup);
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: PROMPT_TIMEOUT_MS,
+      orElse: () =>
+        Effect.fail(new CliCodeLoginFailed({ cause: new Error(sourceText("error.provider.codeLoginNoLink")) })),
+    }),
+    Effect.tapError(() =>
+      Effect.sync(() => {
+        if (child.exitCode === null) child.kill("SIGTERM");
+      }),
+    ),
+  );
+});
+
+async function runCodeLogin<A>(effect: Effect.Effect<A, CliCodeLoginFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }
 
 /** The pasted code, or an error that does not quote it. */

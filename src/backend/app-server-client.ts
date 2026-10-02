@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { isNumber, isString } from "@openbot/contracts/runtime-values";
+import { Effect, Result, Schema } from "effect";
 import { type AgentProvider, RequestTimeoutError } from "./agent-client";
 import { cliSpawnTarget } from "./cli";
 import { JsonLineDecoder, LineTooLongError } from "./jsonl";
@@ -19,7 +20,6 @@ import { createDiagnosticStream } from "./stderr-diagnostics";
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
-  timeout: NodeJS.Timeout;
 }
 
 interface ClientEvents {
@@ -111,7 +111,6 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     this.#process = null;
 
     for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timeout);
       pending.reject(new Error("Codex App Server stopped."));
     }
     this.#pending.clear();
@@ -148,35 +147,50 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     await this.request("thread/unsubscribe", { threadId }, decodeRecordResponse);
   }
 
-  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T>;
-  request<T>(
+  async request<T>(
     method: string,
     params: unknown,
     decoder: ResponseDecoder<T>,
     timeoutMs = this.#requestTimeoutMs,
   ): Promise<T> {
+    const result = await Effect.runPromise(Effect.result(this.requestEffect(method, params, decoder, timeoutMs)));
+    if (Result.isFailure(result)) throw result.failure.cause;
+    return result.success;
+  }
+
+  readonly requestEffect = Effect.fn("CodexAppServer.request")(function* <T>(
+    this: CodexAppServerClient,
+    method: string,
+    params: unknown,
+    decoder: ResponseDecoder<T>,
+    timeoutMs = this.#requestTimeoutMs,
+  ) {
     const id = this.#nextId++;
-    return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.#pending.delete(id);
-        reject(new RequestTimeoutError("Codex", method));
-      }, timeoutMs);
-
+    return yield* Effect.callback<T, AppServerRequestFailed>((resume) => {
       this.#pending.set(id, {
-        resolve: (value) => resolve(decoder(value)),
-        reject,
-        timeout,
+        resolve: (value) =>
+          resume(
+            Effect.try({
+              try: () => decoder(value),
+              catch: (cause) => new AppServerRequestFailed({ cause }),
+            }),
+          ),
+        reject: (cause) => resume(Effect.fail(new AppServerRequestFailed({ cause }))),
       });
-
       try {
         this.#write({ method, id, params });
-      } catch (error) {
-        clearTimeout(timeout);
-        this.#pending.delete(id);
-        reject(error);
+      } catch (cause) {
+        resume(Effect.fail(new AppServerRequestFailed({ cause })));
       }
-    });
-  }
+      return Effect.sync(() => this.#pending.delete(id));
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: timeoutMs,
+        orElse: () => Effect.fail(new AppServerRequestFailed({ cause: new RequestTimeoutError("Codex", method) })),
+      }),
+      Effect.ensuring(Effect.sync(() => this.#pending.delete(id))),
+    );
+  });
 
   notify(method: string, params: unknown = {}): void {
     this.#write({ method, params });
@@ -214,7 +228,6 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     const pending = this.#pending.get(message.id);
     if (!pending) return;
 
-    clearTimeout(pending.timeout);
     this.#pending.delete(message.id);
 
     if (message.error && isRecord(message.error)) {
@@ -232,7 +245,6 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     this.#process = null;
 
     for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timeout);
       pending.reject(error);
     }
     this.#pending.clear();
@@ -252,3 +264,8 @@ function redactDiagnostic(message: string): string {
     .replace(/(?:sk|sess|Bearer|token)[-_a-zA-Z0-9.=]{8,}/gi, "[redacted]")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]");
 }
+
+/** Kept inside the adapter; public callers still receive the native protocol error. */
+export class AppServerRequestFailed extends Schema.TaggedError<AppServerRequestFailed>()("AppServerRequestFailed", {
+  cause: Schema.Defect(),
+}) {}

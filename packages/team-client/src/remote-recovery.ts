@@ -1,5 +1,20 @@
 import type { ConversationSnapshot } from "@openbot/contracts/ipc";
 import { type SourceMessages, sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
+import { runTeamEffect } from "./effect-boundary";
+
+class RemoteRecoveryError extends Schema.TaggedError<RemoteRecoveryError>()("RemoteRecoveryError", {
+  message: Schema.String,
+}) {}
+
+const recoveryCall = <A>(operation: () => Promise<A>) =>
+  Effect.tryPromise({
+    try: operation,
+    catch: (error) =>
+      new RemoteRecoveryError({
+        message: error instanceof Error ? error.message : sourceText("error.remote.operationFailed"),
+      }),
+  });
 
 /** The wait after the first failed attempt. Each next failed attempt doubles it: 2, 4, 8 and 16 seconds. */
 export const REMOTE_RETRY_INTERVAL_MS = 2_000;
@@ -167,7 +182,11 @@ export function createRemoteConnectionRecovery(
     );
   }
 
-  async function run() {
+  function run() {
+    return runTeamEffect(runEffect());
+  }
+
+  const runEffect = Effect.fn("RemoteRecovery.run")(function* () {
     if (!active || disposed || running || suspended) return;
     cancelTimer();
     running = true;
@@ -179,44 +198,50 @@ export function createRemoteConnectionRecovery(
     // A foreground read is not a lost connection. Keep the workspace usable
     // until the transport reports a failure or the read fails.
     if (!online) onStatus({ phase: "connecting", attempt, remainingSeconds: 0 });
-    try {
-      await connect();
-    } catch (error) {
-      if (error instanceof Error && error.message === sourceText("error.remote.appInBackground")) {
-        interrupted = true;
-        retryRequested = false;
-        retryAt = null;
-        return;
-      }
-      if (active) {
-        online = false;
-        if (!disposed) onError(error);
-      }
-      retryRequested = true;
-      // A read on a previously usable peer detected a dead connection. Its first
-      // replacement starts now; only a failed replacement earns a retry delay.
-      if (checkingConnection) {
-        attempt = 0;
-        retryAt = Date.now();
-      }
-      scheduleRetry();
-    } finally {
-      running = false;
-      if (!disposed && !suspended && active) {
-        if (refreshRequested) {
+    yield* Effect.gen(function* () {
+      const result = yield* recoveryCall(connect).pipe(Effect.result);
+      if (Result.isFailure(result)) {
+        const error = result.failure;
+        if (error instanceof Error && error.message === sourceText("error.remote.appInBackground")) {
+          interrupted = true;
+          retryRequested = false;
           retryAt = null;
-          void run();
-        } else if (retryRequested) scheduleRetry();
-        else if (interrupted) void run();
-        else {
-          online = true;
-          attempt = 0;
-          retryAt = null;
-          onStatus({ phase: "online", attempt: 0, remainingSeconds: 0 });
+          return;
         }
+        if (active) {
+          online = false;
+          if (!disposed) onError(error);
+        }
+        retryRequested = true;
+        // A read on a previously usable peer detected a dead connection. Its first
+        // replacement starts now; only a failed replacement earns a retry delay.
+        if (checkingConnection) {
+          attempt = 0;
+          retryAt = Date.now();
+        }
+        scheduleRetry();
       }
-    }
-  }
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          running = false;
+          if (!disposed && !suspended && active) {
+            if (refreshRequested) {
+              retryAt = null;
+              void run();
+            } else if (retryRequested) scheduleRetry();
+            else if (interrupted) void run();
+            else {
+              online = true;
+              attempt = 0;
+              retryAt = null;
+              onStatus({ phase: "online", attempt: 0, remainingSeconds: 0 });
+            }
+          }
+        }),
+      ),
+    );
+  });
 
   return {
     setActive(value: boolean) {
@@ -301,17 +326,21 @@ export function createRemoteReadRefresh() {
       cursors.set(serverId, cursor);
       return () => cursors.get(serverId) === cursor;
     },
-    async refresh<T>(
+    refresh<T>(
       serverId: string,
       load: () => Promise<T>,
       apply: (value: T) => void,
       isCurrent: () => boolean,
     ): Promise<void> {
-      const request = (requests.get(serverId) ?? 0) + 1;
-      requests.set(serverId, request);
-      const cursor = cursors.get(serverId);
-      const value = await load();
-      if (requests.get(serverId) === request && cursors.get(serverId) === cursor && isCurrent()) apply(value);
+      return runTeamEffect(
+        Effect.fn("RemoteRecovery.refresh")(function* () {
+          const request = (requests.get(serverId) ?? 0) + 1;
+          requests.set(serverId, request);
+          const cursor = cursors.get(serverId);
+          const value = yield* recoveryCall(load);
+          if (requests.get(serverId) === request && cursors.get(serverId) === cursor && isCurrent()) apply(value);
+        })(),
+      );
     },
   };
 }
@@ -332,18 +361,24 @@ export function mergeRemoteUnreadIds(current: string[], reads: Record<string, { 
 }
 
 /** Only conversations cached for agents in this server need recovery. */
-export async function resyncRemoteConversations(input: {
+export function resyncRemoteConversations(input: {
   agentIds: string[];
   cached: Record<string, ConversationSnapshot>;
   load: (agentId: string) => Promise<ConversationSnapshot>;
   apply: (snapshot: ConversationSnapshot) => void;
   isCurrent: () => boolean;
 }): Promise<void> {
+  return runTeamEffect(resyncRemoteConversationsEffect(input));
+}
+
+const resyncRemoteConversationsEffect = Effect.fn("RemoteRecovery.resyncConversations")(function* (
+  input: Parameters<typeof resyncRemoteConversations>[0],
+) {
   for (const agentId of input.agentIds) {
     if (!input.isCurrent()) return;
     if (!input.cached[agentId]) continue;
-    const snapshot = await input.load(agentId);
+    const snapshot = yield* recoveryCall(() => input.load(agentId));
     if (!input.isCurrent()) return;
     input.apply(snapshot);
   }
-}
+});

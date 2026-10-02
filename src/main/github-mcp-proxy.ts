@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import { type GitHubOperationError, githubCall, runGitHubEffect } from "./github-effects";
 // The GitHub MCP server that agents reach on this computer. It forwards to GitHub's remote MCP
 // server with the token for each call: the bot token of the repository that the call names, or
 // the user token.
@@ -95,7 +97,7 @@ export class GitHubMcpProxy {
     for (const [token, upstream] of this.#upstreams) {
       if (tokens.has(token)) continue;
       this.#upstreams.delete(token);
-      void upstream.client.close().catch(() => undefined);
+      void runGitHubEffect(githubCall(() => upstream.client.close()).pipe(Effect.catch(() => Effect.void)));
     }
   }
 
@@ -118,7 +120,14 @@ export class GitHubMcpProxy {
     });
   }
 
-  async #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    return runGitHubEffect(this.#handleEffect(request, response));
+  }
+  readonly #handleEffect = Effect.fn("GitHubMcpProxy.handle")(function* (
+    this: GitHubMcpProxy,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Effect.fn.Return<void, GitHubOperationError> {
     if (!this.#authorized(request)) {
       response.writeHead(401, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "unauthorized" }));
@@ -129,16 +138,20 @@ export class GitHubMcpProxy {
       response.end();
       return;
     }
-    const userToken = await this.#options.userToken();
+    const userToken = yield* githubCall(() => this.#options.userToken());
     if (!userToken) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "github_not_connected" }));
       return;
     }
-    const mcp = await this.#serverFor(userToken).catch((error: unknown) => {
-      logger.warn("GitHub's MCP server could not be reached.", { cause: toLogValue(error) });
-      return null;
-    });
+    const mcp = yield* this.#serverForEffect(userToken).pipe(
+      Effect.catch(({ cause: error }) =>
+        Effect.sync(() => {
+          logger.warn("GitHub's MCP server could not be reached.", { cause: toLogValue(error) });
+          return null;
+        }),
+      ),
+    );
     if (!mcp) {
       response.writeHead(502, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "github_unreachable" }));
@@ -146,29 +159,40 @@ export class GitHubMcpProxy {
     }
     // No `sessionIdGenerator`: each POST is one stateless request.
     const transport = new StreamableHTTPServerTransport({});
-    try {
-      await mcp.connect(transport);
-      await transport.handleRequest(request, response, await readJsonBody(request, MAX_BODY_BYTES));
-    } catch {
-      if (!response.headersSent) {
-        response.writeHead(500, { "content-type": "application/json" });
-        response.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32603, message: "Internal GitHub MCP proxy error." },
-          }),
-        );
-      }
-    } finally {
-      await transport.close().catch(() => undefined);
-      await mcp.close().catch(() => undefined);
-    }
-  }
+    yield* Effect.gen(function* () {
+      yield* githubCall(() => mcp.connect(transport));
+      const body = yield* githubCall(() => readJsonBody(request, MAX_BODY_BYTES));
+      yield* githubCall(() => transport.handleRequest(request, response, body));
+    }).pipe(
+      Effect.catch(() =>
+        Effect.sync(() => {
+          if (!response.headersSent) {
+            response.writeHead(500, { "content-type": "application/json" });
+            response.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32603, message: "Internal GitHub MCP proxy error." },
+              }),
+            );
+          }
+        }),
+      ),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          yield* githubCall(() => transport.close()).pipe(Effect.catch(() => Effect.void));
+          yield* githubCall(() => mcp.close()).pipe(Effect.catch(() => Effect.void));
+        }),
+      ),
+    );
+  });
 
   /** The MCP server for one POST, with GitHub's instructions and capabilities. */
-  async #serverFor(userToken: string): Promise<Server> {
-    const user = await this.#upstream(userToken);
+  readonly #serverForEffect = Effect.fn("GitHubMcpProxy.serverFor")(function* (
+    this: GitHubMcpProxy,
+    userToken: string,
+  ): Effect.fn.Return<Server, GitHubOperationError> {
+    const user = yield* this.#upstreamEffect(userToken);
     const capabilities = user.getServerCapabilities() ?? {};
     const instructions = user.getInstructions();
     const mcp = new Server(
@@ -215,45 +239,57 @@ export class GitHubMcpProxy {
       });
     }
     return mcp;
-  }
+  });
 
   /** One call on the client of `token`. A session that GitHub ended opens again once. */
-  async #call<T>(token: string, call: (client: Client) => Promise<T>): Promise<T> {
-    const client = await this.#upstream(token);
-    try {
-      return await call(client);
-    } catch (error) {
-      if (!(error instanceof StreamableHTTPError && error.code === 404)) throw error;
-      this.#drop(token, client);
-      return call(await this.#upstream(token));
-    }
+  #call<T>(token: string, call: (client: Client) => Promise<T>): Promise<T> {
+    return runGitHubEffect(this.#callEffect(token, call));
   }
+  readonly #callEffect = Effect.fn("GitHubMcpProxy.call")(function* <T>(
+    this: GitHubMcpProxy,
+    token: string,
+    call: (client: Client) => Promise<T>,
+  ): Effect.fn.Return<T, GitHubOperationError> {
+    const client = yield* this.#upstreamEffect(token);
+    return yield* githubCall(() => call(client)).pipe(
+      Effect.catch((failure) =>
+        Effect.gen({ self: this }, function* () {
+          const error = failure.cause;
+          if (!(error instanceof StreamableHTTPError && error.code === 404)) return yield* failure;
+          this.#drop(token, client);
+          const replacement = yield* this.#upstreamEffect(token);
+          return yield* githubCall(() => call(replacement));
+        }),
+      ),
+    );
+  });
 
-  async #upstream(token: string): Promise<Client> {
+  readonly #upstreamEffect = Effect.fn("GitHubMcpProxy.upstream")(function* (
+    this: GitHubMcpProxy,
+    token: string,
+  ): Effect.fn.Return<Client, GitHubOperationError> {
     let upstream = this.#upstreams.get(token);
     if (!upstream) {
       const client = new Client({ name: "openbot-github-proxy", version: "1.0.0" }, { capabilities: {} });
       const transport = new StreamableHTTPClientTransport(new URL(this.#options.upstreamUrl), {
         requestInit: { headers: { Authorization: `Bearer ${token}` } },
       });
-      upstream = { client, ready: client.connect(transport) };
+      upstream = { client, ready: runGitHubEffect(githubCall(() => client.connect(transport))) };
       this.#upstreams.set(token, upstream);
     }
-    try {
-      await upstream.ready;
-    } catch (error) {
-      this.#drop(token, upstream.client);
-      throw error;
-    }
-    return upstream.client;
-  }
+    const current = upstream;
+    yield* githubCall(() => current.ready).pipe(
+      Effect.tapError(() => Effect.sync(() => this.#drop(token, current.client))),
+    );
+    return current.client;
+  });
 
   /** Closes `client` only while it is the client of `token`: a parallel call can have opened a new one. */
   #drop(token: string, client: Client): void {
     const upstream = this.#upstreams.get(token);
     if (upstream?.client !== client) return;
     this.#upstreams.delete(token);
-    void client.close().catch(() => undefined);
+    void runGitHubEffect(githubCall(() => client.close()).pipe(Effect.catch(() => Effect.void)));
   }
 
   #authorized(request: IncomingMessage): boolean {

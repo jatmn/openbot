@@ -30,6 +30,17 @@ describe("CodexAppServerClient", () => {
     await vi.waitFor(() => expect(notifications).toContain("test/notification"));
   });
 
+  it("rejects an invalid response without leaving its caller pending", async () => {
+    const client = createClient(await createFakeCodex(), 5_000);
+    client.start();
+    await expect(client.request("test/echo", { text: 42 }, decodeEchoResponse)).rejects.toThrow(
+      "Invalid echo response.",
+    );
+    await expect(client.request("test/echo", { text: "valid" }, decodeEchoResponse)).resolves.toEqual({
+      echoed: "valid",
+    });
+  });
+
   it("rejects timed out requests", async () => {
     const executable = await createFakeCodex();
     const client = createClient(executable, 30);

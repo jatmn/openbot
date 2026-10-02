@@ -20,17 +20,19 @@ import type {
 } from "@openbot/contracts/ipc";
 import type { HostRestartState } from "@openbot/contracts/team-protocol/host-update-v1";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Schema } from "effect";
+import { remoteCall, remoteDecode, runRemoteWorkflow } from "./remote-service-effects";
 import type { RestartReadiness } from "./update-readiness";
 
 export type RequestedUpdateRefusalReason = "disabled" | "managed" | "unsupported" | "restarting";
 
 /** A request this host does not carry out. The route turns the reason into a status code. */
-export class RequestedUpdateRefusal extends Error {
-  readonly reason: RequestedUpdateRefusalReason;
-
+export class RequestedUpdateRefusal extends Schema.TaggedError<RequestedUpdateRefusal>()("RequestedUpdateRefusal", {
+  reason: Schema.Literals(["disabled", "managed", "unsupported", "restarting"]),
+  message: Schema.String,
+}) {
   constructor(reason: RequestedUpdateRefusalReason) {
-    super(refusalMessage(reason));
-    this.reason = reason;
+    super({ reason, message: refusalMessage(reason) });
   }
 }
 
@@ -142,7 +144,7 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
   /** Asks the updater for a check. The answer shows the check under way; the client reads it again. */
   check(): HostUpdateStatus {
     this.#assertAllowed();
-    void this.#updater.checkForUpdates();
+    void runRemoteWorkflow(this.#checkEffect());
     return this.snapshot();
   }
 
@@ -162,21 +164,35 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
     this.#log(`Member ${member.id} asked for an update restart (${mode}).`);
     this.#publish();
     if (status.phase === "ready") this.#scheduleAttempt(this.#graceMs);
-    else if (canDownload(status)) void this.#updater.downloadUpdate();
-    else if (status.phase !== "checking" && status.phase !== "downloading") void this.#updater.checkForUpdates();
+    else if (canDownload(status)) void runRemoteWorkflow(this.#downloadEffect());
+    else if (status.phase !== "checking" && status.phase !== "downloading") void runRemoteWorkflow(this.#checkEffect());
     return this.snapshot();
   }
 
   /** An admin of a joined server sets the host's switches. Only the host user sets `allowRemoteUpdates`. */
-  async changeSettings(change: HostUpdateSettingsChange): Promise<HostUpdateStatus> {
-    this.#assertAllowed();
-    this.emit("preference", await this.setPreference(change));
-    return this.snapshot();
+  changeSettings(change: HostUpdateSettingsChange): Promise<HostUpdateStatus> {
+    return runRemoteWorkflow(this.changeSettingsEffect(change));
   }
 
+  readonly changeSettingsEffect = Effect.fn("RequestedUpdate.changeSettings")(function* (
+    this: RequestedUpdate,
+    change: HostUpdateSettingsChange,
+  ) {
+    yield* remoteDecode(() => this.#assertAllowed());
+    this.emit("preference", yield* this.setPreferenceEffect(change));
+    return this.snapshot();
+  });
+
   /** Stores a preference change and applies it. The host user's Settings and `changeSettings` call this. */
-  async setPreference(change: UpdatePreferenceChange): Promise<UpdatePreference> {
-    const preference = await this.#savePreference(change);
+  setPreference(change: UpdatePreferenceChange): Promise<UpdatePreference> {
+    return runRemoteWorkflow(this.setPreferenceEffect(change));
+  }
+
+  readonly setPreferenceEffect = Effect.fn("RequestedUpdate.setPreference")(function* (
+    this: RequestedUpdate,
+    change: UpdatePreferenceChange,
+  ) {
+    const preference = yield* remoteCall(() => this.#savePreference(change));
     this.#updater.setAutoDownload(preference.autoDownload);
     this.#allowed = preference.allowRemoteUpdates;
     this.#autoInstall = preference.autoInstall;
@@ -187,7 +203,7 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
     }
     this.#advance(this.#updater.getStatus());
     return preference;
-  }
+  });
 
   /**
    * Removes the schedule. A download under way continues; it is the same one auto-download runs. A
@@ -224,7 +240,7 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
       this.#installAutomatically(status);
       return;
     }
-    if (status.phase === "available") void this.#updater.downloadUpdate();
+    if (status.phase === "available") void runRemoteWorkflow(this.#downloadEffect());
     else if (status.phase === "ready") {
       if (!this.#timer) this.#scheduleAttempt(this.#graceMs);
     } else if (status.phase === "up-to-date" || status.phase === "error" || status.phase === "unsupported") {
@@ -237,7 +253,7 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
   #installAutomatically(status: UpdateStatus): void {
     if (!this.#autoInstall || status.managedByHost || !status.availableVersion) return;
     if (status.availableVersion === this.#declinedVersion) return;
-    if (status.phase === "available") void this.#updater.downloadUpdate();
+    if (status.phase === "available") void runRemoteWorkflow(this.#downloadEffect());
     else if (status.phase === "ready") {
       this.#schedule = { memberId: null, requestedBy: null, mode: "when-idle", waitingFor: [] };
       this.#log(`Scheduled the automatic restart into ${status.availableVersion}.`);
@@ -250,12 +266,12 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
     this.#clearTimer();
     this.#timer = setTimeout(() => {
       this.#timer = null;
-      void this.#attempt();
+      void runRemoteWorkflow(this.#attemptEffect());
     }, delayMs);
     this.#timer.unref?.();
   }
 
-  async #attempt(): Promise<void> {
+  readonly #attemptEffect = Effect.fn("RequestedUpdate.attempt")(function* (this: RequestedUpdate) {
     const schedule = this.#schedule;
     if (!schedule || this.#updater.getStatus().phase !== "ready") return;
     if (schedule.mode === "when-idle") {
@@ -277,22 +293,34 @@ export class RequestedUpdate extends EventEmitter<{ preference: [UpdatePreferenc
     this.#log(`Restarting to install the update that ${describe(schedule)} asked for.`);
     this.#announceState("restarting");
     this.#installing = true;
-    try {
-      await this.#updater.installUpdate();
-    } catch (error) {
-      // A refusal before teardown (another macOS session runs OpenBot) leaves the update ready.
-      this.#log(`The requested update restart failed: ${error instanceof Error ? error.message : String(error)}`);
-      if (this.#schedule === schedule) {
-        this.#installError = "install_failed";
-        // Without this, the next status would schedule the same failing install again.
-        if (schedule.memberId === null) this.#declinedVersion = this.#updater.getStatus().availableVersion;
-        this.#clear();
-      }
-    } finally {
-      // The updater is `installing` from the end of its checks, so the latch can end here.
-      this.#installing = false;
-    }
-  }
+    yield* remoteCall(() => this.#updater.installUpdate()).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          const error = failure.cause;
+          // A refusal before teardown (another macOS session runs OpenBot) leaves the update ready.
+          this.#log(`The requested update restart failed: ${error instanceof Error ? error.message : String(error)}`);
+          if (this.#schedule === schedule) {
+            this.#installError = "install_failed";
+            // Without this, the next status would schedule the same failing install again.
+            if (schedule.memberId === null) this.#declinedVersion = this.#updater.getStatus().availableVersion;
+            this.#clear();
+          }
+        }),
+      ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          // The updater is `installing` from the end of its checks, so the latch can end here.
+          this.#installing = false;
+        }),
+      ),
+    );
+  });
+
+  readonly #checkEffect = Effect.fn("RequestedUpdate.check")(() => remoteCall(() => this.#updater.checkForUpdates()));
+
+  readonly #downloadEffect = Effect.fn("RequestedUpdate.download")(() =>
+    remoteCall(() => this.#updater.downloadUpdate()),
+  );
 
   #restarting(): boolean {
     return this.#installing || this.#updater.getStatus().phase === "installing";

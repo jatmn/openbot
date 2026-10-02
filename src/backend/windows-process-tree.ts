@@ -1,4 +1,5 @@
 import { type ChildProcess, execFile } from "node:child_process";
+import { Effect, Fiber, Result, Schema } from "effect";
 
 /**
  * Stops a process and every process it started, and waits for it to exit. Windows has no process
@@ -6,14 +7,43 @@ import { type ChildProcess, execFile } from "node:child_process";
  * running. `taskkill /T` stops the whole tree while the wrapper still holds it.
  */
 export async function stopWindowsProcessTree(child: ChildProcess): Promise<void> {
-  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-  await new Promise<void>((resolve) =>
-    execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true }, () => resolve()),
-  );
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  await exited;
+  const result = await Effect.runPromise(Effect.result(stopWindowsProcessTreeEffect(child)));
+  if (Result.isFailure(result)) throw result.failure.cause;
 }
+
+export class ProcessTreeFailed extends Schema.TaggedError<ProcessTreeFailed>()("ProcessTreeFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+export const stopWindowsProcessTreeEffect = Effect.fn("WindowsProcessTree.stop")(function* (child: ChildProcess) {
+  const pid = child.pid;
+  if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = yield* Effect.forkChild(
+    Effect.callback<void>((resume) => {
+      const onExit = () => {
+        child.off("exit", onExit);
+        resume(Effect.void);
+      };
+      child.once("exit", onExit);
+      return Effect.sync(() => child.off("exit", onExit));
+    }),
+    { startImmediately: true },
+  );
+  yield* Effect.tryPromise({
+    try: () =>
+      new Promise<void>((resolve) =>
+        execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, () => resolve()),
+      ),
+    catch: (cause) => new ProcessTreeFailed({ cause }),
+  });
+  yield* Effect.try({
+    try: () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    },
+    catch: (cause) => new ProcessTreeFailed({ cause }),
+  });
+  yield* Fiber.join(exited);
+}, Effect.uninterruptible);
 
 /**
  * Stops a process that may run under `cmd.exe`, such as a sign-in through a `.cmd` launcher, and

@@ -7,10 +7,32 @@ import { readFile, rm } from "node:fs/promises";
 import type { MessagingCredentialState } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
+import { Effect, Result, Schema } from "effect";
 import { z } from "zod";
-import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
 import type { MessagingCredentials } from "../backend/messaging/messaging-service";
 import type { SecretCipher } from "./provider-credential-store";
+
+class MessagingCredentialFailure extends Schema.TaggedError<MessagingCredentialFailure>()(
+  "MessagingCredentialFailure",
+  {
+    cause: Schema.Defect(),
+  },
+) {}
+
+function messagingIO<A>(operation: () => Promise<A>): Effect.Effect<A, MessagingCredentialFailure> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new MessagingCredentialFailure({ cause }) });
+}
+
+function messagingSync<A>(operation: () => A): Effect.Effect<A, MessagingCredentialFailure> {
+  return Effect.try({ try: operation, catch: (cause) => new MessagingCredentialFailure({ cause }) });
+}
+
+async function runMessaging<A>(operation: Effect.Effect<A, MessagingCredentialFailure>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
+}
 
 /**
  * One envelope with the tokens of every connection, each connection encrypted on its own. The
@@ -44,17 +66,22 @@ export class MessagingCredentialStore implements MessagingCredentials {
   }
 
   /** Reads the envelope. A file that cannot be read does not stop startup, and stays until the user saves. */
-  async load(): Promise<Error | null> {
-    this.#values = new Map();
-    this.#loadError = null;
-    try {
-      this.#values = await this.#read();
-    } catch (error) {
-      this.#loadError =
-        error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
-    }
-    this.#loaded = true;
-    return this.#loadError;
+  load(): Promise<Error | null> {
+    return runMessaging(
+      Effect.gen({ self: this }, function* () {
+        this.#values = new Map();
+        this.#loadError = null;
+        const result = yield* Effect.result(this.#read());
+        if (Result.isSuccess(result)) this.#values = result.success;
+        else {
+          const error = result.failure.cause;
+          this.#loadError =
+            error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
+        }
+        this.#loaded = true;
+        return this.#loadError;
+      }),
+    );
   }
 
   get(connectionId: string): Record<string, string> | null {
@@ -96,43 +123,60 @@ export class MessagingCredentialStore implements MessagingCredentials {
 
   /** One change after the previous one, each from the values the previous change committed. */
   async #edit(change: (next: Map<string, Record<string, string>>) => boolean): Promise<void> {
-    const operation = this.#writeChain.then(async () => {
-      if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
-      // An unreadable envelope starts from empty: nothing in it can be decrypted.
-      const next = new Map(this.#loadError ? [] : this.#values);
-      if (!change(next)) return;
-      if (next.size === 0) await rm(this.#path, { force: true });
-      else await this.#write(next);
-      this.#values = next;
-      this.#loadError = null;
-    });
+    const operation = this.#writeChain.then(() =>
+      runMessaging(
+        Effect.gen({ self: this }, function* () {
+          const next = yield* messagingSync(() => {
+            if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
+            const values = new Map(this.#loadError ? [] : this.#values);
+            return change(values) ? values : null;
+          });
+          if (!next) return;
+          if (next.size === 0) yield* messagingIO(() => rm(this.#path, { force: true }));
+          else yield* this.#write(next);
+          this.#values = next;
+          this.#loadError = null;
+        }).pipe(Effect.uninterruptible),
+      ),
+    );
     this.#writeChain = operation.catch(() => undefined);
     await operation;
   }
 
-  async #read(): Promise<Map<string, Record<string, string>>> {
-    let source: string;
-    try {
-      source = await readFile(this.#path, "utf8");
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return new Map();
-      throw error;
-    }
-    if (source.length > MAX_ENVELOPE_BYTES) throw new Error(sourceText("error.provider.credentialFileTooLarge"));
-    const envelope = envelopeSchema.parse(JSON.parse(source));
-    const values = new Map<string, Record<string, string>>();
-    for (const [connectionId, encrypted] of Object.entries(envelope.connections)) {
-      const decoded = valuesSchema.parse(JSON.parse(this.#cipher.decrypt(Buffer.from(encrypted, "base64"))));
-      for (const value of Object.values(decoded)) registerSecretValue(value);
-      values.set(connectionId, decoded);
-    }
-    return values;
-  }
+  #read = Effect.fn("MessagingCredentialStore.read")(function* (this: MessagingCredentialStore) {
+    const source = yield* messagingIO(() => readFile(this.#path, "utf8")).pipe(
+      Effect.catch(({ cause }) =>
+        cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+          ? Effect.succeed(null)
+          : Effect.fail(new MessagingCredentialFailure({ cause })),
+      ),
+    );
+    if (source === null) return new Map<string, Record<string, string>>();
+    return yield* messagingSync(() => {
+      if (source.length > MAX_ENVELOPE_BYTES) throw new Error(sourceText("error.provider.credentialFileTooLarge"));
+      const envelope = envelopeSchema.parse(JSON.parse(source));
+      const values = new Map<string, Record<string, string>>();
+      for (const [connectionId, encrypted] of Object.entries(envelope.connections)) {
+        const decoded = valuesSchema.parse(JSON.parse(this.#cipher.decrypt(Buffer.from(encrypted, "base64"))));
+        for (const value of Object.values(decoded)) registerSecretValue(value);
+        values.set(connectionId, decoded);
+      }
+      return values;
+    });
+  });
 
-  async #write(values: Map<string, Record<string, string>>): Promise<void> {
-    const connections: Record<string, string> = {};
-    for (const [connectionId, value] of values)
-      connections[connectionId] = this.#cipher.encrypt(JSON.stringify(value)).toString("base64");
-    await writeJsonFileAtomically(this.#path, { version: 1, connections }, { createDirectory: true });
-  }
+  #write = Effect.fn("MessagingCredentialStore.write")(function* (
+    this: MessagingCredentialStore,
+    values: Map<string, Record<string, string>>,
+  ) {
+    const content = yield* messagingSync(() => {
+      const connections: Record<string, string> = {};
+      for (const [connectionId, value] of values)
+        connections[connectionId] = this.#cipher.encrypt(JSON.stringify(value)).toString("base64");
+      return `${JSON.stringify({ version: 1, connections })}\n`;
+    });
+    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
+      Effect.mapError(({ cause }) => new MessagingCredentialFailure({ cause })),
+    );
+  });
 }

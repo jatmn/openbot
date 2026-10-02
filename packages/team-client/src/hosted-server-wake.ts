@@ -1,4 +1,8 @@
 import { type HostedServerState, parseHostedServerSummary } from "@openbot/contracts/hosted-servers";
+import { Effect, Schema } from "effect";
+import { runTeamEffect } from "./effect-boundary";
+
+class HostedServerWakeError extends Schema.TaggedError<HostedServerWakeError>()("HostedServerWakeError", {}) {}
 
 /**
  * A hosted server in one of these states comes online without a user action, so the client reconnects.
@@ -40,27 +44,18 @@ export function createHostedServerWake(
   /** A failed connection reports itself twice, so both reports share one request. */
   const pending = new Map<string, Promise<boolean>>();
 
-  return function wake(hostId: string): Promise<boolean> {
-    const current = pending.get(hostId);
-    if (current) return current;
-    const request = wakeOnce(hostId).finally(() => pending.delete(hostId));
-    pending.set(hostId, request);
-    return request;
-  };
-
-  async function wakeOnce(hostId: string): Promise<boolean> {
+  const wakeOnce = Effect.fn("HostedServerWake.wake")(function* (hostId: string) {
     const time = now();
     const checked = notHostedAt.get(hostId);
     if (checked !== undefined && time - checked < NOT_HOSTED_RECHECK_MS) return false;
     const stopped = gaveUpAt.get(hostId);
     if (stopped !== undefined && time - stopped < NOT_HOSTED_RECHECK_MS) return false;
-    let response: HostedServerWakeResponse;
-    try {
-      response = await requestWake(hostId);
-    } catch {
-      // A network failure is also the reason the host is offline; the next failure asks again.
-      return false;
-    }
+    const response = yield* Effect.tryPromise({
+      try: () => requestWake(hostId),
+      catch: () => new HostedServerWakeError({}),
+    }).pipe(Effect.catch(() => Effect.succeed(null)));
+    // A network failure is also the reason the host is offline; the next failure asks again.
+    if (!response) return false;
     if (!response.ok) {
       attempts.delete(hostId);
       // Not a hosted server of this account, or a server whose plan ended: a wake cannot start it.
@@ -69,7 +64,11 @@ export function createHostedServerWake(
       if (response.status === 402) gaveUpAt.set(hostId, time);
       return false;
     }
-    const server = parseHostedServerSummary(await response.json().catch(() => null));
+    const value = yield* Effect.tryPromise({
+      try: () => response.json(),
+      catch: () => new HostedServerWakeError({}),
+    }).pipe(Effect.catch(() => Effect.succeed(null)));
+    const server = parseHostedServerSummary(value);
     if (!server || !WAKE_RECONNECT_STATES.has(server.state)) {
       attempts.delete(hostId);
       return false;
@@ -83,5 +82,13 @@ export function createHostedServerWake(
     }
     attempts.set(hostId, { count: previous + 1, at: time });
     return true;
-  }
+  });
+
+  return function wake(hostId: string): Promise<boolean> {
+    const current = pending.get(hostId);
+    if (current) return current;
+    const request = runTeamEffect(wakeOnce(hostId)).finally(() => pending.delete(hostId));
+    pending.set(hostId, request);
+    return request;
+  };
 }

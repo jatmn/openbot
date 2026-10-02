@@ -19,6 +19,12 @@ import {
   marketplaceQueryParams,
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Schema } from "effect";
+import { runTeamEffect } from "./effect-boundary";
+
+class MarketplaceCatalogError extends Schema.TaggedError<MarketplaceCatalogError>()("MarketplaceCatalogError", {
+  message: Schema.String,
+}) {}
 
 export interface MarketplaceCatalog {
   skills: {
@@ -34,15 +40,32 @@ export interface MarketplaceCatalog {
 }
 
 export function createMarketplaceCatalog(request: typeof fetch): MarketplaceCatalog {
-  async function read<T>(
+  function read<T>(
     path: string,
     decode: (value: unknown) => T,
     failure = sourceText("error.marketplace.catalogLoadFailed"),
   ): Promise<T> {
-    const response = await request(path, { headers: { accept: "application/json" } });
-    if (!response.ok) throw new Error(failure);
-    return decode(await response.json());
+    return runTeamEffect(readCatalog(path, decode, failure));
   }
+  const readCatalog = Effect.fn("MarketplaceCatalog.read")(function* <T>(
+    path: string,
+    decode: (value: unknown) => T,
+    failure: string,
+  ) {
+    const response = yield* Effect.tryPromise({
+      try: (signal) => request(path, { headers: { accept: "application/json" }, signal }),
+      catch: (error) => new MarketplaceCatalogError({ message: error instanceof Error ? error.message : failure }),
+    });
+    if (!response.ok) return yield* new MarketplaceCatalogError({ message: failure });
+    const value = yield* Effect.tryPromise({
+      try: () => response.json(),
+      catch: (error) => new MarketplaceCatalogError({ message: error instanceof Error ? error.message : failure }),
+    });
+    return yield* Effect.try({
+      try: () => decode(value),
+      catch: (error) => new MarketplaceCatalogError({ message: error instanceof Error ? error.message : failure }),
+    });
+  });
   return {
     skills: {
       list: (query = {}) => read(`/v1/skills/?${marketplaceQueryParams(query)}`, decodeMarketplaceSkillPage),

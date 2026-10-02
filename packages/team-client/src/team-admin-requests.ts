@@ -82,7 +82,23 @@ import { SHARED_TABLES_ROUTES } from "@openbot/contracts/team-protocol/shared-ta
 import { SKILLS_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/skills-admin-v1";
 import { STORAGE_ROUTES } from "@openbot/contracts/team-protocol/storage-v1";
 import type { TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
+import { Effect, Result, Schema } from "effect";
 import type { TeamApiRequest } from "./team-api-requests";
+
+export class TeamAdminRequestError extends Schema.TaggedError<TeamAdminRequestError>()("TeamAdminRequestError", {
+  cause: Schema.Defect(),
+}) {}
+
+const adminCall = <A>(operation: () => Promise<A>) =>
+  Effect.tryPromise({
+    try: operation,
+    catch: (cause) => new TeamAdminRequestError({ cause }),
+  });
+async function runAdminEffect<A>(operation: Effect.Effect<A, TeamAdminRequestError>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(operation));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
+}
 
 // The route codec has already checked the empty reply.
 function ignoreResponse(): void {}
@@ -263,9 +279,19 @@ export function testMcpServer(request: TeamApiRequest, input: TestMcpServerInput
   return request("POST", MCP_ROUTES.test, decodeMcpTestResult, { config: mcpConfig(input.config) });
 }
 
-export async function getStorageUsage(request: TeamApiRequest, input: GetStorageUsageInput): Promise<StorageUsage> {
-  return assertStorageUsageScope(await request("POST", STORAGE_ROUTES.usage, decodeStorageUsage, { ...input }), input);
+export function getStorageUsage(request: TeamApiRequest, input: GetStorageUsageInput): Promise<StorageUsage> {
+  return runAdminEffect(getStorageUsageEffect(request, input));
 }
+export const getStorageUsageEffect = Effect.fn("TeamAdmin.getStorageUsage")(function* (
+  request: TeamApiRequest,
+  input: GetStorageUsageInput,
+) {
+  const result = yield* adminCall(() => request("POST", STORAGE_ROUTES.usage, decodeStorageUsage, { ...input }));
+  return yield* Effect.try({
+    try: () => assertStorageUsageScope(result, input),
+    catch: (cause) => new TeamAdminRequestError({ cause }),
+  });
+});
 
 export function deleteStoredFile(request: TeamApiRequest, input: DeleteStoredFileInput): Promise<void> {
   return request("POST", STORAGE_ROUTES.deleteFile, ignoreResponse, { ...input });
@@ -306,10 +332,17 @@ export function startProviderCodeLogin(
 }
 
 /** A change, then the host's status, so the result is the `AgentStatus` a local change gives. */
-async function providerChange(request: TeamApiRequest, path: string, body: TeamProtocolV2Json): Promise<AgentStatus> {
-  await request("POST", path, ignoreResponse, body);
-  return request("GET", TEAM_API_ROUTES.agents.status, decodeAgentStatus);
+function providerChange(request: TeamApiRequest, path: string, body: TeamProtocolV2Json): Promise<AgentStatus> {
+  return runAdminEffect(providerChangeEffect(request, path, body));
 }
+const providerChangeEffect = Effect.fn("TeamAdmin.providerChange")(function* (
+  request: TeamApiRequest,
+  path: string,
+  body: TeamProtocolV2Json,
+) {
+  yield* adminCall(() => request("POST", path, ignoreResponse, body));
+  return yield* adminCall(() => request("GET", TEAM_API_ROUTES.agents.status, decodeAgentStatus));
+});
 
 /** `providers-v3` only. The code is a credential: it goes in the body, and no reply carries it. */
 export function submitProviderCodeLogin(
@@ -328,15 +361,21 @@ export function cancelProviderCodeLogin(
 }
 
 /** Only the key's state comes back; no reply carries the key. */
-export async function getProviderApiKeyState(
+export function getProviderApiKeyState(
   request: TeamApiRequest,
   provider: AgentProviderId,
 ): Promise<ProviderApiKeyState> {
-  return {
-    provider,
-    status: await request("POST", PROVIDERS_ADMIN_ROUTES.apiKeyState, decodeProviderApiKeyStatus, { provider }),
-  };
+  return runAdminEffect(getProviderApiKeyStateEffect(request, provider));
 }
+export const getProviderApiKeyStateEffect = Effect.fn("TeamAdmin.getProviderApiKeyState")(function* (
+  request: TeamApiRequest,
+  provider: AgentProviderId,
+) {
+  const status = yield* adminCall(() =>
+    request("POST", PROVIDERS_ADMIN_ROUTES.apiKeyState, decodeProviderApiKeyStatus, { provider }),
+  );
+  return { provider, status };
+});
 
 export function setProviderApiKey(request: TeamApiRequest, input: SetProviderApiKeyInput): Promise<AgentStatus> {
   return providerChange(request, PROVIDERS_ADMIN_ROUTES.apiKeySet, { provider: input.provider, key: input.key });

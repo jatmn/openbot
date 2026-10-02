@@ -12,8 +12,10 @@ import { delimiter, extname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { CUSTOM_AGENT_LIMITS } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect } from "effect";
 import { runInLoginShell } from "./cli";
 import { pickWindowsExecutable } from "./mcp-provider-shapes";
+import { providerCall, providerFailure, runProviderClientEffect } from "./provider-client-effects";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,27 +81,31 @@ export interface ResolveAgentCommandOptions {
  * The file that a command starts, or null when there is none now. Throws for a command text that is
  * not an accepted form, so the form can say what is wrong rather than "not found".
  */
-export async function resolveAgentCommand(
+export function resolveAgentCommand(command: string, options: ResolveAgentCommandOptions = {}): Promise<string | null> {
+  return runProviderClientEffect(resolveAgentCommandEffect(command, options));
+}
+
+export const resolveAgentCommandEffect = Effect.fn("AcpAgentCommand.resolve")(function* (
   command: string,
   options: ResolveAgentCommandOptions = {},
-): Promise<string | null> {
+) {
   const platform = options.platform ?? process.platform;
   const form = agentCommandForm(command, platform);
-  if (!form) throw new Error(sourceText("error.provider.customAgentCommandInvalid"));
-  if (form === "path") return (await isExecutableFile(command, platform)) ? command : null;
+  if (!form) return yield* providerFailure(new Error(sourceText("error.provider.customAgentCommandInvalid")));
+  if (form === "path") return (yield* isExecutableFile(command, platform)) ? command : null;
   if (form === "home") {
     const path = join(options.home ?? homedir(), command.slice(2));
-    return (await isExecutableFile(path, platform)) ? path : null;
+    return (yield* isExecutableFile(path, platform)) ? path : null;
   }
-  if (platform === "win32" && !options.searchPath) return whereExe(command);
-  const folders = options.searchPath ?? (await searchPath());
+  if (platform === "win32" && !options.searchPath) return yield* whereExe(command);
+  const folders = options.searchPath ?? (yield* providerCall(searchPath));
   for (const folder of folders) {
     if (!isAbsolute(folder)) continue;
     const candidate = join(folder, command);
-    if (await isExecutableFile(candidate, platform)) return candidate;
+    if (yield* isExecutableFile(candidate, platform)) return candidate;
   }
   return null;
-}
+});
 
 let loginPath: { value: Promise<readonly string[]>; readAt: number } | null = null;
 
@@ -110,32 +116,32 @@ let loginPath: { value: Promise<readonly string[]>; readAt: number } | null = nu
  */
 function searchPath(): Promise<readonly string[]> {
   if (loginPath && Date.now() - loginPath.readAt < LOGIN_PATH_TTL_MS) return loginPath.value;
-  const value = runInLoginShell('printf %s "$PATH"')
-    .catch(() => "")
-    // `printf` writes no newline, so the value is the last line, whatever the profile printed first.
-    .then((stdout) => stdout.split(/\r?\n/u).pop()?.trim() ?? "")
-    .then((shellPath) => [
-      ...new Set([...shellPath.split(delimiter), ...(process.env.PATH ?? "").split(delimiter)].filter(Boolean)),
-    ]);
+  const value = runProviderClientEffect(
+    providerCall(() => runInLoginShell('printf %s "$PATH"')).pipe(
+      Effect.catch(() => Effect.succeed("")),
+      // `printf` writes no newline; profiles can print lines before the PATH.
+      Effect.map((stdout) => stdout.split(/\r?\n/u).pop()?.trim() ?? ""),
+      Effect.map((shellPath) => [
+        ...new Set([...shellPath.split(delimiter), ...(process.env.PATH ?? "").split(delimiter)].filter(Boolean)),
+      ]),
+    ),
+  );
   loginPath = { value, readAt: Date.now() };
   return value;
 }
 
-async function whereExe(command: string): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("where.exe", [command], { timeout: 5_000, maxBuffer: 64 * 1024 });
-    return pickWindowsExecutable(stdout, process.env.PATHEXT);
-  } catch {
-    return null;
-  }
-}
+const whereExe = Effect.fn("AcpAgentCommand.whereExe")((command: string) =>
+  providerCall(() => execFileAsync("where.exe", [command], { timeout: 5_000, maxBuffer: 64 * 1024 })).pipe(
+    Effect.map(({ stdout }) => pickWindowsExecutable(stdout, process.env.PATHEXT)),
+    Effect.catch(() => Effect.succeed(null)),
+  ),
+);
 
-async function isExecutableFile(path: string, platform: NodeJS.Platform): Promise<boolean> {
-  try {
-    if (!(await stat(path)).isFile()) return false;
-    await access(path, platform === "win32" ? constants.F_OK : constants.X_OK);
+const isExecutableFile = Effect.fn("AcpAgentCommand.isExecutableFile")(
+  function* (path: string, platform: NodeJS.Platform) {
+    if (!(yield* providerCall(() => stat(path))).isFile()) return false;
+    yield* providerCall(() => access(path, platform === "win32" ? constants.F_OK : constants.X_OK));
     return true;
-  } catch {
-    return false;
-  }
-}
+  },
+  Effect.catch(() => Effect.succeed(false)),
+);

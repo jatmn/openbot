@@ -1,15 +1,36 @@
 import type { SaveAgentProfileInput, SaveAgentProfileResult } from "@openbot/contracts/ipc";
+import { Effect, Schema } from "effect";
+import { runTeamEffect } from "./effect-boundary";
+
+class AgentProfileSaveFailure extends Schema.TaggedError<AgentProfileSaveFailure>()("AgentProfileSaveFailure", {
+  cause: Schema.Defect(),
+}) {}
 
 /** Reconcile an ambiguous save before applying later edits, retaining a single created identity. */
-export async function saveReviewedAgentProfile(
+export const saveReviewedAgentProfileEffect = Effect.fn("AgentProfile.saveReviewed")(function* (
+  send: (input: SaveAgentProfileInput) => Promise<SaveAgentProfileResult>,
+  input: SaveAgentProfileInput,
+  pending?: SaveAgentProfileInput,
+) {
+  const submit = (value: SaveAgentProfileInput) =>
+    Effect.tryPromise({
+      try: () => send(value),
+      catch: (cause) => new AgentProfileSaveFailure({ cause }),
+    });
+  if (!pending) return yield* submit(input);
+  // Keep the original operation id when a previous save may have committed.
+  const recovered = yield* submit({ ...input, operationId: pending.operationId });
+  if (pending.operationId === input.operationId) return recovered;
+  return yield* submit({ operationId: input.operationId, agentId: recovered.agent.id, draft: input.draft });
+});
+
+export function saveReviewedAgentProfile(
   send: (input: SaveAgentProfileInput) => Promise<SaveAgentProfileResult>,
   input: SaveAgentProfileInput,
   pending?: SaveAgentProfileInput,
 ): Promise<SaveAgentProfileResult> {
-  if (!pending) return send(input);
-  // Reuse the original identity with the latest valid fields. If the first attempt never committed
-  // (for example its section was deleted), correcting that draft must still allow a retry.
-  const recovered = await send({ ...input, operationId: pending.operationId });
-  if (pending.operationId === input.operationId) return recovered;
-  return send({ operationId: input.operationId, agentId: recovered.agent.id, draft: input.draft });
+  // Existing callers classify the transport failure; do not expose a wrapper or log its cause.
+  return runTeamEffect(
+    saveReviewedAgentProfileEffect(send, input, pending).pipe(Effect.mapError((error) => error.cause)),
+  );
 }

@@ -1,4 +1,10 @@
+import { Effect, Schema } from "effect";
+import { runTeamEffect } from "./effect-boundary";
 import { REMOTE_ACCOUNT_CHECK_INTERVAL_MS } from "./remote-directory";
+
+class AccountRefreshFailure extends Schema.TaggedError<AccountRefreshFailure>()("AccountRefreshFailure", {
+  cause: Schema.Defect(),
+}) {}
 
 const ACCOUNT_RETRY_INTERVAL_MS = 60_000;
 
@@ -28,24 +34,9 @@ export function createRemoteAccountRefresh(load: () => Promise<void>, now = Date
     if (!active || (!force && now() < dueAt)) return Promise.resolve();
     cancelTimer();
     const startedRevision = revision;
-    let started = false;
+    // Keep this microtask boundary: background entry can cancel work queued by setActive.
     const operation = Promise.resolve()
-      .then(() => {
-        if (!active || disposed) return;
-        started = true;
-        return load();
-      })
-      .then(
-        () => {
-          if (!started) return;
-          dueAt = revision === startedRevision ? now() + REMOTE_ACCOUNT_CHECK_INTERVAL_MS : now();
-        },
-        (error: unknown) => {
-          // A failed request is not a fresh account check. Bound retries independently of freshness.
-          dueAt = now() + ACCOUNT_RETRY_INTERVAL_MS;
-          throw error;
-        },
-      )
+      .then(() => runTeamEffect(loadAccount(startedRevision).pipe(Effect.mapError((error) => error.cause))))
       .finally(() => {
         pending = null;
         schedule();
@@ -53,6 +44,21 @@ export function createRemoteAccountRefresh(load: () => Promise<void>, now = Date
     pending = operation;
     return operation;
   }
+
+  const loadAccount = Effect.fn("RemoteAccountRefresh.load")(function* (startedRevision: number) {
+    if (!active || disposed) return;
+    yield* Effect.tryPromise({
+      try: () => load(),
+      catch: (cause) => new AccountRefreshFailure({ cause }),
+    }).pipe(
+      Effect.tapError(() =>
+        Effect.sync(() => {
+          dueAt = now() + ACCOUNT_RETRY_INTERVAL_MS;
+        }),
+      ),
+    );
+    dueAt = revision === startedRevision ? now() + REMOTE_ACCOUNT_CHECK_INTERVAL_MS : now();
+  });
 
   return {
     refresh,

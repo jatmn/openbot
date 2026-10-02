@@ -12,6 +12,8 @@ import {
   parseHostedServerSummary,
 } from "@openbot/contracts/hosted-servers";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, type Layer } from "effect";
+import { type AccountServiceFailure, AccountServicePlatform, runAccountEffect } from "./account-service-platform";
 
 /** A client asks for a wake at most this often for one host, while the host stays unavailable. */
 const WAKE_INTERVAL_MS = 60_000;
@@ -52,6 +54,7 @@ export function withHostingDeveloperKey(auth: HostedServerAuthClient, key: strin
  * https Stripe Checkout page.
  */
 export class HostedServerDesktopService {
+  readonly #platform: Layer.Layer<AccountServicePlatform>;
   readonly #lastWakeAt = new Map<string, number>();
   readonly #lastRunningAt = new Map<string, number>();
 
@@ -60,79 +63,143 @@ export class HostedServerDesktopService {
    * when a new server is ready and does not wait for the next directory poll.
    */
   constructor(
-    private readonly auth: HostedServerAuthClient,
-    private readonly openExternal: (url: string) => Promise<void>,
+    auth: HostedServerAuthClient,
+    openExternal: (url: string) => Promise<void>,
     private readonly now: () => number = Date.now,
     private readonly onRunning: (serverId: string) => void = () => {},
-  ) {}
+  ) {
+    this.#platform = AccountServicePlatform.layer(auth, openExternal);
+  }
 
-  async list(): Promise<HostedServerList> {
-    const list = await this.auth.requestAuthorized("/v2/hosting/servers/", { method: "GET" }, decodeList);
-    for (const server of list.servers) {
-      if (server.state !== "running") continue;
-      const last = this.#lastRunningAt.get(server.serverId);
-      if (last !== undefined && this.now() - last < RUNNING_REFRESH_INTERVAL_MS) continue;
-      this.#lastRunningAt.set(server.serverId, this.now());
-      this.onRunning(server.serverId);
-    }
-    return list;
+  list(): Promise<HostedServerList> {
+    return runAccountEffect(this.listEffect(), this.#platform);
+  }
+
+  listEffect(): Effect.Effect<HostedServerList, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      HostedServerList,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      const list = yield* platform.request("/v2/hosting/servers/", { method: "GET" }, decodeList);
+      for (const server of list.servers) {
+        if (server.state !== "running") continue;
+        const last = this.#lastRunningAt.get(server.serverId);
+        if (last !== undefined && this.now() - last < RUNNING_REFRESH_INTERVAL_MS) continue;
+        this.#lastRunningAt.set(server.serverId, this.now());
+        this.onRunning(server.serverId);
+      }
+      return list;
+    });
   }
 
   plans(): Promise<HostedServerCatalog> {
-    return this.auth.requestAuthorized("/v2/hosting/plans", { method: "GET" }, decodeCatalog);
+    return runAccountEffect(
+      AccountServicePlatform.use((platform) => platform.request("/v2/hosting/plans", { method: "GET" }, decodeCatalog)),
+      this.#platform,
+    );
   }
 
-  async create(input: CreateHostedServerInput): Promise<HostedServerSummary> {
-    const checkout = await this.auth.requestAuthorized(
-      "/v2/hosting/servers/",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": input.requestId },
-        body: JSON.stringify({
-          name: input.name,
-          plan: input.plan,
-          interval: input.interval,
-          currency: input.currency,
-        }),
-      },
-      decodeCheckout,
-      30_000,
-    );
-    return this.#open(checkout);
+  create(input: CreateHostedServerInput): Promise<HostedServerSummary> {
+    return runAccountEffect(this.createEffect(input), this.#platform);
+  }
+
+  createEffect(
+    input: CreateHostedServerInput,
+  ): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      HostedServerSummary,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      const checkout = yield* platform.request(
+        "/v2/hosting/servers/",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Idempotency-Key": input.requestId },
+          body: JSON.stringify({
+            name: input.name,
+            plan: input.plan,
+            interval: input.interval,
+            currency: input.currency,
+          }),
+        },
+        decodeCheckout,
+        30_000,
+      );
+      return yield* this.#open(checkout);
+    });
   }
 
   /** Opens the payment page again for a server that waits for its first payment. */
-  async openCheckout(serverId: string): Promise<HostedServerSummary> {
-    const checkout = await this.auth.requestAuthorized(
-      `/v2/hosting/servers/${encodeURIComponent(serverId)}/checkout`,
-      { method: "POST" },
-      decodeCheckout,
-      30_000,
-    );
-    return this.#open(checkout);
+  openCheckout(serverId: string): Promise<HostedServerSummary> {
+    return runAccountEffect(this.openCheckoutEffect(serverId), this.#platform);
   }
 
-  async delete(input: DeleteHostedServerInput): Promise<void> {
-    await this.auth.requestAuthorized(
-      `/v2/hosting/servers/${encodeURIComponent(input.serverId)}`,
-      {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirmName: input.confirmName }),
-      },
-      () => undefined,
-      30_000,
-    );
+  openCheckoutEffect(
+    serverId: string,
+  ): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      HostedServerSummary,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      const checkout = yield* platform.request(
+        `/v2/hosting/servers/${encodeURIComponent(serverId)}/checkout`,
+        { method: "POST" },
+        decodeCheckout,
+        30_000,
+      );
+      return yield* this.#open(checkout);
+    });
+  }
+
+  delete(input: DeleteHostedServerInput): Promise<void> {
+    return runAccountEffect(this.deleteEffect(input), this.#platform);
+  }
+
+  deleteEffect(input: DeleteHostedServerInput): Effect.Effect<void, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      void,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      yield* platform.request(
+        `/v2/hosting/servers/${encodeURIComponent(input.serverId)}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmName: input.confirmName }),
+        },
+        () => undefined,
+        30_000,
+      );
+    });
   }
 
   /** Async, so a missing session rejects and does not throw into the transport error listener. */
-  async wake(serverId: string): Promise<HostedServerSummary> {
-    this.#lastWakeAt.set(serverId, this.now());
-    return await this.auth.requestAuthorized(
-      `/v2/hosting/servers/${encodeURIComponent(serverId)}/wake`,
-      { method: "POST" },
-      decodeSummary,
-    );
+  wake(serverId: string): Promise<HostedServerSummary> {
+    return runAccountEffect(this.wakeEffect(serverId), this.#platform);
+  }
+
+  wakeEffect(serverId: string): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      HostedServerSummary,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      this.#lastWakeAt.set(serverId, this.now());
+      return yield* platform.request(
+        `/v2/hosting/servers/${encodeURIComponent(serverId)}/wake`,
+        { method: "POST" },
+        decodeSummary,
+      );
+    });
   }
 
   /**
@@ -143,16 +210,28 @@ export class HostedServerDesktopService {
   wakeUnavailableHost(serverId: string): Promise<void> {
     const last = this.#lastWakeAt.get(serverId);
     if (last !== undefined && this.now() - last < WAKE_INTERVAL_MS) return Promise.resolve();
-    return this.wake(serverId).then(
-      () => undefined,
-      () => undefined,
+    return runAccountEffect(
+      this.wakeEffect(serverId).pipe(
+        Effect.asVoid,
+        Effect.catch(() => Effect.void),
+      ),
+      this.#platform,
     );
   }
 
   /** A null URL means that the payment is done already, so there is no page to open. */
-  async #open(checkout: HostedServerCheckout): Promise<HostedServerSummary> {
-    if (checkout.checkoutUrl) await this.openExternal(checkout.checkoutUrl);
-    return checkout.server;
+  #open(
+    checkout: HostedServerCheckout,
+  ): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
+      HostedServerSummary,
+      AccountServiceFailure,
+      AccountServicePlatform
+    > {
+      const platform = yield* AccountServicePlatform;
+      if (checkout.checkoutUrl) yield* platform.openPage(checkout.checkoutUrl);
+      return checkout.server;
+    });
   }
 }
 

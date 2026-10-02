@@ -1,8 +1,65 @@
+import { Effect } from "effect";
 import { describe, expect, it, vi } from "vitest";
 import type { RemoteTicketClaims } from "../src/protocol";
 import { SignalService, type SignalSocket } from "../src/signal-service";
+import { RemoteTokenError } from "../src/tokens";
 
 describe("SignalService", () => {
+  it("removes an interrupted Slack delivery before accepting a late response", async () => {
+    const service = new SignalService(
+      {
+        ...fakeTokens(),
+        verifySlackRoute: () => Effect.succeed({ teams: [{ id: "T1", appId: "A1", linkedAt: 1 }] }),
+        validateSlackRoute: () => Effect.succeed(["T1"]),
+      },
+      8,
+    );
+    const ingress = socket("ingress");
+    service.connect(ingress);
+    await service.receive(
+      ingress,
+      JSON.stringify({
+        type: "hello",
+        version: 1,
+        peer: "ingress",
+        token: "host-ticket",
+        slackRoute: "route",
+      }),
+    );
+    const controller = new AbortController();
+    const pending = service.deliverSlack(
+      "A1",
+      "T1",
+      {
+        kind: "events",
+        body: new TextEncoder().encode("private request"),
+        retryNum: null,
+        retryReason: null,
+      },
+      controller.signal,
+    );
+    const rejected = expect(pending).rejects.toThrow();
+    try {
+      await vi.waitFor(() => expect(ingress.messages.at(-1)).toContain('"type":"slack-delivery"'));
+      const delivery = JSON.parse(ingress.messages.at(-1) ?? "{}");
+      controller.abort();
+      await rejected;
+      await service.receive(
+        ingress,
+        JSON.stringify({
+          type: "slack-delivery-result",
+          version: 1,
+          requestId: delivery.requestId,
+          status: 200,
+        }),
+      );
+      expect(ingress.messages.at(-1)).toContain('"code":"permission_denied"');
+    } finally {
+      controller.abort();
+      await service.close();
+    }
+  });
+
   it("notifies only authenticated devices of the changed account without disconnecting them", async () => {
     const service = new SignalService(fakeTokens(), 8);
     const host = socket("host");
@@ -85,7 +142,7 @@ describe("SignalService", () => {
 
   it("validates initial tickets while a restarted Signal can have missed revocations", async () => {
     const tokens = fakeTokens();
-    tokens.validateClaims = vi.fn().mockResolvedValue(false);
+    tokens.validateClaims = vi.fn().mockReturnValue(Effect.succeed(false));
     const service = new SignalService(tokens, 8);
     const host = socket("host");
     await hello(service, host, "host-ticket", "host");
@@ -100,10 +157,13 @@ describe("SignalService", () => {
     try {
       const tokens = fakeTokens();
       const verifyTicket = tokens.verifyTicket;
-      tokens.verifyTicket = async (token) => ({
-        ...(await verifyTicket(token)),
-        sessionExpiresAt: Math.floor(Date.now() / 1_000) + 1,
-      });
+      tokens.verifyTicket = (token) =>
+        verifyTicket(token).pipe(
+          Effect.map((claims) => ({
+            ...claims,
+            sessionExpiresAt: Math.floor(Date.now() / 1_000) + 1,
+          })),
+        );
       const service = new SignalService(tokens, 8);
       const host = socket("host");
       await hello(service, host, "host-ticket", "host");
@@ -349,24 +409,27 @@ function fakeTokens() {
     exp: now + 300,
   });
   return {
-    verifyTicket: async (token: string) => {
-      if (token === "host-ticket") return claims("host", "host-jti");
-      if (token === "stale-host-ticket") return claims("host", "stale-host-jti");
-      if (token === "client-ticket") return claims("member", "client-jti");
-      if (token === "fresh-client-ticket") return claims("member", "fresh-client-jti");
-      if (token === "second-client-ticket") return claims("member", "second-client-jti", "second-client-session");
-      if (token === "owner-ticket") return claims("owner", "owner-jti");
-      if (token === "current-host-ticket") return claims("host", "current-host-jti", "host-session", 2);
-      if (token === "current-client-ticket") return claims("member", "current-client-jti", "client-session", 2);
-      throw new Error("not an initial ticket");
-    },
-    verifyResumeToken: async (token: string) => {
-      if (token === "resume-client") return claims("member", "resume-jti");
-      if (token === "resume-host") return claims("host", "resume-host-jti");
-      throw new Error("not a resume token");
-    },
-    validateClaims: async () => true,
-    issueResumeToken: async (value: RemoteTicketClaims) => `resume-${value.role === "host" ? "host" : "client"}`,
+    verifyTicket: (token: string) =>
+      Effect.gen(function* () {
+        if (token === "host-ticket") return claims("host", "host-jti");
+        if (token === "stale-host-ticket") return claims("host", "stale-host-jti");
+        if (token === "client-ticket") return claims("member", "client-jti");
+        if (token === "fresh-client-ticket") return claims("member", "fresh-client-jti");
+        if (token === "second-client-ticket") return claims("member", "second-client-jti", "second-client-session");
+        if (token === "owner-ticket") return claims("owner", "owner-jti");
+        if (token === "current-host-ticket") return claims("host", "current-host-jti", "host-session", 2);
+        if (token === "current-client-ticket") return claims("member", "current-client-jti", "client-session", 2);
+        return yield* new RemoteTokenError({ message: "not an initial ticket" });
+      }),
+    verifyResumeToken: (token: string) =>
+      Effect.gen(function* () {
+        if (token === "resume-client") return claims("member", "resume-jti");
+        if (token === "resume-host") return claims("host", "resume-host-jti");
+        return yield* new RemoteTokenError({ message: "not a resume token" });
+      }),
+    validateClaims: () => Effect.succeed(true),
+    issueResumeToken: (value: RemoteTicketClaims) =>
+      Effect.succeed(`resume-${value.role === "host" ? "host" : "client"}`),
     iceServers: () => [{ urls: "stun:turn.example.com:3478" }],
   };
 }

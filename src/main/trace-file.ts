@@ -3,6 +3,8 @@ import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { redactValue } from "@openbot/logging";
+import { Effect } from "effect";
+import { type AnalyticsOperationFailure, analyticsIO, runAnalytics } from "./analytics-effects";
 
 /**
  * One timed operation. The name is a fixed string - an IPC channel, a turn origin, a crash origin -
@@ -113,7 +115,7 @@ export class TraceFile {
     if (lines.length === 0) return this.#writes;
     this.#writingLines += lines.length;
     this.#writes = this.#writes
-      .then(() => this.#append(lines))
+      .then(() => runAnalytics(this.#append(lines)))
       .catch(() => undefined)
       .then(() => {
         this.#writingLines -= lines.length;
@@ -121,12 +123,20 @@ export class TraceFile {
     return this.#writes;
   }
 
-  async summarize(): Promise<TraceSummary[]> {
+  summarize(): Promise<TraceSummary[]> {
     void this.flush();
     // The reads join the write chain, so no rotation runs between the read of `.1` and the current file.
-    const files = this.#writes.then(() => Promise.all([`${this.#path}.1`, this.#path].map(readOptional)));
+    const files = this.#writes.then(() =>
+      runAnalytics(Effect.forEach([`${this.#path}.1`, this.#path], readOptional, { concurrency: "unbounded" })),
+    );
     this.#writes = files.then(() => undefined);
-    const text = (await files).join("");
+    return runAnalytics(this.#summarize(files));
+  }
+
+  #summarize = Effect.fn("TraceFile.summarize")(function* (
+    files: Promise<string[]>,
+  ): Effect.fn.Return<TraceSummary[], AnalyticsOperationFailure> {
+    const text = (yield* analyticsIO(() => files)).join("");
     const groups = new Map<
       string,
       { kind: string; name: string; durations: number[]; outcomes: Record<string, number> }
@@ -153,26 +163,23 @@ export class TraceFile {
         };
       })
       .sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
-  }
+  });
 
-  async #append(lines: string[]): Promise<void> {
-    await mkdir(this.#directory, { recursive: true });
-    try {
-      if ((await stat(this.#path)).size >= MAX_FILE_BYTES) await rename(this.#path, `${this.#path}.1`);
-    } catch {
-      // No file yet.
-    }
-    await appendFile(this.#path, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-  }
+  #append = Effect.fn("TraceFile.append")(function* (this: TraceFile, lines: string[]) {
+    yield* analyticsIO(() => mkdir(this.#directory, { recursive: true }));
+    yield* analyticsIO(() => stat(this.#path)).pipe(
+      Effect.flatMap((stats) =>
+        stats.size >= MAX_FILE_BYTES ? analyticsIO(() => rename(this.#path, `${this.#path}.1`)) : Effect.void,
+      ),
+      Effect.catch(() => Effect.void),
+    );
+    yield* analyticsIO(() => appendFile(this.#path, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 }));
+  });
 }
 
-async function readOptional(path: string): Promise<string> {
-  try {
-    return await readFile(path, "utf8");
-  } catch {
-    return "";
-  }
-}
+const readOptional = Effect.fn("TraceFile.readOptional")((path: string) =>
+  analyticsIO(() => readFile(path, "utf8")).pipe(Effect.catch(() => Effect.succeed(""))),
+);
 
 // A crash can cut the last line short, so a line that does not parse is skipped.
 function parseLine(line: string): TraceSpan | null {

@@ -1,3 +1,4 @@
+import { Effect, Schema } from "effect";
 import type { AgentStore } from "../agent-store";
 import { decodeRecordResponse, getRecord } from "../protocol";
 import { finiteNumberOrNull } from "./account-usage";
@@ -102,7 +103,15 @@ export class ContextCompaction {
     return true;
   }
 
-  async request(agentId: string, threadId: string): Promise<void> {
+  request(agentId: string, threadId: string): Promise<void> {
+    return Effect.runPromise(this.requestEffect(agentId, threadId));
+  }
+
+  readonly requestEffect = Effect.fn("ContextCompaction.request")(function* (
+    this: ContextCompaction,
+    agentId: string,
+    threadId: string,
+  ) {
     const budget = this.#budgets.get(threadId);
     const agent = this.#store.list().find((candidate) => candidate.id === agentId);
     const client = agent ? this.#providers.clientForAgent(agent) : null;
@@ -124,15 +133,26 @@ export class ContextCompaction {
     timer.unref?.();
     this.#timers.set(threadId, timer);
 
-    try {
-      await client.request("thread/compact/start", { threadId }, decodeRecordResponse);
-    } catch (error) {
-      budget.lastCompactedTokens = budget.usedTokens;
-      this.#emitError("context_compaction_failed", error, agentId);
-      this.#release(agentId, threadId);
-      this.#scheduleDrain(agentId);
-    }
-  }
+    yield* Effect.tryPromise({
+      try: () => client.request("thread/compact/start", { threadId }, decodeRecordResponse),
+      catch: (cause) => new ContextCompactionFailed({ cause }),
+    }).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          budget.lastCompactedTokens = budget.usedTokens;
+          this.#emitError("context_compaction_failed", failure.cause, agentId);
+          this.#release(agentId, threadId);
+          this.#scheduleDrain(agentId);
+        }),
+      ),
+      Effect.onInterrupt(() =>
+        Effect.sync(() => {
+          this.#release(agentId, threadId);
+          this.#scheduleDrain(agentId);
+        }),
+      ),
+    );
+  });
 
   /**
    * Takes ownership of a `turn/started` that belongs to a compaction we asked for. True means the
@@ -201,3 +221,7 @@ export class ContextCompaction {
     this.#timers.delete(threadId);
   }
 }
+
+export class ContextCompactionFailed extends Schema.TaggedError<ContextCompactionFailed>()("ContextCompactionFailed", {
+  cause: Schema.Defect(),
+}) {}

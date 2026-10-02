@@ -1,9 +1,11 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
+import { Effect } from "effect";
 import { z } from "zod";
 import { AGENT_DATABASE_LIMITS } from "../agent-data/agent-database-protocol";
 import { checkAgentParameters } from "../agent-data/agent-database-rules";
 import type { AgentDatabaseQueryResult, AgentTables } from "../agent-data/agent-tables";
 import { type OpenBotToolResponse, openBotToolFailure, openBotToolResult } from "./routine-tools";
+import { runTool, toolIo, toolStep } from "./tool-operation";
 
 const sql = z.string().min(1).max(AGENT_DATABASE_LIMITS.maxSqlLength);
 const params = z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional();
@@ -46,35 +48,45 @@ export const DATA_TOOL_DEFINITIONS = [
  * model can act on in its next call; a throw reaches it as an opaque JSON-RPC fault it can only give
  * up on.
  */
-export async function handleDataTool(
+export function handleDataTool(
   tool: string,
   args: unknown,
   agentId: string,
   tables: AgentTables | null,
 ): Promise<OpenBotToolResponse | null> {
+  return runTool(handleDataToolEffect(tool, args, agentId, tables));
+}
+
+export const handleDataToolEffect = Effect.fn("DataTools.handle")(function* (
+  tool: string,
+  args: unknown,
+  agentId: string,
+  tables: AgentTables | null,
+) {
   if (!DATA_TOOL_DEFINITIONS.some((definition) => definition.name === tool)) return null;
   if (!tables) return openBotToolFailure("Shared data is unavailable.");
 
   switch (tool) {
     case "list_tables":
-      return openBotToolResult({ tables: await tables.list() });
+      return openBotToolResult({ tables: yield* toolIo(() => tables.list()) });
     case "delete_table": {
-      const removed = await tables.remove(agentId, tableNameSchema.parse(args).name);
+      const input = yield* toolStep(() => tableNameSchema.parse(args));
+      const removed = yield* toolIo(() => tables.remove(agentId, input.name));
       return removed.ok ? openBotToolResult({ deleted: removed.value }) : openBotToolFailure(removed.message);
     }
     default: {
-      const statement = dataStatementSchema.parse(args);
+      const statement = yield* toolStep(() => dataStatementSchema.parse(args));
       const parameters = checkAgentParameters(statement.params);
       if (!parameters.ok) return openBotToolFailure(parameters.message);
       if (tool === "execute_data") {
-        const written = await tables.execute(agentId, statement.sql, parameters.value);
+        const written = yield* toolIo(() => tables.execute(agentId, statement.sql, parameters.value));
         return written.ok ? openBotToolResult(written.value) : openBotToolFailure(written.message);
       }
-      const rows = await tables.query(statement.sql, parameters.value);
+      const rows = yield* toolIo(() => tables.query(statement.sql, parameters.value));
       return rows.ok ? openBotToolResult(readResult(rows.value)) : openBotToolFailure(rows.message);
     }
   }
-}
+});
 
 /**
  * `truncated` alone does not tell the model how much it is missing or what to do next, and a model

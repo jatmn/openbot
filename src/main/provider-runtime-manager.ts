@@ -5,7 +5,6 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, readdir, readFile, rename, rm, stat, statfs, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { finished } from "node:stream/promises";
-import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
   isManagedToolRuntime,
@@ -19,6 +18,7 @@ import {
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
+import { Effect, Result, type Scope, Stream } from "effect";
 import lockValue from "../../native-runtime.lock.json";
 import { type AgentRuntimeLock, parseAgentRuntimeLock } from "../../scripts/agent-runtime-lock";
 import { type BundledProviderExecutables, configuredCliPath } from "../backend/cli";
@@ -32,11 +32,12 @@ import {
   type RuntimeSpec,
   type RuntimeTarget,
 } from "./provider-runtime-descriptors";
+import { ProviderRuntimeFailure, runRuntime, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 import {
   type BlockedVersions,
-  fetchBlockedVersions,
-  latestRelease,
-  readLimitedBody,
+  fetchBlockedVersionsEffect,
+  latestReleaseEffect,
+  readLimitedBodyEffect,
 } from "./provider-runtime-releases";
 
 const execFileAsync = promisify(execFile);
@@ -194,19 +195,29 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     };
   }
 
-  async initialize(): Promise<ProviderRuntimeSnapshot> {
-    await mkdir(this.#root, { recursive: true });
-    await this.#removeAbandonedStaging();
-    await Promise.all(RUNTIMES.map((runtime) => this.#inspect(runtime)));
-    const target = this.#target;
-    if (target) {
-      // Settled, not all: collecting an old version is housekeeping, and a version another instance
-      // still runs refuses to be removed on Windows. Neither may stop the app from starting.
-      await Promise.allSettled(
-        RUNTIMES.map((runtime) => this.#removeOldVersions(runtimeSpec(runtime, target, this.#lock))),
-      );
-    }
-    return this.getStatus();
+  initialize(): Promise<ProviderRuntimeSnapshot> {
+    return runRuntime(this.initializeEffect());
+  }
+  initializeEffect(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+      yield* runtimeIO(async () => await mkdir(this.#root, { recursive: true }));
+      yield* this.#removeAbandonedStagingEffect();
+      yield* Effect.forEach(RUNTIMES, (runtime) => this.#inspectEffect(runtime), {
+        concurrency: "unbounded",
+        discard: true,
+      });
+      const target = this.#target;
+      if (target) {
+        // Settled, not all: collecting an old version is housekeeping, and a version another instance
+        // still runs refuses to be removed on Windows. Neither may stop the app from starting.
+        yield* Effect.forEach(
+          RUNTIMES,
+          (runtime) => Effect.result(this.#removeOldVersionsEffect(runtimeSpec(runtime, target, this.#lock))),
+          { concurrency: "unbounded", discard: true },
+        );
+      }
+      return this.getStatus();
+    });
   }
 
   getStatus(): ProviderRuntimeSnapshot {
@@ -232,14 +243,19 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * so one unreachable registry does not take the offers of the others away. Rejects only when no
    * source answered, which is what a user who asked needs to hear.
    */
-  async checkForUpdates(): Promise<ProviderRuntimeSnapshot> {
-    const target = this.#target;
-    if (!target) return this.getStatus();
-    this.#check ??= this.#runCheck(target).finally(() => {
-      this.#check = null;
+  checkForUpdates(): Promise<ProviderRuntimeSnapshot> {
+    return runRuntime(this.checkForUpdatesEffect());
+  }
+  checkForUpdatesEffect(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+      const target = this.#target;
+      if (!target) return this.getStatus();
+      this.#check ??= this.#runCheck(target).finally(() => {
+        this.#check = null;
+      });
+      yield* runtimeIO(async () => await this.#check);
+      return this.getStatus();
     });
-    await this.#check;
-    return this.getStatus();
   }
 
   /** Checks now and then every hour, until `stop`. The caller starts it once the app is up. */
@@ -251,20 +267,39 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     check();
   }
 
-  async #runCheck(target: RuntimeTarget): Promise<void> {
-    const blocked = fetchBlockedVersions(this.#fetch).catch(() => null);
-    const releases = await Promise.allSettled(
-      PROVIDERS.map(async (provider) => {
-        const release = await latestRelease(provider, { target, lock: this.#lock, fetch: this.#fetch });
-        this.#latest.set(provider, release);
-      }),
-    );
-    this.#blocked = (await blocked) ?? this.#blocked;
-    this.#revision += 1;
-    this.emit("status", this.getStatus());
-    if (releases.every((result) => result.status === "rejected")) {
-      throw new Error(sourceText("error.provider.releaseSourcesUnreachable"));
-    }
+  #runCheck(target: RuntimeTarget): Promise<void> {
+    return runRuntime(this.#runCheckEffect(target));
+  }
+  #runCheckEffect(target: RuntimeTarget): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const [blocked, releases] = yield* Effect.all(
+        [
+          Effect.result(fetchBlockedVersionsEffect(this.#fetch)),
+          Effect.forEach(
+            PROVIDERS,
+            (provider) =>
+              Effect.result(
+                latestReleaseEffect(provider, { target, lock: this.#lock, fetch: this.#fetch }).pipe(
+                  Effect.tap((release) =>
+                    Effect.sync(() => {
+                      this.#latest.set(provider, release);
+                    }),
+                  ),
+                ),
+              ),
+            { concurrency: "unbounded" },
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (Result.isSuccess(blocked)) this.#blocked = blocked.success;
+      this.#revision += 1;
+      this.emit("status", this.getStatus());
+      if (releases.every(Result.isFailure))
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(sourceText("error.provider.releaseSourcesUnreachable")),
+        });
+    });
   }
 
   /**
@@ -336,8 +371,13 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * found` for a machine that only needs a download. Throws when a download fails, so the caller
    * decides whether the test still runs.
    */
-  async ensureToolRuntimesReady(): Promise<void> {
-    for (const tool of MANAGED_TOOL_RUNTIMES) await this.downloadAndWait(tool);
+  ensureToolRuntimesReady(): Promise<void> {
+    return runRuntime(this.ensureToolRuntimesReadyEffect());
+  }
+  ensureToolRuntimesReadyEffect(): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      for (const tool of MANAGED_TOOL_RUNTIMES) yield* this.downloadAndWaitEffect(tool);
+    });
   }
 
   /**
@@ -358,54 +398,64 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     return { binDirectories: [bin], commandAliases: { npx: join(bin, bunxExecutableName(this.#target)) } };
   }
 
-  async download(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
-    if (!this.#target) throw new Error(sourceText("error.provider.runtimesUnsupported"));
-    if (this.#stopping) throw new Error(sourceText("error.provider.closing"));
-    // Only a provider CLI has a path override; nothing points `OPENBOT_BUN_PATH` at a tool runtime.
-    if (!isManagedToolRuntime(runtime) && configuredCliPath(runtime))
-      throw new Error(sourceText("error.provider.cliOverride"));
-    if (this.#tasks.has(runtime)) return this.getStatus();
-    if (this.#check && !(isManagedToolRuntime(runtime) || this.#latest.has(runtime))) {
-      await this.#awaitReleaseCheck(this.#check);
-      if (this.#stopping) throw new Error(sourceText("error.provider.closing"));
+  download(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
+    return runRuntime(this.downloadEffect(runtime));
+  }
+  downloadEffect(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+      if (!this.#target)
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(sourceText("error.provider.runtimesUnsupported")),
+        });
+      if (this.#stopping)
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.closing")) });
+      // Only a provider CLI has a path override; nothing points `OPENBOT_BUN_PATH` at a tool runtime.
+      if (!isManagedToolRuntime(runtime) && configuredCliPath(runtime))
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.cliOverride")) });
       if (this.#tasks.has(runtime)) return this.getStatus();
-    }
-    const spec = this.#targetSpec(runtime, this.#target);
-    const current = this.#statuses[runtime];
-    // A download goes only toward a newer version, never back to an older one. A failed update keeps
-    // the version still installed, so its Retry follows the same rule: when the block list has taken
-    // the newer version away, the Retry ends the error on the installed one instead.
-    if (current.version && !olderVersion(current.version, spec.version)) {
-      if (current.phase !== "ready") this.#setStatus(runtime, await this.#inspect(runtime));
-      return this.getStatus();
-    }
+      if (this.#check && !(isManagedToolRuntime(runtime) || this.#latest.has(runtime))) {
+        yield* this.#awaitReleaseCheck(this.#check);
+        if (this.#stopping)
+          return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.closing")) });
+        if (this.#tasks.has(runtime)) return this.getStatus();
+      }
+      const spec = this.#targetSpec(runtime, this.#target);
+      const current = this.#statuses[runtime];
+      // A download goes only toward a newer version, never back to an older one. A failed update keeps
+      // the version still installed, so its Retry follows the same rule: when the block list has taken
+      // the newer version away, the Retry ends the error on the installed one instead.
+      if (current.version && !olderVersion(current.version, spec.version)) {
+        if (current.phase !== "ready") this.#setStatus(runtime, yield* this.#inspectEffect(runtime));
+        return this.getStatus();
+      }
 
-    const controller = new AbortController();
-    this.#controllers.set(runtime, controller);
-    this.#transfers.set(runtime, spec);
-    this.#cancelled.delete(runtime);
-    this.#setStatus(runtime, {
-      phase: "downloading",
-      progress: 0,
-      message: null,
-      version: this.#statuses[runtime].version,
-    });
-    // The task is registered without an await between it and the guard above, so a second request
-    // for the same runtime finds it and joins it instead of starting a download of its own.
-    const task = this.#updateProviderRuntime(spec, controller.signal)
-      .catch((error: unknown) => {
-        this.#controllers.delete(runtime);
-        this.#tasks.delete(runtime);
-        return this.#handleDownloadFailure(runtime, error);
-      })
-      .finally(() => {
-        this.#controllers.delete(runtime);
-        this.#tasks.delete(runtime);
-        this.#transfers.delete(runtime);
-        this.#cancelled.delete(runtime);
+      const controller = new AbortController();
+      this.#controllers.set(runtime, controller);
+      this.#transfers.set(runtime, spec);
+      this.#cancelled.delete(runtime);
+      this.#setStatus(runtime, {
+        phase: "downloading",
+        progress: 0,
+        message: null,
+        version: this.#statuses[runtime].version,
       });
-    this.#tasks.set(runtime, task);
-    return this.getStatus();
+      // The task is registered without an await between it and the guard above, so a second request
+      // for the same runtime finds it and joins it instead of starting a download of its own.
+      const task = this.#updateProviderRuntime(spec, controller.signal)
+        .catch((error: unknown) => {
+          this.#controllers.delete(runtime);
+          this.#tasks.delete(runtime);
+          return this.#handleDownloadFailure(runtime, error);
+        })
+        .finally(() => {
+          this.#controllers.delete(runtime);
+          this.#tasks.delete(runtime);
+          this.#transfers.delete(runtime);
+          this.#cancelled.delete(runtime);
+        });
+      this.#tasks.set(runtime, task);
+      return this.getStatus();
+    });
   }
 
   /**
@@ -418,53 +468,69 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * holds a first install back only that long. No check is started here: one that already failed
    * would fail again, and the hourly check or the user's own check finds the release later.
    */
-  async #awaitReleaseCheck(check: Promise<void>): Promise<void> {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, RELEASE_CHECK_WAIT_MS);
-      timer.unref();
+  #awaitReleaseCheck(check: Promise<void>): Effect.Effect<void, ProviderRuntimeFailure> {
+    return runtimeIO(() => check).pipe(
+      Effect.catch(() => Effect.void),
+      Effect.timeoutOrElse({ duration: RELEASE_CHECK_WAIT_MS, orElse: () => Effect.void }),
+    );
+  }
+
+  downloadAndWait(runtime: ManagedRuntimeId): Promise<void> {
+    return runRuntime(this.downloadAndWaitEffect(runtime));
+  }
+  downloadAndWaitEffect(runtime: ManagedRuntimeId): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      yield* this.downloadEffect(runtime);
+      yield* runtimeIO(async () => await this.#tasks.get(runtime));
+      const status = this.#statuses[runtime];
+      if (status.phase !== "ready")
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(status.message ?? sourceText("error.provider.runtimeUpdateIncomplete")),
+        });
     });
-    await Promise.race([check.catch(() => undefined), timeout]);
-    clearTimeout(timer);
   }
 
-  async downloadAndWait(runtime: ManagedRuntimeId): Promise<void> {
-    await this.download(runtime);
-    await this.#tasks.get(runtime);
-    const status = this.#statuses[runtime];
-    if (status.phase !== "ready")
-      throw new Error(status.message ?? sourceText("error.provider.runtimeUpdateIncomplete"));
+  cancel(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
+    return runRuntime(this.cancelEffect(runtime));
+  }
+  cancelEffect(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+      if (this.#statuses[runtime].phase !== "downloading") return this.getStatus();
+      const task = this.#tasks.get(runtime);
+      const spec = this.#transfers.get(runtime);
+      this.#cancelled.add(runtime);
+      this.#controllers.get(runtime)?.abort();
+      yield* runtimeIO(async () => await task);
+      if (spec) yield* this.#removePartialEffect(spec);
+      yield* this.#inspectEffect(runtime);
+      this.#setStatus(runtime, this.#statuses[runtime]);
+      return this.getStatus();
+    });
   }
 
-  async cancel(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
-    if (this.#statuses[runtime].phase !== "downloading") return this.getStatus();
-    const task = this.#tasks.get(runtime);
-    const spec = this.#transfers.get(runtime);
-    this.#cancelled.add(runtime);
-    this.#controllers.get(runtime)?.abort();
-    await task;
-    if (spec) await this.#removePartial(spec);
-    await this.#inspect(runtime);
-    this.#setStatus(runtime, this.#statuses[runtime]);
-    return this.getStatus();
+  stop(): Promise<void> {
+    return runRuntime(this.stopEffect());
+  }
+  stopEffect(): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      this.#stopping = true;
+      if (this.#checkTimer) clearInterval(this.#checkTimer);
+      this.#checkTimer = null;
+      for (const controller of this.#controllers.values()) controller.abort();
+      yield* runtimeIO(async () => await Promise.allSettled(this.#tasks.values()));
+    });
   }
 
-  async stop(): Promise<void> {
-    this.#stopping = true;
-    if (this.#checkTimer) clearInterval(this.#checkTimer);
-    this.#checkTimer = null;
-    for (const controller of this.#controllers.values()) controller.abort();
-    await Promise.allSettled(this.#tasks.values());
-  }
-
-  async #inspect(runtime: ManagedRuntimeId): Promise<ProviderRuntimeStatus> {
-    if (!this.#target) return this.#statuses[runtime];
-    const pinned = runtimeSpec(runtime, this.#target, this.#lock);
-    const installed = await this.#newestInstalled(pinned);
-    this.#statuses[runtime] = installed
-      ? readyStatus(installed)
-      : { ...emptyStatus(), version: await this.#previousVersion(pinned) };
-    return this.#statuses[runtime];
+  #inspectEffect(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeStatus, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeStatus, ProviderRuntimeFailure> {
+      if (!this.#target) return this.#statuses[runtime];
+      const pinned = runtimeSpec(runtime, this.#target, this.#lock);
+      const installed = yield* this.#newestInstalledEffect(pinned);
+      this.#statuses[runtime] = installed
+        ? readyStatus(installed)
+        : { ...emptyStatus(), version: yield* this.#previousVersionEffect(pinned) };
+      return this.#statuses[runtime];
+    });
   }
 
   /**
@@ -474,22 +540,25 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * against the record its install wrote. A directory with neither is an older pin this build has no
    * hashes for; `#previousVersion` still lends it out until an update replaces it.
    */
-  async #newestInstalled(pinned: RuntimeSpec): Promise<string | null> {
-    const targetRoot = dirname(this.#installRoot(pinned));
-    const entries = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
-    const versions = entries
-      .filter((entry) => entry.isDirectory() && isVersion(entry.name))
-      .map((entry) => entry.name)
-      // Of two builds that the release does not order, the pinned one comes first.
-      .sort((a, b) => compareReleases(b, a) || Number(b === pinned.version) - Number(a === pinned.version));
-    for (const version of versions) {
-      const spec = version === pinned.version ? pinned : recordedSpec(pinned, version);
-      const installRoot = join(targetRoot, version);
-      if (!(await this.#verifies(installRoot, spec))) continue;
-      await this.#stampInUse(installRoot);
-      return version;
-    }
-    return null;
+
+  #newestInstalledEffect(pinned: RuntimeSpec): Effect.Effect<string | null, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<string | null, ProviderRuntimeFailure> {
+      const targetRoot = dirname(this.#installRoot(pinned));
+      const entries = yield* runtimeIO(async () => await readdir(targetRoot, { withFileTypes: true }).catch(() => []));
+      const versions = entries
+        .filter((entry) => entry.isDirectory() && isVersion(entry.name))
+        .map((entry) => entry.name)
+        // Of two builds that the release does not order, the pinned one comes first.
+        .sort((a, b) => compareReleases(b, a) || Number(b === pinned.version) - Number(a === pinned.version));
+      for (const version of versions) {
+        const spec = version === pinned.version ? pinned : recordedSpec(pinned, version);
+        const installRoot = join(targetRoot, version);
+        if (!(yield* this.#verifiesEffect(installRoot, spec))) continue;
+        yield* this.#stampInUseEffect(installRoot);
+        return version;
+      }
+      return null;
+    });
   }
 
   /**
@@ -498,13 +567,16 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * An update reads the store after it holds the download slot, and must not overwrite the
    * "downloading" state it published to get there. Only `#inspect` records what this returns.
    */
-  async #readStore(spec: RuntimeSpec): Promise<ProviderRuntimeStatus> {
-    const installRoot = this.#installRoot(spec);
-    if (await this.#verifies(installRoot, spec)) {
-      await this.#stampInUse(installRoot);
-      return readyStatus(spec.version);
-    }
-    return { ...emptyStatus(), version: await this.#previousVersion(spec) };
+
+  #readStoreEffect(spec: RuntimeSpec): Effect.Effect<ProviderRuntimeStatus, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeStatus, ProviderRuntimeFailure> {
+      const installRoot = this.#installRoot(spec);
+      if (yield* this.#verifiesEffect(installRoot, spec)) {
+        yield* this.#stampInUseEffect(installRoot);
+        return readyStatus(spec.version);
+      }
+      return { ...emptyStatus(), version: yield* this.#previousVersionEffect(spec) };
+    });
   }
 
   /**
@@ -514,43 +586,57 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * reason to skip the transfer, not the activation: the agent service still runs the old CLI, and
    * a status of `ready` without the swap leaves the offer on screen with no way to answer it.
    */
-  async #updateProviderRuntime(spec: RuntimeSpec, signal: AbortSignal): Promise<void> {
-    const installed = await this.#readStore(spec);
-    if (installed.phase === "ready") {
-      await this.#activate(spec, null);
-      return;
-    }
-    if (this.#stopping) throw new Error(sourceText("error.provider.closing"));
-    signal.throwIfAborted();
-    this.#setStatus(spec.runtime, { phase: "downloading", progress: 0, message: null, version: installed.version });
-    await this.#activate(spec, signal);
+  #updateProviderRuntime(spec: RuntimeSpec, signal: AbortSignal): Promise<void> {
+    return runRuntime(this.#updateProviderRuntimeEffect(spec, signal));
+  }
+  #updateProviderRuntimeEffect(spec: RuntimeSpec, signal: AbortSignal): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const installed = yield* this.#readStoreEffect(spec);
+      if (installed.phase === "ready") {
+        yield* this.#activateEffect(spec, null);
+        return;
+      }
+      if (this.#stopping)
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.closing")) });
+      yield* runtimeSync(() => signal.throwIfAborted());
+      this.#setStatus(spec.runtime, { phase: "downloading", progress: 0, message: null, version: installed.version });
+      yield* this.#activateEffect(spec, signal);
+    });
   }
 
   // Keep the last installed version available while its replacement is downloaded.
-  async #previousVersion(spec: RuntimeSpec): Promise<string | null> {
-    const targetRoot = dirname(this.#installRoot(spec));
-    const entries = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
-    const versions = entries
-      .filter((entry) => entry.isDirectory() && olderVersion(entry.name, spec.version))
-      .map((entry) => entry.name)
-      .sort((a, b) => compareReleases(b, a));
-    for (const version of versions) {
-      const executable = await stat(join(targetRoot, version, "bin", spec.executableName)).catch(() => null);
-      if (!executable?.isFile()) continue;
-      // This is the CLI the agent service runs until the newer one arrives, so it is in use and
-      // the collector in every other instance has to leave it alone. A worktree that pins a newer
-      // version would otherwise take it away while this one is running from it.
-      await this.#stampInUse(join(targetRoot, version));
-      return version;
-    }
-    return null;
+
+  #previousVersionEffect(spec: RuntimeSpec): Effect.Effect<string | null, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<string | null, ProviderRuntimeFailure> {
+      const targetRoot = dirname(this.#installRoot(spec));
+      const entries = yield* runtimeIO(async () => await readdir(targetRoot, { withFileTypes: true }).catch(() => []));
+      const versions = entries
+        .filter((entry) => entry.isDirectory() && olderVersion(entry.name, spec.version))
+        .map((entry) => entry.name)
+        .sort((a, b) => compareReleases(b, a));
+      for (const version of versions) {
+        const executable = yield* runtimeIO(
+          async () => await stat(join(targetRoot, version, "bin", spec.executableName)).catch(() => null),
+        );
+        if (!executable?.isFile()) continue;
+        // This is the CLI the agent service runs until the newer one arrives, so it is in use and
+        // the collector in every other instance has to leave it alone. A worktree that pins a newer
+        // version would otherwise take it away while this one is running from it.
+        yield* this.#stampInUseEffect(join(targetRoot, version));
+        return version;
+      }
+      return null;
+    });
   }
 
   /** The one record a sibling instance can read: this version is in use, so keep it. */
-  async #stampInUse(installRoot: string): Promise<void> {
-    const now = new Date();
-    // Best effort -- a store on a read-only volume still works, it only ages.
-    await utimes(installRoot, now, now).catch(() => undefined);
+
+  #stampInUseEffect(installRoot: string): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const now = new Date();
+      // Best effort -- a store on a read-only volume still works, it only ages.
+      yield* runtimeIO(async () => await utimes(installRoot, now, now).catch(() => undefined));
+    });
   }
 
   /**
@@ -563,117 +649,152 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * a sibling can commit the same version while this instance is still downloading it, and what is
    * then in the store is the sibling's install, adopted rather than written.
    */
-  async #activate(spec: RuntimeSpec, signal: AbortSignal | null): Promise<void> {
-    let installed = false;
-    try {
-      await this.#updateRuntime(spec.runtime, async () => {
-        if (signal) {
-          installed = await this.#runDownload(spec, signal);
-          await this.#removePartial(spec);
-        }
-        return join(this.#installRoot(spec), "bin", spec.executableName);
-      });
+
+  #activateEffect(spec: RuntimeSpec, signal: AbortSignal | null): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* () {
+      let installed = false;
+      const result = yield* Effect.result(
+        runtimeIO(() =>
+          this.#updateRuntime(spec.runtime, () =>
+            runRuntime(
+              Effect.gen({ self: this }, function* () {
+                if (signal) {
+                  installed = yield* this.#runDownloadEffect(spec, signal);
+                  yield* this.#removePartialEffect(spec);
+                }
+                return join(this.#installRoot(spec), "bin", spec.executableName);
+              }),
+            ),
+          ),
+        ),
+      );
+      if (Result.isFailure(result)) {
+        if (installed) yield* runtimeIO(() => rm(this.#installRoot(spec), { recursive: true, force: true }));
+        return yield* result.failure;
+      }
       this.#setStatus(spec.runtime, readyStatus(spec.version));
       this.emit("ready", spec.runtime);
-    } catch (error) {
-      if (installed) await rm(this.#installRoot(spec), { recursive: true, force: true });
-      throw error;
-    }
+    });
   }
 
   /** Answers whether this instance is the one that put the install in the store. */
-  async #runDownload(spec: RuntimeSpec, signal: AbortSignal): Promise<boolean> {
-    await mkdir(this.#downloadRoot(), { recursive: true });
-    await this.#requireDiskSpace(spec);
-    const partialPath = this.#partialPath(spec);
-    const metadataPath = this.#partialMetadataPath(spec);
-    const previous = await readPartialState(partialPath, metadataPath, spec);
-    let offset = previous.offset;
-    let response = await this.#fetchRuntime(spec, signal, offset, previous.metadata?.etag ?? null);
-    if (offset > 0 && !isValidPartialResponse(response, offset, spec.downloadBytes, previous.metadata?.etag ?? null)) {
-      await response.body?.cancel().catch(() => undefined);
-      await this.#removePartial(spec);
-      offset = 0;
-      response = await this.#fetchRuntime(spec, signal, 0, null);
-    }
-    if (!response.ok || (offset > 0 && response.status !== 206)) {
-      throw new Error(sourceText("error.provider.downloadHttp", { status: response.status }));
-    }
-    if (!response.body) throw new Error(sourceText("error.provider.downloadNoData"));
 
-    const etag = response.headers.get("etag");
-    await writeFile(
-      metadataPath,
-      `${JSON.stringify({ url: spec.url, etag, expectedBytes: spec.downloadBytes } satisfies PartialMetadata)}\n`,
-      { mode: 0o600 },
-    );
-    await streamResponse(response, partialPath, offset, signal, (received) => {
-      const progress = Math.min(99, Math.floor((received / spec.downloadBytes) * 100));
-      if (progress !== this.#statuses[spec.runtime].progress) {
-        this.#setStatus(spec.runtime, {
-          phase: "downloading",
-          progress,
-          message: null,
-          version: this.#statuses[spec.runtime].version,
+  #runDownloadEffect(spec: RuntimeSpec, signal: AbortSignal): Effect.Effect<boolean, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<boolean, ProviderRuntimeFailure, Scope.Scope> {
+      yield* runtimeIO(async () => await mkdir(this.#downloadRoot(), { recursive: true }));
+      yield* this.#requireDiskSpaceEffect(spec);
+      const partialPath = this.#partialPath(spec);
+      const metadataPath = this.#partialMetadataPath(spec);
+      const previous = yield* readPartialState(partialPath, metadataPath, spec);
+      let offset = previous.offset;
+      let response = yield* Effect.acquireRelease(
+        this.#fetchRuntimeEffect(spec, signal, offset, previous.metadata?.etag ?? null),
+        releaseDownloadResponse,
+      );
+      if (
+        offset > 0 &&
+        !isValidPartialResponse(response, offset, spec.downloadBytes, previous.metadata?.etag ?? null)
+      ) {
+        yield* runtimeIO(async () => await response.body?.cancel().catch(() => undefined));
+        yield* this.#removePartialEffect(spec);
+        offset = 0;
+        response = yield* Effect.acquireRelease(
+          this.#fetchRuntimeEffect(spec, signal, 0, null),
+          releaseDownloadResponse,
+        );
+      }
+      if (!response.ok || (offset > 0 && response.status !== 206)) {
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(sourceText("error.provider.downloadHttp", { status: response.status })),
         });
       }
-    });
+      if (!response.body)
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.downloadNoData")) });
 
-    this.#setStatus(spec.runtime, {
-      phase: "finishing",
-      progress: null,
-      message: null,
-      version: this.#statuses[spec.runtime].version,
-    });
-    const downloaded = await stat(partialPath);
-    if (downloaded.size !== spec.downloadBytes) {
-      throw new Error(sourceText("error.provider.downloadSize"));
-    }
-    // No digest is Grok's upstream release, which x.ai publishes no hash for and TLS alone vouches for.
-    if (spec.archiveDigest && !(await digestMatches(partialPath, spec.archiveDigest))) {
-      await this.#removePartial(spec);
-      throw new Error(sourceText("error.provider.downloadIntegrity"));
-    }
+      const etag = response.headers.get("etag");
+      yield* runtimeIO(
+        async () =>
+          await writeFile(
+            metadataPath,
+            `${JSON.stringify({ url: spec.url, etag, expectedBytes: spec.downloadBytes } satisfies PartialMetadata)}\n`,
+            { mode: 0o600 },
+          ),
+      );
+      yield* streamResponse(response, partialPath, offset, signal, (received) => {
+        const progress = Math.min(99, Math.floor((received / spec.downloadBytes) * 100));
+        if (progress !== this.#statuses[spec.runtime].progress) {
+          this.#setStatus(spec.runtime, {
+            phase: "downloading",
+            progress,
+            message: null,
+            version: this.#statuses[spec.runtime].version,
+          });
+        }
+      });
 
-    return await this.#install(spec, partialPath);
+      this.#setStatus(spec.runtime, {
+        phase: "finishing",
+        progress: null,
+        message: null,
+        version: this.#statuses[spec.runtime].version,
+      });
+      const downloaded = yield* runtimeIO(async () => await stat(partialPath));
+      if (downloaded.size !== spec.downloadBytes) {
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.downloadSize")) });
+      }
+      // No digest is Grok's upstream release, which x.ai publishes no hash for and TLS alone vouches for.
+      const digest = spec.archiveDigest;
+      if (digest && !(yield* digestMatches(partialPath, digest))) {
+        yield* this.#removePartialEffect(spec);
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.downloadIntegrity")) });
+      }
+
+      return yield* this.#installEffect(spec, partialPath);
+    }).pipe(Effect.scoped);
   }
 
   /** Answers whether this instance committed the install, or adopted the one it found. */
-  async #install(spec: RuntimeSpec, downloadedPath: string): Promise<boolean> {
-    // Named for this attempt, so two instances installing the same version cannot share a directory
-    // and the sweep can tell a live stage from an abandoned one by its age alone. The prefix is not
-    // the one released builds sweep without looking at the age: see `STAGING_PREFIXES`.
-    const staging = join(
-      this.#runtimeRoot(spec.runtime),
-      `.staging-${spec.target}-${spec.version}-${process.pid}-${randomBytes(4).toString("hex")}`,
-    );
-    await mkdir(staging, { recursive: true });
-    let committed = false;
-    try {
-      await providerRuntimeDescriptor(spec.runtime).stage({
-        spec,
-        downloadedPath,
-        staging,
-        lock: this.#lock,
-        downloadSmallFile: (url, expectedSha256) => this.#downloadSmallFile(url, expectedSha256),
-      });
-      if (spec.source === "latest") await writeInstallRecord(staging, spec);
-      await verifyInstalledRuntime(staging, spec, this.#lock);
-      const destination = this.#installRoot(spec);
-      await mkdir(dirname(destination), { recursive: true });
-      committed = await this.#commit(staging, destination, spec);
-      await verifyInstalledRuntime(destination, spec, this.#lock);
-      return committed;
-    } catch (error) {
-      // Only what this instance put there. A directory it adopted belongs to the sibling that
-      // installed it, and that sibling is entitled to keep running from it.
-      if (committed) await this.#discardRejected(spec);
-      throw error;
-    } finally {
-      // Caught, so a stage Windows still holds open cannot replace the error that matters; the sweep
-      // collects what is left by its age.
-      await rm(staging, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
-    }
+
+  #installEffect(spec: RuntimeSpec, downloadedPath: string): Effect.Effect<boolean, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const staging = join(
+        this.#runtimeRoot(spec.runtime),
+        `.staging-${spec.target}-${spec.version}-${process.pid}-${randomBytes(4).toString("hex")}`,
+      );
+      return yield* Effect.acquireUseRelease(
+        runtimeIO(() => mkdir(staging, { recursive: true })),
+        () =>
+          Effect.gen({ self: this }, function* () {
+            let committed = false;
+            const result = yield* Effect.result(
+              Effect.gen({ self: this }, function* () {
+                yield* providerRuntimeDescriptor(spec.runtime).stage({
+                  spec,
+                  downloadedPath,
+                  staging,
+                  lock: this.#lock,
+                  downloadSmallFile: (url, hash) => this.#downloadSmallFileEffect(url, hash),
+                });
+                if (spec.source === "latest") yield* writeInstallRecord(staging, spec);
+                yield* verifyInstalledRuntime(staging, spec, this.#lock);
+                const destination = this.#installRoot(spec);
+                yield* runtimeIO(() => mkdir(dirname(destination), { recursive: true }));
+                committed = yield* this.#commitEffect(staging, destination, spec);
+                yield* verifyInstalledRuntime(destination, spec, this.#lock);
+                return committed;
+              }),
+            );
+            if (Result.isSuccess(result)) return result.success;
+            // Only discard a runtime this instance committed, never a sibling's adopted install.
+            if (committed) yield* this.#discardRejectedEffect(spec);
+            return yield* result.failure;
+          }),
+        () =>
+          runtimeIO(() => rm(staging, { recursive: true, force: true, maxRetries: 5 })).pipe(
+            Effect.catch(() => Effect.void),
+          ),
+      );
+    });
   }
 
   /**
@@ -688,17 +809,20 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * the sibling left it. Only what does not verify is removed, and by then this instance is the
    * only one that can see it.
    */
-  async #discardRejected(spec: RuntimeSpec): Promise<void> {
-    const installRoot = this.#installRoot(spec);
-    const aside = join(
-      this.#runtimeRoot(spec.runtime),
-      `.replaced-${spec.target}-${spec.version}-${randomBytes(4).toString("hex")}`,
-    );
-    if (!(await renameIfPresent(installRoot, aside))) return;
-    if (await this.#verifies(aside, spec)) {
-      if (await renameIfVacant(aside, installRoot)) return;
-    }
-    await rm(aside, { recursive: true, force: true }).catch(() => undefined);
+
+  #discardRejectedEffect(spec: RuntimeSpec): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const installRoot = this.#installRoot(spec);
+      const aside = join(
+        this.#runtimeRoot(spec.runtime),
+        `.replaced-${spec.target}-${spec.version}-${randomBytes(4).toString("hex")}`,
+      );
+      if (!(yield* renameIfPresent(installRoot, aside))) return;
+      if (yield* this.#verifiesEffect(aside, spec)) {
+        if (yield* renameIfVacant(aside, installRoot)) return;
+      }
+      yield* runtimeIO(async () => await rm(aside, { recursive: true, force: true }).catch(() => undefined));
+    });
   }
 
   /**
@@ -714,21 +838,30 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * aside, and aside rather than deleted, because a sibling reading the atomic path must never find
    * it half removed.
    */
-  async #commit(staging: string, destination: string, spec: RuntimeSpec): Promise<boolean> {
-    // Each pass reads the destination again, because a sibling can fill it or replace it between
-    // any two steps below. Whatever it did, the next pass sees the result: a verified install is
-    // adopted, and only what is still damaged is replaced.
-    let held = false;
-    for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt += 1) {
-      if (await renameIfVacant(staging, destination)) return true;
-      // Still vacant: the stage is held open, and there is nothing to adopt or replace.
-      held = !(await pathExists(destination));
-      if (held) continue;
-      if (await this.#verifies(destination, spec)) return false;
-      const outcome = await this.#replaceUnderLock(staging, destination, spec);
-      if (outcome !== "moved") return outcome === "committed";
-    }
-    throw new Error(sourceText(held ? "error.provider.runtimeFilesInUse" : "error.provider.runtimeReplacing"));
+
+  #commitEffect(
+    staging: string,
+    destination: string,
+    spec: RuntimeSpec,
+  ): Effect.Effect<boolean, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<boolean, ProviderRuntimeFailure> {
+      // Each pass reads the destination again, because a sibling can fill it or replace it between
+      // any two steps below. Whatever it did, the next pass sees the result: a verified install is
+      // adopted, and only what is still damaged is replaced.
+      let held = false;
+      for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt += 1) {
+        if (yield* renameIfVacant(staging, destination)) return true;
+        // Still vacant: the stage is held open, and there is nothing to adopt or replace.
+        held = !(yield* pathExists(destination));
+        if (held) continue;
+        if (yield* this.#verifiesEffect(destination, spec)) return false;
+        const outcome = yield* this.#replaceUnderLockEffect(staging, destination, spec);
+        if (outcome !== "moved") return outcome === "committed";
+      }
+      return yield* new ProviderRuntimeFailure({
+        cause: new Error(sourceText(held ? "error.provider.runtimeFilesInUse" : "error.provider.runtimeReplacing")),
+      });
+    });
   }
 
   /**
@@ -741,102 +874,145 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * Answers `moved` when the path changed under this instance or the lock is held elsewhere -- both
    * mean read it again.
    */
-  async #replaceUnderLock(
+
+  #replaceUnderLockEffect(
     staging: string,
     destination: string,
     spec: RuntimeSpec,
-  ): Promise<"committed" | "adopted" | "moved"> {
+  ): Effect.Effect<"committed" | "adopted" | "moved", ProviderRuntimeFailure> {
     const lock = join(this.#runtimeRoot(spec.runtime), `.locking-${spec.target}-${spec.version}`);
-    const claim = await takeLock(lock);
-    if (!claim) return "moved";
-    try {
-      if (await this.#verifies(destination, spec)) return "adopted";
-      // Beside the staging directories, not beside the version ones: that is where the sweep looks,
-      // and `#removeOldVersions` reads everything in the target root as a version.
-      const aside = join(
-        this.#runtimeRoot(spec.runtime),
-        `.replaced-${spec.target}-${spec.version}-${randomBytes(4).toString("hex")}`,
-      );
-      // The claim is read once more against the one thing that can have displaced it: an instance
-      // recovering it as abandoned. Whoever holds the claim by now is the one entitled to move the
-      // destination, and this instance stops before touching it rather than after.
-      if (!(await holdsClaim(lock, claim))) return "moved";
-      // Aside rather than deleted, because a sibling reading the atomic path must never find it
-      // half removed, and gone already means an instance without this lock took it.
-      if (!(await renameIfPresent(destination, aside))) return "moved";
-      // Read once more, now that it is somewhere nothing else can change it. The claim says no
-      // other instance may move this destination, and the reading above says this one was damaged;
-      // both were true when they were read, and neither is a promise about the moment of the move.
-      // What was moved is therefore examined rather than trusted: a runtime that verifies is an
-      // install a sibling committed in between, so it goes back where the sibling left it and is
-      // adopted. Nothing that verifies is ever replaced, whatever the claim said.
-      if (await this.#verifies(aside, spec)) {
-        if (await renameIfVacant(aside, destination)) return "adopted";
-        await rm(aside, { recursive: true, force: true }).catch(() => undefined);
-        return "moved";
-      }
-      try {
-        if (await renameIfVacant(staging, destination)) return "committed";
-      } finally {
-        await rm(aside, { recursive: true, force: true }).catch(() => undefined);
-      }
-      return "moved";
-    } finally {
-      await releaseLock(lock, claim);
-    }
+    return Effect.acquireUseRelease(
+      takeLock(lock),
+      (claim) =>
+        Effect.gen({ self: this }, function* (): Effect.fn.Return<
+          "committed" | "adopted" | "moved",
+          ProviderRuntimeFailure
+        > {
+          if (!claim) return "moved";
+
+          if (yield* this.#verifiesEffect(destination, spec)) return "adopted";
+          // Beside the staging directories, not beside the version ones: that is where the sweep looks,
+          // and `#removeOldVersions` reads everything in the target root as a version.
+          const aside = join(
+            this.#runtimeRoot(spec.runtime),
+            `.replaced-${spec.target}-${spec.version}-${randomBytes(4).toString("hex")}`,
+          );
+          // The claim is read once more against the one thing that can have displaced it: an instance
+          // recovering it as abandoned. Whoever holds the claim by now is the one entitled to move the
+          // destination, and this instance stops before touching it rather than after.
+          if (!(yield* holdsClaim(lock, claim))) return "moved";
+          // Aside rather than deleted, because a sibling reading the atomic path must never find it
+          // half removed, and gone already means an instance without this lock took it.
+          if (!(yield* renameIfPresent(destination, aside))) return "moved";
+          // Read once more, now that it is somewhere nothing else can change it. The claim says no
+          // other instance may move this destination, and the reading above says this one was damaged;
+          // both were true when they were read, and neither is a promise about the moment of the move.
+          // What was moved is therefore examined rather than trusted: a runtime that verifies is an
+          // install a sibling committed in between, so it goes back where the sibling left it and is
+          // adopted. Nothing that verifies is ever replaced, whatever the claim said.
+          if (yield* this.#verifiesEffect(aside, spec)) {
+            if (yield* renameIfVacant(aside, destination)) return "adopted";
+            yield* runtimeIO(() => rm(aside, { recursive: true, force: true })).pipe(Effect.catch(() => Effect.void));
+            return "moved";
+          }
+          const committed = yield* renameIfVacant(staging, destination).pipe(
+            Effect.ensuring(
+              runtimeIO(() => rm(aside, { recursive: true, force: true })).pipe(Effect.catch(() => Effect.void)),
+            ),
+          );
+          if (committed) return "committed";
+          return "moved";
+        }),
+      (claim) => (claim ? releaseLock(lock, claim).pipe(Effect.orDie) : Effect.void),
+    ).pipe(Effect.uninterruptible);
   }
 
-  async #verifies(installRoot: string, spec: RuntimeSpec): Promise<boolean> {
-    return await verifyInstalledRuntime(installRoot, spec, this.#lock).then(
-      () => true,
-      () => false,
+  #verifiesEffect(installRoot: string, spec: RuntimeSpec): Effect.Effect<boolean, ProviderRuntimeFailure> {
+    return verifyInstalledRuntime(installRoot, spec, this.#lock).pipe(
+      Effect.as(true),
+      Effect.catch(() => Effect.succeed(false)),
     );
   }
 
-  async #downloadSmallFile(url: string, expectedSha256: string | null): Promise<Uint8Array> {
-    const response = await this.#fetch(url, { headers: { "User-Agent": "OpenBot-runtime-installer" } });
-    if (!response.ok) throw new Error(sourceText("error.provider.metadataHttp", { status: response.status }));
-    const value = await readLimitedBody(response, sourceText("error.provider.metadataTooLarge"));
-    if (!value) throw new Error(sourceText("error.provider.metadataNoData"));
-    if (expectedSha256 !== null && createHash("sha256").update(value).digest("hex") !== expectedSha256) {
-      throw new Error(sourceText("error.provider.metadataIntegrity"));
-    }
-    return value;
+  #downloadSmallFileEffect(
+    url: string,
+    expectedSha256: string | null,
+  ): Effect.Effect<Uint8Array, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const controller = yield* Effect.acquireRelease(
+        Effect.sync(() => new AbortController()),
+        (controller) => Effect.sync(() => controller.abort()),
+      );
+      const response = yield* runtimeIO((signal) =>
+        this.#fetch(url, {
+          headers: { "User-Agent": "OpenBot-runtime-installer" },
+          signal: AbortSignal.any([signal, controller.signal, AbortSignal.timeout(30_000)]),
+        }),
+      );
+      if (!response.ok)
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(sourceText("error.provider.metadataHttp", { status: response.status })),
+        });
+      const value = yield* readLimitedBodyEffect(response, sourceText("error.provider.metadataTooLarge"));
+      if (!value)
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.metadataNoData")) });
+      if (expectedSha256 !== null && createHash("sha256").update(value).digest("hex") !== expectedSha256) {
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.metadataIntegrity")) });
+      }
+      return value;
+    }).pipe(Effect.scoped);
   }
 
-  async #fetchRuntime(spec: RuntimeSpec, signal: AbortSignal, offset: number, etag: string | null): Promise<Response> {
-    return this.#fetch(spec.url, {
-      signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": "OpenBot-runtime-installer",
-        ...(offset > 0 ? { Range: `bytes=${offset}-`, ...(etag ? { "If-Range": etag } : {}) } : {}),
-      },
+  #fetchRuntimeEffect(
+    spec: RuntimeSpec,
+    signal: AbortSignal,
+    offset: number,
+    etag: string | null,
+  ): Effect.Effect<Response, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<Response, ProviderRuntimeFailure> {
+      return yield* runtimeIO((effectSignal) =>
+        this.#fetch(spec.url, {
+          signal: AbortSignal.any([signal, effectSignal]),
+          redirect: "follow",
+          headers: {
+            "User-Agent": "OpenBot-runtime-installer",
+            ...(offset > 0 ? { Range: `bytes=${offset}-`, ...(etag ? { "If-Range": etag } : {}) } : {}),
+          },
+        }),
+      );
     });
   }
 
-  async #requireDiskSpace(spec: RuntimeSpec): Promise<void> {
-    // Measured on the store, which is where the installed copy lands. The partial can be told to
-    // live elsewhere; in practice both are under the user's home, on one volume.
-    const available = await this.#availableDiskBytes();
-    const existing = await fileSize(this.#partialPath(spec));
-    const required = Math.max(0, spec.downloadBytes - existing) + spec.installedBytes + FREE_SPACE_HEADROOM;
-    if (available < required) throw new Error(sourceText("error.provider.diskSpace"));
+  #requireDiskSpaceEffect(spec: RuntimeSpec): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      // Measured on the store, which is where the installed copy lands. The partial can be told to
+      // live elsewhere; in practice both are under the user's home, on one volume.
+      const available = yield* runtimeIO(async () => await this.#availableDiskBytes());
+      const existing = yield* fileSize(this.#partialPath(spec));
+      const required = Math.max(0, spec.downloadBytes - existing) + spec.installedBytes + FREE_SPACE_HEADROOM;
+      if (available < required)
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.diskSpace")) });
+    });
   }
 
-  async #handleDownloadFailure(runtime: ManagedRuntimeId, error: unknown): Promise<void> {
-    if (this.#cancelled.has(runtime)) return;
-    if (this.#stopping && isAbortError(error)) return;
-    const message = isAbortError(error)
-      ? sourceText("status.provider.downloadStopped")
-      : error instanceof Error
-        ? redactText(error.message)
-        : sourceText("status.provider.downloadFailed");
-    this.#setStatus(runtime, {
-      phase: "download-error",
-      progress: null,
-      message,
-      version: this.#statuses[runtime].version,
+  #handleDownloadFailure(runtime: ManagedRuntimeId, error: unknown): Promise<void> {
+    return runRuntime(this.#handleDownloadFailureEffect(runtime, error));
+  }
+  #handleDownloadFailureEffect(runtime: ManagedRuntimeId, error: unknown): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.sync(() => {
+      if (this.#cancelled.has(runtime)) return;
+      if (this.#stopping && isAbortError(error)) return;
+      const message = isAbortError(error)
+        ? sourceText("status.provider.downloadStopped")
+        : error instanceof Error
+          ? redactText(error.message)
+          : sourceText("status.provider.downloadFailed");
+      this.#setStatus(runtime, {
+        phase: "download-error",
+        progress: null,
+        message,
+        version: this.#statuses[runtime].version,
+      });
     });
   }
 
@@ -866,11 +1042,14 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     return `${this.#partialPath(spec)}.json`;
   }
 
-  async #removePartial(spec: RuntimeSpec): Promise<void> {
-    await Promise.all([
-      rm(this.#partialPath(spec), { force: true }),
-      rm(this.#partialMetadataPath(spec), { force: true }),
-    ]);
+  #removePartialEffect(spec: RuntimeSpec): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.all(
+      [
+        runtimeIO(() => rm(this.#partialPath(spec), { force: true })),
+        runtimeIO(() => rm(this.#partialMetadataPath(spec), { force: true })),
+      ],
+      { concurrency: "unbounded", discard: true },
+    );
   }
 
   /**
@@ -879,24 +1058,22 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * Age is the whole test. A sibling instance may be part-way through staging the same version
    * right now, and removing its directory would fail its install for no reason.
    */
-  async #removeAbandonedStaging(): Promise<void> {
-    const stale = Date.now() - STALE_STAGING_MS;
-    for (const runtime of RUNTIMES) {
-      const root = this.#runtimeRoot(runtime);
-      const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-      await Promise.all(
-        entries
-          .filter((entry) => entry.isDirectory() && STAGING_PREFIXES.some((prefix) => entry.name.startsWith(prefix)))
-          .map(async (entry) => {
-            const path = join(root, entry.name);
-            const modified = await stat(path)
-              .then((value) => value.mtimeMs)
-              .catch(() => Number.POSITIVE_INFINITY);
-            if (modified > stale) return;
-            await rm(path, { recursive: true, force: true }).catch(() => undefined);
-          }),
-      );
-    }
+
+  #removeAbandonedStagingEffect(): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const stale = Date.now() - STALE_STAGING_MS;
+      for (const runtime of RUNTIMES) {
+        const root = this.#runtimeRoot(runtime);
+        const entries = yield* runtimeIO(async () => await readdir(root, { withFileTypes: true }).catch(() => []));
+        yield* Effect.forEach(
+          entries.filter(
+            (entry) => entry.isDirectory() && STAGING_PREFIXES.some((prefix) => entry.name.startsWith(prefix)),
+          ),
+          (entry) => removeStaleRuntimeDirectory(join(root, entry.name), stale),
+          { concurrency: "unbounded", discard: true },
+        );
+      }
+    });
   }
 
   /**
@@ -908,35 +1085,29 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * whatever it verifies on every start, so a version in use anywhere stays recent, and only a tree
    * nothing has opened for a month is collected.
    */
-  async #removeOldVersions(spec: RuntimeSpec): Promise<void> {
-    const targetRoot = join(this.#runtimeRoot(spec.runtime), spec.target);
-    const entries = await readdir(targetRoot, { withFileTypes: true }).catch(() => []);
-    const versions = entries
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-      .map((entry) => entry.name);
-    const keep = new Set([
-      spec.version,
-      this.#statuses[spec.runtime].version,
-      ...versions
-        .filter((version) => version !== spec.version)
-        .sort((a, b) => b.localeCompare(a, "en", { numeric: true }))
-        .slice(0, 1),
-    ]);
-    const stale = Date.now() - VERSION_RETENTION_MS;
-    await Promise.all(
-      versions
-        .filter((version) => !keep.has(version))
-        .map(async (version) => {
-          const path = join(targetRoot, version);
-          const modified = await stat(path)
-            .then((value) => value.mtimeMs)
-            .catch(() => Number.POSITIVE_INFINITY);
-          if (modified > stale) return;
-          // Caught, not thrown: a running binary refuses to be removed on Windows, and housekeeping
-          // must never be what stops the app from starting.
-          await rm(path, { recursive: true, force: true }).catch(() => undefined);
-        }),
-    );
+
+  #removeOldVersionsEffect(spec: RuntimeSpec): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const targetRoot = join(this.#runtimeRoot(spec.runtime), spec.target);
+      const entries = yield* runtimeIO(async () => await readdir(targetRoot, { withFileTypes: true }).catch(() => []));
+      const versions = entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name);
+      const keep = new Set([
+        spec.version,
+        this.#statuses[spec.runtime].version,
+        ...versions
+          .filter((version) => version !== spec.version)
+          .sort((a, b) => b.localeCompare(a, "en", { numeric: true }))
+          .slice(0, 1),
+      ]);
+      const stale = Date.now() - VERSION_RETENTION_MS;
+      yield* Effect.forEach(
+        versions.filter((version) => !keep.has(version)),
+        (version) => removeStaleRuntimeDirectory(join(targetRoot, version), stale),
+        { concurrency: "unbounded", discard: true },
+      );
+    });
   }
 }
 
@@ -958,19 +1129,25 @@ function runtimeSpec(runtime: ManagedRuntimeId, target: RuntimeTarget, lock: Age
  * record written when it was installed, and the installed binary reports the version it should. The
  * last one is what catches a CLI that replaced itself after installation.
  */
-async function verifyInstalledRuntime(root: string, spec: RuntimeSpec, lock: AgentRuntimeLock): Promise<void> {
+const verifyInstalledRuntime = Effect.fn("ProviderRuntime.verifyInstalledRuntime")(function* (
+  root: string,
+  spec: RuntimeSpec,
+  lock: AgentRuntimeLock,
+): Effect.fn.Return<void, ProviderRuntimeFailure> {
   const descriptor = providerRuntimeDescriptor(spec.runtime);
   const executable = join(root, "bin", spec.executableName);
-  await access(executable);
-  if (spec.source === "lock") await descriptor.verify(root, spec, lock);
-  else await verifyInstallRecord(root, spec);
-  const output = descriptor.versionFile
-    ? await readFile(join(root, descriptor.versionFile), "utf8")
-    : (await execFileAsync(executable, ["--version"], { encoding: "utf8", windowsHide: true })).stdout;
-  if (descriptor.parseVersion(output) !== spec.version) {
-    throw new Error(sourceText("error.provider.unexpectedVersion"));
+  yield* runtimeIO(() => access(executable));
+  if (spec.source === "lock") yield* descriptor.verify(root, spec, lock);
+  else yield* verifyInstallRecord(root, spec);
+  const versionFile = descriptor.versionFile;
+  const output = versionFile
+    ? yield* runtimeIO(() => readFile(join(root, versionFile), "utf8"))
+    : (yield* runtimeIO(() => execFileAsync(executable, ["--version"], { encoding: "utf8", windowsHide: true })))
+        .stdout;
+  if ((yield* runtimeSync(() => descriptor.parseVersion(output))) !== spec.version) {
+    return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.unexpectedVersion")) });
   }
-}
+});
 
 /**
  * Moves `from` onto `to`, or reports that something already occupies `to`.
@@ -985,28 +1162,27 @@ async function verifyInstalledRuntime(root: string, spec: RuntimeSpec, lock: Age
  * held after the wait answers `false` like an occupied one, so every caller keeps its own reading of
  * what is there; `#commit` is the one that tells the user which of the two it was.
  */
-async function renameIfVacant(from: string, to: string): Promise<boolean> {
+const renameIfVacant = Effect.fn("ProviderRuntime.renameIfVacant")(function* (
+  from: string,
+  to: string,
+): Effect.fn.Return<boolean, ProviderRuntimeFailure> {
   for (let attempt = 0; ; attempt += 1) {
-    try {
-      await rename(from, to);
-      return true;
-    } catch (error) {
-      const code = errorCode(error);
-      if (code === "ENOTEMPTY" || code === "EEXIST") return false;
-      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
-      const wait = HELD_SOURCE_WAITS_MS[attempt];
-      if (wait === undefined || (await pathExists(to))) return false;
-      await delay(wait);
-    }
+    const renamed = yield* Effect.result(runtimeIO(() => rename(from, to)));
+    if (Result.isSuccess(renamed)) return true;
+    const code = errorCode(renamed.failure.cause);
+    if (code === "ENOTEMPTY" || code === "EEXIST") return false;
+    if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") return yield* renamed.failure;
+    const wait = HELD_SOURCE_WAITS_MS[attempt];
+    if (wait === undefined || (yield* pathExists(to))) return false;
+    yield* Effect.sleep(wait);
   }
-}
-
-async function pathExists(path: string): Promise<boolean> {
-  return await access(path).then(
-    () => true,
-    () => false,
-  );
-}
+});
+const pathExists = Effect.fn("ProviderRuntime.pathExists")((path: string) =>
+  runtimeIO(() => access(path)).pipe(
+    Effect.as(true),
+    Effect.catch(() => Effect.succeed(false)),
+  ),
+);
 
 /**
  * Claims the right to replace one destination, and answers with the claim, or `null` when another
@@ -1025,20 +1201,22 @@ async function pathExists(path: string): Promise<boolean> {
  * alone to look at, and only the claim whose age was read is the abandoned one. Anything else was
  * made in between, by an instance that recovered the path first, and this instance takes nothing.
  */
-async function takeLock(lock: string): Promise<string | null> {
+const takeLock = Effect.fn("ProviderRuntime.takeLock")(function* (
+  lock: string,
+): Effect.fn.Return<string | null, ProviderRuntimeFailure> {
   const claim = `${process.pid}-${randomBytes(4).toString("hex")}`;
-  if (await holdLock(lock, claim)) return claim;
-  const abandoned = await abandonedClaim(lock);
+  if (yield* holdLock(lock, claim)) return claim;
+  const abandoned = yield* abandonedClaim(lock);
   if (abandoned === null) return null;
   const aside = join(dirname(lock), `.replaced-claim-${randomBytes(4).toString("hex")}`);
-  if (!(await renameIfPresent(lock, aside))) return null;
-  const moved = await readClaim(aside);
-  await rm(aside, { recursive: true, force: true }).catch(() => undefined);
+  if (!(yield* renameIfPresent(lock, aside))) return null;
+  const moved = yield* readClaim(aside);
+  yield* runtimeIO(() => rm(aside, { recursive: true, force: true }).catch(() => undefined));
   // The instance whose fresh claim this moved is shut out by `holdsClaim` before it touches the
   // destination, so the path is left to whoever takes it next, and this attempt is not it.
   if (moved !== abandoned) return null;
-  return (await holdLock(lock, claim)) ? claim : null;
-}
+  return (yield* holdLock(lock, claim)) ? claim : null;
+});
 
 /**
  * The claim a lock old enough to be abandoned names, or `null` when no claim there is abandoned.
@@ -1054,122 +1232,158 @@ async function takeLock(lock: string): Promise<string | null> {
  * instance was killed between the two steps of an older build's acquisition, or the claim file was
  * lost. It is recovered like any other abandoned claim.
  */
-async function abandonedClaim(lock: string): Promise<string | null> {
-  const named = await readClaim(lock);
-  const held = await stat(lock)
-    .then((value) => value.mtimeMs)
-    .catch(() => null);
+const abandonedClaim = Effect.fn("ProviderRuntime.abandonedClaim")(function* (
+  lock: string,
+): Effect.fn.Return<string | null, ProviderRuntimeFailure> {
+  const named = yield* readClaim(lock);
+  const held = yield* runtimeIO(() =>
+    stat(lock)
+      .then((value) => value.mtimeMs)
+      .catch(() => null),
+  );
   if (held === null || held > Date.now() - STALE_STAGING_MS) return null;
   return named;
-}
+});
 
 /** Who a claim names, and the empty string when it names no one. */
-async function readClaim(lock: string): Promise<string> {
-  const held = await readFile(join(lock, "claim"), "utf8").catch(() => null);
+const readClaim = Effect.fn("ProviderRuntime.readClaim")(function* (
+  lock: string,
+): Effect.fn.Return<string, ProviderRuntimeFailure> {
+  const held = yield* runtimeIO(() => readFile(join(lock, "claim"), "utf8").catch(() => null));
   return held?.trim() ?? "";
-}
+});
 
 /** Whether the claim on the path is still the one this attempt made. */
-async function holdsClaim(lock: string, claim: string): Promise<boolean> {
-  return (await readClaim(lock)) === claim;
-}
+const holdsClaim = Effect.fn("ProviderRuntime.holdsClaim")(function* (
+  lock: string,
+  claim: string,
+): Effect.fn.Return<boolean, ProviderRuntimeFailure> {
+  return (yield* readClaim(lock)) === claim;
+});
 
 /** Puts a claim on the path in one move, or reports that another instance is already there. */
-async function holdLock(lock: string, claim: string): Promise<boolean> {
+const holdLock = Effect.fn("ProviderRuntime.holdLock")(function* (
+  lock: string,
+  claim: string,
+): Effect.fn.Return<boolean, ProviderRuntimeFailure> {
   // Under the swept prefix, so an instance killed between these two steps leaves nothing permanent.
   const staging = join(dirname(lock), `.replaced-claim-${randomBytes(4).toString("hex")}`);
-  await mkdir(staging, { recursive: true });
-  await writeFile(join(staging, "claim"), `${claim}\n`, { mode: 0o600 });
-  if (await renameIfVacant(staging, lock)) return true;
-  await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+  yield* runtimeIO(() => mkdir(staging, { recursive: true }));
+  yield* runtimeIO(() => writeFile(join(staging, "claim"), `${claim}\n`, { mode: 0o600 }));
+  if (yield* renameIfVacant(staging, lock)) return true;
+  yield* runtimeIO(() => rm(staging, { recursive: true, force: true }).catch(() => undefined));
   return false;
-}
+});
 
 /** Removes the claim only while it is still this attempt's. */
-async function releaseLock(lock: string, claim: string): Promise<void> {
-  if (!(await holdsClaim(lock, claim))) return;
-  await rm(lock, { recursive: true, force: true }).catch(() => undefined);
-}
+const releaseLock = Effect.fn("ProviderRuntime.releaseLock")(function* (
+  lock: string,
+  claim: string,
+): Effect.fn.Return<void, ProviderRuntimeFailure> {
+  if (!(yield* holdsClaim(lock, claim))) return;
+  yield* runtimeIO(() => rm(lock, { recursive: true, force: true }).catch(() => undefined));
+});
 
 /** Moves `from` onto `to`, or reports that another instance already took `from` away. */
-async function renameIfPresent(from: string, to: string): Promise<boolean> {
-  try {
-    await rename(from, to);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
-  }
-}
+const renameIfPresent = Effect.fn("ProviderRuntime.renameIfPresent")((from: string, to: string) =>
+  runtimeIO(() => rename(from, to)).pipe(
+    Effect.as(true),
+    Effect.catch((error) => (errorCode(error.cause) === "ENOENT" ? Effect.succeed(false) : Effect.fail(error))),
+  ),
+);
 
 function errorCode(error: unknown): string | null {
   return error instanceof Error && "code" in error && isString(error.code) ? error.code : null;
 }
 
-async function streamResponse(
+// The response belongs to the download even when status or metadata checks fail before a reader exists.
+function releaseDownloadResponse(response: Response): Effect.Effect<void> {
+  return runtimeIO(async () => {
+    await response.body?.cancel();
+  }).pipe(Effect.catch(() => Effect.void));
+}
+
+const streamResponse = Effect.fn("ProviderRuntime.streamResponse")(function* (
   response: Response,
   path: string,
   offset: number,
   signal: AbortSignal,
   onProgress: (received: number) => void,
-): Promise<void> {
+) {
   const body = response.body;
-  if (!body) throw new Error(sourceText("error.provider.downloadNoData"));
-  const writer = createWriteStream(path, { flags: offset > 0 ? "a" : "w", mode: 0o600 });
-  writer.on("error", () => undefined);
-  const reader = body.getReader();
-  let received = offset;
-  try {
-    while (true) {
-      if (signal.aborted) throw abortError();
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      await new Promise<void>((resolveWrite, rejectWrite) => {
-        writer.write(chunk.value, (error) => (error ? rejectWrite(error) : resolveWrite()));
-      });
-      received += chunk.value.byteLength;
-      onProgress(received);
-    }
-    await new Promise<void>((resolveClose, rejectClose) => {
-      writer.end(resolveClose);
-      writer.once("error", rejectClose);
-    });
-  } catch (error) {
-    writer.destroy();
-    await finished(writer).catch(() => undefined);
-    await reader.cancel().catch(() => undefined);
-    throw error;
-  }
-}
+  if (!body)
+    return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.downloadNoData")) });
+  yield* Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const writer = createWriteStream(path, { flags: offset > 0 ? "a" : "w", mode: 0o600 });
+      writer.on("error", () => undefined);
+      return { writer, reader: body.getReader() };
+    }),
+    ({ writer, reader }) =>
+      Effect.gen(function* () {
+        let received = offset;
+        while (true) {
+          if (signal.aborted) return yield* new ProviderRuntimeFailure({ cause: abortError() });
+          const chunk = yield* runtimeIO(() => reader.read());
+          if (chunk.done) break;
+          yield* Effect.callback<void, ProviderRuntimeFailure>((resume) => {
+            writer.write(chunk.value, (error) =>
+              resume(error ? Effect.fail(new ProviderRuntimeFailure({ cause: error })) : Effect.void),
+            );
+          });
+          received += chunk.value.byteLength;
+          onProgress(received);
+        }
+        yield* Effect.callback<void, ProviderRuntimeFailure>((resume) => {
+          const onError = (cause: Error) => resume(Effect.fail(new ProviderRuntimeFailure({ cause })));
+          writer.once("error", onError);
+          writer.end(() => resume(Effect.void));
+          return Effect.sync(() => {
+            writer.off("error", onError);
+          });
+        });
+      }),
+    ({ writer, reader }) =>
+      Effect.gen(function* () {
+        writer.destroy();
+        yield* runtimeIO(() => finished(writer)).pipe(Effect.catch(() => Effect.void));
+        yield* runtimeIO(() => reader.cancel()).pipe(Effect.catch(() => Effect.void));
+        reader.releaseLock();
+      }),
+  );
+});
 
-async function readPartialState(
+const readPartialState = Effect.fn("ProviderRuntime.readPartialState")(function* (
   partialPath: string,
   metadataPath: string,
   spec: RuntimeSpec,
-): Promise<{ offset: number; metadata: PartialMetadata | null }> {
-  try {
-    const [metadataValue, partial] = await Promise.all([readFile(metadataPath, "utf8"), stat(partialPath)]);
-    const metadata = JSON.parse(metadataValue);
-    if (
-      !isDynamicRecord(metadata) ||
-      !isString(metadata.url) ||
-      (metadata.etag !== null && !isString(metadata.etag)) ||
-      !isNumber(metadata.expectedBytes) ||
-      metadata.url !== spec.url ||
-      metadata.expectedBytes !== spec.downloadBytes ||
-      partial.size <= 0 ||
-      partial.size >= spec.downloadBytes
-    ) {
-      return { offset: 0, metadata: null };
-    }
-    return {
-      offset: partial.size,
-      metadata: { url: metadata.url, etag: metadata.etag, expectedBytes: metadata.expectedBytes },
-    };
-  } catch {
+): Effect.fn.Return<{ offset: number; metadata: PartialMetadata | null }, ProviderRuntimeFailure> {
+  const content = yield* Effect.result(
+    Effect.all([runtimeIO(() => readFile(metadataPath, "utf8")), runtimeIO(() => stat(partialPath))], {
+      concurrency: "unbounded",
+    }),
+  );
+  if (Result.isFailure(content)) return { offset: 0, metadata: null };
+  const [text, partial] = content.success;
+  const decoded = yield* Effect.result(runtimeSync(() => JSON.parse(text)));
+  if (Result.isFailure(decoded)) return { offset: 0, metadata: null };
+  const metadata = decoded.success;
+  if (
+    !isDynamicRecord(metadata) ||
+    !isString(metadata.url) ||
+    (metadata.etag !== null && !isString(metadata.etag)) ||
+    !isNumber(metadata.expectedBytes) ||
+    metadata.url !== spec.url ||
+    metadata.expectedBytes !== spec.downloadBytes ||
+    partial.size <= 0 ||
+    partial.size >= spec.downloadBytes
+  )
     return { offset: 0, metadata: null };
-  }
-}
+  return {
+    offset: partial.size,
+    metadata: { url: metadata.url, etag: metadata.etag, expectedBytes: metadata.expectedBytes },
+  };
+});
 
 function isValidPartialResponse(
   response: Response,
@@ -1188,11 +1402,12 @@ function isValidPartialResponse(
   return start === offset && end >= start && end < total && total === expectedBytes;
 }
 
-async function fileSize(path: string): Promise<number> {
-  return stat(path)
-    .then((value) => value.size)
-    .catch(() => 0);
-}
+const fileSize = Effect.fn("ProviderRuntime.fileSize")((path: string) =>
+  runtimeIO(() => stat(path)).pipe(
+    Effect.map((value) => value.size),
+    Effect.catch(() => Effect.succeed(0)),
+  ),
+);
 
 function emptyStatus(message: string | null = null): ProviderRuntimeStatus {
   return { phase: "not-downloaded", progress: null, message, version: null };
@@ -1226,9 +1441,12 @@ interface InstallRecord {
   files: Record<string, string>;
 }
 
-async function writeInstallRecord(root: string, spec: RuntimeSpec): Promise<void> {
+const writeInstallRecord = Effect.fn("ProviderRuntime.writeInstallRecord")(function* (
+  root: string,
+  spec: RuntimeSpec,
+): Effect.fn.Return<void, ProviderRuntimeFailure> {
   const files: Record<string, string> = {};
-  for (const file of await installedFiles(root)) files[file] = await sha256File(join(root, file));
+  for (const file of yield* installedFiles(root)) files[file] = yield* runtimeIO(() => sha256File(join(root, file)));
   const record: InstallRecord = {
     layoutVersion: 1,
     runtime: spec.runtime,
@@ -1236,16 +1454,20 @@ async function writeInstallRecord(root: string, spec: RuntimeSpec): Promise<void
     target: spec.target,
     files,
   };
-  await writeFile(join(root, INSTALL_RECORD), `${JSON.stringify(record)}\n`);
-}
+  yield* runtimeIO(() => writeFile(join(root, INSTALL_RECORD), `${JSON.stringify(record)}\n`));
+});
 
 /**
  * The install must hold exactly the files in the record, each with the hash it had when installed.
  * A file added later counts as much as a changed one: Codex runs its bundled `zsh`, and a new
  * release can bring files no list written today would name.
  */
-async function verifyInstallRecord(root: string, spec: RuntimeSpec): Promise<void> {
-  const record = JSON.parse(await readFile(join(root, INSTALL_RECORD), "utf8"));
+const verifyInstallRecord = Effect.fn("ProviderRuntime.verifyInstallRecord")(function* (
+  root: string,
+  spec: RuntimeSpec,
+): Effect.fn.Return<void, ProviderRuntimeFailure> {
+  const text = yield* runtimeIO(() => readFile(join(root, INSTALL_RECORD), "utf8"));
+  const record = yield* runtimeSync(() => JSON.parse(text));
   if (
     !isDynamicRecord(record) ||
     record.layoutVersion !== 1 ||
@@ -1254,40 +1476,55 @@ async function verifyInstallRecord(root: string, spec: RuntimeSpec): Promise<voi
     record.target !== spec.target ||
     !isDynamicRecord(record.files)
   ) {
-    throw new Error(sourceText("error.provider.installRecordMismatch"));
+    return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.installRecordMismatch")) });
   }
-  const files = await installedFiles(root);
-  if (files.length !== Object.keys(record.files).length) throw new Error(sourceText("error.provider.runtimeChecksum"));
+  const files = yield* installedFiles(root);
+  if (files.length !== Object.keys(record.files).length)
+    return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.runtimeChecksum")) });
   for (const file of files) {
     const expected = record.files[file];
-    if (!isString(expected) || (await sha256File(join(root, file))) !== expected) {
-      throw new Error(sourceText("error.provider.runtimeChecksum"));
+    if (!isString(expected) || (yield* runtimeIO(() => sha256File(join(root, file)))) !== expected) {
+      return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.runtimeChecksum")) });
     }
   }
-}
+});
 
 /** Every file under `root` but the record, as `/`-separated paths. A link or special file fails. */
-async function installedFiles(root: string, prefix = ""): Promise<string[]> {
+const installedFiles = Effect.fn("ProviderRuntime.installedFiles")(function* (
+  root: string,
+  prefix = "",
+): Effect.fn.Return<string[], ProviderRuntimeFailure> {
   const files: string[] = [];
-  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
+  for (const entry of yield* runtimeIO(() => readdir(join(root, prefix), { withFileTypes: true }))) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) files.push(...(await installedFiles(root, path)));
-    else if (!entry.isFile()) throw new Error(sourceText("error.provider.runtimeSpecialFile"));
+    if (entry.isDirectory()) files.push(...(yield* installedFiles(root, path)));
+    else if (!entry.isFile())
+      return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.runtimeSpecialFile")) });
     else if (path !== INSTALL_RECORD) files.push(path);
   }
   return files;
-}
+});
 
-async function digestMatches(path: string, digest: ArchiveDigest): Promise<boolean> {
+const digestMatches = Effect.fn("ProviderRuntime.digestMatches")(function* (path: string, digest: ArchiveDigest) {
   const hash = createHash(digest.algorithm);
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  yield* Effect.acquireUseRelease(
+    Effect.sync(() => createReadStream(path)),
+    (stream) =>
+      Stream.fromAsyncIterable(stream, (cause) => new ProviderRuntimeFailure({ cause })).pipe(
+        Stream.runForEach((chunk) =>
+          Effect.sync(() => {
+            hash.update(chunk);
+          }),
+        ),
+      ),
+    (stream) =>
+      Effect.sync(() => {
+        stream.destroy();
+      }),
+  );
   return hash.digest("hex") === digest.hex;
-}
+});
 
-/**
- * A release number such as `1.2.3`, or a Cursor build such as `2026.09.28-64d2043`, which can also
- * have the time before the commit: `2026.09.28-10-15-00-64d2043`.
- */
 function isVersion(value: string): boolean {
   return /^\d+\.\d+\.\d+(?:(?:-\d{2}-\d{2}-\d{2})?-[0-9a-f]{7,40})?$/u.test(value);
 }
@@ -1304,3 +1541,15 @@ function compareReleases(a: string, b: string): number {
   const release = (version: string) => version.replace(/-[0-9a-f]{7,40}$/u, "").replaceAll("-", ".");
   return release(a).localeCompare(release(b), "en", { numeric: true });
 }
+
+const removeStaleRuntimeDirectory = Effect.fn("ProviderRuntime.removeStaleDirectory")(function* (
+  path: string,
+  stale: number,
+) {
+  const modified = yield* runtimeIO(() => stat(path)).pipe(
+    Effect.map((value) => value.mtimeMs),
+    Effect.catch(() => Effect.succeed(Number.POSITIVE_INFINITY)),
+  );
+  if (modified > stale) return;
+  yield* runtimeIO(() => rm(path, { recursive: true, force: true })).pipe(Effect.catch(() => Effect.void));
+});

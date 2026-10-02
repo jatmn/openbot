@@ -11,6 +11,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { Effect, Result, Schema } from "effect";
 import { runInLoginShell } from "./cli";
 import { getRecord } from "./protocol";
 
@@ -162,14 +163,24 @@ export function computerUseParam(params: unknown): boolean {
  *   Resolving here, and probing the resolved value, keeps the panel's answer and the agent's answer
  *   the same. An unresolvable command is reported as failed rather than sent.
  */
-export async function usableMcpServers(
+export function usableMcpServers(
   configs: readonly McpServerConfig[],
   tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
   authorization?: McpAuthorizationSource,
 ): Promise<UsableMcpServer[]> {
-  const candidates = configs.filter((config) => config.enabled && !isReservedMcpServerName(config.name));
-  return Promise.all(candidates.map((config) => usableMcpServer(config, tools, authorization)));
+  return runMcpShape(usableMcpServersEffect(configs, tools, authorization));
 }
+
+export const usableMcpServersEffect = Effect.fnUntraced(function* (
+  configs: readonly McpServerConfig[],
+  tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
+  authorization?: McpAuthorizationSource,
+) {
+  const candidates = configs.filter((config) => config.enabled && !isReservedMcpServerName(config.name));
+  return yield* Effect.forEach(candidates, (config) => usableMcpServerEffect(config, tools, authorization), {
+    concurrency: "unbounded",
+  });
+});
 
 /**
  * One configuration made usable, whether or not it is enabled.
@@ -177,11 +188,19 @@ export async function usableMcpServers(
  * A test answers for the configuration in front of the user, and a user may well test a server
  * before turning it on - so this one, unlike `usableMcpServers`, does not filter.
  */
-export async function usableMcpServer(
+export function usableMcpServer(
   config: McpServerConfig,
   tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
   authorization?: McpAuthorizationSource,
 ): Promise<UsableMcpServer> {
+  return runMcpShape(usableMcpServerEffect(config, tools, authorization));
+}
+
+export const usableMcpServerEffect = Effect.fnUntraced(function* (
+  config: McpServerConfig,
+  tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
+  authorization?: McpAuthorizationSource,
+): Effect.fn.Return<UsableMcpServer, McpShapeFailed> {
   // An http server starts no process, so it needs neither a command nor a `PATH`. It is the only
   // kind that can carry a sign-in, because a token travels in a header.
   if (config.transport !== "stdio") {
@@ -190,15 +209,16 @@ export async function usableMcpServer(
       command: "",
       workingDirectory: "",
       path: null,
-      authorization: (await authorization?.(config)) ?? null,
+      authorization: authorization ? yield* mcpShapeIo(() => authorization(config)) : null,
     };
   }
   // A `PATH` the configuration carries is the one the server runs with, so it is the one the command
   // is looked up in: `python` with a virtual environment's `PATH` names that interpreter, and the
   // absolute path a login shell answered with would silently be a different one.
   const configured = mcpEnvironment(config).PATH;
-  const path = appendToolRuntimes(configured ?? (await loginShellPath()), tools.binDirectories);
-  const command = (await resolveMcpCommand(config.command, path)) ?? tools.commandAliases[config.command.trim()];
+  const path = appendToolRuntimes(configured ?? (yield* mcpShapeIo(loginShellPath)), tools.binDirectories);
+  const command =
+    (yield* mcpShapeIo(() => resolveMcpCommand(config.command, path))) ?? tools.commandAliases[config.command.trim()];
   if (!command)
     return {
       config,
@@ -212,7 +232,7 @@ export async function usableMcpServer(
     path,
     authorization: null,
   };
-}
+});
 
 /**
  * The managed directories after everything the machine already had, and `null` when there is
@@ -353,28 +373,33 @@ function windowsExtension(line: string): string {
   return dot > separator ? line.slice(dot).toLowerCase() : "";
 }
 
-async function lookUpMcpCommand(trimmed: string, path: string | null): Promise<string | null> {
-  try {
+function lookUpMcpCommand(trimmed: string, path: string | null): Promise<string | null> {
+  return runMcpShape(lookUpMcpCommandEffect(trimmed, path));
+}
+
+const lookUpMcpCommandEffect = Effect.fn("McpShape.lookUpCommand")(
+  function* (trimmed: string, path: string | null) {
     if (process.platform === "win32") {
-      const { stdout } = await execFileAsync("where.exe", [trimmed], {
-        timeout: 5_000,
-        maxBuffer: 64 * 1024,
-        ...(path === null ? {} : { env: { ...process.env, PATH: path } }),
-      });
+      const { stdout } = yield* mcpShapeIo(() =>
+        execFileAsync("where.exe", [trimmed], {
+          timeout: 5_000,
+          maxBuffer: 64 * 1024,
+          ...(path === null ? {} : { env: { ...process.env, PATH: path } }),
+        }),
+      );
       return pickWindowsExecutable(stdout, process.env.PATHEXT);
     }
     // The assignment goes inside the command, not into the shell's environment: a login shell reads
     // the user's profile first, and a profile that appends to `PATH` would undo an inherited one.
     const search = path === null ? "" : `PATH=${shellWord(path)} `;
-    const stdout = await runInLoginShell(`${search}command -v -- ${shellWord(trimmed)}`);
+    const stdout = yield* mcpShapeIo(() => runInLoginShell(`${search}command -v -- ${shellWord(trimmed)}`));
     // Only the last line: an interactive profile can print a greeting before the command runs. The
     // line is kept as `command -v` gave it - a relative `PATH` entry gives a relative path, and a
     // shell function, such as the `npx` of a lazy-loaded nvm, gives its bare name for spawn to find.
     return stdout.trim().split(/\r?\n/u).at(-1)?.trim() || null;
-  } catch {
-    return null;
-  }
-}
+  },
+  Effect.catch(() => Effect.succeed(null)),
+);
 
 /**
  * This user's own `PATH`, as their login shell builds it, or `null` when it cannot be read.
@@ -389,17 +414,18 @@ export function loginShellPath(): Promise<string | null> {
   return loginShellPathOnce;
 }
 
-async function readLoginShellPath(): Promise<string | null> {
-  if (process.platform === "win32") return null;
-  try {
-    const stdout = await runInLoginShell('printf %s "$PATH"');
-    // `printf` writes no newline, so the value is the last line whatever the user's profile printed
-    // before it.
-    return stdout.split(/\r?\n/u).pop()?.trim() || null;
-  } catch {
-    return null;
-  }
+function readLoginShellPath(): Promise<string | null> {
+  return runMcpShape(readLoginShellPathEffect());
 }
+
+const readLoginShellPathEffect = Effect.fn("McpShape.readLoginShellPath")(
+  function* () {
+    if (process.platform === "win32") return null;
+    const stdout = yield* mcpShapeIo(() => runInLoginShell('printf %s "$PATH"'));
+    return stdout.split(/\r?\n/u).pop()?.trim() || null;
+  },
+  Effect.catch(() => Effect.succeed(null)),
+);
 
 /**
  * Whether testing this configuration is worth waiting for the managed tool runtimes.
@@ -564,12 +590,19 @@ export type CodexMcpServer =
  * The reader is passed in, because this module knows the payload shape and not the transport. An
  * empty record is the answer when the provider holds no configuration of its own.
  */
-export async function codexDisabledServers(
+export function codexDisabledServers(
   readConfig: () => Promise<DynamicRecord>,
 ): Promise<Record<string, CodexDisabledMcpServer>> {
-  const configured = getRecord(getRecord(await readConfig(), "config"), "mcp_servers");
-  return Object.fromEntries(Object.keys(configured ?? {}).map((name) => [name, { enabled: false } as const]));
+  return runMcpShape(codexDisabledServersEffect(readConfig));
 }
+
+export const codexDisabledServersEffect = Effect.fn("McpShape.codexDisabledServers")(function* (
+  readConfig: () => Promise<DynamicRecord>,
+) {
+  const config = yield* mcpShapeIo(readConfig);
+  const configured = getRecord(getRecord(config, "config"), "mcp_servers");
+  return Object.fromEntries(Object.keys(configured ?? {}).map((name) => [name, { enabled: false } as const]));
+});
 
 /** A name Codex found in its own file and must not start. It carries no command; that is the point. */
 export interface CodexDisabledMcpServer {
@@ -671,4 +704,16 @@ export function mcpHandoffHeaders(server: ResolvedMcpServer): Record<string, str
   const named = Object.keys(headers).some((key) => key.toLowerCase() === "authorization");
   if (server.authorization && !named) headers.Authorization = `Bearer ${server.authorization}`;
   return headers;
+}
+
+export class McpShapeFailed extends Schema.TaggedError<McpShapeFailed>()("McpShapeFailed", {
+  cause: Schema.Defect(),
+}) {}
+function mcpShapeIo<A>(run: () => Promise<A>): Effect.Effect<A, McpShapeFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new McpShapeFailed({ cause }) });
+}
+async function runMcpShape<A>(effect: Effect.Effect<A, McpShapeFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }

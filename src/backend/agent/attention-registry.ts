@@ -16,6 +16,7 @@ import type {
 import { AGENT_RUNTIME_ATTENTION_LIMIT } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
+import { Effect, Result, Schema } from "effect";
 import type { AgentClient } from "../agent-client";
 import type { PreparedBrowserSecret } from "../browser-host";
 import {
@@ -212,47 +213,66 @@ export class AttentionRegistry {
     return { attentionComplete, pendingPrompts, pendingApprovals, pendingBrowserTakeovers };
   }
 
-  async respondToPrompt(input: RespondToPromptInput): Promise<void> {
-    const pending = this.#prompts.get(input.requestId);
-    if (!pending) throw new Error(sourceText("error.backend.promptInactive"));
-    const questionIds = new Set(pending.questions.map((question) => question.id));
-    if (Object.keys(input.answers).some((id) => !questionIds.has(id))) {
-      throw new Error(sourceText("error.backend.promptAnswerMismatch"));
-    }
-    this.#routines.markRunningForTurn(getString(pending.params, "turnId"));
-
-    const result =
-      pending.responseKind === "dynamic-tool"
-        ? dynamicPromptResult(input.answers)
-        : pending.responseKind === "mcp-elicitation"
-          ? mcpElicitationResult(pending.params, input.answers)
-          : {
-              answers: Object.fromEntries(
-                Object.entries(input.answers).map(([id, values]) => [id, { answers: values }]),
-              ),
-            };
-    pending.client.respond(pending.id, result);
-    this.#prompts.delete(input.requestId);
-    this.#emitInputResolved("prompt", input.requestId, pending.agentId);
-    try {
-      this.#resolvePersistedPrompt(pending, promptResolution(pending.questions, input.answers));
-    } catch (error) {
-      this.#emitError("prompt_persistence_failed", error, pending.agentId);
-    }
-    this.#emitRuntimeSnapshot();
+  respondToPrompt(input: RespondToPromptInput): Promise<void> {
+    return runAttention(this.respondToPromptEffect(input));
   }
 
-  async respondToApproval(input: RespondToApprovalInput): Promise<void> {
-    const pending = this.#approvals.get(input.requestId);
-    if (!pending) throw new Error(sourceText("error.backend.approvalInactive"));
+  readonly respondToPromptEffect = Effect.fn("AttentionRegistry.respondToPrompt")((input: RespondToPromptInput) =>
+    attentionStep(() => {
+      const pending = this.#prompts.get(input.requestId);
+      if (!pending) throw new Error(sourceText("error.backend.promptInactive"));
+      const questionIds = new Set(pending.questions.map((question) => question.id));
+      if (Object.keys(input.answers).some((id) => !questionIds.has(id))) {
+        throw new Error(sourceText("error.backend.promptAnswerMismatch"));
+      }
+      this.#routines.markRunningForTurn(getString(pending.params, "turnId"));
+
+      const result =
+        pending.responseKind === "dynamic-tool"
+          ? dynamicPromptResult(input.answers)
+          : pending.responseKind === "mcp-elicitation"
+            ? mcpElicitationResult(pending.params, input.answers)
+            : {
+                answers: Object.fromEntries(
+                  Object.entries(input.answers).map(([id, values]) => [id, { answers: values }]),
+                ),
+              };
+      pending.client.respond(pending.id, result);
+      this.#prompts.delete(input.requestId);
+      this.#emitInputResolved("prompt", input.requestId, pending.agentId);
+      try {
+        this.#resolvePersistedPrompt(pending, promptResolution(pending.questions, input.answers));
+      } catch (error) {
+        this.#emitError("prompt_persistence_failed", error, pending.agentId);
+      }
+      this.#emitRuntimeSnapshot();
+    }),
+  );
+
+  respondToApproval(input: RespondToApprovalInput): Promise<void> {
+    return runAttention(this.respondToApprovalEffect(input));
+  }
+
+  readonly respondToApprovalEffect = Effect.fn("AttentionRegistry.respondToApproval")(function* (
+    this: AttentionRegistry,
+    input: RespondToApprovalInput,
+  ) {
+    const pending = yield* attentionStep(() => {
+      const value = this.#approvals.get(input.requestId);
+      if (!value) throw new Error(sourceText("error.backend.approvalInactive"));
+      return value;
+    });
     this.#routines.markRunningForTurn(getString(pending.params, "turnId"));
 
-    if (pending.hostedSiteMutation) {
+    const mutation = pending.hostedSiteMutation;
+    if (mutation) {
       this.#approvals.delete(input.requestId);
-      await this.#hostedSites.resolveApproval(
-        pending.hostedSiteMutation,
-        { client: pending.client, id: pending.id, agentId: pending.approval.agentId },
-        input.decision,
+      yield* attentionIo(() =>
+        this.#hostedSites.resolveApproval(
+          mutation,
+          { client: pending.client, id: pending.id, agentId: pending.approval.agentId },
+          input.decision,
+        ),
       );
     } else if (pending.approval.kind === "permissions") {
       const permissions = getRecord(pending.params, "permissions") ?? {};
@@ -271,7 +291,7 @@ export class AttentionRegistry {
     this.#approvals.delete(input.requestId);
     this.#emitInputResolved("approval", input.requestId, pending.approval.agentId);
     this.#emitRuntimeSnapshot();
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Whether this agent is waiting on a takeover. Its browser tools are refused while one is outstanding:
@@ -282,51 +302,68 @@ export class AttentionRegistry {
     return [...this.#takeovers.values()].some((pending) => pending.request.agentId === agentId);
   }
 
-  async respondToBrowserTakeover(input: RespondToBrowserTakeoverInput): Promise<void> {
-    const pending = this.#takeovers.get(input.requestId);
-    if (!pending) throw new Error(sourceText("error.backend.takeoverInactive"));
-    if (pending.submitting) throw new Error(sourceText("error.backend.authSubmitting"));
-    pending.secret?.cancel();
-    this.#routines.markRunningForTurn(pending.request.turnId);
-    this.#resolveBrowserTakeover(input.requestId, pending, input.decision);
+  respondToBrowserTakeover(input: RespondToBrowserTakeoverInput): Promise<void> {
+    return runAttention(this.respondToBrowserTakeoverEffect(input));
   }
 
-  async respondToBrowserSecret(input: RespondToBrowserSecretInput): Promise<void> {
-    const pending = this.#takeovers.get(input.requestId);
-    if (!pending?.secret || pending.request.agentId !== input.agentId || pending.submitting)
-      throw new Error(sourceText("error.backend.authRequestInactive"));
+  readonly respondToBrowserTakeoverEffect = Effect.fn("AttentionRegistry.respondToBrowserTakeover")(
+    (input: RespondToBrowserTakeoverInput) =>
+      attentionStep(() => {
+        const pending = this.#takeovers.get(input.requestId);
+        if (!pending) throw new Error(sourceText("error.backend.takeoverInactive"));
+        if (pending.submitting) throw new Error(sourceText("error.backend.authSubmitting"));
+        pending.secret?.cancel();
+        this.#routines.markRunningForTurn(pending.request.turnId);
+        this.#resolveBrowserTakeover(input.requestId, pending, input.decision);
+      }),
+  );
+
+  respondToBrowserSecret(input: RespondToBrowserSecretInput): Promise<void> {
+    return runAttention(this.respondToBrowserSecretEffect(input));
+  }
+
+  readonly respondToBrowserSecretEffect = Effect.fnUntraced(function* (
+    this: AttentionRegistry,
+    input: RespondToBrowserSecretInput,
+  ) {
+    const { pending, secret } = yield* attentionStep(() => {
+      const value = this.#takeovers.get(input.requestId);
+      if (!value?.secret || value.request.agentId !== input.agentId || value.submitting)
+        throw new Error(sourceText("error.backend.authRequestInactive"));
+      return { pending: value, secret: value.secret };
+    });
     if (input.decision === "cancel") {
-      pending.secret.cancel();
+      secret.cancel();
       this.#resolveBrowserTakeover(input.requestId, pending, "cancel");
       return;
     }
     if (input.decision === "takeover") {
-      pending.secret.cancel();
+      secret.cancel();
     } else {
       pending.submitting = true;
-      let outcome: "submitted" | "takeover";
-      try {
-        outcome = await pending.secret.submit(input.secret);
-      } catch {
-        outcome = "takeover";
-      } finally {
-        pending.submitting = false;
-      }
+      const outcome = yield* attentionIo(() => secret.submit(input.secret)).pipe(
+        Effect.catch(() => Effect.succeed("takeover")),
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.submitting = false;
+          }),
+        ),
+      );
       if (this.#takeovers.get(input.requestId) !== pending) return;
       if (outcome === "submitted") {
         this.#resolveBrowserTakeover(input.requestId, pending, "complete");
         return;
       }
     }
-    pending.secret.cancel();
+    secret.cancel();
     pending.secret = undefined;
     if (input.decision === "submit" && pending.request.secret)
       pending.request.secret = { ...pending.request.secret, requiresReload: true };
     else delete pending.request.secret;
-    await this.#browser.beginTakeover(pending.request.tabId);
+    yield* attentionIo(() => this.#browser.beginTakeover(pending.request.tabId));
     this.#emit({ type: "browser-takeover-requested", request: pending.request });
     this.#emitRuntimeSnapshot();
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Answers an approval the user has already consented to, and reports whether it did.
@@ -386,20 +423,32 @@ export class AttentionRegistry {
     this.#emit({ type: "approval", approval });
   }
 
-  async surfaceHostedSiteApproval(
+  surfaceHostedSiteApproval(
     client: AgentClient,
     request: AppServerRequest,
     params: DynamicToolCallParams,
     tool: HostedSiteMutationTool,
   ): Promise<void> {
-    const prepared = await this.#hostedSites.prepareApproval(client, request, params, tool);
+    return runAttention(this.surfaceHostedSiteApprovalEffect(client, request, params, tool));
+  }
+
+  readonly surfaceHostedSiteApprovalEffect = Effect.fn("AttentionRegistry.surfaceHostedSiteApproval")(function* (
+    this: AttentionRegistry,
+    client: AgentClient,
+    request: AppServerRequest,
+    params: DynamicToolCallParams,
+    tool: HostedSiteMutationTool,
+  ) {
+    const prepared = yield* attentionIo(() => this.#hostedSites.prepareApproval(client, request, params, tool));
     // A request the provider abandoned during the preparation has nobody to report the decision to.
     if (!prepared || request.signal?.aborted) return;
     if (shouldAutoApprove(this.#approvalAutomation, prepared.approval) && this.#approvalAutomation.turboEnabled()) {
-      await this.#hostedSites.resolveApproval(
-        prepared.mutation,
-        { client, id: request.id, agentId: prepared.approval.agentId },
-        "accept",
+      yield* attentionIo(() =>
+        this.#hostedSites.resolveApproval(
+          prepared.mutation,
+          { client, id: request.id, agentId: prepared.approval.agentId },
+          "accept",
+        ),
       );
       return;
     }
@@ -413,7 +462,7 @@ export class AttentionRegistry {
     });
     this.#routines.markNeedsAttention(prepared.approval.turnId);
     this.#emit({ type: "approval", approval: prepared.approval });
-  }
+  }, Effect.uninterruptible);
 
   surfaceLegacyApproval(client: AgentClient, request: AppServerRequest): void {
     const threadId = getString(request.params, "conversationId");
@@ -492,23 +541,29 @@ export class AttentionRegistry {
       // The card is only shown once the tab has actually been handed over -- references invalidated,
       // diagnostics cleared, any recording stopped. Asking the user for control OpenBot then failed to
       // give them would leave the agent acting on the page underneath them.
-      const prepare = async () => {
+      const prepare = Effect.gen({ self: this }, function* () {
         if (params.tool === "submit_secret") {
-          if (!this.#browser.prepareSecret) throw new Error(sourceText("error.backend.secureAuthUnavailable"));
-          const secret = await this.#browser.prepareSecret({
-            ...params,
-            threadId: publicThreadId,
-            ownerAgentId: agentId,
-          });
+          const prepareSecret = this.#browser.prepareSecret?.bind(this.#browser);
+          if (!prepareSecret)
+            return yield* new AttentionOperationFailed({
+              cause: new Error(sourceText("error.backend.secureAuthUnavailable")),
+            });
+          const secret = yield* attentionIo(() =>
+            prepareSecret({
+              ...params,
+              threadId: publicThreadId,
+              ownerAgentId: agentId,
+            }),
+          );
           if (this.#takeovers.get(requestId) !== pending) {
             secret.cancel();
             return;
           }
           pending.secret = secret;
           pending.request.secret = secret.request;
-        } else await this.#browser.beginTakeover(takeover.tabId);
-      };
-      void prepare().then(
+        } else yield* attentionIo(() => this.#browser.beginTakeover(takeover.tabId));
+      });
+      void runAttention(prepare).then(
         () => {
           if (this.#takeovers.get(requestId) !== pending) return;
           this.#routines.markNeedsAttention(turnId);
@@ -851,4 +906,20 @@ export class AttentionRegistry {
       status: resolution.status,
     });
   }
+}
+
+export class AttentionOperationFailed extends Schema.TaggedError<AttentionOperationFailed>()(
+  "AttentionOperationFailed",
+  { cause: Schema.Defect() },
+) {}
+function attentionIo<A>(run: () => Promise<A>): Effect.Effect<A, AttentionOperationFailed> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new AttentionOperationFailed({ cause }) });
+}
+function attentionStep<A>(run: () => A): Effect.Effect<A, AttentionOperationFailed> {
+  return Effect.try({ try: run, catch: (cause) => new AttentionOperationFailed({ cause }) });
+}
+async function runAttention<A>(effect: Effect.Effect<A, AttentionOperationFailed>): Promise<A> {
+  const result = await Effect.runPromise(Effect.result(effect));
+  if (Result.isFailure(result)) throw result.failure.cause;
+  return result.success;
 }
