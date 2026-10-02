@@ -103,6 +103,7 @@ import { createMockGitHubConnector } from "./mock-github-connector";
 import { createMockHostUpdate, type MockHostUpdateOptions } from "./mock-host-update";
 import { createMockHostedServers } from "./mock-hosted-servers";
 import { createMockMessaging } from "./mock-messaging";
+import { createMockOnePasswordConnector } from "./mock-onepassword-connector";
 import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
 import { createMockSkills, type MockSkillsOptions } from "./mock-skills";
@@ -583,6 +584,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       },
     },
     githubConnector: createMockGitHubConnector(),
+    onePasswordConnector: createMockOnePasswordConnector(),
     billing: createMockBilling(),
     hostedServers: createMockHostedServers(),
     customProviders: {

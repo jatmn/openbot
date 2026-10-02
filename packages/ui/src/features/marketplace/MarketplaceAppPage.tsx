@@ -17,6 +17,7 @@ import { useText } from "@openbot/ui/text";
 import { createSignal, For, Match, Show, Switch } from "solid-js";
 import { GitHubConnectorPanel } from "../settings/GitHubConnectorPanel";
 import { DangerZone, DetailHeader, WizardDialog } from "../settings/IntegrationLayout";
+import { OnePasswordConnectorPanel } from "../settings/OnePasswordConnectorPanel";
 import { AppAction } from "./MarketplaceCards";
 import { AppMark, TryCard } from "./MarketplaceParts";
 import { CATEGORY_LABELS } from "./marketplace-listing";
@@ -275,6 +276,7 @@ export function MarketplaceAppPage(props: { scope: MarketplaceScope; id: string 
       .apps()
       .find((entry) => entry.id === props.id);
   const github = () => (app()?.kind === "github" ? model().github : undefined);
+  const onePassword = () => (app()?.kind === "onepassword" ? model().onePassword : undefined);
   const plugin = () => {
     const current = app();
     return current?.kind === "plugin" ? current : undefined;
@@ -308,6 +310,21 @@ export function MarketplaceAppPage(props: { scope: MarketplaceScope; id: string 
                 onDisconnect={() => current().onDisconnect()}
                 onOpenVerification={() => current().onOpenVerification()}
                 onOpenInstall={() => current().onOpenInstall()}
+              />
+            );
+          }}
+        </Match>
+        <Match when={onePassword()}>
+          {(panel) => {
+            const current = () => panel()();
+            return (
+              <OnePasswordConnectorPanel
+                status={current().status}
+                busy={current().busy}
+                onConnect={(accountId) => current().onConnect(accountId)}
+                onConnectWithToken={(token) => current().onConnectWithToken(token)}
+                onCancel={() => current().onCancel()}
+                onDisconnect={() => current().onDisconnect()}
               />
             );
           }}

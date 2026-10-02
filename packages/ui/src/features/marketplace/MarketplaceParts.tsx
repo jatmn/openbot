@@ -6,6 +6,7 @@ import { useText } from "@openbot/ui/text";
 import type { JSX } from "@solidjs/web";
 import { createSignal, For, Match, Show, Switch } from "solid-js";
 import { GitHubMark, LogoTile } from "../settings/IntegrationLayout";
+import { OnePasswordMark } from "../settings/OnePasswordConnectorPanel";
 import type { MarketplaceApp } from "./marketplace-model";
 
 /** The top of an agent or skill page. The window moves the focus to the title when the page opens. */
@@ -177,6 +178,9 @@ export function AppMark(props: { app: MarketplaceApp }) {
     <Switch fallback={<Puzzle aria-hidden="true" />}>
       <Match when={props.app.kind === "github"}>
         <GitHubMark />
+      </Match>
+      <Match when={props.app.kind === "onepassword"}>
+        <OnePasswordMark />
       </Match>
       <Match when={url()} keyed>
         {(src) => <img src={src} alt="" onError={() => setFailed(src)} />}

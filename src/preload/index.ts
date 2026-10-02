@@ -87,6 +87,7 @@ import {
   decodeNotificationOpenedEvent,
   decodeNotificationPreference,
   decodeNullablePath,
+  decodeOnePasswordConnectorStatus,
   decodePendingAgentTemplate,
   decodePendingListing,
   decodeProviderDetectionSettings,
@@ -552,6 +553,14 @@ const openbotApi: OpenBotDesktopApi = {
     openVerification: decodeVoid,
     openInstall: decodeVoid,
     changed: decodeGitHubConnectorStatus,
+  }),
+  onePasswordConnector: bridgeGroup(IPC_ENDPOINTS.onePasswordConnector, {
+    status: decodeOnePasswordConnectorStatus,
+    connect: decodeOnePasswordConnectorStatus,
+    connectWithToken: decodeOnePasswordConnectorStatus,
+    cancel: decodeOnePasswordConnectorStatus,
+    disconnect: decodeOnePasswordConnectorStatus,
+    changed: decodeOnePasswordConnectorStatus,
   }),
   billing: bridgeGroup(IPC_ENDPOINTS.billing, {
     getState: decodeBillingState,

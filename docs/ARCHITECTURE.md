@@ -1641,6 +1641,18 @@ and its user settings (see `plans/003-mcp-works-on-a-clean-machine.md`). The pan
 environment values, `src/backend/mcp-redaction.ts` removes them from logs, and OAuth tokens are in
 `safeStorage`.
 
+The 1Password connector is built in and has no SQLite row. `src/main/onepassword-connector-service.ts`
+runs the user's `op` CLI once to create the vault "Shared with OpenBot" and a `read_items` service
+account, or takes a pasted service account token, and keeps only the token in
+`openbot-onepassword-connector-v1.json`, encrypted with `safeStorage`. It reads the vault with
+`@1password/sdk` and implements `PasswordVault` (`src/backend/password-vault.ts`). The agent service
+uses it in two places: `openbot_browser.list_logins` returns the logins saved for the tab's HTTPS
+site (id, title, username), and `AttentionRegistry` answers a `submit_secret` password or
+authenticator request for a saved login by filling it through the same `prepareSecret` path as the
+secure card, with no card. A login matches by 1Password's autofill rule, on the registrable domain
+with private suffixes such as `github.io` counted. Agents and providers never receive the token, a
+password or a code.
+
 The GitHub connector is built in and has no SQLite row. `src/main/github-connector-service.ts` signs
 in to the `openbotgit` GitHub App with the device flow, which needs only the public Client ID, and keeps
 the tokens in `openbot-github-connector-v1.json`, encrypted with `safeStorage`. While it is

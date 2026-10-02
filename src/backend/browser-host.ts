@@ -1243,6 +1243,7 @@ export class BrowserHost {
     // been asked for control when nobody was.
     submit_secret: rejectTakeoverTool,
     request_takeover: rejectTakeoverTool,
+    list_logins: rejectTakeoverTool,
   };
 
   async handleDynamicTool(
