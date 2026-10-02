@@ -18,7 +18,14 @@ export async function runSecretHandoffScenario(browser: BrowserHost, localOrigin
         : `
       <label>Password<input id="password" type="password"></label>
       <label>Code<input id="code" inputmode="numeric"></label>
-      ${url.pathname === "/login" ? `<form method="get" action="/search"><label>Search password<input id="get-password" type="password"></label></form>` : ""}
+      ${
+        url.pathname === "/login"
+          ? `<form method="get" action="/search"><label>Search password<input id="get-password" type="password"></label></form>
+      <form action="/search"><label>Default password<input id="default-password" type="password"></label></form>
+      <form method="post" action="/search"><label>Override password<input id="override-password" type="password"></label><button id="override-submit" formmethod="get">Go</button></form>
+      <form method="post" action="/session"><label>Post password<input id="post-password" type="password"></label></form>`
+          : ""
+      }
       <div>${Array.from({ length: 6 }, (_, index) => `<input aria-label="Digit ${index + 1}" id="digit-${index}" maxlength="1">`).join("")}</div>
       <button id="submit" disabled onclick="${url.pathname === "/native-submit" ? "if (!event.isTrusted) return; " : ""}${url.pathname === "/same-page" ? "history.replaceState({}, '', '/complete')" : "location.href='/complete'"}">Sign in</button>
       <script>
@@ -86,7 +93,14 @@ export async function runSecretHandoffScenario(browser: BrowserHost, localOrigin
       }
     }
     // A field built for something else must not take a vault password: its value can reach a URL.
-    for (const selector of ["#code", "#get-password"]) {
+    // A password field in a POST form may.
+    for (const [selector, fillable] of [
+      ["#code", false],
+      ["#get-password", false],
+      ["#default-password", false],
+      ["#override-password", false],
+      ["#post-password", true],
+    ] as const) {
       const tab = await browser.open("https://authentication.openbot.test/login", "secret-thread", "secret-agent");
       try {
         const handoff = await browser.prepareSecret({
@@ -104,7 +118,8 @@ export async function runSecretHandoffScenario(browser: BrowserHost, localOrigin
           },
         });
         handoff.cancel();
-        if (handoff.vaultFillable) throw new Error(`${selector} was accepted for a vault password.`);
+        if (handoff.vaultFillable !== fillable)
+          throw new Error(`${selector} was classified wrongly for a vault password.`);
       } finally {
         await browser.close(tab.id);
       }
