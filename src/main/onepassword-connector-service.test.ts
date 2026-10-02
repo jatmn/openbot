@@ -231,6 +231,37 @@ describe("OnePasswordConnectorService", () => {
     await expect(readFile(path, "utf8")).rejects.toThrow();
   });
 
+  it("reads the login list again when the page opens, so a login moved into the vault is counted", async () => {
+    let logins = 1;
+    let now = 0;
+    const client = fakeClient();
+    const list = client.items.list;
+    client.items.list = async (vaultId) => (await list(vaultId)).slice(0, logins);
+    const path = join(directory, "connector.json");
+    const connector = new OnePasswordConnectorService({
+      store: new OnePasswordConnectorStore(path, cipher),
+      hostName: "test-mac",
+      appVersion: "1.0.0",
+      cliInstall: null,
+      openExternal: async () => undefined,
+      findCli: async () => [],
+      runCli: fakeCli([]),
+      createClient: async () => client,
+      now: () => now,
+    });
+    await connector.connectWithToken(TOKEN);
+    logins = 0;
+    now = 60_000;
+    const changed: number[] = [];
+    connector.onChanged((status) => {
+      if (status.loginCount !== null) changed.push(status.loginCount);
+    });
+
+    await connector.checkSetup();
+
+    await vi.waitFor(() => expect(changed).toContain(0));
+  });
+
   it("walks the setup from no CLI, through Install, to an app integration that is off", async () => {
     let installed = false;
     const { connector } = service(fakeCli([]), {

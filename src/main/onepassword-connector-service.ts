@@ -40,6 +40,8 @@ const SETUP_CHECK_TIMEOUT_MS = 15_000;
 const ONEPASSWORD_DOWNLOAD_URL = "https://1password.com/downloads/";
 /** Service accounts have hourly read limits, so the list of logins is read again only this often. */
 const INDEX_MAX_AGE_MS = 5 * 60_000;
+/** A page that opens reads a list older than this again, so the count follows the user's changes. */
+const INDEX_REFRESH_ON_VIEW_MS = 30_000;
 /** Each listed login costs one read. A page with more saved logins than this lists the first ones. */
 const MAX_LISTED_LOGINS = 10;
 
@@ -246,9 +248,8 @@ export class OnePasswordConnectorService implements PasswordVault {
     if (!record) return;
     registerSecretValue(record.token);
     // The vault names and the login count come from 1Password; the app does not wait for them.
-    void this.#readIndex().then(
-      () => this.#emitStatus(),
-      (cause: unknown) => logger.warn("The 1Password vault could not be read.", { cause: toLogValue(cause) }),
+    void this.#readIndex().catch((cause: unknown) =>
+      logger.warn("The 1Password vault could not be read.", { cause: toLogValue(cause) }),
     );
   }
 
@@ -287,6 +288,13 @@ export class OnePasswordConnectorService implements PasswordVault {
         this.#checking = null;
       });
       await this.#checking;
+    }
+    // The user moves logins into the vault in the 1Password app, outside this window. A page that
+    // opens or gets the focus back reads the list again; the answer arrives as a status event.
+    if (this.#store.read() && !this.#connecting) {
+      void this.#readIndex(INDEX_REFRESH_ON_VIEW_MS).catch((cause: unknown) =>
+        logger.warn("The 1Password vault could not be read.", { cause: toLogValue(cause) }),
+      );
     }
     return this.status();
   }
@@ -577,14 +585,18 @@ export class OnePasswordConnectorService implements PasswordVault {
     return this.#client.client;
   }
 
-  #readIndex(): Promise<LoginIndex> {
-    if (this.#index && this.#now() - this.#index.readAt < INDEX_MAX_AGE_MS) return Promise.resolve(this.#index);
+  #readIndex(maxAgeMs = INDEX_MAX_AGE_MS): Promise<LoginIndex> {
+    if (this.#index && this.#now() - this.#index.readAt < maxAgeMs) return Promise.resolve(this.#index);
     if (this.#indexing) return this.#indexing;
     const generation = this.#generation;
     const indexing = this.#clientForToken()
       .then((client) => this.#buildIndex(client))
       .then((index) => {
-        if (generation === this.#generation) this.#index = index;
+        if (generation === this.#generation) {
+          this.#index = index;
+          // The page shows the vault names and the login count from this list.
+          this.#emitStatus();
+        }
         return index;
       })
       .finally(() => {
