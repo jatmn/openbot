@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { basename } from "node:path";
 import { isValidAvatarImage } from "@openbot/contracts/avatar-images";
-import { parseInviteUrl } from "@openbot/contracts/invite-links";
+import { type InviteLinkOptions, type InviteLinkPayload, parseInviteUrl } from "@openbot/contracts/invite-links";
 import type {
   AgentEvent,
   AgentImportPreview,
@@ -117,6 +117,8 @@ interface CentralAccountSession {
 
 interface RemoteServerManagerOptions {
   allowLocalDevelopmentInvites?: boolean;
+  /** The origin of the self-hosted account service that this app is configured to use. */
+  selfHostedApiOrigin?: string | undefined;
   appVersion?: string;
   webrtcTransport?: TeamWebRtcClientTransport;
   getLocalHostId?: () => string | null;
@@ -154,6 +156,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   readonly #team: RemoteTeamDirectory;
   readonly #centralAccount: CentralAccountSession;
   readonly #allowLocalDevelopmentInvites: boolean;
+  readonly #inviteLinks: InviteLinkOptions;
   readonly #appVersion: string | null;
   #duplicateOperationIds = new Map<string, string>();
   /** When Signal first missed each host that restarts into an update. */
@@ -186,6 +189,10 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
     this.#centralAccount = centralAccount;
     this.#allowLocalDevelopmentInvites = options.allowLocalDevelopmentInvites ?? false;
+    this.#inviteLinks = {
+      allowLocalDevelopmentApiUrl: this.#allowLocalDevelopmentInvites,
+      selfHostedApiOrigin: options.selfHostedApiOrigin,
+    };
     this.#webrtcTransport = options.webrtcTransport ?? null;
     this.#getLocalHostId = options.getLocalHostId ?? (() => null);
     this.#onHostUnavailable = options.onHostUnavailable ?? (() => undefined);
@@ -309,6 +316,19 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
    * cannot understand. The suspension is recorded first, so the `disconnected` event this raises
    * finds the pause already in place and does not schedule a reconnect around it.
    */
+  /**
+   * A self-hosted account service gets the token of each invitation that this app previews or
+   * accepts, so it must not see the token of an invitation for another service.
+   */
+  #parseInvite(inviteUrl: string): InviteLinkPayload {
+    const invite = parseInviteUrl(inviteUrl, this.#inviteLinks);
+    const service = this.#inviteLinks.selfHostedApiOrigin;
+    if (service && new URL(invite.apiUrl).origin !== service) {
+      throw new Error(sourceText("error.remote.inviteOtherService"));
+    }
+    return invite;
+  }
+
   #suspendServer(serverId: string): void {
     this.#events.suspendReconnect(serverId);
     if (this.#store.find(serverId)?.transport !== "webrtc-v2") return;
@@ -517,11 +537,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   ): Effect.fn.Return<ServerSummary, RemoteWorkflowError, RemoteRequest> {
     const transport = this.#webrtcTransport;
 
-    const invite = yield* remoteDecode(() =>
-      parseInviteUrl(input.inviteUrl, {
-        allowLocalDevelopmentApiUrl: this.#allowLocalDevelopmentInvites,
-      }),
-    );
+    const invite = yield* remoteDecode(() => this.#parseInvite(input.inviteUrl));
     if (transport && !isLocalDevelopmentApi(invite.apiUrl)) {
       const preview = yield* remoteCall(() => transport.previewInvite(invite.token));
       if (preview.hostId !== invite.serverId)
@@ -649,11 +665,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   ): Effect.fn.Return<InvitePreview, RemoteWorkflowError, RemoteRequest> {
     const transport = this.#webrtcTransport;
 
-    const invite = yield* remoteDecode(() =>
-      parseInviteUrl(input.inviteUrl, {
-        allowLocalDevelopmentApiUrl: this.#allowLocalDevelopmentInvites,
-      }),
-    );
+    const invite = yield* remoteDecode(() => this.#parseInvite(input.inviteUrl));
     if (transport && !isLocalDevelopmentApi(invite.apiUrl)) {
       const preview = yield* remoteCall(() => transport.previewInvite(invite.token));
       if (preview.hostId !== invite.serverId)

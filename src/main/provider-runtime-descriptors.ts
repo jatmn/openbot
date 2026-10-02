@@ -1,4 +1,17 @@
-import { access, chmod, copyFile, link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  cp,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import type { ManagedRuntimeId } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
@@ -12,6 +25,7 @@ import {
   parseAntigravityVersion,
   parseBunVersion,
   parseClaudeVersion,
+  parseClineVersion,
   parseCodexVersion,
   parseCursorManifestVersion,
   parseGrokVersion,
@@ -117,6 +131,11 @@ export function cursorPackageUrl(
   artifact: AgentRuntimeLock["cursor"]["artifacts"][RuntimeTarget],
 ): string {
   return `${distribution}/${version}/${artifact.platformDirectory}/${artifact.architecture}/${artifact.asset}`;
+}
+
+/** Cline tags each CLI release `cli-v<version>`, apart from the tags of its editor extension. */
+function clineTag(version: string): string {
+  return `cli-v${version}`;
 }
 
 /** The lock's hash for a file of a pinned version; an upstream release's file has none to compare. */
@@ -636,6 +655,103 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     // the manifest that OpenBot wrote, as for Antigravity.
     versionFile: CURSOR_MANIFEST,
     parseVersion: parseCursorManifestVersion,
+  },
+  cline: {
+    runtime: "cline",
+    spec: (target, lock) => {
+      const artifact = lock.cline.artifacts[target];
+      return {
+        runtime: "cline",
+        target,
+        version: lock.cline.version,
+        packageVersion: lock.cline.version,
+        source: "lock",
+        url: `${lock.cline.registry}/${artifact.package}/-/${artifact.asset}`,
+        archiveDigest: { algorithm: "sha256", hex: artifact.assetSha256 },
+        downloadBytes: artifact.downloadBytes,
+        installedBytes: artifact.installedBytes,
+        executableName: artifact.executable,
+      };
+    },
+    stage: Effect.fn("ProviderRuntime.cline.stage")(function* ({
+      spec,
+      downloadedPath,
+      staging,
+      lock,
+      downloadSmallFile,
+    }: ProviderStageContext): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const artifact = lock.cline.artifacts[spec.target];
+      yield* withNpmPackage(
+        downloadedPath,
+        staging,
+        {
+          name: artifact.package,
+          version: spec.packageVersion,
+          archivePathError: sourceText("error.provider.clineArchivePath"),
+          mismatchError: sourceText("error.provider.clinePackageMismatch"),
+        },
+        (packageRoot) =>
+          Effect.gen(function* () {
+            // The platform tarball carries no licence, so it comes from the tagged source like OpenCode's.
+            const license = yield* downloadSmallFile(
+              `${lock.cline.repository}/raw/${encodeURIComponent(clineTag(spec.version))}/LICENSE`,
+              pinnedHash(spec, lock.cline.licenseSha256),
+            );
+            // The CLI finds its plugin bootstrap and hub webview from the folder of its executable, so
+            // the whole package keeps its layout. Only the npm manifest stays out.
+            const entries = (yield* runtimeIO(() => readdir(packageRoot))).filter((entry) => entry !== "package.json");
+            yield* Effect.forEach(
+              entries,
+              (entry) =>
+                runtimeIO(() => cp(join(packageRoot, entry), join(staging, entry), { recursive: true })).pipe(
+                  Effect.uninterruptible,
+                ),
+              { concurrency: "unbounded", discard: true },
+            );
+            yield* Effect.all(
+              [
+                runtimeIO(() => writeFile(join(staging, "LICENSE"), license)).pipe(Effect.uninterruptible),
+                runtimeIO(() =>
+                  writeFile(
+                    join(staging, "cline-package.json"),
+                    layoutManifest({
+                      version: spec.version,
+                      target: spec.target,
+                      executable: `bin/${spec.executableName}`,
+                    }),
+                  ),
+                ).pipe(Effect.uninterruptible),
+              ],
+              { concurrency: "unbounded" },
+            );
+            if (spec.target !== "win32-x64")
+              yield* runtimeIO(() => chmod(join(staging, "bin", spec.executableName), 0o755));
+          }),
+      );
+    }),
+    verify: Effect.fn("ProviderRuntime.cline.verify")(function* (
+      root: string,
+      spec: RuntimeSpec,
+      lock: AgentRuntimeLock,
+    ): Effect.fn.Return<void, ProviderRuntimeFailure> {
+      const artifact = lock.cline.artifacts[spec.target];
+      const [executable, bootstrap, license] = yield* Effect.all(
+        [
+          runtimeIO(() => sha256File(join(root, "bin", spec.executableName))),
+          runtimeIO(() => sha256File(join(root, "extensions", "plugin-sandbox-bootstrap.js"))),
+          runtimeIO(() => sha256File(join(root, "LICENSE"))),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (executable !== artifact.binarySha256 || bootstrap !== artifact.bootstrapSha256) {
+        return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.clineChecksum")) });
+      }
+      if (license !== lock.cline.licenseSha256)
+        return yield* new ProviderRuntimeFailure({
+          cause: new Error(sourceText("error.provider.clineLicenseChecksum")),
+        });
+    }),
+    parseVersion: parseClineVersion,
   },
   bun: {
     runtime: "bun",

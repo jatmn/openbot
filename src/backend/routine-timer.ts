@@ -22,6 +22,8 @@ export class RoutineTimer {
   #timer: NodeJS.Timeout | null = null;
   #firing = false;
   #suspended = false;
+  /** A restart of the app waits for the agents to be idle, so no routine may start new work. */
+  #held = false;
 
   constructor(
     private readonly sources: () => Iterable<RoutineDueSource>,
@@ -37,7 +39,7 @@ export class RoutineTimer {
     if (this.#firing) return;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
-    if (this.#suspended || !this.isRunning()) return;
+    if (this.#paused() || !this.isRunning()) return;
     const earliest = this.nextDueAt();
     if (!earliest) return;
     const delay = Math.max(0, Math.min(new Date(earliest).getTime() - Date.now(), MAX_DELAY));
@@ -74,6 +76,25 @@ export class RoutineTimer {
     this.arm();
   }
 
+  /**
+   * Holds routine firing apart from a system sleep, so a resume from sleep does not release it.
+   * A routine that comes due meanwhile runs when `release` is called, or when the app starts again.
+   */
+  hold(): void {
+    this.#held = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = null;
+  }
+
+  release(): void {
+    this.#held = false;
+    this.arm();
+  }
+
+  #paused(): boolean {
+    return this.#suspended || this.#held;
+  }
+
   dispose(): void {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
@@ -92,9 +113,10 @@ export class RoutineTimer {
     this.#firing = true;
     yield* Effect.gen({ self: this }, function* () {
       for (const source of this.sources()) {
-        if (this.#suspended) break;
+        // A suspend or a hold can arrive while an enqueue awaits. The rest stays due and fires later.
+        if (this.#paused()) break;
         yield* Effect.tryPromise({
-          try: () => source.processDue(now, () => !this.#suspended),
+          try: () => source.processDue(now, () => !this.#paused()),
           catch: (cause) => new RoutinePassFailed({ cause }),
         }).pipe(Effect.catch((failure) => Effect.sync(() => this.onError("routine_scheduler_failed", failure.cause))));
       }

@@ -43,6 +43,7 @@ export const messages = {
   "onboarding.provider.freeModels": "無料のモデル、アカウント不要",
   "onboarding.provider.googlePlan": "Google AI Pro または Ultra プラン",
   "onboarding.provider.cursorPlan": "Cursor プランまたは API キー",
+  "onboarding.provider.clineAccount": "Cline アカウントで無料モデル",
   "onboarding.provider.tryFree": "無料で試す",
   "onboarding.provider.noSignIn": "サインイン不要",
   "onboarding.provider.more": "その他のプロバイダー",
@@ -62,6 +63,7 @@ export const messages = {
   "onboarding.next.finishing": "{provider} はまだ設定中です。",
   "onboarding.next.downloadError":
     "{provider} をダウンロードできませんでした。続行するにはダウンロードを再試行してください。",
+  "onboarding.next.downloadErrorReason": "{provider} をセットアップできませんでした: {reason}",
   "onboarding.next.notDownloaded": "続行するには {provider} をダウンロードしてください。",
   "onboarding.next.connecting": "{provider} は接続中です。",
   "onboarding.next.connect": "続行するには {provider} を接続してください。",

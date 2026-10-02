@@ -20,7 +20,7 @@ import { ProviderRuntimeFailure, runRuntime, runtimeIO, runtimeSync } from "./pr
  * follows upstream. The lock still names the version a first install uses when no source answers.
  *
  * Every download keeps a hash from its source: GitHub's asset `digest` for Codex and npm's
- * `dist.integrity` for Claude and OpenCode. x.ai publishes no hash for Grok, so a Grok release is
+ * `dist.integrity` for Claude, OpenCode and Cline. x.ai publishes no hash for Grok, so a Grok release is
  * trusted on TLS alone, and so are Antigravity and Cursor from the ACP registry. Bun is a tool
  * runtime rather than a provider, and stays on the lock.
  */
@@ -237,6 +237,20 @@ const LATEST_RELEASES: Record<
       archiveDigest: null,
       downloadBytes: yield* downloadSizeEffect(fetch, url),
     };
+  }),
+  cline: Effect.fn("ProviderRuntime.cline.latest")(function* ({
+    target,
+    lock,
+    fetch,
+  }: LatestReleaseContext): Effect.fn.Return<RuntimeSpec, ProviderRuntimeFailure> {
+    const pinned = providerRuntimeDescriptor("cline").spec(target, lock);
+    const artifact = yield* npmArtifactEffect(
+      fetch,
+      lock.cline.registry,
+      lock.cline.artifacts[target].package,
+      "latest",
+    );
+    return { ...pinned, ...artifact, version: artifact.packageVersion, source: "latest" };
   }),
 };
 

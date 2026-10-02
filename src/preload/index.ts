@@ -48,6 +48,7 @@ import {
   decodeProviderApiKeyState,
   decodeProviderCodeLoginStart,
   decodeRoutine,
+  decodeRoutineCalendar,
   decodeRoutineRun,
   decodeRoutineRuns,
   decodeRoutines,
@@ -462,6 +463,8 @@ const openbotApi: OpenBotDesktopApi = {
   ...bridgeGroup(IPC_ENDPOINTS.providers, {
     connectProvider: decodeAgentStatusFromMain,
     refreshAgentProviders: decodeAgentStatusFromMain,
+    restartProvider: decodeAgentStatusFromMain,
+    cancelProviderRestart: decodeAgentStatusFromMain,
     updateProviderCli: decodeAgentStatusFromMain,
     setProviderApiKey: decodeAgentStatusFromMain,
     clearProviderApiKey: decodeAgentStatusFromMain,
@@ -659,6 +662,7 @@ const openbotApi: OpenBotDesktopApi = {
       deleteRoutine: decodeVoid,
       testRoutine: decodeRoutineRun,
       listRoutineRuns: decodeRoutineRuns,
+      routineCalendar: decodeRoutineCalendar,
     }),
     ...bridgeGroup(IPC_ENDPOINTS.channelMemories, {
       listChannelMemories: decodeChannelMemories,
@@ -745,6 +749,8 @@ const openbotApi: OpenBotDesktopApi = {
     getPreference: decodeUpdatePreference,
     setPreference: decodeUpdatePreference,
     cancelScheduledRestart: decodeUpdateStatus,
+    restartWhenIdle: decodeUpdateStatus,
+    cancelIdleRestart: decodeUpdateStatus,
     event: decodeUpdateStatus,
     preference: decodeUpdatePreference,
   }),

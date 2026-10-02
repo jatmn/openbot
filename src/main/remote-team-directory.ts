@@ -10,7 +10,7 @@
 // So the two arms stay visible. Hiding them behind one method would read as tidier and would cost
 // the next reader an hour the first time an invitation goes missing from the wrong server.
 
-import { createInviteUrl } from "@openbot/contracts/invite-links";
+import { createInviteUrl, selfHostedApiOrigin } from "@openbot/contracts/invite-links";
 import type {
   InviteSummary,
   TeamInviteSummary,
@@ -209,6 +209,9 @@ export class RemoteTeamDirectory {
     if (transport) {
       if (!server.fingerprint)
         return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.inviteNeedsConnection")) });
+      // The account service cannot email links for a self-hosted service.
+      if (input.email && selfHostedApiOrigin(transport.controlPlaneUrl))
+        return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.selfHostedInviteNoEmail")) });
       const invite = yield* remoteCall(() => transport.createInvite(serverId, input));
       const result: InviteSummary = yield* remoteDecode(() => ({
         id: invite.inviteId,
@@ -218,12 +221,15 @@ export class RemoteTeamDirectory {
         email: input.email ?? null,
         permanent: invite.permanent,
         useCount: invite.useCount,
-        inviteUrl: createInviteUrl({
-          apiUrl: transport.controlPlaneUrl,
-          serverId,
-          fingerprint: server.fingerprint,
-          token: invite.token,
-        }),
+        inviteUrl: createInviteUrl(
+          {
+            apiUrl: transport.controlPlaneUrl,
+            serverId,
+            fingerprint: server.fingerprint,
+            token: invite.token,
+          },
+          { selfHostedApiOrigin: selfHostedApiOrigin(transport.controlPlaneUrl) },
+        ),
       }));
       const email = input.email;
       if (email) {

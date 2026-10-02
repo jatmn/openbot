@@ -119,6 +119,23 @@ const CONNECTING_STATUS: Record<AgentProviderId, AgentStatus> = {
     message: null,
     fullAccess: true,
   },
+  cline: {
+    phase: "blocked",
+    cliVersion: "3.0.68",
+    auth: { kind: "unknown" },
+    providers: [
+      {
+        id: "cline",
+        state: "sign-in-required",
+        connectionState: "connecting",
+        version: "3.0.68",
+        message: null,
+      },
+    ],
+    capabilities: { chat: "unavailable", browser: "ready", computerUse: "unavailable" },
+    message: null,
+    fullAccess: true,
+  },
   acp: {
     phase: "blocked",
     cliVersion: null,
@@ -744,6 +761,7 @@ export function installOpenbotStub(): void {
       listMemories: vi.fn().mockResolvedValue([]),
       listRoutines: vi.fn().mockResolvedValue([]),
       listRoutineRuns: vi.fn().mockResolvedValue([]),
+      routineCalendar: vi.fn().mockResolvedValue({ routines: [], runs: [] }),
       listTables: vi.fn().mockResolvedValue([]),
       deleteTable: vi.fn().mockResolvedValue(undefined),
       createMemory: vi.fn().mockImplementation(async (input) => ({

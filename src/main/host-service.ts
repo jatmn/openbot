@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { dirname, join } from "node:path";
-import { createInviteUrl } from "@openbot/contracts/invite-links";
+import { createInviteUrl, selfHostedApiOrigin } from "@openbot/contracts/invite-links";
 import type {
   AvatarImageInput,
   CentralAuthUser,
@@ -1182,17 +1182,25 @@ export class HostService extends EventEmitter<HostEvents> {
       return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.host.nameBeforePublish")) });
     const remoteInviteApiUrl = this.#remoteInviteApiUrl();
     if (remoteInviteApiUrl && optionalCreateRemoteInvite) {
+      // The account service cannot email links for a self-hosted service.
+      if (input.email && selfHostedApiOrigin(remoteInviteApiUrl))
+        return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.selfHostedInviteNoEmail")) });
       const invite = yield* remoteCall(() => optionalCreateRemoteInvite(identity.serverId, input));
       // The invitation belongs to the account that asked for it, so it stays on that host
       // and shows up in its invite list. What must not happen is emailing it under the new
       // account's authorization, or handing it back to the renderer the new account sees.
       yield* remoteDecode(() => this.#assertStillActiveHost(identity.serverId));
-      const inviteUrl = createInviteUrl({
-        apiUrl: remoteInviteApiUrl,
-        serverId: identity.serverId,
-        fingerprint: identity.fingerprint,
-        token: invite.token,
-      });
+      const inviteUrl = yield* remoteDecode(() =>
+        createInviteUrl(
+          {
+            apiUrl: remoteInviteApiUrl,
+            serverId: identity.serverId,
+            fingerprint: identity.fingerprint,
+            token: invite.token,
+          },
+          { selfHostedApiOrigin: selfHostedApiOrigin(remoteInviteApiUrl) },
+        ),
+      );
       const result: InviteSummary = {
         id: invite.inviteId,
         role: input.role,

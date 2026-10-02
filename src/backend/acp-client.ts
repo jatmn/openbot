@@ -536,7 +536,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     if (!this.running) return yield* providerFailure(new Error("ACP client is not running."));
     switch (method) {
       case "initialize":
-        yield* this.#ensureInitializedEffect();
+        yield* this.#ensureInitializedEffect(timeoutMs);
         return yield* providerCall(() => decoder({}));
       case "account/read": {
         if (!this.#signedIn) return yield* providerCall(() => decoder({ account: null, requiresOpenaiAuth: false }));
@@ -644,8 +644,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
 
   readonly #ensureInitializedEffect = Effect.fn("AcpAgentClient.ensureInitialized")(function* (
     this: AcpAgentClient,
+    timeoutMs = this.#requestTimeoutMs,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
-    const initialized = this.#initialized ?? this.#initialize();
+    const initialized = this.#initialized ?? this.#initialize(timeoutMs);
     this.#initialized = initialized;
     return yield* providerCall(() => initialized);
   });
@@ -674,12 +675,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
   });
 
-  #initialize(): Promise<void> {
-    return runProviderClientEffect(this.#initializeEffect());
+  #initialize(timeoutMs: number): Promise<void> {
+    return runProviderClientEffect(this.#initializeEffect(timeoutMs));
   }
 
   readonly #initializeEffect = Effect.fn("AcpAgentClient.initialize")(function* (
     this: AcpAgentClient,
+    timeoutMs: number,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     const connection = yield* providerSync(() => this.#requireConnection());
     this.#initialization = yield* providerCall(() =>
@@ -689,14 +691,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
           clientInfo: OPENBOT_ACP_CLIENT_INFO,
         }),
-        this.#requestTimeoutMs,
+        timeoutMs,
         "ACP initialization timed out.",
       ),
     );
     const initialization = this.#initialization;
     try {
       providerResult(yield* Effect.result(providerCall(() => this.options.authenticate?.(connection, initialization))));
-      this.#models = providerResult(yield* Effect.result(this.#discoverModelsEffect()));
+      this.#models = providerResult(yield* Effect.result(this.#discoverModelsEffect(timeoutMs)));
       if (this.#models.length === 0 && !this.options.allowNoModels) {
         throw new Error(sourceText("error.provider.acpNoModels"));
       }
@@ -864,7 +866,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       providerResult(yield* Effect.result(this.#startThreadEffect(params, true)));
     } catch (error) {
       // The next turn replaces the missing session, so the user has nothing to act on.
-      if (!(error instanceof MissingOpenCodeSessionError)) {
+      if (!(error instanceof MissingAcpSessionError)) {
         this.emit("diagnostic", this.#redact(`ACP session load for a read failed: ${String(error)}`));
       }
       return null;
@@ -1040,6 +1042,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   });
 
   /**
+   * An agent that follows the protocol answers a session missing from its store with `-32002`, the
+   * resource-not-found error, naming the session. Cline does.
+   *
    * OpenCode answers a session missing from its store with the same `-32603` "OpenCode service
    * failure" as a fault of its internal server. Only a `session/list` that answers in full without
    * the session shows it is missing: the caller then replaces it and hands it the transcript. A
@@ -1056,12 +1061,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     try {
       return providerResult(yield* Effect.result(providerCall(() => connection.loadSession(request))));
     } catch (error) {
+      if (isSessionNotFound(error, request.sessionId)) {
+        return yield* providerFailure(new MissingAcpSessionError(`ACP session not found: ${request.sessionId}`, error));
+      }
       if (this.provider !== "opencode" || !isOpenCodeServiceFailure(error)) return yield* providerFailure(error);
       failure = error;
     }
     const listing = yield* this.#sessionListingEffect(connection, request);
     if (listing === "absent")
-      return yield* providerFailure(new MissingOpenCodeSessionError(request.sessionId, failure));
+      return yield* providerFailure(
+        new MissingAcpSessionError(
+          `OpenCode session not found: ${request.sessionId} (OpenCode service failure)`,
+          failure,
+        ),
+      );
     yield* providerCall(() => new Promise((resolve) => setTimeout(resolve, OPENCODE_LOAD_RETRY_MS)));
     try {
       // The process can have stopped during the wait; this reports that instead of a closed stream.
@@ -1389,7 +1402,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#completeThought(thread, turn);
     this.#completeMessage(thread, turn, "final_answer");
     if (status === "failed" && error) {
-      const detail = this.#redact(String(error));
+      const detail = this.#redact(failureText(error));
       const message =
         this.provider === "opencode" &&
         /invalid api key|unauthori[sz]ed|token refresh failed|authentication failed/i.test(detail)
@@ -1845,13 +1858,32 @@ function isDynamicToolResult(value: unknown): value is DynamicToolResult {
   );
 }
 
-/** A session load that OpenCode failed while its internal server worked. */
-class MissingOpenCodeSessionError extends Error {
-  constructor(sessionId: string, cause: unknown) {
+/** A session that the agent does not have, so the caller opens a new one. */
+class MissingAcpSessionError extends Error {
+  constructor(message: string, cause: unknown) {
     // The wording is what `isMissingProviderSessionError` recognizes.
-    super(`OpenCode session not found: ${sessionId} (OpenCode service failure)`, { cause });
-    this.name = "MissingOpenCodeSessionError";
+    super(message, { cause });
+    this.name = "MissingAcpSessionError";
   }
+}
+
+/** The protocol's resource-not-found error, for this session. */
+function isSessionNotFound(error: unknown, sessionId: string): boolean {
+  if (!(error instanceof RequestError) || error.code !== -32002) return false;
+  const uri = isRecord(error.data) ? error.data.uri : undefined;
+  return uri === sessionId || error.message.includes(sessionId);
+}
+
+/**
+ * The text of a failed turn. When a handler in an ACP agent throws, the SDK answers `Internal error`
+ * and puts the thrown message in `data.details`, which `String(error)` leaves out (#1193).
+ */
+function failureText(error: unknown): string {
+  if (!(error instanceof RequestError) || !isRecord(error.data)) return String(error);
+  const details = error.data.details;
+  return typeof details === "string" && details && !error.message.includes(details)
+    ? `${String(error)}: ${details}`
+    : String(error);
 }
 
 /**
