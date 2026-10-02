@@ -1127,6 +1127,7 @@ it.each(["submitted", "takeover"] as const)(
       prepareSecret: async () => ({
         request: { method: "otp" as const, origin: "https://example.com", digits: 6 },
         agentScriptedOrigin: false,
+        vaultFillable: false,
         submit,
         cancel,
       }),
@@ -1256,7 +1257,7 @@ describe("filling from the shared password vault", () => {
     submission: "enter",
   };
 
-  async function startSignIn(logins: VaultLogin[], agentScriptedOrigin = false) {
+  async function startSignIn(logins: VaultLogin[], agentScriptedOrigin = false, vaultFillable = true) {
     const client = new FakeAgentClient("codex");
     const tabs: BrowserTab[] = [];
     const submit = vi.fn(async (_secret: string) => "submitted" as const);
@@ -1265,6 +1266,7 @@ describe("filling from the shared password vault", () => {
       prepareSecret: async () => ({
         request: { method: "password" as const, origin: "https://example.com", digits: 6 },
         agentScriptedOrigin,
+        vaultFillable,
         submit,
         cancel: vi.fn(),
       }),
@@ -1333,6 +1335,14 @@ describe("filling from the shared password vault", () => {
   // A listener that the agent's own script put on the page would read the password as it is filled.
   it("opens the card instead of filling on a site where the agent ran its own script", async () => {
     const { events, submit, call } = await startSignIn([LOGIN], true);
+    call("fill", "submit_secret", { ...passwordArguments, loginId: LOGIN.id });
+    await waitFor(() => events.some((event) => event.type === "browser-takeover-requested"));
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // A search box in a GET form would put the password in a URL that the agent can read.
+  it("opens the card instead of filling a field that is not a password field", async () => {
+    const { events, submit, call } = await startSignIn([LOGIN], false, false);
     call("fill", "submit_secret", { ...passwordArguments, loginId: LOGIN.id });
     await waitFor(() => events.some((event) => event.type === "browser-takeover-requested"));
     expect(submit).not.toHaveBeenCalled();

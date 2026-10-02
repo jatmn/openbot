@@ -182,6 +182,12 @@ export interface PreparedBrowserSecret {
    * script can still listen to the fields, so only the user may decide to fill them.
    */
   agentScriptedOrigin: boolean;
+  /**
+   * True when the target fields are built for this secret: password fields for a password, one-time
+   * code fields for an authenticator code, none in a `method="get"` form. A field that the agent
+   * chose for something else, such as a search box, could put the value in a URL the agent reads.
+   */
+  vaultFillable: boolean;
   submit(secret: string): Promise<"submitted" | "takeover">;
   cancel(): void;
 }
@@ -669,6 +675,10 @@ export class BrowserHost {
         // Password cards do not use digits; keep public metadata within its released bounds.
         request: { method: args.method, origin: url.origin, digits: args.method === "password" ? 6 : args.digits },
         agentScriptedOrigin: this.#agentScriptedOrigins.has(url.origin),
+        vaultFillable:
+          args.method === "password"
+            ? entry.fields.password
+            : args.method === "authenticator" && entry.fields.oneTimeCode,
         cancel: () => {
           if (tab.secret === protection && !protection.submitted) {
             tab.secret = undefined;

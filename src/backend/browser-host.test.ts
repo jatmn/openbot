@@ -167,7 +167,7 @@ vi.mock("./browser-cdp", () => ({
     destroy() {}
     invalidateReferences() {}
     async prepareSecret() {
-      return { enter: secretEntry, clear: secretClear };
+      return { enter: secretEntry, clear: secretClear, fields: { password: true, oneTimeCode: false } };
     }
     async evaluate() {
       return "page value";
