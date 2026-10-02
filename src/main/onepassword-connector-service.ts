@@ -82,7 +82,7 @@ export interface OnePasswordConnectorServiceOptions {
   /** The CLI executables to try, in order. A test passes a fake. */
   findCli?: () => Promise<string[]>;
   runCli?: OnePasswordCliRunner;
-  installCli?: (signal: AbortSignal) => Promise<unknown>;
+  installCli?: ((signal: AbortSignal) => Promise<unknown>) | undefined;
   createClient?: (token: string) => Promise<OnePasswordClient>;
   now?: () => number;
 }
@@ -555,8 +555,8 @@ export class OnePasswordConnectorService implements PasswordVault {
     const index = await this.#buildIndex(client);
     if (index.vaultNames.length === 0)
       throw new OnePasswordConnectError(sourceText("error.connector.onePasswordNoVault"));
-    if (signal.aborted) return;
-    await this.#store.write(record);
+    // Asked inside the store's queued write, so a stop during the write keeps nothing.
+    if (!(await this.#store.write(record, () => !signal.aborted))) return;
     this.#generation += 1;
     this.#client = { token: record.token, client: Promise.resolve(client) };
     this.#index = index;

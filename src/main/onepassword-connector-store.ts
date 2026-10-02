@@ -57,25 +57,42 @@ export class OnePasswordConnectorStore {
     return this.#record;
   }
 
-  write(record: OnePasswordConnectorRecord): Promise<void> {
+  /**
+   * Stores `record` while `current()` holds. It is asked again after the file is written, in the
+   * same queued change: an attempt that was stopped during the write removes the file again and
+   * leaves no token in memory or on disk. True when the record was kept.
+   */
+  write(record: OnePasswordConnectorRecord, current: () => boolean = () => true): Promise<boolean> {
     return this.#enqueue(async () => {
+      if (!current()) return false;
       const encrypted = this.#cipher.encrypt(JSON.stringify(record)).toString("base64");
       // Write then rename, so a crash leaves the previous connection readable.
       await writeJsonFileAtomically(this.#path, { version: 1, record: encrypted }, { createDirectory: true });
+      if (!current()) {
+        await rm(this.#path, { force: true });
+        this.#record = null;
+        return false;
+      }
       this.#record = record;
+      return true;
     });
   }
 
+  /** Forgets the record at once, so no read starts with it, then removes the file. */
   clear(): Promise<void> {
+    this.#record = null;
     return this.#enqueue(async () => {
       await rm(this.#path, { force: true });
       this.#record = null;
     });
   }
 
-  #enqueue(change: () => Promise<void>): Promise<void> {
+  #enqueue<T>(change: () => Promise<T>): Promise<T> {
     const result = this.#queue.then(change, change);
-    this.#queue = result.catch(() => undefined);
+    this.#queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
     return result;
   }
 

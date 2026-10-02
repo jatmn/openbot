@@ -69,13 +69,14 @@ function service(
     createClient?: (token: string) => Promise<OnePasswordClient>;
     findCli?: () => Promise<string[]>;
     installCli?: (signal: AbortSignal) => Promise<unknown>;
+    store?: (path: string) => OnePasswordConnectorStore;
   } = {},
 ) {
   const path = join(directory, "connector.json");
   return {
     path,
     connector: new OnePasswordConnectorService({
-      store: new OnePasswordConnectorStore(path, cipher),
+      store: options.store?.(path) ?? new OnePasswordConnectorStore(path, cipher),
       hostName: "test-mac",
       appVersion: "1.0.0",
       cliInstall: null,
@@ -161,6 +162,40 @@ describe("OnePasswordConnectorService", () => {
     release?.();
 
     expect(await secret).toBeNull();
+  });
+
+  it("gives no password to a read that starts while Disconnect removes the file", async () => {
+    const { connector } = service(fakeCli([]));
+    await connector.connectWithToken(TOKEN);
+
+    const disconnecting = connector.disconnect();
+    expect(await connector.secretFor("login-1", "https://github.com", "password")).toBeNull();
+    await disconnecting;
+  });
+
+  it("keeps no token when Cancel arrives while the token is being stored", async () => {
+    let unblock: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    let writing = false;
+    class SlowStore extends OnePasswordConnectorStore {
+      override async write(...args: Parameters<OnePasswordConnectorStore["write"]>): Promise<boolean> {
+        writing = true;
+        await gate;
+        return super.write(...args);
+      }
+    }
+    const { connector, path } = service(fakeCli([]), { store: (file) => new SlowStore(file, cipher) });
+
+    const connecting = connector.connectWithToken(TOKEN);
+    await vi.waitFor(() => expect(writing).toBe(true));
+    connector.cancel();
+    unblock?.();
+
+    expect((await connecting).state).toBe("disconnected");
+    expect(await connector.loginsFor("https://github.com")).toBeNull();
+    await expect(readFile(path, "utf8")).rejects.toThrow();
   });
 
   it("stores no token whose check finishes after Disconnect", async () => {
