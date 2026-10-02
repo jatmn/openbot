@@ -177,6 +177,11 @@ const BROWSER_WEB_PREFERENCES = {
 
 export interface PreparedBrowserSecret {
   request: BrowserSecretRequest;
+  /**
+   * True when an agent ran its own script on a page of this origin during this app session. That
+   * script can still listen to the fields, so only the user may decide to fill them.
+   */
+  agentScriptedOrigin: boolean;
   submit(secret: string): Promise<"submitted" | "takeover">;
   cancel(): void;
 }
@@ -202,6 +207,10 @@ function runBrowserTool<Name extends BrowserToolName>(
   hooks: BrowserDynamicToolHooks,
 ): Promise<DynamicToolResult> {
   return handlers[tool](call, params, hooks);
+}
+
+function urlOrigin(value: string): string | null {
+  return URL.canParse(value) ? new URL(value).origin : null;
 }
 
 async function rejectTakeoverTool(): Promise<DynamicToolResult> {
@@ -231,6 +240,11 @@ export class BrowserHost {
   #target: BrowserViewTarget = "main";
   readonly #mountedViews = new Map<WebContentsView, BrowserWindow>();
   readonly #takeoverTabIds = new Set<string>();
+  /**
+   * The origins where an agent ran `evaluate`. Kept by origin, not by document: a same-origin popup,
+   * opener or service worker carries the script past one document.
+   */
+  readonly #agentScriptedOrigins = new Set<string>();
   #persistQueue: Promise<void> = Promise.resolve();
   #destroyPromise: Promise<void> | null = null;
   /** Whether the machine is too low on memory for one more tab. Only a hosted server has a reading. */
@@ -654,6 +668,7 @@ export class BrowserHost {
       return {
         // Password cards do not use digits; keep public metadata within its released bounds.
         request: { method: args.method, origin: url.origin, digits: args.method === "password" ? 6 : args.digits },
+        agentScriptedOrigin: this.#agentScriptedOrigins.has(url.origin),
         cancel: () => {
           if (tab.secret === protection && !protection.submitted) {
             tab.secret = undefined;
@@ -1168,6 +1183,9 @@ export class BrowserHost {
     },
     evaluate: async ({ args }, params) => {
       this.#requireToolTab(params, args.tabId);
+      // Recorded before the script runs: a failed or timed-out evaluation can still have left a listener.
+      const origin = urlOrigin(currentTabUrl(this.#requireTab(args.tabId)));
+      if (origin) this.#agentScriptedOrigins.add(origin);
       return textResult(
         await this.#runEvaluation(
           args.tabId,

@@ -1126,6 +1126,7 @@ it.each(["submitted", "takeover"] as const)(
       ...fakeBrowser(tabs),
       prepareSecret: async () => ({
         request: { method: "otp" as const, origin: "https://example.com", digits: 6 },
+        agentScriptedOrigin: false,
         submit,
         cancel,
       }),
@@ -1255,7 +1256,7 @@ describe("filling from the shared password vault", () => {
     submission: "enter",
   };
 
-  async function startSignIn(logins: VaultLogin[]) {
+  async function startSignIn(logins: VaultLogin[], agentScriptedOrigin = false) {
     const client = new FakeAgentClient("codex");
     const tabs: BrowserTab[] = [];
     const submit = vi.fn(async (_secret: string) => "submitted" as const);
@@ -1263,6 +1264,7 @@ describe("filling from the shared password vault", () => {
       ...fakeBrowser(tabs),
       prepareSecret: async () => ({
         request: { method: "password" as const, origin: "https://example.com", digits: 6 },
+        agentScriptedOrigin,
         submit,
         cancel: vi.fn(),
       }),
@@ -1324,6 +1326,14 @@ describe("filling from the shared password vault", () => {
   it("opens the card when the vault has no login for the site", async () => {
     const { events, submit, call } = await startSignIn([]);
     call("fill", "submit_secret", passwordArguments);
+    await waitFor(() => events.some((event) => event.type === "browser-takeover-requested"));
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  // A listener that the agent's own script put on the page would read the password as it is filled.
+  it("opens the card instead of filling on a site where the agent ran its own script", async () => {
+    const { events, submit, call } = await startSignIn([LOGIN], true);
+    call("fill", "submit_secret", { ...passwordArguments, loginId: LOGIN.id });
     await waitFor(() => events.some((event) => event.type === "browser-takeover-requested"));
     expect(submit).not.toHaveBeenCalled();
   });

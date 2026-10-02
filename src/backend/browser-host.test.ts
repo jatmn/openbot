@@ -903,6 +903,27 @@ describe("secure browser handoff", () => {
     return { tab, prepared, contents };
   }
 
+  // A vault fill without a card is allowed only where no agent script can listen to the fields.
+  it("marks the origin of a page where the agent ran its own script", async () => {
+    const before = await prepare("password", 0);
+    expect(before.prepared.agentScriptedOrigin).toBe(false);
+    before.prepared.cancel();
+
+    await host.handleDynamicTool({
+      namespace: "openbot_browser",
+      tool: "evaluate",
+      arguments: { tabId: before.tab.id, expression: "document.title" },
+      threadId: "thread",
+      ownerAgentId: "agent",
+      turnId: "turn",
+      callId: "evaluate",
+    });
+
+    const after = await prepare("password", 0);
+    expect(after.prepared.agentScriptedOrigin).toBe(true);
+    after.prepared.cancel();
+  });
+
   it("prepares a password card when the provider supplies zero unused digits", async () => {
     const { prepared } = await prepare("password", 0);
     expect(prepared.request.method).toBe("password");

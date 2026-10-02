@@ -1653,7 +1653,9 @@ answers at least one account), and Connect. The service keeps only the token in
 uses it in two places: `openbot_browser.list_logins` returns the logins saved for the tab's HTTPS
 site (id, title, username), and `AttentionRegistry` answers a `submit_secret` password or
 authenticator request for a saved login by filling it through the same `prepareSecret` path as the
-secure card, with no card. A login matches by 1Password's autofill rule, on the registrable domain
+secure card, with no card. On an origin where an agent ran `evaluate` during this app session,
+`BrowserHost` reports `agentScriptedOrigin` and the card opens instead, because the agent's script
+could read the filled fields. A login matches by 1Password's autofill rule, on the registrable domain
 with private suffixes such as `github.io` counted. Agents and providers never receive the token, a
 password or a code.
 

@@ -830,6 +830,8 @@ export class AttentionRegistry {
   async #fillFromVault(requestId: RequestId, pending: PendingBrowserTakeover): Promise<boolean> {
     const request = pending.secret?.request;
     if (!this.#passwordVault || !request || request.method === "otp") return false;
+    // A script the agent ran on this site can read what is filled. The card lets the user decide.
+    if (pending.secret?.agentScriptedOrigin !== false) return false;
     const kind = request.method === "password" ? "password" : "totp";
     let secret: string | null = null;
     try {
