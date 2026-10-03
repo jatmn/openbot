@@ -23,7 +23,7 @@ const NO_USAGE: AccountRateLimitsReadResult = { rateLimits: null, rateLimitsByLi
  * No key, a key the console rejects, and a key with no Go subscription all read as no usage, so the
  * dock hides the row instead of showing an error for the free catalog.
  */
-export class OpenCodeUsageFailed extends Schema.TaggedError<OpenCodeUsageFailed>()("OpenCodeUsageFailed", {
+class OpenCodeUsageFailed extends Schema.TaggedError<OpenCodeUsageFailed>()("OpenCodeUsageFailed", {
   cause: Schema.Defect(),
 }) {}
 

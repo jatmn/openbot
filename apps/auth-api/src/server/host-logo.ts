@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect";
 
-export class HostLogoError extends Schema.TaggedError<HostLogoError>()("HostLogoError", {}) {}
+class HostLogoError extends Schema.TaggedError<HostLogoError>()("HostLogoError", {}) {}
 
 import { isUuidV4 } from "@openbot/contracts/validation";
 

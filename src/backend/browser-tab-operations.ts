@@ -96,7 +96,7 @@ export const boundEngineOperation = Effect.fn("BrowserTab.boundOperation")(funct
   );
 });
 
-export const unwindStalledOperation = Effect.fn("BrowserTab.unwind")(function* <A>(
+const unwindStalledOperation = Effect.fn("BrowserTab.unwind")(function* <A>(
   tab: BrowserHostTab,
   completion: Fiber.Fiber<A, BrowserOperationError>,
 ) {

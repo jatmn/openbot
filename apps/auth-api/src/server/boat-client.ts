@@ -27,7 +27,6 @@ const BoatSandboxState = Schema.Literals([
 ]);
 export type BoatSandboxState = typeof BoatSandboxState.Type;
 const BoatSandbox = Schema.Struct({ id: Schema.String, state: BoatSandboxState });
-export type BoatSandbox = typeof BoatSandbox.Type;
 
 /** Provider messages and raw causes can contain credentials and are not retained. */
 export class BoatApiError extends Schema.TaggedError<BoatApiError>()("BoatApiError", {

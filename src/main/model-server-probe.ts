@@ -21,8 +21,6 @@ interface ModelServerTarget {
   headers: readonly CustomProviderHeader[];
 }
 
-export type ProbeModels = (target: ModelServerTarget, timeoutMs: number) => Effect.Effect<DetectedModel[], ProbeError>;
-
 /** The part of an address that an error may name. */
 function hostOf(baseUrl: string): string {
   try {
@@ -38,23 +36,23 @@ function modelsUrl(baseUrl: string): URL {
   return url;
 }
 
-export class ModelServerUnavailable extends Schema.TaggedError<ModelServerUnavailable>()("ModelServerUnavailable", {
+class ModelServerUnavailable extends Schema.TaggedError<ModelServerUnavailable>()("ModelServerUnavailable", {
   message: Schema.String,
 }) {}
 
-export class ModelServerTimeout extends Schema.TaggedError<ModelServerTimeout>()("ModelServerTimeout", {
+class ModelServerTimeout extends Schema.TaggedError<ModelServerTimeout>()("ModelServerTimeout", {
   message: Schema.String,
 }) {}
 
-export class ModelServerRejected extends Schema.TaggedError<ModelServerRejected>()("ModelServerRejected", {
+class ModelServerRejected extends Schema.TaggedError<ModelServerRejected>()("ModelServerRejected", {
   message: Schema.String,
 }) {}
 
-export class InvalidModelList extends Schema.TaggedError<InvalidModelList>()("InvalidModelList", {
+class InvalidModelList extends Schema.TaggedError<InvalidModelList>()("InvalidModelList", {
   message: Schema.String,
 }) {}
 
-export class ModelListTooLarge extends Schema.TaggedError<ModelListTooLarge>()("ModelListTooLarge", {
+class ModelListTooLarge extends Schema.TaggedError<ModelListTooLarge>()("ModelListTooLarge", {
   message: Schema.String,
 }) {}
 

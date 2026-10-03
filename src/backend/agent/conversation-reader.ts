@@ -145,7 +145,7 @@ export class ConversationReader {
   }, Effect.uninterruptible);
 }
 
-export class ConversationReadFailed extends Schema.TaggedError<ConversationReadFailed>()("ConversationReadFailed", {
+class ConversationReadFailed extends Schema.TaggedError<ConversationReadFailed>()("ConversationReadFailed", {
   cause: Schema.Defect(),
 }) {}
 

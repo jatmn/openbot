@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { Effect, Schema, Stream } from "effect";
 
-export class FileHashFailure extends Schema.TaggedError<FileHashFailure>()("FileHashFailure", {
+class FileHashFailure extends Schema.TaggedError<FileHashFailure>()("FileHashFailure", {
   cause: Schema.Defect(),
 }) {}
 

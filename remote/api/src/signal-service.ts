@@ -15,7 +15,7 @@ import {
 import { RemoteTokenError } from "./tokens";
 
 /** The workspaces a verified route ticket names, each with the time it was linked to the host. */
-export interface SlackRoute {
+interface SlackRoute {
   teams: SlackRouteTeam[];
 }
 

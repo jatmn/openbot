@@ -92,7 +92,7 @@ function scanTargets(addresses: readonly string[]): KnownServer[] {
   return targets;
 }
 
-export class ProviderDiscovery extends Context.Service<
+class ProviderDiscovery extends Context.Service<
   ProviderDiscovery,
   {
     scanModelServers(): Effect.Effect<DetectedModelServer[]>;

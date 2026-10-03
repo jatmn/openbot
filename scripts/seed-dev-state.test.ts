@@ -65,7 +65,7 @@ describe("development state seed", () => {
       channelRoutines: 2,
       channelRoutineRuns: 2,
     });
-    await expect(readSetupState(join(profilePath, "openbot-setup-v2.json"))).resolves.toEqual({
+    await expect(Effect.runPromise(readSetupState(join(profilePath, "openbot-setup-v2.json")))).resolves.toEqual({
       completed: true,
       preferredProvider: "codex",
       preferredModel: null,

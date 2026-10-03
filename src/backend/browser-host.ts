@@ -1330,7 +1330,9 @@ export class BrowserHost {
         return textResult(
           yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
             Effect.gen({ self: this }, function* () {
-              const environment = resolveEnvironment(args, tab.environment, tab.view.getBounds());
+              const environment = yield* browserSync(() =>
+                resolveEnvironment(args, tab.environment, tab.view.getBounds()),
+              );
               // This also bounds the engine's rollback if applying the environment fails.
               yield* boundEngineOperation(
                 tab,

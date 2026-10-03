@@ -218,6 +218,6 @@ export class ContextCompaction {
   }
 }
 
-export class ContextCompactionFailed extends Schema.TaggedError<ContextCompactionFailed>()("ContextCompactionFailed", {
+class ContextCompactionFailed extends Schema.TaggedError<ContextCompactionFailed>()("ContextCompactionFailed", {
   cause: Schema.Defect(),
 }) {}

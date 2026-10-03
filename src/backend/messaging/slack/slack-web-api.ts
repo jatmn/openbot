@@ -12,7 +12,7 @@ const RATE_LIMIT_NOTICE_MS = 5_000;
 const REDIRECT_LIMIT = 3;
 
 const SlackEnvelope = Schema.Record(Schema.String, Schema.Unknown);
-export type SlackResponse = typeof SlackEnvelope.Type & { ok: true };
+type SlackResponse = typeof SlackEnvelope.Type & { ok: true };
 
 export class SlackApiError extends Error {
   constructor(

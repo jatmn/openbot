@@ -68,6 +68,6 @@ export function createAgentAdminSettings({
   }
 }
 
-export class AgentSettingsFailure extends Schema.TaggedError<AgentSettingsFailure>()("AgentSettingsFailure", {
+class AgentSettingsFailure extends Schema.TaggedError<AgentSettingsFailure>()("AgentSettingsFailure", {
   cause: Schema.Defect(),
 }) {}

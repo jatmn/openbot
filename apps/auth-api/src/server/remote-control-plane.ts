@@ -206,7 +206,7 @@ export class RemoteTicketSigner {
  * Signs the Slack route ticket that names the workspaces linked to a host. It uses its own key,
  * which the public JWKS also lists, so each key can rotate on its own.
  */
-export class SlackRouteSigner {
+class SlackRouteSigner {
   readonly #keyId: string;
   readonly #privateJwk: JWK;
   #key: Awaited<ReturnType<typeof importJWK>> | null = null;

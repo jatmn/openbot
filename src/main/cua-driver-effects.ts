@@ -1,4 +1,4 @@
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
 /** Keep driver diagnostics inside the main-process boundary. */
 export class CuaDriverFailure extends Schema.TaggedError<CuaDriverFailure>()("CuaDriverFailure", {
@@ -11,10 +11,4 @@ export function cuaIO<A>(operation: (signal: AbortSignal) => Promise<A>): Effect
 
 export function cuaSync<A>(operation: () => A): Effect.Effect<A, CuaDriverFailure> {
   return Effect.try({ try: operation, catch: (cause) => new CuaDriverFailure({ cause }) });
-}
-
-export async function runCua<A>(operation: Effect.Effect<A, CuaDriverFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

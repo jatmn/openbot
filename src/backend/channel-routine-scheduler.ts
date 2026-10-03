@@ -357,7 +357,7 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
   }
 }
 
-export class ChannelRoutineFailed extends Schema.TaggedError<ChannelRoutineFailed>()("ChannelRoutineFailed", {
+class ChannelRoutineFailed extends Schema.TaggedError<ChannelRoutineFailed>()("ChannelRoutineFailed", {
   cause: Schema.Defect(),
 }) {}
 

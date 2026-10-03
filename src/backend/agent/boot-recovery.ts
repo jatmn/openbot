@@ -281,7 +281,7 @@ export class BootRecovery {
   });
 }
 
-export class BootRecoveryFailed extends Schema.TaggedError<BootRecoveryFailed>()("BootRecoveryFailed", {
+class BootRecoveryFailed extends Schema.TaggedError<BootRecoveryFailed>()("BootRecoveryFailed", {
   cause: Schema.Defect(),
 }) {}
 

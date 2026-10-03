@@ -71,7 +71,7 @@ class AuthRetentionDatabase extends Context.Service<AuthRetentionDatabase, D1Dat
   "@openbot/auth-api/AuthRetentionDatabase",
 ) {}
 
-export class AuthRetentionError extends Schema.TaggedError<AuthRetentionError>()("AuthRetentionError", {
+class AuthRetentionError extends Schema.TaggedError<AuthRetentionError>()("AuthRetentionError", {
   message: Schema.String,
 }) {}
 

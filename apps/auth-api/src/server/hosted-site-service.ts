@@ -35,12 +35,6 @@ import {
 } from "./hosted-site-records";
 import { type HostedSiteScope, hostedSiteLimit, scopeServerId } from "./hosted-site-server";
 
-export interface HostedSiteList {
-  sites: HostedSiteSummary[];
-  limit: number;
-  used: number;
-}
-
 export interface HostedSiteUploadSession {
   uploadId: string;
   site: HostedSiteSummary;

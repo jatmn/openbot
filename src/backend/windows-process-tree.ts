@@ -6,7 +6,7 @@ import { Effect, Fiber, Schema } from "effect";
  * group: a `.cmd` command runs under `cmd.exe`, and a kill of the wrapper leaves the real program
  * running. `taskkill /T` stops the whole tree while the wrapper still holds it.
  */
-export class ProcessTreeFailed extends Schema.TaggedError<ProcessTreeFailed>()("ProcessTreeFailed", {
+class ProcessTreeFailed extends Schema.TaggedError<ProcessTreeFailed>()("ProcessTreeFailed", {
   cause: Schema.Defect(),
 }) {}
 

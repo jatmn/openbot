@@ -161,7 +161,7 @@ const DEFAULT_BUNDLED_EXECUTABLES: BundledProviderExecutables = { claude: null, 
 
 export type { TestMcpServerOptions } from "./agent/mcp-gateway";
 export type { RoutineMutationOptions } from "./agent/routine-scheduler";
-export type { ResolvedSharedFile, ResolvedWorkspaceFile } from "./workspace-paths";
+export type { ResolvedSharedFile } from "./workspace-paths";
 
 interface AgentServiceEvents {
   event: [event: AgentEvent];

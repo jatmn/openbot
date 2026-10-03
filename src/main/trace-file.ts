@@ -18,16 +18,6 @@ export interface TraceSpan {
   outcome: string;
 }
 
-/** Counts and durations for one span name, over every line the trace file still holds. */
-export interface TraceSummary {
-  kind: string;
-  name: string;
-  count: number;
-  outcomes: Record<string, number>;
-  p95Ms: number;
-  maxMs: number;
-}
-
 export interface TraceFileOptions {
   directory: string;
 }

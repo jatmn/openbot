@@ -20,13 +20,6 @@ import type { AuthUser, WorkerBindings } from "./types";
 const MAX_TEMPLATES_PER_USER = 5;
 const TEMPLATE_LIMIT_MESSAGE = `You can publish up to ${MAX_TEMPLATES_PER_USER} agents. Unpublish one to publish another.`;
 
-/** What the owner's app reads to show whether one of its agents is published. */
-export interface OwnedAgentTemplate {
-  id: string;
-  sourceAgentId: string;
-  updatedAt: string;
-}
-
 interface TemplateRow {
   id: string;
   source_agent_id: string;
