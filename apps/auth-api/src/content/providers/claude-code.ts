@@ -17,7 +17,7 @@ export const CLAUDE_CODE_PROVIDER: ProviderPage = {
     {
       icon: "laptop",
       title: "A full desktop app on Linux",
-      text: "Anthropic's desktop app is in beta on Linux, for Ubuntu and Debian only. OpenBot runs Claude Code on any x64 or arm64 Linux, as an AppImage.",
+      text: "Anthropic's desktop app is in beta on Linux, for Ubuntu and Debian only. OpenBot runs Claude Code on x64 and arm64 Linux, as an AppImage.",
     },
   ],
   vendor: "Anthropic",
@@ -58,7 +58,7 @@ export const CLAUDE_CODE_PROVIDER: ProviderPage = {
     {
       question: "Can I run Claude Code on Linux with a graphical app?",
       answer:
-        "Yes. Anthropic's desktop app is in beta on Linux, for Ubuntu 22.04 or later and Debian 12 or later. OpenBot runs Claude Code on x64 and arm64 Linux as an AppImage, also on other distributions.",
+        "Yes. Anthropic's desktop app is in beta on Linux, for Ubuntu 22.04 or later and Debian 12 or later. OpenBot runs Claude Code on x64 and arm64 Linux as an AppImage, on any distribution that runs an AppImage.",
     },
     {
       question: "Can Claude Code and Codex work together in OpenBot?",

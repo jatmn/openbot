@@ -12,7 +12,7 @@ export const CLINE_PROVIDER: ProviderPage = {
   answer:
     "OpenBot runs the Cline agent without an editor, on macOS, Windows or Linux, with your Cline account or a Cline API key. You get shared channels with agents on other providers, and an app on your phone.",
   connect:
-    "Choose Cline, and OpenBot downloads and pins its own copy of the Cline CLI, or uses the one you installed. Then sign in with Cline in the browser, or set `CLINE_API_KEY`.",
+    "Choose Cline, and OpenBot downloads and pins its own copy of the Cline CLI, or uses the one you installed, version 3.0.68 or later. Then sign in with Cline in the browser, or set `CLINE_API_KEY`.",
   adds: [
     {
       icon: "laptop",

@@ -17,7 +17,7 @@ export const LOCAL_MODELS_PROVIDER: ProviderPage = {
   adds: [
     {
       icon: "laptop",
-      title: "Nothing leaves your computer",
+      title: "Model requests stay on your computer",
       text: "With a local model, the requests go to a server on your computer, not to a provider. Any other OpenAI-compatible server works too.",
     },
     {

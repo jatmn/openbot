@@ -6365,12 +6365,11 @@ a {
   line-height: 1.55;
 }
 
-.provider-table thead th:first-child {
-  width: 26%;
-}
-
-.provider-table thead th:nth-child(2) {
-  width: 26%;
+/* Above the phone layout only: below 641px each row is a grid, where a percentage width shrinks the cell. */
+@media (min-width: 641px) {
+  .provider-table thead th:is(:first-child, :nth-child(2)) {
+    width: 26%;
+  }
 }
 
 .compare-section[data-revealed="false"] :is(.provider-step, .provider-add) {

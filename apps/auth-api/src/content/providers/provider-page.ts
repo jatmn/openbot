@@ -65,7 +65,7 @@ export const OPENBOT_ADDS: readonly ProviderAdd[] = [
   {
     icon: "lock",
     title: "Your data on your computer",
-    text: "Workspaces, chats and files stay in a database on the computer that runs OpenBot. The provider you choose gets the requests you send.",
+    text: "Workspaces, chats and files stay on the computer that runs OpenBot. The provider you choose gets the requests you send.",
   },
   {
     icon: "tag",

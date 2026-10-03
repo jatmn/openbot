@@ -89,8 +89,8 @@ export function ProviderArticlePage(props: ProviderArticlePageProps) {
           <li class="provider-step">
             <h3 class="provider-step-title">Give your agent a job</h3>
             <p class="provider-step-text">
-              Create an agent on {props.page.name}, choose its model and a workspace folder, and give it a task. When
-              the work grows, add agents on other providers to the same channel.
+              Create an agent on {props.page.name}, choose its model, and give it a task. OpenBot makes a workspace
+              folder for it. When the work grows, add agents on other providers to the same channel.
             </p>
           </li>
         </ol>

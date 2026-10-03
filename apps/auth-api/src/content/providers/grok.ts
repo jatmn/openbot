@@ -11,7 +11,7 @@ export const GROK_PROVIDER: ProviderPage = {
   answer:
     "OpenBot gives xAI's Grok coding agent a desktop app on macOS, Windows or Linux, with your Grok account or an xAI API key. You get shared channels with agents on other providers, and an app on your phone.",
   connect:
-    "Choose Grok, and OpenBot downloads and pins its own copy of the Grok CLI, or uses the one you installed. Then run `grok login` to sign in with your Grok account, or set `XAI_API_KEY`.",
+    "Choose Grok, and OpenBot downloads and pins its own copy of the Grok CLI, or uses the one you installed. Then sign in with your Grok account, or set `XAI_API_KEY`.",
   adds: [
     {
       icon: "laptop",
