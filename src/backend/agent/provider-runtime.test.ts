@@ -1,4 +1,6 @@
 // @vitest-environment node
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
@@ -35,6 +37,7 @@ import { DrainScheduler } from "./drain-scheduler";
 import { createAcpRequestEchoReader, isUsageLimitDiagnostic } from "./provider-diagnostics";
 import { OPENCODE_FREE_MODEL_FALLBACKS } from "./provider-models";
 import { PROVIDER_IDLE_RELEASE_MS, PROVIDER_UNASSIGNED_RELEASE_MS } from "./provider-runtime";
+import { waitForSuccessfulProcess } from "./provider-status";
 
 let root: string;
 let service: AgentService | null = null;
@@ -49,6 +52,22 @@ afterEach(async () => {
 });
 
 describe.sequential("ProviderRuntime: account checks and login", () => {
+  it.each([0, 7])("reads login exit code %i when the child exits before its Effect starts", async (code) => {
+    const child = spawn(process.execPath, ["-e", `process.exit(${code})`], { stdio: "ignore" });
+    await once(child, "exit");
+    const completion = runTestEffect(waitForSuccessfulProcess(child, 1_000));
+    if (code === 0) await expect(completion).resolves.toBeUndefined();
+    else await expect(completion).rejects.toThrow(`Provider login stopped with code ${code}.`);
+  });
+
+  it("reports a login signal when the child exits before its Effect starts", async () => {
+    const child = spawn(process.execPath, ["-e", "process.kill(process.pid, 'SIGTERM')"], { stdio: "ignore" });
+    await once(child, "exit");
+    await expect(runTestEffect(waitForSuccessfulProcess(child, 1_000))).rejects.toThrow(
+      "Provider login stopped with SIGTERM.",
+    );
+  });
+
   it("reconnects OpenCode without a browser and refuses to replace an active client", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
     const { store, mailbox } = stores(root);

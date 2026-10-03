@@ -84,6 +84,8 @@ export const waitForSuccessfulProcess = Effect.fnUntraced(function* (
     };
     child.once("error", failed);
     child.once("exit", exited);
+    // The login child can exit before this Effect is scheduled.
+    if (child.exitCode !== null || child.signalCode !== null) exited(child.exitCode, child.signalCode);
     return Effect.sync(cleanup);
   }).pipe(
     Effect.timeoutOrElse({

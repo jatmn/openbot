@@ -1147,8 +1147,16 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       const maximumMessageSize = state.connection?.sctp?.maxMessageSize ?? Number.POSITIVE_INFINITY;
       for (const frame of yield* peerDecode(() => encodeTeamWebRtcPayload(data, maximumMessageSize))) {
         yield* waitForWritable(state, channel);
-        if (frame instanceof ArrayBuffer) yield* peerDecode(() => channel.send(frame));
-        else yield* peerDecode(() => channel.send(frame));
+        yield* Effect.try({
+          try: () => {
+            if (frame instanceof ArrayBuffer) channel.send(frame);
+            else channel.send(frame);
+          },
+          catch: (error) =>
+            new RemotePeerError({
+              message: error instanceof Error ? error.message : sourceText("error.remote.requestNotSent"),
+            }),
+        });
       }
     })();
   }
