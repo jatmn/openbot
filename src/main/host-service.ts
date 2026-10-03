@@ -181,6 +181,7 @@ export class HostService extends EventEmitter<HostEvents> {
   #shutdown: Promise<void> | null = null;
   readonly #remoteScreen: RemoteScreenGateway;
   readonly #browserView: BrowserViewGateway;
+  #lastBrowserViewInputAt: number | null = null;
   readonly #webrtcGateway: TeamWebRtcHostGateway | null;
   readonly #liveActivityPush: LiveActivityPushService | undefined;
   #status: HostStatus;
@@ -250,6 +251,9 @@ export class HostService extends EventEmitter<HostEvents> {
     this.#browserView = new BrowserViewGateway({
       browser: options.browser,
       authenticate: (token) => options.store.authenticate(token),
+      onInput: () => {
+        this.#lastBrowserViewInputAt = Date.now();
+      },
     });
     const sendLiveActivityPush = options.sendLiveActivityPush;
     this.#liveActivityPush = sendLiveActivityPush
@@ -921,8 +925,12 @@ export class HostService extends EventEmitter<HostEvents> {
     return this.#api.connectedClientCount();
   }
 
-  lastClientRequestAt(): number | null {
-    return this.#api.lastClientRequestAt();
+  /** The last request that changed data, typing, or input in a browser view. */
+  lastClientUseAt(): number | null {
+    const request = this.#api.lastClientUseAt();
+    const view = this.#lastBrowserViewInputAt;
+    if (request === null || view === null) return request ?? view;
+    return Math.max(request, view);
   }
 
   announceRestart(state: HostRestartState, version: string | null): void {

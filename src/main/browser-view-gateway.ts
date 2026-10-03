@@ -56,6 +56,8 @@ export interface BrowserViewGatewayOptions {
   browser: Pick<BrowserHost, "startView" | "dispatchViewInput">;
   /** Answers the member a direct socket's token belongs to, for a client that is not tunneled. */
   authenticate: (token: string) => { id: string } | null;
+  /** A member pressed a key or moved the pointer in a view. A hosted server counts it as use. */
+  onInput?: () => void;
   maxSessions?: number;
 }
 
@@ -297,6 +299,7 @@ export class BrowserViewGateway {
       forgetFramesBefore(session.frameSizes, input.sequence);
       return;
     }
+    this.#options.onInput?.();
     // Input that arrives before the first frame has no frame to be a fraction of.
     let frame = { width: session.frameWidth, height: session.frameHeight };
     if (input.type === "pointer") {

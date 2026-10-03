@@ -36,6 +36,7 @@ export const decodeRoutine = guardedDecoder(isRoutine, "routine response");
 export const decodeRoutines = guardedListDecoder(isRoutine, "routine list response");
 export const decodeRoutineRun = guardedDecoder(isRoutineRun, "routine run response");
 export const decodeRoutineRuns = guardedListDecoder(isRoutineRun, "routine history response");
+export const decodeAutomationRunCommand = guardedDecoder(isString, "run command response");
 export const decodeRoutineCalendar = guardedDecoder(isRoutineCalendar, "routine calendar response");
 
 /** A reply carrying nothing but the provider and a status, so an unexpected field cannot slip in. */

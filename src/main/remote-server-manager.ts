@@ -54,6 +54,7 @@ import { TEAM_MEMBER_LEAVE_CAPABILITY, type TeamCurrentCapability } from "@openb
 import type { HostRestartEvent } from "@openbot/contracts/team-protocol/host-update-v1";
 import { decodeTeamProtocolV1CurrentHttpResponse } from "@openbot/contracts/team-protocol/v1-adapter";
 import { sourceText } from "@openbot/i18n/source";
+import type { HostedServerAvailability } from "@openbot/team-client/hosted-server-wake";
 import { Effect, Layer, ManagedRuntime, Result } from "effect";
 import { contentDispositionFileName } from "./content-disposition";
 import { decodeAgentSummary, decodeDraftAttachment, decodeDuplicateAgentResultFromHost } from "./remote-agent-decoding";
@@ -122,8 +123,18 @@ interface RemoteServerManagerOptions {
   appVersion?: string;
   webrtcTransport?: TeamWebRtcClientTransport;
   getLocalHostId?: () => string | null;
-  /** Signal answered that the host is not connected. A hosted server that stopped is started here. */
-  onHostUnavailable?: (serverId: string) => void;
+  /** The account service's hosted servers. Each joined host can be one. */
+  hostedServers?: HostedServerWakeHooks;
+}
+
+export interface HostedServerWakeHooks {
+  /**
+   * Signal answered that the host is not connected. Tells whether it is a hosted server that sleeps, and
+   * starts a stopped server that does not sleep when `wake` is true.
+   */
+  unavailable: (serverId: string, wake: boolean) => Promise<HostedServerAvailability>;
+  /** The user's input starts a sleeping server. */
+  wake: (serverId: string) => Promise<unknown>;
 }
 
 export interface DevelopmentRemoteServerConnection {
@@ -142,6 +153,9 @@ export const AGENT_IMPORT_UPLOAD_TIMEOUT_MS = TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT
 // How long a host that restarts into an update keeps the fast retry after Signal first misses it. A
 // host that is not back by then is offline, as any other host.
 const HOST_RESTART_RETRY_MS = 10 * 60_000;
+// How long a hosted server keeps the short retry after a wake request. It boots in about a minute; a
+// server that is not back by then is asked about again.
+const HOSTED_SERVER_START_MS = 5 * 60_000;
 export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   readonly #runtime: ManagedRuntime.ManagedRuntime<RemoteRequest, never>;
   readonly #operations = new Set<Promise<unknown>>();
@@ -165,7 +179,11 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   readonly #getLocalHostId: () => string | null;
   /** From the last host list. Null before one, or when this computer hosts nothing that the account lists. */
   #localMemberLimit: number | null = null;
-  readonly #onHostUnavailable: (serverId: string) => void;
+  readonly #hostedServers: HostedServerWakeHooks | null;
+  /** When each hosted server that starts after a wake request started. */
+  readonly #hostedStartAt = new Map<string, number>();
+  /** Hosted servers that did not come online in the start time. Only the user's next wake starts them again. */
+  readonly #hostedStartExpired = new Set<string>();
   #appFocused = true;
   readonly #remoteViewerProxy: RemoteViewerProxy | null;
   #selectChain = Promise.resolve();
@@ -195,7 +213,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     };
     this.#webrtcTransport = options.webrtcTransport ?? null;
     this.#getLocalHostId = options.getLocalHostId ?? (() => null);
-    this.#onHostUnavailable = options.onHostUnavailable ?? (() => undefined);
+    this.#hostedServers = options.hostedServers ?? null;
     this.#client = new RemoteServerClient({
       appVersion: this.#appVersion,
       servers: this.#store,
@@ -256,6 +274,8 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     this.#webrtcTransport?.on("connected", (serverId) => {
       this.#events.clearReconnectBackoff(serverId);
       this.#hostRestartAway.delete(serverId);
+      this.#hostedStartAt.delete(serverId);
+      this.#hostedStartExpired.delete(serverId);
       this.#connections.markConnected(serverId);
       this.#emitChanged();
       const server = this.#store.find(serverId);
@@ -298,11 +318,16 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
     this.#webrtcTransport?.on("event", (serverId, event) => this.#handleWebRtcEvent(serverId, event));
     this.#webrtcTransport?.on("error", (serverId, code, message) => {
-      if (code === "host_unavailable" && !this.#awaitsHostRestart(serverId)) {
+      // Each failure checks the start time, so a start that fails for another reason also ends.
+      const hostedStarting = this.#awaitsHostedStart(serverId);
+      if (code === "host_unavailable" && !this.#awaitsHostRestart(serverId) && !hostedStarting) {
         this.#events.markHostOffline(serverId);
-        // A hosted server that stopped for no use starts again only for use: the selected server with
-        // the app in focus. A reconnect in the background does not start it.
-        if (this.#appFocused && serverId === this.#store.activeServerId) this.#onHostUnavailable(serverId);
+        // A hosted server that another reason stopped starts again only for the selected server with the
+        // app in focus. A server that sleeps waits for the user's input.
+        this.#checkHostedServer(
+          serverId,
+          !this.#hostedStartExpired.has(serverId) && this.#appFocused && serverId === this.#store.activeServerId,
+        );
       }
       if (!this.#connections.reportTransportError(serverId, code, message)) this.#events.scheduleReconnect(serverId);
       if (code === "session_revoked") this.emit("directoryInvalidated");
@@ -468,7 +493,8 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     );
     this.#emitChanged();
     this.startEventConnections();
-    if (this.#events.isHostOffline(serverId)) this.#onHostUnavailable(serverId);
+    if (this.#connections.hostedSleepFor(serverId) === "sleeping") this.#wakeHostedServer(serverId);
+    else if (this.#events.isHostOffline(serverId)) this.#checkHostedServer(serverId, true);
     return this.list();
   });
 
@@ -872,7 +898,59 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     this.#emitChanged();
   });
 
+  /**
+   * A wake request started this hosted server: show that it starts, and reconnect each few seconds
+   * until it answers. The account client calls it for each wake, also one from settings.
+   */
+  hostedServerStarting(serverId: string): void {
+    if (!this.#store.has(serverId) || this.#connections.stateFor(serverId) === "online") return;
+    // Automatic wakes stop after an expired start, so this wake came from the user.
+    this.#hostedStartExpired.delete(serverId);
+    this.#hostedStartAt.set(serverId, Date.now());
+    this.#events.setHostStarting(serverId, true);
+    if (this.#connections.setHostedSleep(serverId, "waking")) this.#emitChanged();
+  }
+
+  #wakeHostedServer(serverId: string): void {
+    const hosted = this.#hostedServers;
+    if (hosted) void this.#run(remoteCall(() => hosted.wake(serverId)).pipe(Effect.catch(() => Effect.void)));
+  }
+
+  #checkHostedServer(serverId: string, wake: boolean): void {
+    if (!this.#hostedServers) return;
+    void this.#run(this.#checkHostedServerEffect(serverId, wake).pipe(Effect.catch(() => Effect.void)));
+  }
+
+  readonly #checkHostedServerEffect = Effect.fn("RemoteManager.checkHostedServer")(function* (
+    this: RemoteServerManager,
+    serverId: string,
+    wake: boolean,
+  ) {
+    const hosted = this.#hostedServers;
+    if (!hosted) return;
+    const availability = yield* remoteCall(() => hosted.unavailable(serverId, wake));
+    // A later wake or connection owns the current state.
+    if (availability === "waking" || this.#hostedStartAt.has(serverId) || !this.#store.has(serverId)) return;
+    if (this.#connections.stateFor(serverId) === "online") return;
+    if (this.#connections.setHostedSleep(serverId, availability === "sleeping" ? "sleeping" : null))
+      this.#emitChanged();
+  });
+
+  /** A hosted server starts after a wake request, so a missed connection is not news until the start time ends. */
+  #awaitsHostedStart(serverId: string): boolean {
+    const since = this.#hostedStartAt.get(serverId);
+    if (since === undefined) return false;
+    if (Date.now() - since < HOSTED_SERVER_START_MS) return true;
+    this.#hostedStartAt.delete(serverId);
+    this.#hostedStartExpired.add(serverId);
+    this.#events.setHostStarting(serverId, false);
+    if (this.#connections.setHostedSleep(serverId, null)) this.#emitChanged();
+    return false;
+  }
+
   #clearServerConnectionState(serverId: string): void {
+    this.#hostedStartAt.delete(serverId);
+    this.#hostedStartExpired.delete(serverId);
     this.#events.forget(serverId);
     this.#refresh.forget(serverId);
     this.#connections.forget(serverId);
@@ -1551,11 +1629,15 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     if (this.#connections.setHostRestart(serverId, state === "none" ? null : { state, version })) this.#emitChanged();
   }
 
+  // Best effort, the same as the screen sharing flag. The host sends an identity whenever it changes,
+  // so a store that cannot be written must not turn one of them into an uncaught exception in the main
+  // process. The new name stays in memory and the next write of any field saves it.
   #applyServerIdentity(serverId: string, identity: { serverName: string; logoVersion: string | null }): void {
     void this.#run(
-      this.#store
-        .updateEffect(serverId, { name: identity.serverName, logoVersion: identity.logoVersion })
-        .pipe(Effect.tap(() => Effect.sync(() => this.#emitChanged()))),
+      this.#store.updateEffect(serverId, { name: identity.serverName, logoVersion: identity.logoVersion }).pipe(
+        Effect.tap(() => Effect.sync(() => this.#emitChanged())),
+        Effect.catch(() => Effect.void),
+      ),
     );
   }
 

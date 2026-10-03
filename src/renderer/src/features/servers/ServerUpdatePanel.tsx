@@ -25,11 +25,11 @@ import {
   SettingsSection,
   SwitchField,
   TriangleAlert,
-  toast,
 } from "@openbot/ui";
 import { restartReasonKey } from "@openbot/ui/features/updates/restart-reasons";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
+import { actionToast } from "../../action-toast";
 import { watchHostUpdate } from "./host-update-toast";
 
 /** The update calls of one server's host. The desktop reaches them through main. */
@@ -115,7 +115,7 @@ export function ServerUpdatePanel(
       const next = await call(props.serverId);
       if (current === generation) show(next);
     } catch (error) {
-      toast.error(t("server.settings.actionFailedTitle"), {
+      actionToast.error(t("server.settings.actionFailedTitle"), {
         description: errorMessage(error, t("server.settings.actionFailed")),
       });
     } finally {

@@ -189,6 +189,7 @@ export function SettingsModal(props: SettingsModalProps) {
             value={props.value}
             variant={props.appInfo?.variant ?? "production"}
             onUpdateSetting={updateSetting}
+            onUpdateSettings={updateSettings}
             selectMount={modalElement}
             turboModePending={props.turboModePending}
             onTestNotification={props.onTestNotification}

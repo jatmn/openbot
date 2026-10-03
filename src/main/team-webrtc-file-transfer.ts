@@ -275,6 +275,7 @@ export class TeamWebRtcFileTransfer {
           Effect.fail(new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.fileTransferTimeout")) })),
         );
       }, timeoutMs);
+      timer.unref?.();
       this.#waiters.set(key, {
         timer,
         resolve: (file) => resume(Effect.succeed(file)),

@@ -11,12 +11,17 @@ import {
   parseHostedServerList,
   parseHostedServerSummary,
 } from "@openbot/contracts/hosted-servers";
+import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import {
+  createHostedServerStatusCheck,
+  createHostedServerWake,
+  type HostedServerAvailability,
+  type HostedServerWakeResponse,
+  WAKE_RECONNECT_STATES,
+} from "@openbot/team-client/hosted-server-wake";
 import { Effect, type Layer } from "effect";
 import { type AccountServiceFailure, AccountServicePlatform, runAccountEffect } from "./account-service-platform";
-
-/** A client asks for a wake at most this often for one host, while the host stays unavailable. */
-const WAKE_INTERVAL_MS = 60_000;
 
 /** A running server that the joined list does not have yet makes the list refresh at most this often. */
 const RUNNING_REFRESH_INTERVAL_MS = 15_000;
@@ -55,20 +60,43 @@ export function withHostingDeveloperKey(auth: HostedServerAuthClient, key: strin
  */
 export class HostedServerDesktopService {
   readonly #platform: Layer.Layer<AccountServicePlatform>;
-  readonly #lastWakeAt = new Map<string, number>();
   readonly #lastRunningAt = new Map<string, number>();
+  readonly #statusCheck: ReturnType<typeof createHostedServerStatusCheck>;
 
   /**
    * `onRunning` gets each running server from a list, so the caller can refresh the joined servers
-   * when a new server is ready and does not wait for the next directory poll.
+   * when a new server is ready and does not wait for the next directory poll. `onWake` gets each server
+   * that starts after a wake request, so the caller reconnects to it soon.
    */
   constructor(
     auth: HostedServerAuthClient,
     openExternal: (url: string) => Promise<void>,
     private readonly now: () => number = Date.now,
     private readonly onRunning: (serverId: string) => void = () => {},
+    private readonly onWake: (serverId: string) => void = () => {},
   ) {
     this.#platform = AccountServicePlatform.layer(auth, openExternal);
+    const wake = createHostedServerWake(
+      (serverId) => respond(() => runAccountEffect(this.#requestWakeEffect(serverId), this.#platform)),
+      now,
+    );
+    this.#statusCheck = createHostedServerStatusCheck(
+      (serverId) =>
+        respond(() =>
+          runAccountEffect(
+            AccountServicePlatform.use((platform) =>
+              platform.request(
+                `/v2/hosting/servers/${encodeURIComponent(serverId)}/status`,
+                { method: "GET" },
+                (value) => value,
+              ),
+            ),
+            this.#platform,
+          ),
+        ),
+      wake,
+      now,
+    );
   }
 
   list(): Promise<HostedServerList> {
@@ -181,43 +209,32 @@ export class HostedServerDesktopService {
     });
   }
 
-  /** Async, so a missing session rejects and does not throw into the transport error listener. */
+  /** The user starts the server. Failure stays a rejected Promise at the listener boundary. */
   wake(serverId: string): Promise<HostedServerSummary> {
     return runAccountEffect(this.wakeEffect(serverId), this.#platform);
   }
+  readonly wakeEffect = Effect.fn("HostedServer.wake")(function* (this: HostedServerDesktopService, serverId: string) {
+    this.#statusCheck.forget(serverId);
+    return yield* this.#requestWakeEffect(serverId);
+  });
 
-  wakeEffect(serverId: string): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
-    return Effect.gen({ self: this }, function* (): Effect.fn.Return<
-      HostedServerSummary,
-      AccountServiceFailure,
-      AccountServicePlatform
-    > {
-      const platform = yield* AccountServicePlatform;
-      this.#lastWakeAt.set(serverId, this.now());
-      return yield* platform.request(
-        `/v2/hosting/servers/${encodeURIComponent(serverId)}/wake`,
-        { method: "POST" },
-        decodeSummary,
-      );
-    });
+  unavailableHost(serverId: string, wake: boolean): Promise<HostedServerAvailability> {
+    return this.#statusCheck.unavailable(serverId, { wake });
   }
 
-  /**
-   * Signal answered that the host is not connected. When the host is a hosted server that the
-   * provider stopped, this starts it, and the reconnect that already runs finds it online. For any other host the
-   * account server answers 404, so the result is ignored.
-   */
-  wakeUnavailableHost(serverId: string): Promise<void> {
-    const last = this.#lastWakeAt.get(serverId);
-    if (last !== undefined && this.now() - last < WAKE_INTERVAL_MS) return Promise.resolve();
-    return runAccountEffect(
-      this.wakeEffect(serverId).pipe(
-        Effect.asVoid,
-        Effect.catch(() => Effect.void),
-      ),
-      this.#platform,
+  readonly #requestWakeEffect = Effect.fn("HostedServer.requestWake")(function* (
+    this: HostedServerDesktopService,
+    serverId: string,
+  ) {
+    const platform = yield* AccountServicePlatform;
+    const server = yield* platform.request(
+      `/v2/hosting/servers/${encodeURIComponent(serverId)}/wake`,
+      { method: "POST" },
+      decodeSummary,
     );
-  }
+    if (WAKE_RECONNECT_STATES.has(server.state)) this.onWake(serverId);
+    return server;
+  });
 
   /** A null URL means that the payment is done already, so there is no page to open. */
   #open(
@@ -232,6 +249,18 @@ export class HostedServerDesktopService {
       if (checkout.checkoutUrl) yield* platform.openPage(checkout.checkoutUrl);
       return checkout.server;
     });
+  }
+}
+
+/** The account client throws an error with the status and the error code of the answer. The wake helper reads a response. */
+async function respond(request: () => Promise<unknown>): Promise<HostedServerWakeResponse> {
+  try {
+    const value = await request();
+    return { ok: true, status: 200, json: async () => value };
+  } catch (error) {
+    if (!isDynamicRecord(error) || typeof error.status !== "number") throw error;
+    const body = { error: { code: typeof error.code === "string" ? error.code : null } };
+    return { ok: false, status: error.status, json: async () => body };
   }
 }
 

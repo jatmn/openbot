@@ -776,6 +776,8 @@ export const IPC_ENDPOINTS = {
     deleteRoutine: scopedRequest<DeleteRoutineInput, void>()("agent:delete-routine"),
     testRoutine: scopedRequest<TestRoutineInput, RoutineRun>()("agent:test-routine"),
     listRoutineRuns: scopedRequest<ListRoutineRunsInput, RoutineRun[]>()("agent:list-routine-runs"),
+    /** The shell command a local script uses to run the routine. It names the token file, not the token. */
+    automationRunCommand: scopedRequest<TestRoutineInput, string>()("agent:automation-run-command"),
     // Every routine of the host, of agents and channels, with its runs in a range.
     routineCalendar: scopedRequest<RoutineCalendarInput, RoutineCalendar>()("agent:routine-calendar"),
   },

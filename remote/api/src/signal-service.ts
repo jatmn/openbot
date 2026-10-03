@@ -535,6 +535,8 @@ export class SignalService {
           this.#fail(socket, "authentication_required", "Remote ticket is invalid or expired.", 1008);
           return;
         }
+        // Verification may finish after disconnect removed the socket. Register nothing then.
+        if (!this.#sockets.has(socket.id)) return;
         const { claims, slackRoute } = authentication.success;
         if (message.peer !== "ingress" && this.#userConnectionCount(claims.userId) >= this.#maximumConnectionsPerUser) {
           this.#fail(socket, "rate_limited", "Too many active remote connections.", 1008);
@@ -555,6 +557,8 @@ export class SignalService {
         this.#metrics.acceptedConnections += 1;
         this.#metrics.activeSockets = this.#sockets.size;
         const resumeToken = yield* tokens.issueResumeToken(claims);
+        // Token signing is asynchronous too. Disconnect already removes the peer and timer.
+        if (!this.#sockets.has(socket.id)) return;
         if (message.peer === "ingress") {
           for (const team of slackRoute.teams) {
             const route = slackRouteKey(team.appId, team.id);

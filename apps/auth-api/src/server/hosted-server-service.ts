@@ -17,6 +17,7 @@ import {
   type HostedServerList,
   type HostedServerSize,
   type HostedServerState,
+  type HostedServerStatus,
   type HostedServerSummary,
   parseHostedServerName,
 } from "@openbot/contracts/hosted-servers";
@@ -523,6 +524,28 @@ export class HostedServerService {
     yield* this.#finishDelete(yield* this.#requireRow(serverId));
   });
 
+  /**
+   * The state of a server for its owner or a member. It changes nothing, so a client can ask on each lost
+   * connection whether the server sleeps, and wake it only on the user's next input.
+   */
+  status(user: AuthUser, serverId: string): Promise<HostedServerStatus> {
+    return this.#run(this.#statusEffect(user, serverId));
+  }
+
+  readonly #statusEffect = Effect.fn("HostedServerService.status")(function* (
+    this: HostedServerService,
+    user: AuthUser,
+    serverId: string,
+  ): Effect.fn.Return<HostedServerStatus, HostedFailure, HostedServerDependencies> {
+    const row = yield* this.#requireUsableRow(user, serverId);
+    return {
+      serverId: row.server_id,
+      state: row.observed_state,
+      error: row.observed_error,
+      sleeping: row.desired_state === "idle",
+    };
+  });
+
   wake(user: AuthUser, serverId: string): Promise<HostedServerSummary> {
     return this.#run(this.#wakeEffect(user, serverId));
   }
@@ -533,18 +556,7 @@ export class HostedServerService {
     serverId: string,
   ): Effect.fn.Return<HostedServerSummary, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers h
-         WHERE h.server_id = ? AND h.desired_state != 'deleted' AND (h.owner_user_id = ? OR EXISTS(
-           SELECT 1 FROM remote_memberships m WHERE m.host_id = h.server_id AND m.user_id = ? AND m.status = 'active'
-         ))`,
-        )
-        .bind(serverId, user.id, user.id)
-        .first<HostedServerRow>(),
-    );
-    if (!row) return yield* notFound();
+    const row = yield* this.#requireUsableRow(user, serverId);
     if (row.desired_state === "stopped") {
       return yield* new HostedServerServiceError(
         402,
@@ -1920,6 +1932,28 @@ export class HostedServerService {
     }
     return { billing: this.#billing };
   }
+
+  /** A server that is not deleted, of which the user is the owner or an active member. */
+  readonly #requireUsableRow = Effect.fn("HostedServerService.requireUsableRow")(function* (
+    this: HostedServerService,
+    user: AuthUser,
+    serverId: string,
+  ): Effect.fn.Return<HostedServerRow, HostedFailure, HostedServerDependencies> {
+    const dependencies = yield* HostedServerDependencies;
+    const row = yield* hostedCall(() =>
+      dependencies.database
+        .prepare(
+          `SELECT ${ROW_COLUMNS} FROM hosted_servers h
+         WHERE h.server_id = ? AND h.desired_state != 'deleted' AND (h.owner_user_id = ? OR EXISTS(
+           SELECT 1 FROM remote_memberships m WHERE m.host_id = h.server_id AND m.user_id = ? AND m.status = 'active'
+         ))`,
+        )
+        .bind(serverId, user.id, user.id)
+        .first<HostedServerRow>(),
+    );
+    if (!row) return yield* notFound();
+    return row;
+  });
 
   readonly #requireRow = Effect.fn("HostedServerService.requireRow")(function* (
     this: HostedServerService,

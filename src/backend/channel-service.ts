@@ -1543,6 +1543,9 @@ export class ChannelService {
       Array.isArray(args.resources) && args.resources.length && args.resources.every(isString)
         ? args.resources
         : ["host"];
+    // Reject an oversized list before the loop. The loop runs a blocking `realpathSync` per
+    // workspace entry on the Electron main thread.
+    if (resources.length > 64) return yield* channelFailure(new Error("Invalid task resources."));
     for (let i = 0; i < resources.length; i++) {
       const resource = resources[i] ?? "host";
       if (resource.startsWith("workspace:") && isAbsolute(resource.slice(10)))
@@ -1552,7 +1555,8 @@ export class ChannelService {
           new Error("Use host, browser, none, or workspace:<absolute path> for task resources."),
         );
     }
-    if (resources.length > 64 || resources.some((resource) => resource.length > 4096))
+    // Measure each resource after canonicalization.
+    if (resources.some((resource) => resource.length > 4096))
       return yield* channelFailure(new Error("Invalid task resources."));
     const dependencies = Array.isArray(args.dependencies) && args.dependencies.every(isString) ? args.dependencies : [];
     if (dependencies.some((id) => dependsOn(tasks, id, task.id) || !tasks.some((item) => item.id === id)))
