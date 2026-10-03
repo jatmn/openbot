@@ -98,7 +98,7 @@ afterEach(async () => {
 
 describe("RequestedUpdate", () => {
   it("checks, downloads, waits for idle work, then installs", async () => {
-    runTestEffect(create().start(ADA, "when-idle"));
+    await runTestEffect(create().start(ADA, "when-idle"));
     expect(updater.checkForUpdates).toHaveBeenCalledOnce();
     expect(updater.scheduled).toEqual({ requestedBy: "Ada", mode: "when-idle", waitingFor: [] });
 
@@ -131,7 +131,7 @@ describe("RequestedUpdate", () => {
   it("restarts at ready without waiting when the admin asks for now", async () => {
     updater.status = { ...updater.status, phase: "ready", availableVersion: "0.25.0", progress: 100 };
     readiness = { safeToRestart: false, reasons: ["agent-turn"] };
-    runTestEffect(create().start(ADA, "now"));
+    await runTestEffect(create().start(ADA, "now"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(updater.installUpdate).toHaveBeenCalledOnce();
   });
@@ -139,10 +139,10 @@ describe("RequestedUpdate", () => {
   it("a second request with now skips the wait of the first", async () => {
     updater.status = { ...updater.status, phase: "ready", availableVersion: "0.25.0", progress: 100 };
     readiness = { safeToRestart: false, reasons: ["agent-turn"] };
-    runTestEffect(create().start(ADA, "when-idle"));
+    await runTestEffect(create().start(ADA, "when-idle"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(updater.installUpdate).not.toHaveBeenCalled();
-    runTestEffect(requested.start(ADA, "now"));
+    await runTestEffect(requested.start(ADA, "now"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(updater.installUpdate).toHaveBeenCalledOnce();
   });
@@ -150,7 +150,7 @@ describe("RequestedUpdate", () => {
   it("cancel stops a restart that waits, and is refused once the install runs", async () => {
     updater.status = { ...updater.status, phase: "ready", availableVersion: "0.25.0", progress: 100 };
     readiness = { safeToRestart: false, reasons: ["agent-turn"] };
-    runTestEffect(create().start(ADA, "when-idle"));
+    await runTestEffect(create().start(ADA, "when-idle"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(requested.cancel().restart).toBeNull();
     expect(updater.scheduled).toBeNull();
@@ -174,7 +174,7 @@ describe("RequestedUpdate", () => {
         };
       }),
     );
-    runTestEffect(create().start(ADA, "now"));
+    await runTestEffect(create().start(ADA, "now"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(updater.installUpdate).toHaveBeenCalledOnce();
     expect(() => requested.cancel()).toThrow(RequestedUpdateRefusal);
@@ -187,14 +187,14 @@ describe("RequestedUpdate", () => {
     updater.installUpdate.mockReturnValueOnce(
       Effect.fail(new UpdateOperationFailure({ cause: new Error("Another OpenBot session is still running.") })),
     );
-    runTestEffect(create().start(ADA, "now"));
+    await runTestEffect(create().start(ADA, "now"));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(requested.snapshot()).toMatchObject({ phase: "ready", errorCode: "install_failed", restart: null });
     expect(updater.scheduled).toBeNull();
   });
 
   it("schedules nothing when the check finds no update", async () => {
-    runTestEffect(create().start(ADA, "when-idle"));
+    await runTestEffect(create().start(ADA, "when-idle"));
     updater.set({ phase: "checking" });
     updater.set({ phase: "up-to-date" });
     expect(requested.snapshot().restart).toBeNull();
@@ -209,7 +209,7 @@ describe("RequestedUpdate", () => {
       expect.objectContaining({ reason: "managed" }),
     );
     expect(requested.snapshot().remoteUpdates).toBe("managed");
-    runTestEffect(requested.dispose());
+    await runTestEffect(requested.dispose());
 
     updater.status = { ...updater.status, managedByHost: false };
     await expect(runTestEffect(create({ allowRemoteUpdates: false }).check())).rejects.toMatchObject(
@@ -222,7 +222,7 @@ describe("RequestedUpdate", () => {
   it("turning remote updates off removes a restart that waits", async () => {
     updater.status = { ...updater.status, phase: "ready", availableVersion: "0.25.0", progress: 100 };
     readiness = { safeToRestart: false, reasons: ["agent-turn"] };
-    runTestEffect(create().start(ADA, "when-idle"));
+    await runTestEffect(create().start(ADA, "when-idle"));
     await runTestEffect(requested.setPreference({ allowRemoteUpdates: false }));
     expect(updater.scheduled).toBeNull();
     readiness = { safeToRestart: true, reasons: [] };
@@ -307,7 +307,7 @@ describe("RequestedUpdate automatic install", () => {
     expect(requested.snapshot().restart).toBeNull();
 
     await runTestEffect(requested.setPreference({ allowRemoteUpdates: true }));
-    runTestEffect(requested.start(ADA, "when-idle"));
+    await runTestEffect(requested.start(ADA, "when-idle"));
     await runTestEffect(requested.setPreference({ autoInstall: false }));
     expect(requested.snapshot().restart?.requestedBy).toBe("Ada");
   });

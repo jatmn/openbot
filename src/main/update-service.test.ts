@@ -228,7 +228,7 @@ describe("UpdateService", () => {
     service.start(false);
     await runTestEffect(service.checkForUpdates());
 
-    runTestEffect(service.setAutoDownload(true));
+    await runTestEffect(service.setAutoDownload(true));
 
     expect(service.getAutoDownload()).toBe(true);
     await vi.waitFor(() => expect(service.getStatus().phase).toBe("ready"));
@@ -241,7 +241,7 @@ describe("UpdateService", () => {
     service.start(false);
     await runTestEffect(service.checkForUpdates());
 
-    runTestEffect(service.setAutoDownload(false));
+    await runTestEffect(service.setAutoDownload(false));
 
     expect(service.getStatus().phase).toBe("available");
     expect(updater.downloadUpdate).not.toHaveBeenCalled();

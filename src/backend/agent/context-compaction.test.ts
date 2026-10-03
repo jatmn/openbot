@@ -81,7 +81,7 @@ describe.sequential("ContextCompaction: pressure, threshold and failure", () => 
     // A compaction keeps no conversation turn id, so a refresh reads its thread as idle. Dropping
     // the routing here would lose the compaction's own completion, and the agent would hold its
     // queue for good.
-    runTestEffect(
+    await runTestEffect(
       service.saveMcpServer({
         config: {
           id: "",
