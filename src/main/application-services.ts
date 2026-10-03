@@ -1712,6 +1712,7 @@ export async function createApplicationServices({
           return siblings;
         }
       : undefined,
+    currentUid: typeof process.getuid === "function" ? process.getuid() : undefined,
     platform: process.platform,
     logDirectory: join(app.getPath("userData"), "logs", "update"),
     // Squirrel.Mac only. The path is meaningless under a Linux or Windows home directory.

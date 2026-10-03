@@ -23,6 +23,8 @@ import { RemoteDesktopOperationError } from "./remote-desktop-effects";
 import type { RemoteDesktopRuntimePaths } from "./remote-desktop-runtime-artifact";
 import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 import {
+  RemoteRuntimeStartError,
+  type RemoteRuntimeStartStage,
   SunshineApiError,
   SunshineMoonlightRuntime,
   type SunshineMoonlightRuntimeState,
@@ -35,6 +37,11 @@ const VIEWER_COOKIE = "openbotRemoteViewer";
 const MAX_PENDING_STREAM_FRAMES = 32;
 const MAX_PENDING_STREAM_BYTES = 1_048_576;
 const MAX_TIMER_DELAY_MS = 2_147_000_000;
+const RUNTIME_START_FAILURE = {
+  sunshine: "error.remote.sunshineStartFailed",
+  moonlight: "error.remote.moonlightStartFailed",
+  pairing: "error.remote.pairingFailed",
+} as const satisfies Record<RemoteRuntimeStartStage, string>;
 const viewerGrantSchema = z.object({ grant: z.string().min(1).max(256) });
 const viewerStateSchema = z.object({
   source: z.literal("openbot-moonlight"),
@@ -539,7 +546,9 @@ export class RemoteScreenGateway {
       return yield* new RemoteWorkflowError({
         cause: new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive")),
       });
-    yield* this.#ensureRuntime();
+    yield* this.#ensureRuntime().pipe(
+      Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause: this.#runtimeStartRefusal(cause) })),
+    );
     if (this.#testSessionId)
       return yield* new RemoteWorkflowError({
         cause: new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive")),
@@ -1024,28 +1033,61 @@ export class RemoteScreenGateway {
     if (!paths || this.#linuxWithoutX11)
       return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.runtimeUnavailable")) });
     const dependencies = yield* ScreenDependencies;
-    this.#runtime ??= this.#options.createRuntime({
-      paths,
-      stateDirectory: this.#options.runtimeStateDirectory,
-      platform: this.#options.platform,
-      credentials: yield* dependencies.credentials(),
-      getDisplays: () => this.#options.getDisplays?.() ?? [],
-      getIceServers: () =>
-        Effect.gen({ self: this }, function* () {
-          // Loopback tests need no account or Signal service. Keep remote ICE configuration
-          // whenever a remote session shares this runtime.
-          if (this.#sessions.size > 0 && [...this.#sessions.keys()].every((id) => this.#localTestServers.has(id)))
-            return [];
-          return yield* dependencies.iceServers();
-        }).pipe(Effect.mapError(({ cause }) => new RemoteDesktopOperationError({ cause }))),
-      onDiagnostic: this.#options.onDiagnostic,
-    });
+    if (!this.#runtime) {
+      const runtime: RemoteScreenRuntime = this.#options.createRuntime({
+        paths,
+        stateDirectory: this.#options.runtimeStateDirectory,
+        platform: this.#options.platform,
+        credentials: yield* dependencies.credentials(),
+        getDisplays: () => this.#options.getDisplays?.() ?? [],
+        getIceServers: () =>
+          Effect.gen({ self: this }, function* () {
+            // Loopback tests need no account or Signal service. Keep remote ICE configuration
+            // whenever a remote session shares this runtime.
+            if (this.#sessions.size > 0 && [...this.#sessions.keys()].every((id) => this.#localTestServers.has(id)))
+              return [];
+            return yield* dependencies.iceServers();
+          }).pipe(Effect.mapError(({ cause }) => new RemoteDesktopOperationError({ cause }))),
+        onDiagnostic: this.#options.onDiagnostic,
+        onExit: () => {
+          if (this.#runtime === runtime) Effect.runFork(this.#provide(this.#runtimeExited()));
+        },
+      });
+      this.#runtime = runtime;
+    }
     const runtime = this.#runtime;
     this.#runtimeState = yield* runtime
       .start()
       .pipe(Effect.mapError(({ cause }: RemoteDesktopOperationError) => new RemoteWorkflowError({ cause })));
     this.#selectedDisplayId = this.#runtimeState.selectedDisplayId;
     return this.#runtimeState;
+  });
+
+  // A start failure is the host's answer to the member, so it names the part that failed. The cause
+  // can hold local paths and ports, so it goes to the host's diagnostics only.
+  #runtimeStartRefusal(error: unknown): RemoteScreenError {
+    if (error instanceof RemoteScreenError) return error;
+    const stage = error instanceof RemoteRuntimeStartError ? error.stage : null;
+    const cause = error instanceof RemoteRuntimeStartError ? error.cause : error;
+    this.#options.onDiagnostic?.(
+      stage === "sunshine" ? "sunshine" : "moonlight",
+      `OpenBot: the remote desktop runtime did not start (${stage ?? "runtime"}): ${describeCause(cause)}\n`,
+    );
+    return new RemoteScreenError(
+      503,
+      "host_unavailable",
+      sourceText(stage ? RUNTIME_START_FAILURE[stage] : "error.remote.runtimeStartFailed"),
+    );
+  }
+
+  // The runtime's processes are gone, so no session it served can stream again. End them and stop
+  // what is left of it; the next session starts a new runtime, and a start that fails names its reason.
+  readonly #runtimeExited = Effect.fn("RemoteScreenGateway.runtimeExited")(function* (this: RemoteScreenGateway) {
+    yield* Effect.all(
+      [...this.#sessions.keys()].map((id) => this.closeSession(id, "connection_failed")),
+      { concurrency: "unbounded" },
+    );
+    yield* this.#stopRuntime();
   });
 
   #reportScreenRecordingDenied(denied: boolean): void {
@@ -1179,6 +1221,20 @@ export class RemoteScreenError extends Schema.TaggedError<RemoteScreenError>()("
 
 // Sunshine captures and sends input through X11 only. Under Wayland, X11 reaches only the windows
 // of XWayland clients, so the stream would show an empty screen.
+// The runtime wraps a cause, such as "Sunshine did not start on a reserved port family", around the
+// reason it did not start: an exit, or no answer.
+function describeCause(cause: unknown): string {
+  const parts: string[] = [];
+  for (
+    let next = cause;
+    next !== undefined && parts.length < 3;
+    next = next instanceof Error ? next.cause : undefined
+  ) {
+    parts.push(next instanceof Error ? next.message : String(next));
+  }
+  return parts.join(": ");
+}
+
 function isX11Session(environment: Readonly<Record<string, string | undefined>>): boolean {
   return Boolean(environment.DISPLAY) && !environment.WAYLAND_DISPLAY && environment.XDG_SESSION_TYPE !== "wayland";
 }
@@ -1192,7 +1248,7 @@ function sendViewer(
   const sessionPath = TEAM_API_ROUTES.remoteScreen.session(sessionId);
   const hostId = runtime.hostIds[streamerSlot - 1] ?? runtime.hostId;
   const target = `${sessionPath}/moonlight/stream.html?hostId=${hostId}&appId=${runtime.desktopAppId}`;
-  const html = `<!doctype html><meta charset="utf-8"><title>OpenBot Moonlight Remote</title><meta name="color-scheme" content="dark"><style>html,body{margin:0;width:100%;height:100%;background:#090b0c;color:#fff;font:14px system-ui}main{display:grid;place-items:center;height:100%}</style><main>Connecting…</main><script type="module">const grant=new URL(location.href).hash.slice(1);history.replaceState(null,"",location.pathname);const response=await fetch(${JSON.stringify(`${sessionPath}/authorize`)},{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({grant})});if(!response.ok){document.querySelector("main").textContent="Remote access expired";throw new Error("grant rejected")}location.replace(${JSON.stringify(target)});</script>`;
+  const html = `<!doctype html><meta charset="utf-8"><title>OpenBot Moonlight Remote</title><meta name="color-scheme" content="dark"><style>html,body{margin:0;width:100%;height:100%;background:#090b0c;color:#fff;font:14px system-ui}main{display:grid;place-items:center;height:100%}</style><main>Connecting…</main><script type="module">const grant=new URL(location.href).hash.slice(1);history.replaceState(null,"",location.pathname);const response=await fetch(${JSON.stringify(`${sessionPath}/authorize`)},{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({grant})});if(!response.ok){document.querySelector("main").textContent="Remote access expired";const refused=()=>parent.postMessage(${JSON.stringify({ source: "openbot-moonlight", type: "viewer-state", sessionId, state: "error" })},"*");document.readyState==="complete"?refused():addEventListener("load",refused);throw new Error("grant rejected")}location.replace(${JSON.stringify(target)});</script>`;
   response.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Content-Security-Policy":

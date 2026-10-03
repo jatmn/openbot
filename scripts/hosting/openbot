@@ -4,7 +4,8 @@
 # src/main/server-mode.ts, and to systemd for the service.
 #
 # The socket is in /run/openbot, which only the service user can enter. Run this as that user or
-# with sudo.
+# with sudo. In the Docker image (`mode` is `container`) there is no systemd: Docker starts, stops
+# and replaces OpenBot, and only the account commands work.
 set -euo pipefail
 # shellcheck source=openbot-hosted-update
 source "$(dirname "$(readlink -f "$0")")/openbot-hosted-update"
@@ -36,8 +37,26 @@ service_user() {
   cat "$INSTALL/hosted/service-user" 2>/dev/null || echo openbot
 }
 
+in_container() {
+  [ -r "$INSTALL/hosted/mode" ] && [ "$(<"$INSTALL/hosted/mode")" = container ]
+}
+
+# Stops a command that Docker does in the image.
+require_host() {
+  in_container || return 0
+  fail "In a container, $1. See https://github.com/nightly-labs/openbot/blob/main/docs/docker.md"
+}
+
 require_root() {
   [ "$(id -u)" -eq 0 ] || fail "Run this with sudo: sudo openbot $*"
+}
+
+# Stops with the command that shows the log, which is not the same in a container.
+not_answering() {
+  if in_container; then
+    fail "OpenBot does not answer. Read the log on the host with: docker logs <container>"
+  fi
+  fail "OpenBot does not answer. Read the log with: openbot logs"
 }
 
 # Waits for the socket after a start. A user that cannot enter /run/openbot never sees it.
@@ -45,13 +64,13 @@ wait_for_socket() {
   local second
   for ((second = 0; second < 30; second++)); do
     [ -S "$SOCKET" ] && return 0
-    systemctl is-active --quiet "$UNIT" || fail "OpenBot is not running. Start it with: sudo openbot start"
+    in_container || systemctl is-active --quiet "$UNIT" || fail "OpenBot is not running. Start it with: sudo openbot start"
     if [ -d /run/openbot ] && [ ! -x /run/openbot ]; then
       fail "Run this with sudo, or as the user $(service_user)."
     fi
     sleep 1
   done
-  fail "OpenBot does not answer. Read the log with: openbot logs"
+  not_answering
 }
 
 # Percent-encodes each byte. printf is a shell builtin, so the value is in no process arguments.
@@ -72,7 +91,7 @@ control() {
   wait_for_socket
   response=$(printf '%s' "$body" | curl --silent --show-error --max-time 120 --unix-socket "$SOCKET" \
     -X "$method" "${arguments[@]}" --write-out 'status=%{http_code}\n' "http://openbot$path") ||
-    fail "OpenBot does not answer. Read the log with: openbot logs"
+    not_answering
 }
 
 value() {
@@ -172,11 +191,13 @@ login_command() {
 }
 
 logs_command() {
+  require_host "read the log on the host with: docker logs <container>"
   if [ "${1:-}" = -f ]; then exec journalctl --unit "$UNIT" --follow --lines 100; fi
   exec journalctl --unit "$UNIT" --lines 200 --no-pager
 }
 
 update_command() {
+  require_host "pull the new image on the host, then make the container again"
   require_root update
   local before after reply
   before=$(version_of "$INSTALL/app")
@@ -200,6 +221,7 @@ update_command() {
 # /srv/openbot-hosted stay: the keyring has the key of the encrypted data in that home folder, so the
 # two go together, and a later install uses them again.
 uninstall_command() {
+  require_host "run openbot logout, then remove the container on the host. The data stays in its volume"
   require_root uninstall
   local user home reply unit entry
   { [ -r "$INSTALL/hosted/mode" ] && [ "$(<"$INSTALL/hosted/mode")" = self ]; } ||
@@ -252,6 +274,7 @@ case $command in
     ;;
   logs) logs_command "$@" ;;
   start | stop | restart)
+    require_host "run docker $command <container> on the host"
     require_root "$command"
     systemctl "$command" "$UNIT"
     ;;

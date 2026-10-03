@@ -37,6 +37,22 @@ export class SunshineApiError extends Schema.TaggedError<SunshineApiError>()("Su
   }
 }
 
+export type RemoteRuntimeStartStage = "sunshine" | "moonlight" | "pairing";
+
+/**
+ * A start that failed, with the part that failed. The gateway turns the stage into the reason a
+ * member reads; the cause stays in the host's diagnostics.
+ */
+export class RemoteRuntimeStartError extends Error {
+  constructor(
+    readonly stage: RemoteRuntimeStartStage,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "RemoteRuntimeStartError";
+  }
+}
+
 const MOONLIGHT_STREAMER_SLOTS = 4;
 // First candidate for Sunshine's base port. Sunshine derives its whole port family from this one
 // `port` value, so every OpenBot instance must claim a disjoint family: two macOS users share one
@@ -329,6 +345,8 @@ interface SunshineMoonlightRuntimeOptions {
   getIceServers: () => Effect.Effect<RemoteDesktopIceServer[], RemoteDesktopOperationError>;
   spawnProcess?: RemoteRuntimeSpawn;
   onDiagnostic?: (source: "sunshine" | "moonlight", message: string) => void;
+  /** Called when Sunshine or Moonlight Web exits after the runtime started. */
+  onExit?: (source: "sunshine" | "moonlight") => void;
   allocateSunshineBasePort?: () => Effect.Effect<number, RemoteDesktopOperationError>;
   allocateMoonlightPort?: () => Effect.Effect<number, RemoteDesktopOperationError>;
   allocateWebRtcPortRange?: () => Effect.Effect<MoonlightWebRtcPortRange, RemoteDesktopOperationError>;
@@ -446,8 +464,9 @@ export class SunshineMoonlightRuntime {
     if (!this.#state) return;
     yield* this.#writeSunshineConfigEffect();
     const sunshine = this.#sunshine;
-    if (sunshine) yield* stopRemoteProcess(sunshine);
+    // Clear before waiting so the exit watcher recognizes an intended stop.
     this.#sunshine = null;
+    if (sunshine) yield* stopRemoteProcess(sunshine);
     // Reuse the already allocated ports: Moonlight paired against this Sunshine HTTP port, so a
     // reallocation here would orphan every existing pairing.
     yield* this.#startSunshineOnceEffect();
@@ -506,6 +525,16 @@ export class SunshineMoonlightRuntime {
     return port;
   }
 
+  // A stop that interrupts the start is not a start failure. A process that has already ended names
+  // the stage, because a pairing call to a Sunshine that has exited fails too.
+  #failStart(stage: RemoteRuntimeStartStage): (error: RemoteDesktopOperationError) => RemoteDesktopOperationError {
+    return (error) => {
+      if (this.#stopRequested) return error;
+      const ended = childEnded(this.#sunshine) ? "sunshine" : childEnded(this.#moonlight) ? "moonlight" : null;
+      return desktopFailure(new RemoteRuntimeStartError(ended ?? stage, error.cause));
+    };
+  }
+
   #throwIfStopRequested(): void {
     if (this.#stopRequested) throw new Error(sourceText("error.backend.remoteDesktopStoppedWhileStarting"));
   }
@@ -546,7 +575,9 @@ export class SunshineMoonlightRuntime {
         }
         desktopResult(yield* Effect.result(this.#writeIceHelperEffect()));
         desktopResult(yield* Effect.result(this.#setSunshineCredentialsEffect()));
-        desktopResult(yield* Effect.result(this.#startSunshineWithRetryEffect()));
+        desktopResult(
+          yield* Effect.result(this.#startSunshineWithRetryEffect().pipe(Effect.mapError(this.#failStart("sunshine")))),
+        );
         desktopResult(yield* Effect.result(this.#writeMoonlightConfigEffect()));
         const displays = desktopResult(yield* Effect.result(this.#getSunshineDisplaysEffect()));
         if (!this.#selectedDisplayId || !displays.some((display) => display.id === this.#selectedDisplayId)) {
@@ -564,12 +595,22 @@ export class SunshineMoonlightRuntime {
                 headers: { [this.#moonlightHeader]: moonlightSlotUser(1) },
               },
               this.#moonlight,
-            ),
+            ).pipe(Effect.mapError(this.#failStart("moonlight"))),
           ),
         );
         this.#options.onDiagnostic?.("moonlight", "OpenBot: Moonlight Web is ready.\n");
-        const paired = desktopResult(yield* Effect.result(this.#bootstrapMoonlightEffect(moonlightPort)));
+        const paired = desktopResult(
+          yield* Effect.result(
+            this.#bootstrapMoonlightEffect(moonlightPort).pipe(Effect.mapError(this.#failStart("pairing"))),
+          ),
+        );
         desktopResult(yield* Effect.result(desktopSync(() => this.#throwIfStopRequested())));
+        // An exit during pairing precedes the exit watcher becoming active.
+        if (childEnded(this.#sunshine) || childEnded(this.#moonlight)) {
+          return yield* this.#failStart("pairing")(
+            desktopFailure(new Error("A remote desktop process exited during pairing.")),
+          );
+        }
         this.#state = {
           baseUrl: `http://127.0.0.1:${moonlightPort}`,
           authHeader: this.#moonlightHeader,
@@ -777,6 +818,7 @@ export class SunshineMoonlightRuntime {
       }),
     );
     this.#pipeDiagnostics(this.#sunshine, "sunshine");
+    this.#watchExit(this.#sunshine, "sunshine");
     yield* waitForHttpsEffect(
       yield* desktopSync(() => this.#requireSunshineHttpsPort()),
       join(this.#options.stateDirectory, "sunshine-cert.pem"),
@@ -808,6 +850,7 @@ export class SunshineMoonlightRuntime {
       },
     );
     this.#pipeDiagnostics(this.#moonlight, "moonlight");
+    this.#watchExit(this.#moonlight, "moonlight");
   }
 
   readonly #bootstrapMoonlightEffect = Effect.fn("SunshineMoonlightRuntime.bootstrapMoonlight")(function* (
@@ -1093,6 +1136,18 @@ export class SunshineMoonlightRuntime {
       (server) => (retained ? Effect.void : closeSocketEffect(server).pipe(Effect.catch(() => Effect.void))),
     );
   });
+
+  // After a start, nothing waits on these processes. One that exits on its own would leave a runtime
+  // that still reports itself started, and every new session would wait for a stream that never comes.
+  #watchExit(child: ChildProcess, source: "sunshine" | "moonlight"): void {
+    child.once("exit", (code, signal) => {
+      // A stop clears the field before it waits. A start in progress fails its own readiness wait.
+      if ((source === "sunshine" ? this.#sunshine : this.#moonlight) !== child || !this.#state) return;
+      this.#state = null;
+      this.#options.onDiagnostic?.(source, `OpenBot: ${source} exited unexpectedly (${signal ?? `code ${code}`}).\n`);
+      this.#options.onExit?.(source);
+    });
+  }
 
   #pipeDiagnostics(process: ChildProcess, source: "sunshine" | "moonlight"): void {
     for (const stream of [process.stdout, process.stderr]) {

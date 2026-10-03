@@ -99,6 +99,7 @@ const writeDiagnosticEffect = Effect.fn("RemoteDesktop.writeDiagnostic")(functio
 
 interface ManagedChildProcess {
   exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
   killed: boolean;
   kill(signal?: NodeJS.Signals): boolean;
   once(event: string, listener: (...args: unknown[]) => unknown): unknown;
@@ -109,7 +110,8 @@ export const stopRemoteProcess = Effect.fn("RemoteDesktop.stopProcess")(function
   child: ManagedChildProcess,
   graceMs = 2_000,
 ) {
-  if (child.exitCode !== null || child.killed) return;
+  // A child that a signal ended has already emitted its exit event.
+  if (child.exitCode !== null || child.signalCode !== null || child.killed) return;
   yield* Effect.callback<void, RemoteDesktopOperationError>((resume) => {
     let complete = false;
     const finish = () => {
