@@ -3,8 +3,8 @@ import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { redactValue } from "@openbot/logging";
-import { Effect } from "effect";
-import { type AnalyticsOperationFailure, analyticsIO, runAnalytics } from "./analytics-effects";
+import { Effect, Semaphore } from "effect";
+import { analyticsIO, runAnalytics } from "./analytics-effects";
 
 /**
  * One timed operation. The name is a fixed string - an IPC channel, a turn origin, a crash origin -
@@ -57,7 +57,7 @@ export class TraceFile {
   readonly #openTurns = new Map<string, { startedAt: number; origin: string }>();
   #pending: string[] = [];
   #timer: NodeJS.Timeout | null = null;
-  #writes: Promise<void> = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
   #writingLines = 0;
 
   constructor(options: TraceFileOptions) {
@@ -76,11 +76,11 @@ export class TraceFile {
     });
     this.#pending.push(JSON.stringify(line));
     if (this.#pending.length >= MAX_PENDING_LINES) {
-      void this.flush();
+      void runAnalytics(this.flush());
       return;
     }
     if (this.#timer) return;
-    this.#timer = setTimeout(() => void this.flush(), FLUSH_DELAY_MS);
+    this.#timer = setTimeout(() => void runAnalytics(this.flush()), FLUSH_DELAY_MS);
     this.#timer.unref();
   }
 
@@ -106,37 +106,28 @@ export class TraceFile {
     });
   }
 
-  /** Writes the pending lines. The returned promise settles after every earlier write. */
-  flush(): Promise<void> {
+  /** Writes the pending lines and waits for earlier writes. */
+  readonly flush = Effect.fn("TraceFile.flush")(function* (this: TraceFile) {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
     const lines = this.#pending;
     this.#pending = [];
-    if (lines.length === 0) return this.#writes;
     this.#writingLines += lines.length;
-    this.#writes = this.#writes
-      .then(() => runAnalytics(this.#append(lines)))
-      .catch(() => undefined)
-      .then(() => {
-        this.#writingLines -= lines.length;
-      });
-    return this.#writes;
-  }
-
-  summarize(): Promise<TraceSummary[]> {
-    void this.flush();
-    // The reads join the write chain, so no rotation runs between the read of `.1` and the current file.
-    const files = this.#writes.then(() =>
-      runAnalytics(Effect.forEach([`${this.#path}.1`, this.#path], readOptional, { concurrency: "unbounded" })),
+    yield* this.#writes.withPermit(lines.length ? this.#append(lines).pipe(Effect.ignore) : Effect.void).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          this.#writingLines -= lines.length;
+        }),
+      ),
     );
-    this.#writes = files.then(() => undefined);
-    return runAnalytics(this.#summarize(files));
-  }
+  }, Effect.uninterruptible);
 
-  #summarize = Effect.fn("TraceFile.summarize")(function* (
-    files: Promise<string[]>,
-  ): Effect.fn.Return<TraceSummary[], AnalyticsOperationFailure> {
-    const text = (yield* analyticsIO(() => files)).join("");
+  readonly summarize = Effect.fn("TraceFile.summarize")(function* (this: TraceFile) {
+    yield* this.flush();
+    // Hold the same permit for both files so rotation cannot split the read.
+    const text = (yield* this.#writes.withPermit(
+      Effect.forEach([`${this.#path}.1`, this.#path], readOptional, { concurrency: "unbounded" }),
+    )).join("");
     const groups = new Map<
       string,
       { kind: string; name: string; durations: number[]; outcomes: Record<string, number> }

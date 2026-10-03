@@ -1,7 +1,7 @@
 import { access } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect } from "effect";
-import { desktopCall, runDesktopEffect } from "./remote-desktop-effects";
+import { desktopCall } from "./remote-desktop-effects";
 
 export interface RemoteDesktopRuntimePaths {
   sunshine: string;
@@ -17,10 +17,7 @@ interface ResolveRuntimeInput {
   architecture: string;
   overrideRoot?: string;
 }
-export function resolveRemoteDesktopRuntime(input: ResolveRuntimeInput): Promise<RemoteDesktopRuntimePaths | null> {
-  return runDesktopEffect(resolveRemoteDesktopRuntimeEffect(input));
-}
-export const resolveRemoteDesktopRuntimeEffect = Effect.fn("RemoteDesktop.resolveRuntime")(function* (
+export const resolveRemoteDesktopRuntime = Effect.fn("RemoteDesktop.resolveRuntime")(function* (
   input: ResolveRuntimeInput,
 ) {
   const platformDirectory = input.platform;

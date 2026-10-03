@@ -37,24 +37,13 @@ export interface McpProbeResult {
  * deadline below, and a server can do real work at startup. The answer is reported once and not
  * stored.
  */
-export async function testMcpServer(
-  config: McpServerConfig,
-  timeoutMs = MCP_PROBE_TIMEOUT_MS,
-  tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
-  oauth?: McpOAuthAuthority,
-): Promise<McpProbeResult> {
-  const result = await Effect.runPromise(Effect.result(testMcpServerEffect(config, timeoutMs, tools, oauth)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
 // SDK errors can quote credentials. Internal operations have no tracing spans; only the
 // redacted McpProbeResult crosses the probe boundary.
-class McpProbeFailure extends Schema.TaggedError<McpProbeFailure>()("McpProbeFailure", {
+export class McpProbeFailure extends Schema.TaggedError<McpProbeFailure>()("McpProbeFailure", {
   cause: Schema.Defect(),
 }) {}
 
-export const testMcpServerEffect = Effect.fnUntraced(function* (
+export const testMcpServer = Effect.fnUntraced(function* (
   config: McpServerConfig,
   timeoutMs = MCP_PROBE_TIMEOUT_MS,
   tools: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES,
@@ -65,8 +54,10 @@ export const testMcpServerEffect = Effect.fnUntraced(function* (
     Effect.sync(() => (config.transport === "http" ? (oauth?.signIn(config.url) ?? null) : null)),
     (signIn) =>
       Effect.gen(function* () {
-        const server = yield* probeIo(() =>
-          usableMcpServer(config, tools, oauth ? (subject) => oauth.accessToken(subject.url) : undefined),
+        const server = yield* usableMcpServer(
+          config,
+          tools,
+          oauth ? (subject) => oauth.accessToken(subject.url) : undefined,
         );
         return yield* probeMcpServerEffect(server, timeoutMs, signIn);
       }),
@@ -92,7 +83,10 @@ const probeMcpServerEffect = Effect.fnUntraced(function* (
   if (!signIn || !(first.failure.cause instanceof UnauthorizedError)) return failure(first.failure.cause);
   // The person's sign-in has its own deadline; the retried connection gets a fresh transport.
   const retry = yield* Effect.result(
-    probeIo(() => signIn.complete()).pipe(Effect.andThen(connectAndCountEffect(server, timeoutMs, signIn.provider))),
+    signIn.complete().pipe(
+      Effect.mapError((error) => new McpProbeFailure({ cause: error.cause })),
+      Effect.andThen(connectAndCountEffect(server, timeoutMs, signIn.provider)),
+    ),
   );
   return Result.isFailure(retry) ? failure(retry.failure.cause) : { toolCount: retry.success, error: null };
 });

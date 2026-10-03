@@ -1,7 +1,6 @@
 import { BILLING_CURRENCIES, BILLING_METADATA, type BillingCurrency } from "@openbot/contracts/billing";
 import { isOneOf } from "@openbot/contracts/runtime-values";
 import { Effect, Option, Result, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 
 /** Stripe changes response shapes by API version, so every request names the version this code reads. */
 export const STRIPE_API_VERSION = "2025-03-31.basil";
@@ -36,7 +35,7 @@ export class StripeRequestError extends Schema.TaggedError<StripeRequestError>()
     });
   }
 }
-class StripeTransportError extends Schema.TaggedError<StripeTransportError>()("StripeTransportError", {}) {}
+export class StripeTransportError extends Schema.TaggedError<StripeTransportError>()("StripeTransportError", {}) {}
 
 const Metadata = Schema.Record(Schema.String, Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed({})));
 const CurrencyOptions = Schema.optional(
@@ -112,15 +111,8 @@ export class StripeClient {
    * A Customer Portal page. With a flow it opens on the plan change or the cancel page of one
    * subscription, and goes back to `returnUrl` when that step is done.
    */
-  createPortalSession(input: {
-    customerId: string;
-    returnUrl: string;
-    flow?: { type: "subscription_update" | "subscription_cancel"; subscriptionId: string };
-  }): Promise<string> {
-    return runApiEffect(this.#createPortalSessionEffect(input));
-  }
 
-  readonly #createPortalSessionEffect = Effect.fn("StripeClient.createPortalSession")(function* (
+  readonly createPortalSession = Effect.fn("StripeClient.createPortalSession")(function* (
     this: StripeClient,
     input: {
       customerId: string;
@@ -138,14 +130,11 @@ export class StripeClient {
     const session = yield* this.#requestEffect("POST", "/v1/billing_portal/sessions", body, sessionSchema);
     if (!session.url) return yield* new StripeRequestError(200, "invalid_response", "missing_url");
     return session.url;
-  });
+  }).bind(this);
 
   /** The subscription, with the Price amount in each currency, so the plan's own currency has a price. */
-  getSubscription(subscriptionId: string): Promise<StripeSubscription> {
-    return runApiEffect(this.#getSubscriptionEffect(subscriptionId));
-  }
 
-  readonly #getSubscriptionEffect = Effect.fn("StripeClient.getSubscription")(function* (
+  readonly getSubscription = Effect.fn("StripeClient.getSubscription")(function* (
     this: StripeClient,
     subscriptionId: string,
   ): Effect.fn.Return<StripeSubscription, StripeRequestError | StripeTransportError> {
@@ -156,14 +145,11 @@ export class StripeClient {
       null,
       subscriptionSchema,
     );
-  });
+  }).bind(this);
 
   /** The active Prices with these lookup keys, with the amount in each currency. */
-  listPricesByLookupKeys(lookupKeys: readonly string[]): Promise<StripePrice[]> {
-    return runApiEffect(this.#listPricesByLookupKeysEffect(lookupKeys));
-  }
 
-  readonly #listPricesByLookupKeysEffect = Effect.fn("StripeClient.listPricesByLookupKeys")(function* (
+  readonly listPricesByLookupKeys = Effect.fn("StripeClient.listPricesByLookupKeys")(function* (
     this: StripeClient,
     lookupKeys: readonly string[],
   ): Effect.fn.Return<StripePrice[], StripeRequestError | StripeTransportError> {
@@ -171,31 +157,25 @@ export class StripeClient {
     for (const key of lookupKeys) query.append("lookup_keys[]", key);
     query.append("expand[]", "data.currency_options");
     return [...(yield* this.#requestEffect("GET", `/v1/prices?${query}`, null, priceListSchema)).data];
-  });
+  }).bind(this);
 
   /** The same idempotency key gives the same customer, so two requests at once make one customer. */
-  createCustomer(input: { userId: string; email: string }, idempotencyKey: string): Promise<string> {
-    return runApiEffect(this.#createCustomerEffect(input, idempotencyKey));
-  }
 
-  readonly #createCustomerEffect = Effect.fn("StripeClient.createCustomer")(function* (
+  readonly createCustomer = Effect.fn("StripeClient.createCustomer")(function* (
     this: StripeClient,
     input: { userId: string; email: string },
     idempotencyKey: string,
   ): Effect.fn.Return<string, StripeRequestError | StripeTransportError> {
     const body = new URLSearchParams({ email: input.email, [`metadata[${BILLING_METADATA.userId}]`]: input.userId });
     return (yield* this.#requestEffect("POST", "/v1/customers", body, customerSchema, idempotencyKey)).id;
-  });
+  }).bind(this);
 
   /**
    * True when the customer was deleted in Stripe. Stripe still returns a deleted customer, with
    * `deleted`. A customer of another Stripe account, or of test data that was reset, does not exist.
    */
-  isCustomerDeleted(customerId: string): Promise<boolean> {
-    return runApiEffect(this.#isCustomerDeletedEffect(customerId));
-  }
 
-  readonly #isCustomerDeletedEffect = Effect.fn("StripeClient.isCustomerDeleted")(function* (
+  readonly isCustomerDeleted = Effect.fn("StripeClient.isCustomerDeleted")(function* (
     this: StripeClient,
     customerId: string,
   ): Effect.fn.Return<boolean, StripeRequestError | StripeTransportError> {
@@ -206,27 +186,15 @@ export class StripeClient {
       return yield* result.failure;
     }
     return result.success.deleted === true;
-  });
+  }).bind(this);
 
   /**
    * A subscription Checkout for one server. The metadata goes on the session and on the subscription, so
    * the webhook links the subscription to the account and the server. Each call makes a new page, so it
    * takes no idempotency key: the caller closes the previous page.
    */
-  createCheckoutSession(input: {
-    customerId: string;
-    priceId: string;
-    currency: BillingCurrency;
-    userId: string;
-    serverId: string;
-    successUrl: string;
-    cancelUrl: string;
-    nowSeconds: number;
-  }): Promise<{ id: string; url: string }> {
-    return runApiEffect(this.#createCheckoutSessionEffect(input));
-  }
 
-  readonly #createCheckoutSessionEffect = Effect.fn("StripeClient.createCheckoutSession")(function* (
+  readonly createCheckoutSession = Effect.fn("StripeClient.createCheckoutSession")(function* (
     this: StripeClient,
     input: {
       customerId: string;
@@ -259,17 +227,14 @@ export class StripeClient {
     const session = yield* this.#requestEffect("POST", "/v1/checkout/sessions", body, checkoutSessionSchema);
     if (!session.url) return yield* new StripeRequestError(200, "invalid_response", "missing_url");
     return { id: session.id, url: session.url };
-  });
+  }).bind(this);
 
   /**
    * Closes a Checkout page. Returns the page in its final status: `expired`, or `complete` for a page
    * that the user paid. Stripe refuses to expire a session that is not open, so the service then reads it.
    */
-  expireCheckoutSession(sessionId: string): Promise<StripeCheckoutSession> {
-    return runApiEffect(this.#expireCheckoutSessionEffect(sessionId));
-  }
 
-  readonly #expireCheckoutSessionEffect = Effect.fn("StripeClient.expireCheckoutSession")(function* (
+  readonly expireCheckoutSession = Effect.fn("StripeClient.expireCheckoutSession")(function* (
     this: StripeClient,
     sessionId: string,
   ): Effect.fn.Return<StripeCheckoutSession, StripeRequestError | StripeTransportError> {
@@ -280,14 +245,11 @@ export class StripeClient {
     if (Result.isSuccess(result)) return result.success;
     if (!(result.failure instanceof StripeRequestError) || result.failure.status !== 400) return yield* result.failure;
     return yield* this.#requestEffect("GET", path, null, checkoutSessionSchema);
-  });
+  }).bind(this);
 
   /** Cancels a subscription now. Stripe gives no refund and no credit for the rest of the period. */
-  cancelSubscription(subscriptionId: string): Promise<StripeSubscription> {
-    return runApiEffect(this.#cancelSubscriptionEffect(subscriptionId));
-  }
 
-  readonly #cancelSubscriptionEffect = Effect.fn("StripeClient.cancelSubscription")(function* (
+  readonly cancelSubscription = Effect.fn("StripeClient.cancelSubscription")(function* (
     this: StripeClient,
     subscriptionId: string,
   ): Effect.fn.Return<StripeSubscription, StripeRequestError | StripeTransportError> {
@@ -297,7 +259,7 @@ export class StripeClient {
       null,
       subscriptionSchema,
     );
-  });
+  }).bind(this);
 
   readonly #requestEffect = Effect.fn("StripeClient.request")(function* <T>(
     this: StripeClient,
@@ -383,13 +345,13 @@ export function parseStripeEvent(payload: string): StripeEvent | null {
  * Checks a `Stripe-Signature` header (`t=<seconds>,v1=<hex>[,v1=<hex>]`) against the raw body.
  * During a secret rotation Stripe sends one `v1` for each secret, so any match is enough.
  */
-export async function verifyStripeSignature(
+export const verifyStripeSignature = Effect.fn("verifyStripeSignature")(function* (
   payload: string,
   header: string | null,
   secret: string,
   now = Date.now(),
   toleranceSeconds = SIGNATURE_TOLERANCE_SECONDS,
-): Promise<boolean> {
+) {
   if (!header || !secret) return false;
   let timestamp: string | null = null;
   const signatures: string[] = [];
@@ -403,15 +365,18 @@ export async function verifyStripeSignature(
   }
   if (!timestamp || !/^\d{1,12}$/u.test(timestamp) || signatures.length === 0) return false;
   if (Math.abs(now / 1_000 - Number(timestamp)) > toleranceSeconds) return false;
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
+  const key = yield* Effect.tryPromise({
+    try: () =>
+      crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+        "sign",
+      ]),
+    catch: () => new StripeTransportError({}),
+  });
   const expected = new Uint8Array(
-    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${timestamp}.${payload}`)),
+    yield* Effect.tryPromise({
+      try: () => crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${timestamp}.${payload}`)),
+      catch: () => new StripeTransportError({}),
+    }),
   );
   let matched = false;
   for (const signature of signatures) {
@@ -419,7 +384,7 @@ export async function verifyStripeSignature(
     if (constantTimeEqual(expected, hexBytes(signature))) matched = true;
   }
   return matched;
-}
+});
 
 function hexBytes(value: string): Uint8Array {
   const bytes = new Uint8Array(value.length / 2);

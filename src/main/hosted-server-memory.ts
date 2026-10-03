@@ -1,5 +1,5 @@
 import { readdir, readFile, readlink, writeFile } from "node:fs/promises";
-import { Effect, Schema } from "effect";
+import { Deferred, Effect, Schema } from "effect";
 import type { HostMemory, HostMemoryLevel } from "../backend/host-memory";
 
 const SAMPLE_INTERVAL_MS = 5_000;
@@ -38,7 +38,7 @@ export class HostedServerMemory implements HostMemory {
   /** The start times of the turns reserved in the last `TURN_RESERVE_MS`. Each one is its own object, so its release removes only it. */
   readonly #reservations = new Set<{ at: number }>();
   #timer: ReturnType<typeof setInterval> | null = null;
-  #pending: Promise<void> | null = null;
+  #pending: Deferred.Deferred<void> | null = null;
   #sample: MemorySample | null = null;
   #level: HostMemoryLevel = "ok";
   #readErrorLogged = false;
@@ -49,15 +49,17 @@ export class HostedServerMemory implements HostMemory {
 
   start(): void {
     if (this.#timer) return;
-    void this.tick();
-    this.#timer = setInterval(() => void this.tick(), SAMPLE_INTERVAL_MS);
+    void Effect.runPromise(this.tick());
+    this.#timer = setInterval(() => void Effect.runPromise(this.tick()), SAMPLE_INTERVAL_MS);
     this.#timer.unref();
   }
 
-  stop(): Promise<void> {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = null;
-    return this.#pending ?? Promise.resolve();
+  stop(): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      if (this.#timer) clearInterval(this.#timer);
+      this.#timer = null;
+      return this.#pending ? Deferred.await(this.#pending) : Effect.void;
+    });
   }
 
   level(): HostMemoryLevel {
@@ -86,11 +88,20 @@ export class HostedServerMemory implements HostMemory {
     return () => this.#listeners.delete(listener);
   }
 
-  tick(): Promise<void> {
-    this.#pending ??= Effect.runPromise(this.#tick()).finally(() => {
-      this.#pending = null;
-    });
-    return this.#pending;
+  tick(): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      if (this.#pending) return Deferred.await(this.#pending);
+      const pending = Deferred.makeUnsafe<void>();
+      this.#pending = pending;
+      return this.#tick().pipe(
+        Effect.onExit((exit) =>
+          Effect.gen({ self: this }, function* () {
+            this.#pending = null;
+            yield* Deferred.done(pending, exit);
+          }),
+        ),
+      );
+    }).pipe(Effect.uninterruptible);
   }
 
   #tick = Effect.fn("HostedServerMemory.tick")(function* (this: HostedServerMemory) {

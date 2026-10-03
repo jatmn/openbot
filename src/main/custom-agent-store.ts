@@ -12,14 +12,14 @@ import type { CustomAgentEnvInput, CustomAgentSummary, SaveCustomAgentInput } fr
 import { CUSTOM_AGENT_LIMITS } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema, Semaphore } from "effect";
 import { z } from "zod";
 import { resolveAgentCommand } from "../backend/acp-agent-command";
-import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
+import { writeFileAtomically } from "../backend/atomic-json-file";
 import type { CustomAgentConfig } from "../backend/custom-acp-agents-client";
 import type { CustomProviderCipher } from "./custom-provider-store";
 
-class CustomAgentFailure extends Schema.TaggedError<CustomAgentFailure>()("CustomAgentFailure", {
+export class CustomAgentFailure extends Schema.TaggedError<CustomAgentFailure>()("CustomAgentFailure", {
   cause: Schema.Defect(),
 }) {}
 function agentIO<A>(operation: () => Promise<A>): Effect.Effect<A, CustomAgentFailure> {
@@ -28,12 +28,6 @@ function agentIO<A>(operation: () => Promise<A>): Effect.Effect<A, CustomAgentFa
 function agentSync<A>(operation: () => A): Effect.Effect<A, CustomAgentFailure> {
   return Effect.try({ try: operation, catch: (cause) => new CustomAgentFailure({ cause }) });
 }
-async function runAgent<A>(operation: Effect.Effect<A, CustomAgentFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
 export const CUSTOM_AGENTS_FILE = "custom-agents.json";
 
 /**
@@ -68,20 +62,23 @@ const NO_SECURE_STORAGE_MESSAGE = sourceText("error.provider.customAgentNoSecure
 export class CustomAgentStore {
   readonly #path: string;
   readonly #cipher: CustomProviderCipher;
-  readonly #resolve: (command: string) => Promise<string | null>;
+  readonly #resolve: (command: string) => Effect.Effect<string | null, CustomAgentFailure>;
   #entries: Entry[] = [];
   /** Set when the file exists and this build cannot read it. See `load`. */
   #readOnly = false;
-  #writeChain = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
 
   constructor(options: {
     path: string;
     cipher: CustomProviderCipher;
-    resolve?: (command: string) => Promise<string | null>;
+    resolve?: (command: string) => Effect.Effect<string | null, CustomAgentFailure>;
   }) {
     this.#path = options.path;
     this.#cipher = options.cipher;
-    this.#resolve = options.resolve ?? resolveAgentCommand;
+    this.#resolve =
+      options.resolve ??
+      ((command) =>
+        resolveAgentCommand(command).pipe(Effect.mapError((error) => new CustomAgentFailure({ cause: error.cause }))));
   }
 
   /**
@@ -89,38 +86,36 @@ export class CustomAgentStore {
    * overwritten, because a newer build's agents would be lost with it: the app starts with no custom
    * agents, and every write is refused until the file is readable again.
    */
-  load(): Promise<void> {
-    return runAgent(
-      Effect.gen({ self: this }, function* () {
-        const contents = yield* agentIO(() => readFile(this.#path, "utf8")).pipe(
-          Effect.catch(({ cause }) =>
-            cause instanceof Error && "code" in cause && cause.code === "ENOENT"
-              ? Effect.succeed(null)
-              : Effect.fail(new CustomAgentFailure({ cause })),
-          ),
-        );
-        if (contents === null) return;
-        const file = parseAgentFile(contents);
-        if (!file) {
-          this.#readOnly = true;
-          this.#entries = [];
-          return;
-        }
-        this.#readOnly = false;
-        this.#entries = yield* Effect.forEach(file.agents, (stored) =>
-          this.#openSecret(stored.secret).pipe(Effect.map((values) => ({ stored, values }))),
-        );
-      }),
-    );
+  load(): Effect.Effect<void, CustomAgentFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const contents = yield* agentIO(() => readFile(this.#path, "utf8")).pipe(
+        Effect.catch(({ cause }) =>
+          cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+            ? Effect.succeed(null)
+            : Effect.fail(new CustomAgentFailure({ cause })),
+        ),
+      );
+      if (contents === null) return;
+      const file = parseAgentFile(contents);
+      if (!file) {
+        this.#readOnly = true;
+        this.#entries = [];
+        return;
+      }
+      this.#readOnly = false;
+      this.#entries = yield* Effect.forEach(file.agents, (stored) =>
+        this.#openSecret(stored.secret).pipe(Effect.map((values) => ({ stored, values }))),
+      );
+    });
   }
 
   /** What the renderer may know: the variable names, and never a value. */
-  list(): Promise<CustomAgentSummary[]> {
-    return runAgent(
+  list(): Effect.Effect<CustomAgentSummary[]> {
+    return Effect.suspend(() =>
       Effect.forEach(
         this.#entries,
         ({ stored }) =>
-          agentIO(() => this.#resolve(stored.command)).pipe(
+          this.#resolve(stored.command).pipe(
             Effect.catch(() => Effect.succeed(null)),
             Effect.map((resolvedCommand) => ({
               id: stored.id,
@@ -166,8 +161,8 @@ export class CustomAgentStore {
    * an edit on a computer whose keychain is gone does not lose values that a later keychain could
    * still open.
    */
-  async save(input: SaveCustomAgentInput): Promise<void> {
-    await this.#mutate(() => {
+  save(input: SaveCustomAgentInput): Effect.Effect<void, CustomAgentFailure> {
+    return this.#mutate(() => {
       const index = this.#entries.findIndex((entry) => entry.stored.id === input.id);
       const current = this.#entries[index];
       if (!current && this.#entries.length >= CUSTOM_AGENT_LIMITS.agents) {
@@ -205,8 +200,8 @@ export class CustomAgentStore {
   }
 
   /** Removes one agent and its values. An id that is not saved writes nothing. */
-  async remove(id: string): Promise<void> {
-    await this.#mutate(() => {
+  remove(id: string): Effect.Effect<void, CustomAgentFailure> {
+    return this.#mutate(() => {
       const remaining = this.#entries.filter((entry) => entry.stored.id !== id);
       return remaining.length === this.#entries.length ? null : remaining;
     });
@@ -221,28 +216,23 @@ export class CustomAgentStore {
    * One change, start to end, with no other change between its read and its write. The list is
    * published only after the durable write, so a failed write leaves what the file still holds.
    */
-  async #mutate(build: () => Entry[] | null): Promise<void> {
-    this.assertWritable();
-    const operation = this.#writeChain.then(() =>
-      runAgent(
-        Effect.gen({ self: this }, function* () {
-          const entries = yield* agentSync(() => {
-            this.assertWritable();
-            return build();
-          });
-          if (!entries) return;
-          const content = yield* agentSync(
-            () => `${JSON.stringify({ version: 1, agents: entries.map((entry) => entry.stored) })}\n`,
-          );
-          yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
-            Effect.mapError(({ cause }) => new CustomAgentFailure({ cause })),
-          );
-          this.#entries = entries;
-        }).pipe(Effect.uninterruptible),
-      ),
+  #mutate(build: () => Entry[] | null): Effect.Effect<void, CustomAgentFailure> {
+    return this.#writes.withPermit(
+      Effect.gen({ self: this }, function* () {
+        const entries = yield* agentSync(() => {
+          this.assertWritable();
+          return build();
+        });
+        if (!entries) return;
+        const content = yield* agentSync(
+          () => `${JSON.stringify({ version: 1, agents: entries.map((entry) => entry.stored) })}\n`,
+        );
+        yield* writeFileAtomically(this.#path, content, { createDirectory: true }).pipe(
+          Effect.mapError(({ cause }) => new CustomAgentFailure({ cause })),
+        );
+        this.#entries = entries;
+      }).pipe(Effect.uninterruptible),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    await operation;
   }
 
   /**

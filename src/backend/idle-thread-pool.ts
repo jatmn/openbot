@@ -1,4 +1,5 @@
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, type Scope } from "effect";
+import type { ProviderClientOperationError } from "./provider-client-effects";
 
 /** What a pool holds of a thread. The client owns the turn; the pool owns the timer and the time. */
 export interface IdleThread {
@@ -15,6 +16,7 @@ export interface IdleThread {
 export interface IdleThreadPoolOptions<Thread extends IdleThread, Released> {
   /** How long a thread with no turn stays open. */
   releaseAfterMs: number;
+  scope(): Scope.Scope;
   /** How many idle threads stay open before the timeout. */
   idleLimit: number;
   /** Whether the thread can be closed and opened again. One that cannot would lose its session. */
@@ -22,9 +24,9 @@ export interface IdleThreadPoolOptions<Thread extends IdleThread, Released> {
   /** What opening the thread again needs, kept while it is closed. */
   snapshot(thread: Thread): Released;
   /** Ends the process or session of a thread that the pool no longer holds. */
-  dispose(thread: Thread): Promise<void>;
+  dispose(thread: Thread): Effect.Effect<void, ProviderClientOperationError>;
   /** Opens a released thread again. It must `add` the thread before it settles. */
-  reopen(threadId: string, released: Released): Promise<unknown>;
+  reopen(threadId: string, released: Released): Effect.Effect<unknown, ProviderClientOperationError>;
 }
 
 /**
@@ -36,7 +38,7 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
   readonly #options: IdleThreadPoolOptions<Thread, Released>;
   readonly #threads = new Map<string, Thread>();
   readonly #released = new Map<string, Released>();
-  readonly #waking = new Map<string, Promise<unknown>>();
+  readonly #waking = new Map<string, Deferred.Deferred<unknown, ProviderClientOperationError>>();
   readonly #startingTurns = new Set<string>();
 
   constructor(options: IdleThreadPoolOptions<Thread, Released>) {
@@ -77,17 +79,14 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
   }
 
   /** Stops holding the thread and ends it. No snapshot is kept. */
-  close(thread: Thread): Promise<void> {
-    return runPool(this.closeEffect(thread));
-  }
 
-  readonly closeEffect = Effect.fn("IdleThreadPool.close")(function* (
+  readonly close = Effect.fn("IdleThreadPool.close")(function* (
     this: IdleThreadPool<Thread, Released>,
     thread: Thread,
   ) {
     this.#threads.delete(thread.id);
     this.#disarm(thread);
-    yield* poolIo(() => this.#options.dispose(thread));
+    yield* this.#options.dispose(thread);
   }, Effect.uninterruptible);
 
   /** Stops every timer and forgets every thread. The caller ends the threads it gets back. */
@@ -103,18 +102,15 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
    * Runs `open` with the thread marked as starting a turn. Opening the thread again yields, and
    * another thread going idle in that gap must not close this one.
    */
-  startTurn<T>(threadId: string, open: () => Promise<T>): Promise<T> {
-    return runPool(this.startTurnEffect(threadId, open));
-  }
 
-  readonly startTurnEffect = Effect.fn("IdleThreadPool.startTurn")(function* <T>(
+  readonly startTurn = Effect.fn("IdleThreadPool.startTurn")(function* <T>(
     this: IdleThreadPool<Thread, Released>,
     threadId: string,
-    open: () => Promise<T>,
+    open: () => Effect.Effect<T, ProviderClientOperationError>,
   ) {
     return yield* Effect.acquireUseRelease(
       Effect.sync(() => this.#startingTurns.add(threadId)),
-      () => poolIo(open),
+      () => open(),
       () =>
         Effect.sync(() => {
           this.#startingTurns.delete(threadId);
@@ -130,18 +126,18 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
   }
 
   /** Marks a thread with no turn as idle, and closes the longest idle threads over the limit. */
-  markIdle(thread: Thread): void {
+  readonly markIdle = Effect.fn("IdleThreadPool.markIdle")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    thread: Thread,
+  ) {
     thread.idleSince = Date.now();
     this.#arm(thread);
-    this.#releaseOverLimit();
-  }
+    yield* this.#releaseIdleOver(this.#options.idleLimit);
+  });
 
   /** Opens a released thread again. One reopen per thread, however many callers ask for it. */
-  wake(threadId: string): Promise<void> {
-    return runPool(this.wakeEffect(threadId));
-  }
 
-  readonly wakeEffect = Effect.fn("IdleThreadPool.wake")(function* (
+  readonly wake = Effect.fn("IdleThreadPool.wake")(function* (
     this: IdleThreadPool<Thread, Released>,
     threadId: string,
   ) {
@@ -149,31 +145,36 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
     if (released === undefined || this.#threads.has(threadId)) return;
     const waking = this.#waking.get(threadId);
     if (waking) {
-      yield* poolIo(() => waking);
+      yield* Deferred.await(waking);
       return;
     }
-    yield* poolIo(() => this.opening(threadId, () => this.#options.reopen(threadId, released)));
+    yield* this.opening(threadId, () => this.#options.reopen(threadId, released));
   }, Effect.uninterruptible);
 
   /** Waits for an open of the thread that is in flight, whether it succeeds or not. */
-  async opened(threadId: string): Promise<void> {
-    await this.#waking.get(threadId)?.catch(() => undefined);
-  }
+  readonly opened = Effect.fn("IdleThreadPool.opened")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    threadId: string,
+  ) {
+    const opening = this.#waking.get(threadId);
+    if (opening) yield* Deferred.await(opening).pipe(Effect.ignore);
+  });
 
-  /**
-   * Runs `open`, which must `add` the thread before it settles, as the one open of that thread:
-   * `wake` waits for it rather than opening the thread a second time. Returns `false`, and does not
-   * run `open`, when another open of the thread is in flight.
-   */
-  async opening(threadId: string, open: () => Promise<unknown>): Promise<boolean> {
+  /** Joins one in-flight open without creating another provider session. */
+  readonly opening = Effect.fn("IdleThreadPool.opening")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    threadId: string,
+    open: () => Effect.Effect<unknown, ProviderClientOperationError>,
+  ) {
     if (this.#waking.has(threadId)) return false;
-    const opening = open().finally(() => {
-      if (this.#waking.get(threadId) === opening) this.#waking.delete(threadId);
-    });
-    this.#waking.set(threadId, opening);
-    await opening;
+    const completion = Deferred.makeUnsafe<unknown, ProviderClientOperationError>();
+    this.#waking.set(threadId, completion);
+    const exit = yield* Effect.exit(open());
+    yield* Deferred.done(completion, exit);
+    if (this.#waking.get(threadId) === completion) this.#waking.delete(threadId);
+    yield* exit;
     return true;
-  }
+  }, Effect.uninterruptible);
 
   #arm(thread: Thread): void {
     this.#disarm(thread);
@@ -181,7 +182,7 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
     thread.idleRelease = setTimeout(() => {
       thread.idleRelease = null;
       if (!this.#isIdle(thread)) return;
-      this.#release(thread);
+      Effect.runFork(this.#release(thread));
     }, this.#options.releaseAfterMs);
     thread.idleRelease.unref?.();
   }
@@ -199,38 +200,30 @@ export class IdleThreadPool<Thread extends IdleThread, Released> {
    * Closes each idle thread that can open again, before its timeout, to free its processes when the
    * machine is low on memory. Its next turn opens it again from its session.
    */
-  releaseIdle(): void {
-    this.#releaseIdleOver(0);
-  }
-
-  #releaseOverLimit(): void {
-    this.#releaseIdleOver(this.#options.idleLimit);
+  releaseIdle(): Effect.Effect<void, ProviderClientOperationError> {
+    return this.#releaseIdleOver(0);
   }
 
   /** An armed release timer marks a thread that is idle and can be opened again. */
-  #releaseIdleOver(limit: number): void {
+  readonly #releaseIdleOver = Effect.fn("IdleThreadPool.releaseIdleOver")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    limit: number,
+  ) {
     const idle = [...this.#threads.values()]
       .filter((thread) => thread.idleRelease !== null && thread.idleSince > 0 && this.#isIdle(thread))
       .sort((left, right) => left.idleSince - right.idleSince);
     for (const thread of idle.slice(0, Math.max(0, idle.length - limit))) {
-      this.#release(thread);
+      yield* this.#release(thread);
     }
-  }
+  });
 
-  #release(thread: Thread): void {
+  readonly #release = Effect.fn("IdleThreadPool.release")(function* (
+    this: IdleThreadPool<Thread, Released>,
+    thread: Thread,
+  ) {
     this.#released.set(thread.id, this.#options.snapshot(thread));
-    void this.close(thread);
-  }
-}
-
-export class ThreadPoolFailed extends Schema.TaggedError<ThreadPoolFailed>()("ThreadPoolFailed", {
-  cause: Schema.Defect(),
-}) {}
-function poolIo<A>(run: () => Promise<A>): Effect.Effect<A, ThreadPoolFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new ThreadPoolFailed({ cause }) });
-}
-async function runPool<A>(effect: Effect.Effect<A, ThreadPoolFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(effect));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
+    this.#threads.delete(thread.id);
+    this.#disarm(thread);
+    yield* Effect.forkIn(this.#options.dispose(thread), this.#options.scope(), { startImmediately: true });
+  });
 }

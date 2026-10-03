@@ -3,7 +3,6 @@ import { AVATAR_IMAGE_LIMITS } from "@openbot/contracts/input-limits";
 import { isUuidV4 } from "@openbot/contracts/validation";
 import { Effect, Result, Schema } from "effect";
 import { AuthOperationError, type AuthService, AuthServiceError } from "./auth-service";
-import { runApiEffect } from "./effect-runtime";
 import type { AuthUser } from "./types";
 
 export interface StoredAvatarUpload {
@@ -22,7 +21,7 @@ function avatarCall<A>(operation: () => Promise<A>): Effect.Effect<A, AvatarStor
   });
 }
 
-const readUpload = Effect.fn("AvatarStorage.readUpload")(function* (request: Request) {
+export const readAvatarUpload = Effect.fn("AvatarStorage.readAvatarUpload")(function* (request: Request) {
   const mimeType = request.headers.get("Content-Type")?.split(";", 1)[0]?.trim() ?? "";
   if (!isAvatarMimeType(mimeType)) return yield* new AvatarUploadError(415, "unsupported_avatar_type");
   const declaredLength = Number(request.headers.get("Content-Length") ?? 0);
@@ -58,26 +57,24 @@ const readUpload = Effect.fn("AvatarStorage.readUpload")(function* (request: Req
   );
 });
 
-export function readAvatarUpload(request: Request): Promise<StoredAvatarUpload> {
-  return runApiEffect(readUpload(request));
-}
-
 function updateAvatar(
   service: Pick<AuthService, "updateAvatar">,
   token: string,
   avatarUrl: string | null,
   previousUrl: string | null,
 ) {
-  return Effect.tryPromise({
-    try: () => service.updateAvatar(token, avatarUrl, previousUrl),
-    catch: (error) =>
-      error instanceof AuthServiceError || error instanceof AuthOperationError
-        ? error
-        : new AvatarStorageError({ message: "Account avatar operation failed." }),
-  });
+  return service
+    .updateAvatar(token, avatarUrl, previousUrl)
+    .pipe(
+      Effect.mapError((error) =>
+        error instanceof AuthServiceError || error instanceof AuthOperationError
+          ? error
+          : new AvatarStorageError({ message: "Account avatar operation failed." }),
+      ),
+    );
 }
 
-const storeAvatar = Effect.fn("AvatarStorage.store")(function* (
+export const storeAccountAvatar = Effect.fn("AvatarStorage.store")(function* (
   service: Pick<AuthService, "updateAvatar">,
   bucket: R2Bucket,
   token: string,
@@ -102,17 +99,8 @@ const storeAvatar = Effect.fn("AvatarStorage.store")(function* (
 });
 
 /** Keep the new object only when the account still has the expected avatar. */
-export function storeAccountAvatar(
-  service: Pick<AuthService, "updateAvatar">,
-  bucket: R2Bucket,
-  token: string,
-  user: AuthUser,
-  upload: StoredAvatarUpload,
-): Promise<AuthUser> {
-  return runApiEffect(storeAvatar(service, bucket, token, user, upload));
-}
 
-const removeAvatar = Effect.fn("AvatarStorage.remove")(function* (
+export const removeAccountAvatar = Effect.fn("AvatarStorage.remove")(function* (
   service: Pick<AuthService, "updateAvatar">,
   bucket: R2Bucket,
   token: string,
@@ -122,15 +110,6 @@ const removeAvatar = Effect.fn("AvatarStorage.remove")(function* (
   yield* deletePreviousAvatar(bucket, user);
   return updated;
 });
-
-export function removeAccountAvatar(
-  service: Pick<AuthService, "updateAvatar">,
-  bucket: R2Bucket,
-  token: string,
-  user: AuthUser,
-): Promise<AuthUser> {
-  return runApiEffect(removeAvatar(service, bucket, token, user));
-}
 
 const deletePreviousAvatar = Effect.fn("AvatarStorage.deletePrevious")(function* (bucket: R2Bucket, user: AuthUser) {
   const previousVersion = avatarVersion(user.avatarUrl, user.id);

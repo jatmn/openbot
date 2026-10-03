@@ -10,7 +10,6 @@ import {
   isEmailDeliveryFailure,
   normalizeEmail,
 } from "./auth-service";
-import { runApiEffect } from "./effect-runtime";
 import type { AuthUser, TeamInviteEmailDelivery } from "./types";
 
 export interface TeamInviteEmailServices {
@@ -25,7 +24,7 @@ const Invitation = Schema.Struct({
   role: Schema.Literals(["admin", "member"]),
 });
 
-const sendInvitation = Effect.fn("TeamInviteEmail.send")(function* (
+export const sendTeamInviteEmail = Effect.fn("TeamInviteEmail.send")(function* (
   services: TeamInviteEmailServices,
   user: Pick<AuthUser, "id" | "email">,
   input: DynamicRecord,
@@ -44,39 +43,34 @@ const sendInvitation = Effect.fn("TeamInviteEmail.send")(function* (
     try: () => normalizeEmail(body.email),
     catch: (error) => (error instanceof AuthServiceError ? error : invalid()),
   });
-  yield* Effect.tryPromise({
-    try: () => services.auth.enforceTeamInviteRateLimit(user.id, email, sourceIp),
-    catch: (error) =>
-      error instanceof AuthServiceError ? error : new AuthOperationError({ message: "Account operation failed." }),
-  });
+  yield* services.auth
+    .enforceTeamInviteRateLimit(user.id, email, sourceIp)
+    .pipe(
+      Effect.mapError((error) =>
+        error instanceof AuthServiceError ? error : new AuthOperationError({ message: "Account operation failed." }),
+      ),
+    );
   const delivery = services.delivery();
   if (!delivery)
     return yield* new AuthServiceError(503, "email_delivery_not_configured", "Email delivery is unavailable.");
-  yield* Effect.tryPromise({
-    try: () =>
-      delivery.send({
-        email,
-        inviterEmail: user.email,
-        serverName: body.serverName,
-        inviteUrl: body.inviteUrl,
-        role: body.role,
-      }),
-    catch: (error) =>
-      isEmailDeliveryFailure(error)
-        ? emailDeliveryFailure(error.message, "OpenBot could not send the invitation.")
-        : new AuthOperationError({ message: "Account operation failed." }),
-  });
+  yield* delivery
+    .send({
+      email,
+      inviterEmail: user.email,
+      serverName: body.serverName,
+      inviteUrl: body.inviteUrl,
+      role: body.role,
+    })
+    .pipe(
+      Effect.mapError((error) =>
+        isEmailDeliveryFailure(error)
+          ? emailDeliveryFailure(error.message, "OpenBot could not send the invitation.")
+          : new AuthOperationError({ message: "Account operation failed." }),
+      ),
+    );
 });
 
 /** The bearer and cookie routes share the same invitation workflow. */
-export function sendTeamInviteEmail(
-  services: TeamInviteEmailServices,
-  user: Pick<AuthUser, "id" | "email">,
-  body: DynamicRecord,
-  sourceIp: string,
-): Promise<void> {
-  return runApiEffect(sendInvitation(services, user, body, sourceIp));
-}
 
 function isValidInviteUrl(value: string): boolean {
   if (value.length > 4_096 || /[\r\n]/u.test(value)) return false;

@@ -1,5 +1,5 @@
 import { SLACK_ROUTE_TTL_SECONDS, type SlackRouteTeam } from "@openbot/contracts/signal-protocol/slack-route";
-import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
+import { Context, Effect, Layer, Result } from "effect";
 import {
   decodeSignalClientMessage,
   encodeSignalServerMessage,
@@ -32,7 +32,9 @@ export interface RemoteTokenProvider {
   revokeSession?(sessionId: string): void;
 }
 
-class SignalTokens extends Context.Service<SignalTokens, RemoteTokenProvider>()("@openbot/remote-api/SignalTokens") {
+export class SignalTokens extends Context.Service<SignalTokens, RemoteTokenProvider>()(
+  "@openbot/remote-api/SignalTokens",
+) {
   static layer(provider: RemoteTokenProvider) {
     return Layer.succeed(SignalTokens, provider);
   }
@@ -167,7 +169,7 @@ export class SignalService {
     slackDeliveriesUnavailable: 0,
   };
 
-  readonly #runtime: ManagedRuntime.ManagedRuntime<SignalTokens, never>;
+  readonly dependencies: Layer.Layer<SignalTokens>;
 
   constructor(
     tokens: RemoteTokenProvider,
@@ -177,15 +179,14 @@ export class SignalService {
     slackLimits: SlackDeliveryLimits = DEFAULT_SLACK_DELIVERY_LIMITS,
   ) {
     this.#tokens = tokens;
-    this.#runtime = ManagedRuntime.make(SignalTokens.layer(tokens));
+    this.dependencies = SignalTokens.layer(tokens);
     this.#maximumConnectionsPerUser = maximumConnectionsPerUser;
     this.#maximumConnectionsPerIp = maximumConnectionsPerIp;
     this.#maximumMessagesPerMinute = maximumMessagesPerMinute;
     this.#slackLimits = slackLimits;
   }
 
-  async close(): Promise<void> {
-    await this.#runtime.dispose();
+  close(): void {
     for (const timer of this.#connectionDropTimers.values()) clearTimeout(timer);
     for (const timer of this.#peerExpirationTimers.values()) clearTimeout(timer);
     this.#connectionDropTimers.clear();
@@ -203,11 +204,7 @@ export class SignalService {
     return true;
   }
 
-  receive(socket: SignalSocket, input: string | Uint8Array): Promise<void> {
-    return this.#runtime.runPromise(this.receiveEffect(socket, input));
-  }
-
-  readonly receiveEffect = Effect.fn("Signal.receiveEffect")((socket: SignalSocket, input: string | Uint8Array) =>
+  readonly receive = Effect.fn("Signal.receive")((socket: SignalSocket, input: string | Uint8Array) =>
     Effect.gen({ self: this }, function* () {
       const tokens = yield* SignalTokens;
       if (!this.#acceptMessage(socket)) {
@@ -283,46 +280,48 @@ export class SignalService {
     }),
   );
 
-  disconnect(socket: SignalSocket): void {
-    this.#sockets.delete(socket.id);
-    const peer = this.#peers.get(socket.id);
-    this.#clearPeerExpiration(socket.id);
-    if (!peer) {
+  readonly disconnect = Effect.fn("Signal.disconnect")((socket: SignalSocket) =>
+    Effect.gen({ self: this }, function* () {
+      this.#sockets.delete(socket.id);
+      const peer = this.#peers.get(socket.id);
+      this.#clearPeerExpiration(socket.id);
+      if (!peer) {
+        this.#metrics.activeSockets = this.#sockets.size;
+        return;
+      }
+      this.#peers.delete(socket.id);
+      if (peer.peer === "host") {
+        const hostSockets = this.#hosts.get(peer.claims.hostId);
+        hostSockets?.delete(socket.id);
+        if (hostSockets?.size === 0) this.#hosts.delete(peer.claims.hostId);
+      }
+      if (peer.peer === "ingress") {
+        for (const route of peer.slackTeams) {
+          if (this.#slackTeams.get(route) === socket.id) this.#slackTeams.delete(route);
+        }
+        for (const [requestId, pending] of [...this.#pendingDeliveries]) {
+          if (pending.socketId === socket.id) this.#settleDelivery(requestId, this.#unavailable());
+        }
+      }
+      for (const connection of [...this.#connections.values()]) {
+        if (connection.client.id !== socket.id && connection.host.id !== socket.id) continue;
+        if (connection.client.id === socket.id) {
+          this.#scheduleConnectionDrop(connection);
+          continue;
+        }
+        this.#clearConnectionDrop(connection.id);
+        this.#connections.delete(connection.id);
+        const clientPeer = this.#peers.get(connection.client.id);
+        if (clientPeer) clientPeer.connectionId = null;
+      }
+      this.#metrics.activePeerConnections = this.#connections.size;
       this.#metrics.activeSockets = this.#sockets.size;
-      return;
-    }
-    this.#peers.delete(socket.id);
-    if (peer.peer === "host") {
-      const hostSockets = this.#hosts.get(peer.claims.hostId);
-      hostSockets?.delete(socket.id);
-      if (hostSockets?.size === 0) this.#hosts.delete(peer.claims.hostId);
-    }
-    if (peer.peer === "ingress") {
-      for (const route of peer.slackTeams) {
-        if (this.#slackTeams.get(route) === socket.id) this.#slackTeams.delete(route);
+      if (peer.peer === "host") {
+        const replacement = this.#currentHost(peer.claims.hostId);
+        if (replacement) yield* this.#restoreWaitingClients(replacement);
       }
-      for (const [requestId, pending] of [...this.#pendingDeliveries]) {
-        if (pending.socketId === socket.id) this.#settleDelivery(requestId, this.#unavailable());
-      }
-    }
-    for (const connection of [...this.#connections.values()]) {
-      if (connection.client.id !== socket.id && connection.host.id !== socket.id) continue;
-      if (connection.client.id === socket.id) {
-        this.#scheduleConnectionDrop(connection);
-        continue;
-      }
-      this.#clearConnectionDrop(connection.id);
-      this.#connections.delete(connection.id);
-      const clientPeer = this.#peers.get(connection.client.id);
-      if (clientPeer) clientPeer.connectionId = null;
-    }
-    if (peer.peer === "host") {
-      const replacement = this.#currentHost(peer.claims.hostId);
-      if (replacement) void this.#runtime.runPromise(this.#restoreWaitingClients(replacement));
-    }
-    this.#metrics.activePeerConnections = this.#connections.size;
-    this.#metrics.activeSockets = this.#sockets.size;
-  }
+    }),
+  );
 
   profileChanged(userId: string): void {
     this.#notifyAccount(userId, "account-profile-changed");
@@ -390,69 +389,59 @@ export class SignalService {
    * its answer. It resolves 503 when no host holds the workspace, the host is too busy, or it does
    * not answer in time: Slack then sends the request again, so nothing needs to be kept here.
    */
-  deliverSlack(
-    appId: string,
-    teamId: string,
-    delivery: SlackDelivery,
-    signal?: AbortSignal,
-  ): Promise<SlackDeliveryResponse> {
-    return this.#runtime.runPromise(this.deliverSlackEffect(appId, teamId, delivery), { signal });
-  }
-
-  readonly deliverSlackEffect = Effect.fn("Signal.deliverSlack")(
-    (appId: string, teamId: string, delivery: SlackDelivery) =>
-      Effect.gen({ self: this }, function* () {
-        const socketId = this.#slackTeams.get(slackRouteKey(appId, teamId));
-        const ingress = socketId ? this.#peers.get(socketId) : undefined;
-        if (!ingress) return this.#unavailable();
-        const hostId = ingress.claims.hostId;
-        let hostPending = 0;
-        let hostBytes = 0;
-        for (const pending of this.#pendingDeliveries.values()) {
-          if (pending.hostId !== hostId) continue;
-          hostPending += 1;
-          hostBytes += pending.bytes;
-        }
-        const bytes = Math.ceil(delivery.body.byteLength / 3) * 4;
-        if (
-          this.#pendingDeliveries.size >= this.#slackLimits.maximumPending ||
-          hostPending >= this.#slackLimits.maximumPendingPerHost ||
-          hostBytes + bytes > this.#slackLimits.maximumPendingBytesPerHost
-        ) {
-          return this.#unavailable();
-        }
-        const requestId = randomIdentifier();
-        return yield* Effect.callback<SlackDeliveryResponse>((resume) => {
-          const resolve = (response: SlackDeliveryResponse) => resume(Effect.succeed(response));
-          const timer = setTimeout(
-            () => this.#settleDelivery(requestId, this.#unavailable()),
-            this.#slackLimits.timeoutMilliseconds,
-          );
-          timer.unref?.();
-          this.#pendingDeliveries.set(requestId, { socketId: ingress.socket.id, hostId, bytes, timer, resolve });
-          this.#metrics.slackDeliveries += 1;
-          this.#send(ingress.socket, {
-            type: "slack-delivery",
-            version: 1,
-            requestId,
-            teamId,
-            kind: delivery.kind,
-            retryNum: delivery.retryNum,
-            retryReason: delivery.retryReason,
-            bodyBase64: Buffer.from(delivery.body).toString("base64"),
-          });
-        }).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              const pending = this.#pendingDeliveries.get(requestId);
-              if (pending) {
-                clearTimeout(pending.timer);
-                this.#pendingDeliveries.delete(requestId);
-              }
-            }),
-          ),
+  readonly deliverSlack = Effect.fn("Signal.deliverSlack")((appId: string, teamId: string, delivery: SlackDelivery) =>
+    Effect.gen({ self: this }, function* () {
+      const socketId = this.#slackTeams.get(slackRouteKey(appId, teamId));
+      const ingress = socketId ? this.#peers.get(socketId) : undefined;
+      if (!ingress) return this.#unavailable();
+      const hostId = ingress.claims.hostId;
+      let hostPending = 0;
+      let hostBytes = 0;
+      for (const pending of this.#pendingDeliveries.values()) {
+        if (pending.hostId !== hostId) continue;
+        hostPending += 1;
+        hostBytes += pending.bytes;
+      }
+      const bytes = Math.ceil(delivery.body.byteLength / 3) * 4;
+      if (
+        this.#pendingDeliveries.size >= this.#slackLimits.maximumPending ||
+        hostPending >= this.#slackLimits.maximumPendingPerHost ||
+        hostBytes + bytes > this.#slackLimits.maximumPendingBytesPerHost
+      ) {
+        return this.#unavailable();
+      }
+      const requestId = randomIdentifier();
+      return yield* Effect.callback<SlackDeliveryResponse>((resume) => {
+        const resolve = (response: SlackDeliveryResponse) => resume(Effect.succeed(response));
+        const timer = setTimeout(
+          () => this.#settleDelivery(requestId, this.#unavailable()),
+          this.#slackLimits.timeoutMilliseconds,
         );
-      }),
+        timer.unref?.();
+        this.#pendingDeliveries.set(requestId, { socketId: ingress.socket.id, hostId, bytes, timer, resolve });
+        this.#metrics.slackDeliveries += 1;
+        this.#send(ingress.socket, {
+          type: "slack-delivery",
+          version: 1,
+          requestId,
+          teamId,
+          kind: delivery.kind,
+          retryNum: delivery.retryNum,
+          retryReason: delivery.retryReason,
+          bodyBase64: Buffer.from(delivery.body).toString("base64"),
+        });
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const pending = this.#pendingDeliveries.get(requestId);
+            if (pending) {
+              clearTimeout(pending.timer);
+              this.#pendingDeliveries.delete(requestId);
+            }
+          }),
+        ),
+      );
+    }),
   );
 
   /**

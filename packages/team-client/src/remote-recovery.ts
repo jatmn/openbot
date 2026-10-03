@@ -161,7 +161,7 @@ export function createRemoteConnectionRecovery(
     if (remaining === 0 && !running) {
       retryAt = null;
       if (attempt >= REMOTE_RETRY_LIMIT) attempt = 0;
-      void run();
+      void runTeamEffect(run());
       return;
     }
     onStatus({
@@ -182,11 +182,7 @@ export function createRemoteConnectionRecovery(
     );
   }
 
-  function run() {
-    return runTeamEffect(runEffect());
-  }
-
-  const runEffect = Effect.fn("RemoteRecovery.run")(function* () {
+  const run = Effect.fn("RemoteRecovery.run")(function* () {
     if (!active || disposed || running || suspended) return;
     cancelTimer();
     running = true;
@@ -228,9 +224,9 @@ export function createRemoteConnectionRecovery(
           if (!disposed && !suspended && active) {
             if (refreshRequested) {
               retryAt = null;
-              void run();
+              void runTeamEffect(run());
             } else if (retryRequested) scheduleRetry();
-            else if (interrupted) void run();
+            else if (interrupted) void runTeamEffect(run());
             else {
               online = true;
               attempt = 0;
@@ -260,7 +256,7 @@ export function createRemoteConnectionRecovery(
         suspended = false;
         if (running) return;
         else if (retryAt !== null) scheduleRetry();
-        else void run();
+        else void runTeamEffect(run());
       }
     },
     offline(error?: unknown) {
@@ -282,7 +278,7 @@ export function createRemoteConnectionRecovery(
       retryAt = null;
       attempt = 0;
       cancelTimer();
-      if (active) void run();
+      if (active) void runTeamEffect(run());
     },
     /**
      * A failure no retry can fix: the two ends disagree about the wire, so the next attempt is told
@@ -307,7 +303,7 @@ export function createRemoteConnectionRecovery(
       attempt = 0;
       cancelTimer();
       if (running || !active) refreshRequested = true;
-      else void run();
+      else void runTeamEffect(run());
     },
     dispose() {
       disposed = true;
@@ -326,21 +322,19 @@ export function createRemoteReadRefresh() {
       cursors.set(serverId, cursor);
       return () => cursors.get(serverId) === cursor;
     },
-    refresh<T>(
+    refresh<T, E>(
       serverId: string,
-      load: () => Promise<T>,
+      load: () => Effect.Effect<T, E>,
       apply: (value: T) => void,
       isCurrent: () => boolean,
-    ): Promise<void> {
-      return runTeamEffect(
-        Effect.fn("RemoteRecovery.refresh")(function* () {
-          const request = (requests.get(serverId) ?? 0) + 1;
-          requests.set(serverId, request);
-          const cursor = cursors.get(serverId);
-          const value = yield* recoveryCall(load);
-          if (requests.get(serverId) === request && cursors.get(serverId) === cursor && isCurrent()) apply(value);
-        })(),
-      );
+    ): Effect.Effect<void, E> {
+      return Effect.gen(function* () {
+        const request = (requests.get(serverId) ?? 0) + 1;
+        requests.set(serverId, request);
+        const cursor = cursors.get(serverId);
+        const value = yield* load();
+        if (requests.get(serverId) === request && cursors.get(serverId) === cursor && isCurrent()) apply(value);
+      });
     },
   };
 }
@@ -361,23 +355,17 @@ export function mergeRemoteUnreadIds(current: string[], reads: Record<string, { 
 }
 
 /** Only conversations cached for agents in this server need recovery. */
-export function resyncRemoteConversations(input: {
+export const resyncRemoteConversations = Effect.fn("RemoteRecovery.resyncConversations")(function* <E>(input: {
   agentIds: string[];
   cached: Record<string, ConversationSnapshot>;
-  load: (agentId: string) => Promise<ConversationSnapshot>;
+  load: (agentId: string) => Effect.Effect<ConversationSnapshot, E>;
   apply: (snapshot: ConversationSnapshot) => void;
   isCurrent: () => boolean;
-}): Promise<void> {
-  return runTeamEffect(resyncRemoteConversationsEffect(input));
-}
-
-const resyncRemoteConversationsEffect = Effect.fn("RemoteRecovery.resyncConversations")(function* (
-  input: Parameters<typeof resyncRemoteConversations>[0],
-) {
+}) {
   for (const agentId of input.agentIds) {
     if (!input.isCurrent()) return;
     if (!input.cached[agentId]) continue;
-    const snapshot = yield* recoveryCall(() => input.load(agentId));
+    const snapshot = yield* input.load(agentId);
     if (!input.isCurrent()) return;
     input.apply(snapshot);
   }

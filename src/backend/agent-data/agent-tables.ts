@@ -2,7 +2,7 @@ import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { SharedTable } from "@openbot/contracts/ipc";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import {
   AGENT_DATABASE_LIMITS,
   AGENT_DATABASE_METADATA_TABLE,
@@ -71,11 +71,8 @@ export class AgentTables {
   }
 
   /** Every table with its owner and row count, for both the agent tool and agent settings. */
-  list(): Promise<AgentTableSummary[]> {
-    return runTables(this.listEffect());
-  }
 
-  listEffect(): Effect.Effect<AgentTableSummary[], AgentTablesError> {
+  list(): Effect.Effect<AgentTableSummary[], AgentTablesError> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentTableSummary[], AgentTablesError> {
       const ready = yield* this.#ensure();
       if (!ready.ok) return [];
@@ -103,22 +100,15 @@ export class AgentTables {
   }
 
   /** What agent settings renders. The same listing, without the SQL the user has no use for. */
-  listShared(): Promise<SharedTable[]> {
-    return runTables(this.listSharedEffect());
-  }
 
-  listSharedEffect(): Effect.Effect<SharedTable[], AgentTablesError> {
+  listShared(): Effect.Effect<SharedTable[], AgentTablesError> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<SharedTable[], AgentTablesError> {
-      const tables = yield* this.listEffect();
+      const tables = yield* this.list();
       return tables.map(({ name, ownerAgentId, rowCount }) => ({ name, ownerAgentId, rowCount }));
     });
   }
 
-  query(sql: string, parameters: AgentDatabaseParameter[]): Promise<AgentDatabaseCheck<AgentDatabaseQueryResult>> {
-    return runTables(this.queryEffect(sql, parameters));
-  }
-
-  queryEffect(
+  query(
     sql: string,
     parameters: AgentDatabaseParameter[],
   ): Effect.Effect<AgentDatabaseCheck<AgentDatabaseQueryResult>, AgentTablesError> {
@@ -143,15 +133,8 @@ export class AgentTables {
    * that is how a table an agent creates with `CREATE TABLE` becomes a table it owns, with no
    * separate call to claim it.
    */
-  execute(
-    agentId: string,
-    sql: string,
-    parameters: AgentDatabaseParameter[],
-  ): Promise<AgentDatabaseCheck<AgentDatabaseWriteResult>> {
-    return runTables(this.executeEffect(agentId, sql, parameters));
-  }
 
-  executeEffect(
+  execute(
     agentId: string,
     sql: string,
     parameters: AgentDatabaseParameter[],
@@ -179,11 +162,8 @@ export class AgentTables {
   }
 
   /** The agent-facing delete. Only the agent that created a table may remove it. */
-  remove(agentId: string, name: string): Promise<AgentDatabaseCheck<string>> {
-    return runTables(this.removeEffect(agentId, name));
-  }
 
-  removeEffect(agentId: string, name: string): Effect.Effect<AgentDatabaseCheck<string>, AgentTablesError> {
+  remove(agentId: string, name: string): Effect.Effect<AgentDatabaseCheck<string>, AgentTablesError> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentDatabaseCheck<string>, AgentTablesError> {
       const table = yield* this.#find(name);
       if (!table.ok) return table;
@@ -200,11 +180,8 @@ export class AgentTables {
   }
 
   /** The user's delete, from agent settings. Not owner-gated: the data is on their computer. */
-  removeAsUser(name: string): Promise<void> {
-    return runTables(this.removeAsUserEffect(name));
-  }
 
-  removeAsUserEffect(name: string): Effect.Effect<void, AgentTablesError> {
+  removeAsUser(name: string): Effect.Effect<void, AgentTablesError> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, AgentTablesError> {
       const table = yield* this.#find(name);
       if (!table.ok) return yield* new AgentTablesError({ message: table.message });
@@ -232,7 +209,7 @@ export class AgentTables {
       AgentTablesError
     > {
       const wanted = name.trim().toLowerCase();
-      const table = (yield* this.listEffect()).find((entry) => entry.name.toLowerCase() === wanted);
+      const table = (yield* this.list()).find((entry) => entry.name.toLowerCase() === wanted);
       if (!table) return { ok: false, message: `There is no table called ${name}.` };
       return { ok: true, value: table };
     });
@@ -380,7 +357,7 @@ export class AgentTables {
       AgentDatabaseCheck<AgentDatabaseRows>,
       AgentTablesError
     > {
-      const outcome = yield* this.#supervisor.sendEffect({
+      const outcome = yield* this.#supervisor.send({
         kind: "statement",
         databasePath: this.#path,
         mode: request.mode,
@@ -407,10 +384,4 @@ function tableIO<A>(operation: () => Promise<A>): Effect.Effect<A, AgentTablesEr
     try: operation,
     catch: (error) => new AgentTablesError({ message: error instanceof Error ? error.message : String(error) }),
   });
-}
-
-async function runTables<A>(operation: Effect.Effect<A, AgentTablesError>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure;
-  return result.success;
 }

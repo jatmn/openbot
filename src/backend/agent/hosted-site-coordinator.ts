@@ -32,13 +32,16 @@ import { type OpenBotToolResponse, openBotToolResult, siteToolString } from "./r
 
 /** The openbot.site host, injected so the backend never depends on the account Worker directly. */
 export interface AgentHostedSites {
-  list(): Promise<HostedSiteList>;
-  publish(input: PublishHostedSiteInput, allowedRoots: readonly string[]): Promise<HostedSiteSummary>;
+  list(): Effect.Effect<HostedSiteList, HostedSiteOperationFailed>;
+  publish(
+    input: PublishHostedSiteInput,
+    allowedRoots: readonly string[],
+  ): Effect.Effect<HostedSiteSummary, HostedSiteOperationFailed>;
   replace(
     input: PublishHostedSiteInput & { siteId: string },
     allowedRoots: readonly string[],
-  ): Promise<HostedSiteSummary>;
-  delete(siteId: string): Promise<void>;
+  ): Effect.Effect<HostedSiteSummary, HostedSiteOperationFailed>;
+  delete(siteId: string): Effect.Effect<void, HostedSiteOperationFailed>;
 }
 
 /**
@@ -115,20 +118,11 @@ export class HostedSiteCoordinator {
     this.#reconcileEventsAfterRestart();
   }
 
-  listSites(): Promise<HostedSiteList> {
+  listSites(): Effect.Effect<HostedSiteList, HostedSiteOperationFailed> {
     return this.#requireHostedSites().list();
   }
 
-  prepareApproval(
-    client: AgentClient,
-    request: AppServerRequest,
-    params: DynamicToolCallParams,
-    tool: HostedSiteMutationTool,
-  ): Promise<{ approval: AgentApproval; mutation: HostedSiteMutationContext } | null> {
-    return runSite(this.prepareApprovalEffect(client, request, params, tool));
-  }
-
-  readonly prepareApprovalEffect = Effect.fn("HostedSiteCoordinator.prepareApproval")(function* (
+  readonly prepareApproval = Effect.fn("HostedSiteCoordinator.prepareApproval")(function* (
     this: HostedSiteCoordinator,
     client: AgentClient,
     request: AppServerRequest,
@@ -172,15 +166,8 @@ export class HostedSiteCoordinator {
    * Runs an approved mutation, or records the decline. Never throws: every failure becomes a
    * terminal marker plus an error event, because the provider is still waiting on a response.
    */
-  resolveApproval(
-    mutation: HostedSiteMutationContext,
-    target: HostedSiteApprovalTarget,
-    decision: "accept" | "decline",
-  ): Promise<void> {
-    return runSite(this.resolveApprovalEffect(mutation, target, decision));
-  }
 
-  readonly resolveApprovalEffect = Effect.fn("HostedSiteCoordinator.resolveApproval")(function* (
+  readonly resolveApproval = Effect.fn("HostedSiteCoordinator.resolveApproval")(function* (
     this: HostedSiteCoordinator,
     mutation: HostedSiteMutationContext,
     target: HostedSiteApprovalTarget,
@@ -297,7 +284,7 @@ export class HostedSiteCoordinator {
     siteId: string,
   ) {
     const host = yield* siteStep(() => this.#requireHostedSites());
-    const { sites } = yield* siteIo(() => host.list());
+    const { sites } = yield* host.list();
     for (const site of sites) if (site.id === siteId) return site;
     return yield* new HostedSiteOperationFailed({ cause: new Error("The hosted site was not found.") });
   });
@@ -315,7 +302,7 @@ export class HostedSiteCoordinator {
     if (context.action === "delete") {
       const siteId = yield* siteStep(() => siteToolString(args.siteId, "siteId", INPUT_LIMITS.identifier));
       const host = yield* siteStep(() => this.#requireHostedSites());
-      yield* siteIo(() => host.delete(siteId));
+      yield* host.delete(siteId);
       return { response: openBotToolResult({ deleted: true, siteId }), eventDetails: context.eventDetails };
     }
 
@@ -338,9 +325,7 @@ export class HostedSiteCoordinator {
         ? undefined
         : yield* siteStep(() => siteToolString(args.siteId, "siteId", INPUT_LIMITS.identifier));
     const host = yield* siteStep(() => this.#requireHostedSites());
-    const site = siteId
-      ? yield* siteIo(() => host.replace({ ...input, siteId }, roots))
-      : yield* siteIo(() => host.publish(input, roots));
+    const site = siteId ? yield* host.replace({ ...input, siteId }, roots) : yield* host.publish(input, roots);
     return { response: openBotToolResult(site), eventDetails: hostedSiteEventDetails(site, siteId) };
   });
 
@@ -545,14 +530,7 @@ export class HostedSiteOperationFailed extends Schema.TaggedError<HostedSiteOper
   "HostedSiteOperationFailed",
   { cause: Schema.Defect() },
 ) {}
-function siteIo<A>(run: () => Promise<A>): Effect.Effect<A, HostedSiteOperationFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new HostedSiteOperationFailed({ cause }) });
-}
+
 function siteStep<A>(run: () => A): Effect.Effect<A, HostedSiteOperationFailed> {
   return Effect.try({ try: run, catch: (cause) => new HostedSiteOperationFailed({ cause }) });
-}
-async function runSite<A>(effect: Effect.Effect<A, HostedSiteOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(effect));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

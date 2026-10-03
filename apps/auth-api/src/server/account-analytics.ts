@@ -15,7 +15,6 @@ import {
 } from "@openbot/contracts/hosted-servers";
 import { isOneOf } from "@openbot/contracts/runtime-values";
 import { Effect, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 
 /** The same OpenPanel project as the desktop app and the website. ANALYTICS.md is the contract. */
 const OPENPANEL_API_URL = "https://analytics.openbot.run/api";
@@ -90,7 +89,7 @@ export interface AccountAnalyticsOptions {
   clientSecret: string | undefined;
   fetch: (input: string, init: RequestInit) => Promise<Response>;
   /** Keeps the Worker alive until the send ends (`waitUntil`). */
-  schedule: (send: Promise<void>) => void;
+  schedule: (send: Effect.Effect<void>) => void;
 }
 
 class AnalyticsDeliveryError extends Schema.TaggedError<AnalyticsDeliveryError>()("AnalyticsDeliveryError", {}) {}
@@ -125,10 +124,8 @@ export function createAccountAnalytics(options: AccountAnalyticsOptions): Accoun
       const properties = accountEventProperties(event);
       if (!properties || !ACCOUNT_ID_PATTERN.test(accountId)) return;
       options.schedule(
-        runApiEffect(
-          send(accountId, event, properties).pipe(
-            Effect.catch(() => Effect.sync(() => console.warn("Account analytics send failed."))),
-          ),
+        send(accountId, event, properties).pipe(
+          Effect.catch(() => Effect.sync(() => console.warn("Account analytics send failed."))),
         ),
       );
     },

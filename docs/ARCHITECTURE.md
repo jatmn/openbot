@@ -597,15 +597,14 @@ runtime until peer disposal. Signal owns a process runtime. Worker service depen
 belong to a request or invocation; they must not retain request bindings in a global
 runtime. Response streams and `waitUntil` tasks retain their framework lifetimes.
 
-Existing constructor-injected services keep their dependency interfaces. Their domain
-methods compose named Effects and retain Promise methods for callers. Stateless operations
-run at these boundaries without a managed runtime. Native queues keep their ordering and
-shared Promise identity; Effect operations run inside each queued task. Synchronous SQLite
-transactions stay synchronous. A mutation that must finish before rollback or shutdown uses
-an explicit interruption boundary.
+Constructor-injected services expose one Effect operation per async method. Service ports
+accept Effects, and callers compose them directly. There are no paired Promise facades.
+Deferred values share pending results; semaphores preserve operation order; owned scopes
+retain background fibers until cleanup. Synchronous SQLite transactions stay synchronous.
+A mutation that must finish before rollback or shutdown uses an explicit interruption boundary.
 
-The renderer and mobile application workflows remain outside this migration. They consume
-the shared team client's existing Promise and event interfaces. Electron window management,
+The renderer and mobile application workflows remain outside this migration. Their native
+callbacks execute shared client Effects and keep existing UI and event behavior. Electron window management,
 HTTP routing, IPC handlers, SDK callback registration, and startup/teardown hooks remain
 framework code. They call Effect service boundaries and await resource disposal.
 
@@ -835,7 +834,7 @@ check; a device holding no Signal socket finds the change at its next 15-minute 
 Mobile uses one shared lifecycle subscription and a refresh controller per account endpoint.
 A foreground return checks absolute freshness: successful account and directory responses stay fresh
 for 15 minutes, and background time counts toward that deadline. Failed mobile checks retry after
-one minute while foregrounded. Concurrent requests share one promise; invalidations received during
+one minute while foregrounded. Concurrent requests share one Effect result through a Deferred; invalidations received during
 a request cause one follow-up after success. iOS `inactive` alone does not reset these deadlines.
 Stored mobile sessions become available before startup validation completes; network failures retain
 them, and validation results apply only to the initiating login.

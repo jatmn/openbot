@@ -1,10 +1,9 @@
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import {
   type ProviderClientOperationError,
   providerCall,
   providerFailure,
   providerSync,
-  runProviderClientEffect,
 } from "./provider-client-effects";
 // "Check agent": one trial start of a custom agent, before the user saves it.
 //
@@ -25,7 +24,7 @@ import { redactText } from "@openbot/logging";
 import { OPENBOT_ACP_CLIENT_CAPABILITIES, OPENBOT_ACP_CLIENT_INFO } from "./acp-client";
 import { cliSpawnTarget } from "./cli";
 import { stopWindowsProcessTree } from "./windows-process-tree";
-import { TimeoutError, withTimeout } from "./with-timeout";
+import { TimeoutError } from "./with-timeout";
 
 const AGENT_CHECK_TIMEOUT_MS = 20_000;
 const STOP_GRACE_MS = 2_000;
@@ -45,10 +44,7 @@ export interface AgentCheckTarget {
  * agent's last stderr line is added only after `redactText` and after the agent's own environment
  * values are masked, because an agent can print the key it was given.
  */
-export function checkAcpAgent(target: AgentCheckTarget): Promise<CustomAgentCheckResult> {
-  return runProviderClientEffect(checkAcpAgentEffect(target));
-}
-export const checkAcpAgentEffect = Effect.fn("AcpAgent.check")((target: AgentCheckTarget) =>
+export const checkAcpAgent = Effect.fn("AcpAgent.check")((target: AgentCheckTarget) =>
   Effect.acquireUseRelease(
     providerCall(() => mkdtemp(join(tmpdir(), "openbot-agent-check-"))),
     (folder) =>
@@ -75,10 +71,13 @@ export const checkAcpAgentEffect = Effect.fn("AcpAgent.check")((target: AgentChe
             const last = lines.at(-1);
             if (last) lastStderr = last;
           });
-          const ended = new Promise<never>((_resolve, reject) => {
-            started.once("error", () => reject(new CheckEnd("stopped")));
-            started.once("close", () => reject(new CheckEnd("stopped")));
-          });
+          const ended = Deferred.makeUnsafe<never, ProviderClientOperationError>();
+          started.once("error", () =>
+            Deferred.doneUnsafe(ended, Effect.fail(providerFailure(new CheckEnd("stopped")))),
+          );
+          started.once("close", () =>
+            Deferred.doneUnsafe(ended, Effect.fail(providerFailure(new CheckEnd("stopped")))),
+          );
           const connection = yield* providerSync(
             () =>
               new ClientSideConnection(
@@ -90,18 +89,18 @@ export const checkAcpAgentEffect = Effect.fn("AcpAgent.check")((target: AgentChe
               ),
           );
           const initialization = yield* providerCall(() =>
-            withTimeout(
-              Promise.race([
-                connection.initialize({
-                  protocolVersion: OPENBOT_ACP_PROTOCOL_VERSION,
-                  clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
-                  clientInfo: OPENBOT_ACP_CLIENT_INFO,
-                }),
-                ended,
-              ]),
-              target.timeoutMs ?? AGENT_CHECK_TIMEOUT_MS,
-              sourceText("error.provider.customAgentCheckTimedOut"),
-            ),
+            connection.initialize({
+              protocolVersion: OPENBOT_ACP_PROTOCOL_VERSION,
+              clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
+              clientInfo: OPENBOT_ACP_CLIENT_INFO,
+            }),
+          ).pipe(
+            Effect.raceFirst(Deferred.await(ended)),
+            Effect.timeoutOrElse({
+              duration: target.timeoutMs ?? AGENT_CHECK_TIMEOUT_MS,
+              orElse: () =>
+                Effect.fail(providerFailure(new TimeoutError(sourceText("error.provider.customAgentCheckTimedOut")))),
+            }),
           );
           if (initialization.protocolVersion !== OPENBOT_ACP_PROTOCOL_VERSION) {
             return yield* providerFailure(
@@ -228,7 +227,7 @@ const stopGroup = Effect.fn("AcpAgent.stopGroup")(function* (
 ): Effect.fn.Return<void, ProviderClientOperationError> {
   if (process.platform === "win32") {
     child.stdin.destroy();
-    return yield* providerCall(() => stopWindowsProcessTree(child));
+    return yield* stopWindowsProcessTree(child).pipe(Effect.mapError((failure) => providerFailure(failure.cause)));
   }
   const signal = (name: NodeJS.Signals) => {
     try {

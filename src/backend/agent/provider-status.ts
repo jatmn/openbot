@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import type { AgentProviderStatus } from "@openbot/contracts/ipc";
 import { redactText } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import type { AgentProvider } from "../agent-client";
 import { CodexCliError } from "../cli";
 
@@ -56,20 +56,11 @@ export function providerFailureStatus(
   return { state: "error", version: version ?? null, message };
 }
 
-export async function waitForSuccessfulProcess(
-  child: ChildProcess,
-  timeoutMs: number,
-  description = "Provider login",
-): Promise<void> {
-  const result = await Effect.runPromise(Effect.result(waitForSuccessfulProcessEffect(child, timeoutMs, description)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-}
-
 export class ProviderProcessFailed extends Schema.TaggedError<ProviderProcessFailed>()("ProviderProcessFailed", {
   cause: Schema.Defect(),
 }) {}
 
-export const waitForSuccessfulProcessEffect = Effect.fnUntraced(function* (
+export const waitForSuccessfulProcess = Effect.fnUntraced(function* (
   child: ChildProcess,
   timeoutMs: number,
   description = "Provider login",

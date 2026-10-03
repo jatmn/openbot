@@ -13,7 +13,7 @@ import type {
 } from "./mcp-provider-shapes";
 import { confineSpawnTarget, grokStatePaths, type ProcessConfinement } from "./process-confinement";
 import { type AccountRateLimitsReadResult, getRecord, getString } from "./protocol";
-import { providerCall, runProviderClientEffect } from "./provider-client-effects";
+import { providerCall } from "./provider-client-effects";
 
 export class GrokAgentClient extends AcpAgentClient {
   constructor(
@@ -47,21 +47,14 @@ export class GrokAgentClient extends AcpAgentClient {
       signInMessage: sourceText("error.provider.grokSignIn"),
       authenticate,
       readAccount: (connection) =>
-        runProviderClientEffect(
-          providerCall(() => connection.extMethod("_x.ai/auth/info", {})).pipe(Effect.map(grokAccount)),
-        ),
+        providerCall(() => connection.extMethod("_x.ai/auth/info", {})).pipe(Effect.map(grokAccount)),
       readRateLimits: (connection) =>
-        runProviderClientEffect(
-          providerCall(() => connection.extMethod("_x.ai/billing", {})).pipe(Effect.map(grokRateLimits)),
-        ),
+        providerCall(() => connection.extMethod("_x.ai/billing", {})).pipe(Effect.map(grokRateLimits)),
     });
   }
 }
 
-function authenticate(connection: ClientSideConnection, initialization: InitializeResponse): Promise<void> {
-  return runProviderClientEffect(authenticateEffect(connection, initialization));
-}
-const authenticateEffect = Effect.fn("Grok.authenticate")(function* (
+const authenticate = Effect.fn("Grok.authenticate")(function* (
   connection: ClientSideConnection,
   initialization: InitializeResponse,
 ) {

@@ -29,7 +29,7 @@ import { Transform, type TransformCallback } from "node:stream";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { createOpenBotLogger, type Logger } from "@openbot/logging";
 import { Effect, Result } from "effect";
-import { CuaDriverFailure, cuaIO, runCua } from "./cua-driver-effects";
+import { CuaDriverFailure, cuaIO } from "./cua-driver-effects";
 import { rewriteCallAnswer } from "./cua-driver-structured-text";
 
 /**
@@ -314,11 +314,7 @@ export class CuaDriverActionTap {
     return this.#now() - pointer.at <= maxAgeMs ? pointer : null;
   }
 
-  listen(addresses: ActionTapAddresses): Promise<void> {
-    return runCua(this.listenEffect(addresses));
-  }
-
-  listenEffect = Effect.fn("CuaDriverActionTap.listen")(function* (
+  listen = Effect.fn("CuaDriverActionTap.listen")(function* (
     this: CuaDriverActionTap,
     { upstream, tap }: ActionTapAddresses,
   ) {
@@ -343,18 +339,14 @@ export class CuaDriverActionTap {
     // Keep the listener safe after it is acquired and while it is closed after a bind failure.
     server.on("error", () => undefined);
     if (Result.isFailure(result)) {
-      yield* this.closeEffect();
+      yield* this.close();
       return yield* result.failure;
     }
     yield* cuaIO(() => chmod(tap, 0o600)).pipe(Effect.catch(() => Effect.void));
     this.#address = tap;
   }, Effect.uninterruptible);
 
-  close(): Promise<void> {
-    return runCua(this.closeEffect());
-  }
-
-  closeEffect = Effect.fn("CuaDriverActionTap.close")(function* (this: CuaDriverActionTap) {
+  close = Effect.fn("CuaDriverActionTap.close")(function* (this: CuaDriverActionTap) {
     const server = this.#server;
     this.#server = null;
     this.#address = null;

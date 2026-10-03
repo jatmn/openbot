@@ -8,20 +8,12 @@ import {
 } from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Effect, Result, Semaphore } from "effect";
 import { isMissingFileError } from "../backend/file-errors";
-import { PreferenceFileFailure, readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
+import { PreferenceFileFailure, readPreferenceFile, writePreferenceFile } from "./preference-file";
 
 /** Missing settings use the product default; invalid settings always require approval. */
-export function readApprovalAutomation(
-  path: string,
-  knownAgentIds: Iterable<string>,
-  legacyPath?: string,
-): Promise<ApprovalAutomationPreference> {
-  return runPreference(readApprovalAutomationEffect(path, knownAgentIds, legacyPath));
-}
-
-const readApprovalAutomationEffect = Effect.fn("ApprovalAutomation.read")(function* (
+export const readApprovalAutomation = Effect.fn("ApprovalAutomation.read")(function* (
   path: string,
   knownAgentIds: Iterable<string>,
   legacyPath?: string,
@@ -54,7 +46,7 @@ const readApprovalAutomationEffect = Effect.fn("ApprovalAutomation.read")(functi
     if (Array.isArray(ids) && ids.length <= INPUT_LIMITS.agents && ids.every(isString)) {
       const granted = new Set(ids);
       // Snapshot every existing choice before enabling the default for future agents.
-      return yield* writeApprovalAutomationEffect(path, {
+      return yield* writeApprovalAutomation(path, {
         turbo: parsed.turbo,
         defaultAutoApprove: true,
         autoApproveOverrides: Object.fromEntries([...knownAgentIds].map((id) => [id, granted.has(id)])),
@@ -64,13 +56,7 @@ const readApprovalAutomationEffect = Effect.fn("ApprovalAutomation.read")(functi
   return { turbo: false, defaultAutoApprove: false, autoApproveOverrides: {} };
 });
 
-export function writeApprovalAutomation(
-  path: string,
-  preference: ApprovalAutomationPreference,
-): Promise<ApprovalAutomationPreference> {
-  return runPreference(writeApprovalAutomationEffect(path, preference));
-}
-const writeApprovalAutomationEffect = Effect.fn("ApprovalAutomation.write")(function* (
+export const writeApprovalAutomation = Effect.fn("ApprovalAutomation.write")(function* (
   path: string,
   preference: ApprovalAutomationPreference,
 ) {
@@ -98,7 +84,7 @@ export class ApprovalAutomation {
   readonly #path: string;
   readonly #knownAgentIds: () => Iterable<string>;
   #preference: ApprovalAutomationPreference;
-  #pendingWrite: Promise<unknown> = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
   readonly #deletingAgentIds = new Set<string>();
   readonly #listeners = new Set<(preference: ApprovalAutomationPreference) => void>();
 
@@ -141,39 +127,39 @@ export class ApprovalAutomation {
     return () => this.#listeners.delete(listener);
   }
 
-  set(input: SetApprovalAutomationInput): Promise<ApprovalAutomationPreference> {
-    if (input.autoApprove && input.agentId && this.#deletingAgentIds.has(input.agentId)) {
-      return Promise.reject(new Error(sourceText("error.agent.approvalWhileDeleting")));
-    }
-    const write = this.#pendingWrite.then(
-      () => runPreference(this.#apply(input)),
-      () => runPreference(this.#apply(input)),
-    );
-    this.#pendingWrite = write.catch(() => undefined);
-    return write;
+  set(input: SetApprovalAutomationInput): Effect.Effect<ApprovalAutomationPreference, PreferenceFileFailure> {
+    return Effect.suspend(() => {
+      if (input.autoApprove && input.agentId && this.#deletingAgentIds.has(input.agentId)) {
+        return Effect.fail(
+          new PreferenceFileFailure({ cause: new Error(sourceText("error.agent.approvalWhileDeleting")) }),
+        );
+      }
+      return this.#writes.withPermit(this.#apply(input));
+    });
   }
 
   /** Persist revocation before deleting data, and keep grant writes behind the deletion. */
-  deleteAgent(agentId: string, remove: () => Promise<void>): Promise<void> {
-    this.#deletingAgentIds.add(agentId);
-    const deletion = this.#pendingWrite.then(() =>
-      runPreference(
-        Effect.gen({ self: this }, function* () {
-          yield* this.#apply({ agentId, autoApprove: false });
-          yield* Effect.tryPromise({ try: remove, catch: (cause) => new PreferenceFileFailure({ cause }) });
-        }).pipe(
+  deleteAgent<E>(
+    agentId: string,
+    remove: () => Effect.Effect<void, E>,
+  ): Effect.Effect<void, E | PreferenceFileFailure> {
+    return Effect.suspend(() => {
+      this.#deletingAgentIds.add(agentId);
+      return this.#writes
+        .withPermit(
+          Effect.gen({ self: this }, function* () {
+            yield* this.#apply({ agentId, autoApprove: false });
+            yield* remove();
+          }),
+        )
+        .pipe(
           Effect.ensuring(
             Effect.sync(() => {
               this.#deletingAgentIds.delete(agentId);
             }),
           ),
-          Effect.uninterruptible,
-        ),
-      ),
-    );
-
-    this.#pendingWrite = deletion.catch(() => undefined);
-    return deletion;
+        );
+    }).pipe(Effect.uninterruptible);
   }
 
   #apply = Effect.fn("ApprovalAutomation.apply")(function* (
@@ -184,7 +170,7 @@ export class ApprovalAutomation {
     // Apply the new choice while the file write is pending; restore it when the write fails.
     const previous = this.#preference;
     this.#preference = next;
-    const saved = yield* Effect.result(writeApprovalAutomationEffect(this.#path, next));
+    const saved = yield* Effect.result(writeApprovalAutomation(this.#path, next));
     if (Result.isFailure(saved)) {
       this.#preference = previous;
       return yield* saved.failure;

@@ -7,12 +7,9 @@ import {
 import { isBoolean, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
 import { isMissingFileError } from "../backend/file-errors";
-import { readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
+import { type PreferenceFileFailure, readPreferenceFile, writePreferenceFile } from "./preference-file";
 
-export function readDynamicIslandPreference(path: string): Promise<DynamicIslandPreference> {
-  return runPreference(readDynamicIslandPreferenceEffect(path));
-}
-const readDynamicIslandPreferenceEffect = Effect.fn("readDynamicIslandPreference")((path: string) =>
+export const readDynamicIslandPreference = Effect.fn("readDynamicIslandPreference")((path: string) =>
   readPreferenceFile(path, (parsed): DynamicIslandPreference => {
     if (!isDynamicRecord(parsed) || !isBoolean(parsed.enabled)) {
       return { ...DEFAULT_DYNAMIC_ISLAND_PREFERENCE };
@@ -61,11 +58,9 @@ const readDynamicIslandPreferenceEffect = Effect.fn("readDynamicIslandPreference
 export function writeDynamicIslandPreference(
   path: string,
   preference: DynamicIslandPreference,
-): Promise<DynamicIslandPreference> {
-  return runPreference(
-    Effect.gen(function* () {
-      yield* writePreferenceFile(path, { version: 3, ...preference });
-      return { ...preference };
-    }),
-  );
+): Effect.Effect<DynamicIslandPreference, PreferenceFileFailure> {
+  return Effect.gen(function* () {
+    yield* writePreferenceFile(path, { version: 3, ...preference });
+    return { ...preference };
+  });
 }

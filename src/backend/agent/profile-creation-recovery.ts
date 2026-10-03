@@ -4,7 +4,7 @@ import { decodeSaveAgentProfileResult } from "@openbot/contracts/ipc";
 import { isGeneratedAgentId, isUuidV4 } from "@openbot/contracts/validation";
 import { Effect } from "effect";
 import type { OpenBotDatabase } from "../openbot-database";
-import { runStored, StoredStateFailure, storedIO, storedSync } from "../stored-state-effects";
+import { StoredStateFailure, storedIO, storedSync } from "../stored-state-effects";
 
 /** A marker precedes every profile-created row, so a crash cannot orphan an executable agent. */
 export class ProfileCreationRecovery {
@@ -13,10 +13,7 @@ export class ProfileCreationRecovery {
     private readonly workspaces: string,
   ) {}
 
-  begin(agentId: string, operationId: string): Promise<void> {
-    return runStored(this.beginEffect(agentId, operationId));
-  }
-  beginEffect = Effect.fn("ProfileCreationRecovery.begin")(function* (
+  begin = Effect.fn("ProfileCreationRecovery.begin")(function* (
     this: ProfileCreationRecovery,
     agentId: string,
     operationId: string,
@@ -30,10 +27,7 @@ export class ProfileCreationRecovery {
     );
   }, Effect.uninterruptible);
 
-  recover(database: OpenBotDatabase, removeAgent: (agentId: string) => Promise<void>): Promise<void> {
-    return runStored(this.recoverEffect(database, (id) => storedIO(() => removeAgent(id))));
-  }
-  recoverEffect = Effect.fn("ProfileCreationRecovery.recover")(function* (
+  recover = Effect.fn("ProfileCreationRecovery.recover")(function* (
     this: ProfileCreationRecovery,
     database: OpenBotDatabase,
     removeAgent: (agentId: string) => Effect.Effect<void, StoredStateFailure>,

@@ -1,3 +1,4 @@
+import type { RemoteFailure } from "./remote-control-plane";
 // The OpenBot Slack app's OAuth install. One app serves every workspace: a workspace member installs
 // it once, and the workspace is linked to one OpenBot host, which answers all of its messages. The
 // Worker exchanges the code because the client secret lives here, records only which host answers
@@ -9,7 +10,6 @@ import { SLACK_BOT_SCOPES } from "@openbot/contracts/slack-app";
 import { isRawP256PublicKey, sealSlackWorkspaceGrant } from "@openbot/contracts/slack-workspace-grant";
 import { Effect, Schema } from "effect";
 import { hmacSha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
 import { authEventStatement } from "./remote-control-plane";
 import type { AuthUser, WorkerBindings } from "./types";
 
@@ -65,7 +65,7 @@ export class SlackAppService {
   readonly #fetch: Fetch;
   readonly #now: () => number;
   readonly #developmentOrigin: string | null;
-  readonly #flushAuthEvents: () => Promise<void>;
+  readonly #flushAuthEvents: () => Effect.Effect<void, RemoteFailure>;
 
   constructor(
     bindings: Pick<
@@ -73,7 +73,7 @@ export class SlackAppService {
       "DB" | "SLACK_CLIENT_ID" | "SLACK_CLIENT_SECRET" | "SLACK_STATE_SECRET" | "SLACK_DEV_PUBLIC_ORIGIN"
     >,
     // Sends the queued Signal events. The Worker passes its delivery; the cron sends them otherwise.
-    options: { fetch?: Fetch; now?: () => number; flushAuthEvents?: () => Promise<void> } = {},
+    options: { fetch?: Fetch; now?: () => number; flushAuthEvents?: () => Effect.Effect<void, RemoteFailure> } = {},
   ) {
     const clientId = bindings.SLACK_CLIENT_ID?.trim();
     const clientSecret = bindings.SLACK_CLIENT_SECRET?.trim();
@@ -88,7 +88,7 @@ export class SlackAppService {
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#now = options.now ?? Date.now;
     this.#developmentOrigin = bindings.SLACK_DEV_PUBLIC_ORIGIN?.trim() || null;
-    this.#flushAuthEvents = options.flushAuthEvents ?? (async () => undefined);
+    this.#flushAuthEvents = options.flushAuthEvents ?? (() => Effect.void);
   }
 
   /**
@@ -100,14 +100,8 @@ export class SlackAppService {
   }
 
   /** The Slack install URL for one connect of one host that the account owns. */
-  authorizeUrl(
-    user: AuthUser,
-    input: { hostId: string; hostNonce: string; hostPublicKey: string; redirectUri: string; returnUrl?: string },
-  ): Promise<string> {
-    return runApiEffect(this.#authorizeUrlEffect(user, input));
-  }
 
-  readonly #authorizeUrlEffect = Effect.fn("SlackAppService.authorizeUrl")(function* (
+  readonly authorizeUrl = Effect.fn("SlackAppService.authorizeUrl")(function* (
     this: SlackAppService,
     user: AuthUser,
     input: { hostId: string; hostNonce: string; hostPublicKey: string; redirectUri: string; returnUrl?: string },
@@ -145,7 +139,7 @@ export class SlackAppService {
     url.searchParams.set("redirect_uri", input.redirectUri);
     url.searchParams.set("state", state);
     return url.toString();
-  });
+  }).bind(this);
 
   /**
    * Exchanges the code, links the workspace to the host in `state`, and seals the bot token to the
@@ -154,15 +148,8 @@ export class SlackAppService {
    * A workspace answers to one host. The account that connected it can move it to another of its
    * hosts; another account gets `slack_workspace_taken` until the first host disconnects.
    */
-  complete(input: {
-    code: string;
-    state: string;
-    redirectUri: string;
-  }): Promise<{ nonce: string; grant: string; returnUrl?: string }> {
-    return runApiEffect(this.#completeEffect(input));
-  }
 
-  readonly #completeEffect = Effect.fn("SlackAppService.complete")(function* (
+  readonly complete = Effect.fn("SlackAppService.complete")(function* (
     this: SlackAppService,
     input: {
       code: string;
@@ -226,7 +213,9 @@ export class SlackAppService {
         ),
       ]),
     );
-    yield* slackCall(() => this.#flushAuthEvents());
+    yield* this.#flushAuthEvents().pipe(
+      Effect.mapError((error) => (error instanceof SlackAppError ? error : new SlackOperationError({}))),
+    );
     if (!linked || linked.meta.changes === 0) {
       return yield* new SlackAppError(
         409,
@@ -247,14 +236,14 @@ export class SlackAppService {
         }),
       ),
     };
-  });
+  }).bind(this);
 
   readonly #signState = Effect.fn("SlackAppService.signState")(function* (
     this: SlackAppService,
     payload: StatePayload,
   ): Effect.fn.Return<string, SlackAppError | SlackOperationError> {
     const body = toBase64Url(new TextEncoder().encode(JSON.stringify(payload)));
-    return `${body}.${yield* slackCall(() => hmacSha256(this.#stateSecret, body))}`;
+    return `${body}.${yield* hmacSha256(this.#stateSecret, body).pipe(Effect.mapError((error) => (error instanceof SlackAppError ? error : new SlackOperationError({}))))}`;
   });
 
   readonly #verifyState = Effect.fn("SlackAppService.verifyState")(function* (

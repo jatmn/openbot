@@ -35,7 +35,7 @@ import {
   verifyBoatWebhookSignature,
 } from "./boat-client";
 import { deriveSecret, hmacSha256, randomToken, sha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
+import type { RemoteFailure } from "./remote-control-plane";
 import { PERSISTENT_SESSION_EXPIRES_AT } from "./session-policy";
 import type { AuthUser, WorkerBindings } from "./types";
 
@@ -125,7 +125,7 @@ class HostedServerOperationError extends Schema.TaggedError<HostedServerOperatio
   "HostedServerOperationError",
   {},
 ) {}
-type HostedFailure = HostedServerServiceError | BoatApiError | BillingError | HostedServerOperationError;
+export type HostedFailure = HostedServerServiceError | BoatApiError | BillingError | HostedServerOperationError;
 function hostedFailure(error: unknown): HostedFailure {
   return error instanceof HostedServerServiceError || error instanceof BoatApiError || error instanceof BillingError
     ? error
@@ -186,7 +186,7 @@ export interface HostedServerServiceOptions {
   fetch?: BoatFetch;
   now?: () => number;
   /** Removes the Remote host of a deleted server. It is null when Remote is not configured. */
-  removeHost?: ((ownerUserId: string, hostId: string) => Promise<void>) | null | undefined;
+  removeHost?: ((ownerUserId: string, hostId: string) => Effect.Effect<void, RemoteFailure>) | null | undefined;
   /** Null when the deployment has no Stripe key. Then no server can be created, and plans are not checked. */
   billing?: HostedServerBilling | null;
   analytics?: AccountAnalytics;
@@ -220,16 +220,14 @@ class HostedServerDependencies extends Context.Service<
     boat: BoatClient | null;
     billing: HostedServerBilling | null;
     now: () => number;
-    removeHost: ((ownerUserId: string, hostId: string) => Promise<void>) | null;
+    removeHost: ((ownerUserId: string, hostId: string) => Effect.Effect<void, RemoteFailure>) | null;
     analytics: AccountAnalytics;
   }
 >()("auth-api/HostedServerService/Dependencies") {}
 
 export class HostedServerService {
   readonly #layer: Layer.Layer<HostedServerDependencies>;
-  #run<A>(operation: Effect.Effect<A, HostedFailure, HostedServerDependencies>): Promise<A> {
-    return runApiEffect(operation.pipe(Effect.provide(this.#layer)));
-  }
+
   readonly #boat: BoatClient | null;
   readonly #template: string | null;
   readonly #ticketKey: string | null;
@@ -286,545 +284,542 @@ export class HostedServerService {
   }
 
   /** The plans and prices that the create dialog shows. */
-  plans(user: AuthUser): Promise<HostedServerCatalog> {
-    return this.#run(this.#plansEffect(user));
-  }
 
-  readonly #plansEffect = Effect.fn("HostedServerService.plans")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-  ): Effect.fn.Return<HostedServerCatalog, HostedFailure, HostedServerDependencies> {
-    const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
-    return yield* hostedCall(() => billing.catalog());
-  });
+  readonly plans = Effect.fn("HostedServerService.plans")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+    ): Effect.fn.Return<HostedServerCatalog, HostedFailure, HostedServerDependencies> {
+      const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
+      return yield* billing.catalog().pipe(Effect.mapError(hostedFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  list(user: AuthUser): Promise<HostedServerList> {
-    return this.#run(this.#listEffect(user));
-  }
-
-  readonly #listEffect = Effect.fn("HostedServerService.list")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-  ): Effect.fn.Return<HostedServerList, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const rows = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+  readonly list = Effect.fn("HostedServerService.list")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+    ): Effect.fn.Return<HostedServerList, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const rows = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE owner_user_id = ? AND desired_state != 'deleted' ORDER BY created_at`,
-        )
-        .bind(user.id)
-        .all<HostedServerRow>(),
-    );
-    return {
-      available: this.isAvailableFor(user),
-      servers: rows.results.map(summary),
-      maxServers: MAX_SERVERS_PER_ACCOUNT,
-    };
-  });
+          )
+          .bind(user.id)
+          .all<HostedServerRow>(),
+      );
+      return {
+        available: this.isAvailableFor(user),
+        servers: rows.results.map(summary),
+        maxServers: MAX_SERVERS_PER_ACCOUNT,
+      };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Adds a server that waits for payment, and returns its Stripe Checkout page. The sandbox is made only
    * when Stripe confirms the payment. The same Idempotency-Key returns the same server with a new page.
    */
-  create(
-    user: AuthUser,
-    input: { name: unknown; plan: unknown; interval: unknown; currency: unknown },
-    idempotencyKeyHeader: string | null,
-    returnTo: CheckoutReturn,
-  ): Promise<HostedServerCheckout> {
-    return this.#run(this.#createEffect(user, input, idempotencyKeyHeader, returnTo));
-  }
 
-  readonly #createEffect = Effect.fn("HostedServerService.create")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-    input: { name: unknown; plan: unknown; interval: unknown; currency: unknown },
-    idempotencyKeyHeader: string | null,
-    returnTo: CheckoutReturn,
-  ): Effect.fn.Return<HostedServerCheckout, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
-    const idempotencyKey = idempotencyKeyHeader?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u.test(idempotencyKey)) {
-      return yield* new HostedServerServiceError(
-        400,
-        "invalid_idempotency_key",
-        "A valid Idempotency-Key header is required.",
+  readonly create = Effect.fn("HostedServerService.create")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+      input: { name: unknown; plan: unknown; interval: unknown; currency: unknown },
+      idempotencyKeyHeader: string | null,
+      returnTo: CheckoutReturn,
+    ): Effect.fn.Return<HostedServerCheckout, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
+      const idempotencyKey = idempotencyKeyHeader?.trim() ?? "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u.test(idempotencyKey)) {
+        return yield* new HostedServerServiceError(
+          400,
+          "invalid_idempotency_key",
+          "A valid Idempotency-Key header is required.",
+        );
+      }
+      const name = yield* hostedValidate(() => serverName(input.name));
+      if (!isOneOf(BILLING_PLAN_IDS, input.plan)) return yield* invalid("plan");
+      if (!isOneOf(BILLING_INTERVALS, input.interval)) return yield* invalid("interval");
+      if (!isOneOf(BILLING_CURRENCIES, input.currency)) return yield* invalid("currency");
+      const size = HOSTED_PLAN_SIZE[input.plan];
+      const previous = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE owner_user_id = ? AND idempotency_key = ?`)
+          .bind(user.id, idempotencyKey)
+          .first<HostedServerRow>(),
       );
-    }
-    const name = yield* hostedValidate(() => serverName(input.name));
-    if (!isOneOf(BILLING_PLAN_IDS, input.plan)) return yield* invalid("plan");
-    if (!isOneOf(BILLING_INTERVALS, input.interval)) return yield* invalid("interval");
-    if (!isOneOf(BILLING_CURRENCIES, input.currency)) return yield* invalid("currency");
-    const size = HOSTED_PLAN_SIZE[input.plan];
-    const previous = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE owner_user_id = ? AND idempotency_key = ?`)
-        .bind(user.id, idempotencyKey)
-        .first<HostedServerRow>(),
-    );
-    if (previous) return yield* this.#checkout(previous, user, billing, returnTo);
-    const unpaid = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+      if (previous) return yield* this.#checkout(previous, user, billing, returnTo);
+      const unpaid = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE owner_user_id = ? AND observed_state = 'awaiting_payment' AND desired_state = 'running'
            AND NOT EXISTS(
              SELECT 1 FROM billing_subscriptions s
              WHERE s.server_id = hosted_servers.server_id AND s.status IN ${OPEN_STATUSES_SQL}
            )
          ORDER BY updated_at DESC LIMIT 1`,
-        )
-        .bind(user.id)
-        .first<HostedServerRow>(),
-    );
-    if (unpaid) {
-      const choice = { plan: input.plan, interval: input.interval, currency: input.currency };
-      return yield* this.#reuseUnpaid(unpaid, choice, idempotencyKey, user, billing, returnTo);
-    }
-    const count = yield* hostedCall(() =>
-      dependencies.database
-        .prepare("SELECT COUNT(*) AS count FROM hosted_servers WHERE owner_user_id = ? AND desired_state != 'deleted'")
-        .bind(user.id)
-        .first<{ count: number }>(),
-    );
-    if ((count?.count ?? 0) >= MAX_SERVERS_PER_ACCOUNT) {
-      return yield* new HostedServerServiceError(
-        409,
-        "hosted_server_limit",
-        "This account has the maximum number of servers.",
+          )
+          .bind(user.id)
+          .first<HostedServerRow>(),
       );
-    }
-    const serverId = crypto.randomUUID();
-    const now = dependencies.now();
-    const inserted = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `INSERT INTO hosted_servers(
+      if (unpaid) {
+        const choice = { plan: input.plan, interval: input.interval, currency: input.currency };
+        return yield* this.#reuseUnpaid(unpaid, choice, idempotencyKey, user, billing, returnTo);
+      }
+      const count = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM hosted_servers WHERE owner_user_id = ? AND desired_state != 'deleted'",
+          )
+          .bind(user.id)
+          .first<{ count: number }>(),
+      );
+      if ((count?.count ?? 0) >= MAX_SERVERS_PER_ACCOUNT) {
+        return yield* new HostedServerServiceError(
+          409,
+          "hosted_server_limit",
+          "This account has the maximum number of servers.",
+        );
+      }
+      const serverId = crypto.randomUUID();
+      const now = dependencies.now();
+      const inserted = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `INSERT INTO hosted_servers(
            server_id, owner_user_id, name, size, plan, billing_interval, currency, desired_state, observed_state,
            idempotency_key, created_at, updated_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 'awaiting_payment', ?, ?, ?)
          ON CONFLICT(owner_user_id, idempotency_key) DO NOTHING`,
-        )
-        .bind(serverId, user.id, name, size, input.plan, input.interval, input.currency, idempotencyKey, now, now)
-        .run(),
-    );
-    if (inserted.meta.changes !== 1) {
-      const concurrent = yield* hostedCall(() =>
-        dependencies.database
-          .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE owner_user_id = ? AND idempotency_key = ?`)
-          .bind(user.id, idempotencyKey)
-          .first<HostedServerRow>(),
+          )
+          .bind(serverId, user.id, name, size, input.plan, input.interval, input.currency, idempotencyKey, now, now)
+          .run(),
       );
-      if (!concurrent)
-        return yield* new HostedServerServiceError(409, "hosted_server_conflict", "Try the request again.");
-      return yield* this.#checkout(concurrent, user, billing, returnTo);
-    }
-    return yield* this.#checkout(yield* this.#requireRow(serverId), user, billing, returnTo);
-  });
+      if (inserted.meta.changes !== 1) {
+        const concurrent = yield* hostedCall(() =>
+          dependencies.database
+            .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE owner_user_id = ? AND idempotency_key = ?`)
+            .bind(user.id, idempotencyKey)
+            .first<HostedServerRow>(),
+        );
+        if (!concurrent)
+          return yield* new HostedServerServiceError(409, "hosted_server_conflict", "Try the request again.");
+        return yield* this.#checkout(concurrent, user, billing, returnTo);
+      }
+      return yield* this.#checkout(yield* this.#requireRow(serverId), user, billing, returnTo);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** A new Checkout page for a server of the owner that still waits for its first payment. */
-  checkout(user: AuthUser, serverId: string, returnTo: CheckoutReturn): Promise<HostedServerCheckout> {
-    return this.#run(this.#checkoutEffect(user, serverId, returnTo));
-  }
 
-  readonly #checkoutEffect = Effect.fn("HostedServerService.checkout")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-    serverId: string,
-    returnTo: CheckoutReturn,
-  ): Effect.fn.Return<HostedServerCheckout, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ? AND desired_state != 'deleted'`,
-        )
-        .bind(serverId, user.id)
-        .first<HostedServerRow>(),
-    );
-    if (!row) return yield* notFound();
-    return yield* this.#checkout(row, user, billing, returnTo);
-  });
+  readonly checkout = Effect.fn("HostedServerService.checkout")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+      serverId: string,
+      returnTo: CheckoutReturn,
+    ): Effect.fn.Return<HostedServerCheckout, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const { billing } = yield* hostedValidate(() => this.#requireAvailable(user));
+      const row = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ? AND desired_state != 'deleted'`,
+          )
+          .bind(serverId, user.id)
+          .first<HostedServerRow>(),
+      );
+      if (!row) return yield* notFound();
+      return yield* this.#checkout(row, user, billing, returnTo);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Stripe runs this after it stores a subscription that names a server. The plan decides: a paid
    * server is made or started again, and a server whose plan ended stops.
    */
-  onSubscriptionSynced(sync: SubscriptionSync): Promise<void> {
-    return this.#run(this.#onSubscriptionSyncedEffect(sync));
-  }
 
-  readonly #onSubscriptionSyncedEffect = Effect.fn("HostedServerService.onSubscriptionSynced")(function* (
-    this: HostedServerService,
-    sync: SubscriptionSync,
-  ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ?`)
-        .bind(sync.serverId, sync.userId)
-        .first<HostedServerRow>(),
-    );
-    if (!row) return;
-    if (row.desired_state === "deleted") {
-      // A Checkout that finished after the owner deleted the server: no server takes this payment.
-      if (isOpenBillingStatus(sync.status))
-        yield* hostedCall(() => dependencies.billing?.cancelSubscription(sync.subscriptionId));
-      return;
-    }
-    if (isOpenBillingStatus(sync.status)) yield* this.#followPlan(row, sync);
-    yield* this.#applyPlan(yield* this.#requireRow(row.server_id));
-    yield* this.#resize(yield* this.#requireRow(row.server_id));
-  });
-
-  delete(user: AuthUser, serverId: string, confirmName: unknown): Promise<void> {
-    return this.#run(this.#deleteEffect(user, serverId, confirmName));
-  }
-
-  readonly #deleteEffect = Effect.fn("HostedServerService.delete")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-    serverId: string,
-    confirmName: unknown,
-  ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ?`)
-        .bind(serverId, user.id)
-        .first<HostedServerRow>(),
-    );
-    if (!row || row.observed_state === "deleted") return yield* notFound();
-    if (confirmName !== row.name) {
-      return yield* new HostedServerServiceError(
-        400,
-        "hosted_server_confirm_mismatch",
-        "Type the server name to delete it.",
+  readonly onSubscriptionSynced = Effect.fn("HostedServerService.onSubscriptionSynced")(
+    function* (
+      this: HostedServerService,
+      sync: SubscriptionSync,
+    ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const row = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ?`)
+          .bind(sync.serverId, sync.userId)
+          .first<HostedServerRow>(),
       );
-    }
-    yield* this.#cancelPlans(row);
-    // From here the webhook and the wake paths ignore the row, and the cron finishes a failed deletion.
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare("UPDATE hosted_servers SET desired_state = 'deleted', updated_at = ? WHERE server_id = ?")
-        .bind(dependencies.now(), serverId)
-        .run(),
-    );
-    this.#track(row, { name: "hosted_server_action", action: "deleted", plan: row.plan, size: row.size });
-    // A payment that the webhook stored after the first cancel. A later one sees the deleted row.
-    yield* hostedCall(() =>
-      dependencies.billing?.cancelServerPlans(row.owner_user_id, row.server_id).catch((error: unknown) => {
-        console.warn("Hosted server plan cancel failed.", { serverId: row.server_id, error: safeErrorCode(error) });
-      }),
-    );
-    // Read again: a setup that ran at the same time can have stored its sandbox.
-    yield* this.#finishDelete(yield* this.#requireRow(serverId));
-  });
+      if (!row) return;
+      if (row.desired_state === "deleted") {
+        // A Checkout that finished after the owner deleted the server: no server takes this payment.
+        if (isOpenBillingStatus(sync.status) && dependencies.billing)
+          yield* dependencies.billing.cancelSubscription(sync.subscriptionId).pipe(Effect.mapError(hostedFailure));
+        return;
+      }
+      if (isOpenBillingStatus(sync.status)) yield* this.#followPlan(row, sync);
+      yield* this.#applyPlan(yield* this.#requireRow(row.server_id));
+      yield* this.#resize(yield* this.#requireRow(row.server_id));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
+
+  readonly delete = Effect.fn("HostedServerService.delete")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+      serverId: string,
+      confirmName: unknown,
+    ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const row = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE server_id = ? AND owner_user_id = ?`)
+          .bind(serverId, user.id)
+          .first<HostedServerRow>(),
+      );
+      if (!row || row.observed_state === "deleted") return yield* notFound();
+      if (confirmName !== row.name) {
+        return yield* new HostedServerServiceError(
+          400,
+          "hosted_server_confirm_mismatch",
+          "Type the server name to delete it.",
+        );
+      }
+      yield* this.#cancelPlans(row);
+      // From here the webhook and the wake paths ignore the row, and the cron finishes a failed deletion.
+      yield* hostedCall(() =>
+        dependencies.database
+          .prepare("UPDATE hosted_servers SET desired_state = 'deleted', updated_at = ? WHERE server_id = ?")
+          .bind(dependencies.now(), serverId)
+          .run(),
+      );
+      this.#track(row, { name: "hosted_server_action", action: "deleted", plan: row.plan, size: row.size });
+      // A payment that the webhook stored after the first cancel. A later one sees the deleted row.
+      if (dependencies.billing)
+        yield* dependencies.billing.cancelServerPlans(row.owner_user_id, row.server_id).pipe(
+          Effect.catch((error) =>
+            Effect.sync(() => {
+              console.warn("Hosted server plan cancel failed.", {
+                serverId: row.server_id,
+                error: safeErrorCode(error),
+              });
+            }),
+          ),
+        );
+      // Read again: a setup that ran at the same time can have stored its sandbox.
+      yield* this.#finishDelete(yield* this.#requireRow(serverId));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * The state of a server for its owner or a member. It changes nothing, so a client can ask on each lost
    * connection whether the server sleeps, and wake it only on the user's next input.
    */
-  status(user: AuthUser, serverId: string): Promise<HostedServerStatus> {
-    return this.#run(this.#statusEffect(user, serverId));
-  }
 
-  readonly #statusEffect = Effect.fn("HostedServerService.status")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-    serverId: string,
-  ): Effect.fn.Return<HostedServerStatus, HostedFailure, HostedServerDependencies> {
-    const row = yield* this.#requireUsableRow(user, serverId);
-    return {
-      serverId: row.server_id,
-      state: row.observed_state,
-      error: row.observed_error,
-      sleeping: row.desired_state === "idle",
-    };
-  });
+  readonly status = Effect.fn("HostedServerService.status")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+      serverId: string,
+    ): Effect.fn.Return<HostedServerStatus, HostedFailure, HostedServerDependencies> {
+      const row = yield* this.#requireUsableRow(user, serverId);
+      return {
+        serverId: row.server_id,
+        state: row.observed_state,
+        error: row.observed_error,
+        sleeping: row.desired_state === "idle",
+      };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  wake(user: AuthUser, serverId: string): Promise<HostedServerSummary> {
-    return this.#run(this.#wakeEffect(user, serverId));
-  }
-
-  readonly #wakeEffect = Effect.fn("HostedServerService.wake")(function* (
-    this: HostedServerService,
-    user: AuthUser,
-    serverId: string,
-  ): Effect.fn.Return<HostedServerSummary, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const row = yield* this.#requireUsableRow(user, serverId);
-    if (row.desired_state === "stopped") {
-      return yield* new HostedServerServiceError(
-        402,
-        "plan_required",
-        "The plan of this server ended. Renew it to start the server.",
-      );
-    }
-    if (row.desired_state === "idle") {
-      const now = dependencies.now();
-      // The start counts as use, so the server does not stop again before its first client connects.
-      yield* hostedCall(() =>
-        dependencies.database
-          .prepare(
-            `UPDATE hosted_servers SET desired_state = 'running', last_active_at = ?, updated_at = ?
+  readonly wake = Effect.fn("HostedServerService.wake")(
+    function* (
+      this: HostedServerService,
+      user: AuthUser,
+      serverId: string,
+    ): Effect.fn.Return<HostedServerSummary, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const row = yield* this.#requireUsableRow(user, serverId);
+      if (row.desired_state === "stopped") {
+        return yield* new HostedServerServiceError(
+          402,
+          "plan_required",
+          "The plan of this server ended. Renew it to start the server.",
+        );
+      }
+      if (row.desired_state === "idle") {
+        const now = dependencies.now();
+        // The start counts as use, so the server does not stop again before its first client connects.
+        yield* hostedCall(() =>
+          dependencies.database
+            .prepare(
+              `UPDATE hosted_servers SET desired_state = 'running', last_active_at = ?, updated_at = ?
            WHERE server_id = ? AND desired_state = 'idle'`,
-          )
-          .bind(now, now, row.server_id)
-          .run(),
-      );
-      // A server that still stops starts again when the provider reports that it stopped.
-      yield* this.#wakeForClient(yield* this.#requireRow(serverId));
-    } else if (!(yield* this.#retrySetup(row))) {
-      yield* this.#wakeForClient(row);
-    }
-    const current = yield* this.#requireRow(serverId);
-    // A client asks for a start because it cannot reach the server. When the row says it runs, a lost
-    // provider event can hide a stop, so the provider is asked.
-    if (current.observed_state === "running" && current.provider_sandbox_id) yield* this.#refresh(current);
-    return summary(yield* this.#requireRow(serverId));
-  });
+            )
+            .bind(now, now, row.server_id)
+            .run(),
+        );
+        // A server that still stops starts again when the provider reports that it stopped.
+        yield* this.#wakeForClient(yield* this.#requireRow(serverId));
+      } else if (!(yield* this.#retrySetup(row))) {
+        yield* this.#wakeForClient(row);
+      }
+      const current = yield* this.#requireRow(serverId);
+      // A client asks for a start because it cannot reach the server. When the row says it runs, a lost
+      // provider event can hide a stop, so the provider is asked.
+      if (current.observed_state === "running" && current.provider_sandbox_id) yield* this.#refresh(current);
+      return summary(yield* this.#requireRow(serverId));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * The server reports whether it is in use (a client works with it or an agent works) and when its next
    * routine runs. Only the session that the server got from its claim can report for it. A report with
    * no body is from an older server: it is in use and does not change the next run.
    */
-  reportActivity(sessionToken: string, serverId: string, report: HostedServerActivityReport): Promise<void> {
-    return this.#run(this.#reportActivityEffect(sessionToken, serverId, report));
-  }
 
-  readonly #reportActivityEffect = Effect.fn("HostedServerService.reportActivity")(function* (
-    this: HostedServerService,
-    sessionToken: string,
-    serverId: string,
-    report: HostedServerActivityReport,
-  ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const sessionTokenHash = yield* hostedCall(() => sha256(sessionToken));
-    const now = dependencies.now();
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+  readonly reportActivity = Effect.fn("HostedServerService.reportActivity")(
+    function* (
+      this: HostedServerService,
+      sessionToken: string,
+      serverId: string,
+      report: HostedServerActivityReport,
+    ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const sessionTokenHash = yield* sha256(sessionToken).pipe(Effect.mapError(hostedFailure));
+      const now = dependencies.now();
+      const row = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE server_id = ? AND desired_state != 'deleted' AND auth_session_id = (
            SELECT id FROM auth_sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?
          )`,
-        )
-        .bind(serverId, sessionTokenHash, now)
-        .first<HostedServerRow>(),
-    );
-    if (!row) return yield* notFound();
-    // A run that is due now is the server's own work: it runs, so the cron has no start to make for it.
-    const reported = report.nextRunAt;
-    const nextRunAt =
-      reported === undefined
-        ? row.next_run_at
-        : reported !== null && reported > now && reported <= now + NEXT_RUN_MAX_AHEAD_MS
-          ? reported
-          : null;
-    // An idle server already stops. Its next start comes from a client or from its next run.
-    const active = report.inUse && row.desired_state === "running";
-    if (!active && nextRunAt === row.next_run_at) return;
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `UPDATE hosted_servers SET next_run_at = ?,
-           last_active_at = CASE WHEN ? AND desired_state = 'running' THEN ? ELSE last_active_at END
-         WHERE server_id = ? AND desired_state != 'deleted'`,
-        )
-        .bind(nextRunAt, active ? 1 : 0, now, row.server_id)
-        .run(),
-    );
-    if (active) yield* this.#extendLease(row, now);
-  });
-
-  redeemClaim(claim: unknown): Promise<HostedServerClaim> {
-    return this.#run(this.#redeemClaimEffect(claim));
-  }
-
-  readonly #redeemClaimEffect = Effect.fn("HostedServerService.redeemClaim")(function* (
-    this: HostedServerService,
-    claim: unknown,
-  ): Effect.fn.Return<HostedServerClaim, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    if (!isString(claim) || claim.length < 16 || claim.length > 128) return yield* invalidClaim();
-    const claimHash = yield* hostedCall(() => sha256(claim));
-    const now = dependencies.now();
-    const row = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT server_id, name, owner_user_id, auth_session_id FROM hosted_servers
-         WHERE claim_token_hash = ? AND claim_expires_at > ? AND desired_state != 'deleted'`,
-        )
-        .bind(claimHash, now)
-        .first<{ server_id: string; name: string; owner_user_id: string; auth_session_id: string | null }>(),
-    );
-    if (!row) return yield* invalidClaim();
-    const sessionId = crypto.randomUUID();
-    const sessionToken = randomToken();
-    const sessionTokenHash = yield* hostedCall(() => sha256(sessionToken));
-    const [redeemed] = yield* hostedCall(() =>
-      dependencies.database.batch([
-        // The first redeem shortens the claim lifetime to the retry window. A later one does not extend it.
-        dependencies.database
-          .prepare(
-            `UPDATE hosted_servers SET claim_redeemed_at = COALESCE(claim_redeemed_at, ?),
-             claim_expires_at = MIN(claim_expires_at, ?), auth_session_id = ?, updated_at = ?
-           WHERE server_id = ? AND claim_token_hash = ? AND claim_expires_at > ? AND auth_session_id IS ?`,
           )
-          .bind(now, now + CLAIM_REDEEM_RETRY_MS, sessionId, now, row.server_id, claimHash, now, row.auth_session_id),
-        dependencies.database
-          .prepare(
-            `INSERT INTO auth_sessions(id, user_id, token_hash, expires_at, created_at, last_used_at)
-           SELECT ?, owner_user_id, ?, ?, ?, ? FROM hosted_servers
-           WHERE server_id = ? AND auth_session_id = ?`,
-          )
-          .bind(sessionId, sessionTokenHash, PERSISTENT_SESSION_EXPIRES_AT, now, now, row.server_id, sessionId),
-        // The session of an earlier redeem, or of an earlier VM of this server.
-        dependencies.database
-          .prepare(
-            `UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL
-             AND EXISTS(SELECT 1 FROM hosted_servers WHERE server_id = ? AND auth_session_id = ?)`,
-          )
-          .bind(now, row.auth_session_id, row.server_id, sessionId),
-      ]),
-    );
-    if (redeemed?.meta.changes !== 1) return yield* invalidClaim();
-    const user = yield* hostedCall(() =>
-      dependencies.database
-        .prepare("SELECT id, email, name, avatar_url FROM users WHERE id = ?")
-        .bind(row.owner_user_id)
-        .first<{ id: string; email: string; name: string | null; avatar_url: string | null }>(),
-    );
-    if (!user) return yield* invalidClaim();
-    return {
-      hostId: row.server_id,
-      name: row.name,
-      sessionToken,
-      user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatar_url },
-    };
-  });
-
-  handleWebhook(input: { deliveryId: string; timestamp: string; signature: string; body: string }): Promise<void> {
-    return this.#run(this.#handleWebhookEffect(input));
-  }
-
-  readonly #handleWebhookEffect = Effect.fn("HostedServerService.handleWebhook")(function* (
-    this: HostedServerService,
-    input: { deliveryId: string; timestamp: string; signature: string; body: string },
-  ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const webhookSecret = this.#webhookSecret;
-    if (!webhookSecret) {
-      return yield* new HostedServerServiceError(503, "hosting_not_configured", "Hosted servers are not configured.");
-    }
-    const now = dependencies.now();
-    const valid =
-      /^[A-Za-z0-9_-]{1,128}$/u.test(input.deliveryId) &&
-      (yield* hostedCall(() => verifyBoatWebhookSignature({ ...input, secret: webhookSecret, now })));
-    if (!valid)
-      return yield* new HostedServerServiceError(401, "webhook_signature_invalid", "The signature is invalid.");
-    const seen = yield* hostedCall(() =>
-      dependencies.database
-        .prepare("SELECT 1 AS seen FROM hosting_webhook_deliveries WHERE delivery_id = ?")
-        .bind(input.deliveryId)
-        .first<{ seen: number }>(),
-    );
-    if (seen) return;
-    const event = parseWebhookEvent(input.body, now);
-    if (event) {
-      const row = yield* hostedCall(() =>
-        dependencies.database
-          .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE provider_sandbox_id = ?`)
-          .bind(event.sandboxId)
+          .bind(serverId, sessionTokenHash, now)
           .first<HostedServerRow>(),
       );
-      if (row) yield* this.#observe(row, event.state, event.createdAt);
-    }
-    // Recorded after the change, so a delivery that failed half way is applied again on retry.
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          "INSERT INTO hosting_webhook_deliveries(delivery_id, received_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(input.deliveryId, now)
-        .run(),
-    );
-  });
-
-  tick(now = this.#now()): Promise<HostedServerTickResult> {
-    return this.#run(this.#tickEffect(now));
-  }
-
-  readonly #tickEffect = Effect.fn("HostedServerService.tick")(function* (
-    this: HostedServerService,
-    now = this.#now(),
-  ): Effect.fn.Return<HostedServerTickResult, HostedFailure, HostedServerDependencies> {
-    const dependencies = yield* HostedServerDependencies;
-    const result: HostedServerTickResult = {
-      restarted: 0,
-      reconciled: 0,
-      deleted: 0,
-      provisioned: 0,
-      stopped: 0,
-      abandoned: 0,
-      resized: 0,
-      idle: 0,
-      scheduled: 0,
-      failed: 0,
-    };
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `UPDATE hosted_servers SET claim_token_hash = NULL
-         WHERE claim_token_hash IS NOT NULL AND claim_expires_at <= ?`,
-        )
-        .bind(now)
-        .run(),
-    );
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare("DELETE FROM hosting_webhook_deliveries WHERE received_at < ?")
-        .bind(now - DELIVERY_RETENTION_MS)
-        .run(),
-    );
-    const boat = dependencies.boat;
-    if (!boat) return result;
-    const run = (
-      rows: HostedServerRow[],
-      action: (row: HostedServerRow) => Effect.Effect<unknown, HostedFailure, HostedServerDependencies>,
-    ) =>
-      Effect.gen({ self: this }, function* () {
-        let done = 0;
-        for (const row of rows) {
-          const operationResult0 = yield* Effect.result(
-            Effect.gen({ self: this }, function* () {
-              yield* action(row);
-              done += 1;
-            }),
-          );
-          if (Result.isFailure(operationResult0)) {
-            const error = operationResult0.failure;
-
-            result.failed += 1;
-            console.warn("Hosted server task failed.", { serverId: row.server_id, error: safeErrorCode(error) });
-          }
-        }
-        return done;
-      });
-    const billing = dependencies.billing;
-    if (billing) {
-      yield* hostedCall(() => billing.refreshLapsedPlans(now));
-      // The Stripe webhook applies a plan at once. This catches a webhook that failed. Without billing,
-      // no plan is checked, so a deployment that loses its Stripe key does not stop each server.
-      const planChanged = yield* hostedCall(() =>
+      if (!row) return yield* notFound();
+      // A run that is due now is the server's own work: it runs, so the cron has no start to make for it.
+      const reported = report.nextRunAt;
+      const nextRunAt =
+        reported === undefined
+          ? row.next_run_at
+          : reported !== null && reported > now && reported <= now + NEXT_RUN_MAX_AHEAD_MS
+            ? reported
+            : null;
+      // An idle server already stops. Its next start comes from a client or from its next run.
+      const active = report.inUse && row.desired_state === "running";
+      if (!active && nextRunAt === row.next_run_at) return;
+      yield* hostedCall(() =>
         dependencies.database
           .prepare(
-            `SELECT ${ROW_COLUMNS} FROM hosted_servers h
+            `UPDATE hosted_servers SET next_run_at = ?,
+           last_active_at = CASE WHEN ? AND desired_state = 'running' THEN ? ELSE last_active_at END
+         WHERE server_id = ? AND desired_state != 'deleted'`,
+          )
+          .bind(nextRunAt, active ? 1 : 0, now, row.server_id)
+          .run(),
+      );
+      if (active) yield* this.#extendLease(row, now);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
+
+  readonly redeemClaim = Effect.fn("HostedServerService.redeemClaim")(
+    function* (
+      this: HostedServerService,
+      claim: unknown,
+    ): Effect.fn.Return<HostedServerClaim, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      if (!isString(claim) || claim.length < 16 || claim.length > 128) return yield* invalidClaim();
+      const claimHash = yield* sha256(claim).pipe(Effect.mapError(hostedFailure));
+      const now = dependencies.now();
+      const row = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT server_id, name, owner_user_id, auth_session_id FROM hosted_servers
+         WHERE claim_token_hash = ? AND claim_expires_at > ? AND desired_state != 'deleted'`,
+          )
+          .bind(claimHash, now)
+          .first<{ server_id: string; name: string; owner_user_id: string; auth_session_id: string | null }>(),
+      );
+      if (!row) return yield* invalidClaim();
+      const sessionId = crypto.randomUUID();
+      const sessionToken = randomToken();
+      const sessionTokenHash = yield* sha256(sessionToken).pipe(Effect.mapError(hostedFailure));
+      const [redeemed] = yield* hostedCall(() =>
+        dependencies.database.batch([
+          // The first redeem shortens the claim lifetime to the retry window. A later one does not extend it.
+          dependencies.database
+            .prepare(
+              `UPDATE hosted_servers SET claim_redeemed_at = COALESCE(claim_redeemed_at, ?),
+             claim_expires_at = MIN(claim_expires_at, ?), auth_session_id = ?, updated_at = ?
+           WHERE server_id = ? AND claim_token_hash = ? AND claim_expires_at > ? AND auth_session_id IS ?`,
+            )
+            .bind(now, now + CLAIM_REDEEM_RETRY_MS, sessionId, now, row.server_id, claimHash, now, row.auth_session_id),
+          dependencies.database
+            .prepare(
+              `INSERT INTO auth_sessions(id, user_id, token_hash, expires_at, created_at, last_used_at)
+           SELECT ?, owner_user_id, ?, ?, ?, ? FROM hosted_servers
+           WHERE server_id = ? AND auth_session_id = ?`,
+            )
+            .bind(sessionId, sessionTokenHash, PERSISTENT_SESSION_EXPIRES_AT, now, now, row.server_id, sessionId),
+          // The session of an earlier redeem, or of an earlier VM of this server.
+          dependencies.database
+            .prepare(
+              `UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL
+             AND EXISTS(SELECT 1 FROM hosted_servers WHERE server_id = ? AND auth_session_id = ?)`,
+            )
+            .bind(now, row.auth_session_id, row.server_id, sessionId),
+        ]),
+      );
+      if (redeemed?.meta.changes !== 1) return yield* invalidClaim();
+      const user = yield* hostedCall(() =>
+        dependencies.database
+          .prepare("SELECT id, email, name, avatar_url FROM users WHERE id = ?")
+          .bind(row.owner_user_id)
+          .first<{ id: string; email: string; name: string | null; avatar_url: string | null }>(),
+      );
+      if (!user) return yield* invalidClaim();
+      return {
+        hostId: row.server_id,
+        name: row.name,
+        sessionToken,
+        user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatar_url },
+      };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
+
+  readonly handleWebhook = Effect.fn("HostedServerService.handleWebhook")(
+    function* (
+      this: HostedServerService,
+      input: { deliveryId: string; timestamp: string; signature: string; body: string },
+    ): Effect.fn.Return<void, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const webhookSecret = this.#webhookSecret;
+      if (!webhookSecret) {
+        return yield* new HostedServerServiceError(503, "hosting_not_configured", "Hosted servers are not configured.");
+      }
+      const now = dependencies.now();
+      const valid =
+        /^[A-Za-z0-9_-]{1,128}$/u.test(input.deliveryId) &&
+        (yield* verifyBoatWebhookSignature({ ...input, secret: webhookSecret, now }).pipe(
+          Effect.mapError(hostedFailure),
+        ));
+      if (!valid)
+        return yield* new HostedServerServiceError(401, "webhook_signature_invalid", "The signature is invalid.");
+      const seen = yield* hostedCall(() =>
+        dependencies.database
+          .prepare("SELECT 1 AS seen FROM hosting_webhook_deliveries WHERE delivery_id = ?")
+          .bind(input.deliveryId)
+          .first<{ seen: number }>(),
+      );
+      if (seen) return;
+      const event = parseWebhookEvent(input.body, now);
+      if (event) {
+        const row = yield* hostedCall(() =>
+          dependencies.database
+            .prepare(`SELECT ${ROW_COLUMNS} FROM hosted_servers WHERE provider_sandbox_id = ?`)
+            .bind(event.sandboxId)
+            .first<HostedServerRow>(),
+        );
+        if (row) yield* this.#observe(row, event.state, event.createdAt);
+      }
+      // Recorded after the change, so a delivery that failed half way is applied again on retry.
+      yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            "INSERT INTO hosting_webhook_deliveries(delivery_id, received_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
+          )
+          .bind(input.deliveryId, now)
+          .run(),
+      );
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
+
+  readonly tick = Effect.fn("HostedServerService.tick")(
+    function* (
+      this: HostedServerService,
+      now = this.#now(),
+    ): Effect.fn.Return<HostedServerTickResult, HostedFailure, HostedServerDependencies> {
+      const dependencies = yield* HostedServerDependencies;
+      const result: HostedServerTickResult = {
+        restarted: 0,
+        reconciled: 0,
+        deleted: 0,
+        provisioned: 0,
+        stopped: 0,
+        abandoned: 0,
+        resized: 0,
+        idle: 0,
+        scheduled: 0,
+        failed: 0,
+      };
+      yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `UPDATE hosted_servers SET claim_token_hash = NULL
+         WHERE claim_token_hash IS NOT NULL AND claim_expires_at <= ?`,
+          )
+          .bind(now)
+          .run(),
+      );
+      yield* hostedCall(() =>
+        dependencies.database
+          .prepare("DELETE FROM hosting_webhook_deliveries WHERE received_at < ?")
+          .bind(now - DELIVERY_RETENTION_MS)
+          .run(),
+      );
+      const boat = dependencies.boat;
+      if (!boat) return result;
+      const run = (
+        rows: HostedServerRow[],
+        action: (row: HostedServerRow) => Effect.Effect<unknown, HostedFailure, HostedServerDependencies>,
+      ) =>
+        Effect.gen({ self: this }, function* () {
+          let done = 0;
+          for (const row of rows) {
+            const operationResult0 = yield* Effect.result(
+              Effect.gen({ self: this }, function* () {
+                yield* action(row);
+                done += 1;
+              }),
+            );
+            if (Result.isFailure(operationResult0)) {
+              const error = operationResult0.failure;
+
+              result.failed += 1;
+              console.warn("Hosted server task failed.", { serverId: row.server_id, error: safeErrorCode(error) });
+            }
+          }
+          return done;
+        });
+      const billing = dependencies.billing;
+      if (billing) {
+        yield* billing.refreshLapsedPlans(now).pipe(Effect.mapError(hostedFailure));
+        // The Stripe webhook applies a plan at once. This catches a webhook that failed. Without billing,
+        // no plan is checked, so a deployment that loses its Stripe key does not stop each server.
+        const planChanged = yield* hostedCall(() =>
+          dependencies.database
+            .prepare(
+              `SELECT ${ROW_COLUMNS} FROM hosted_servers h
            WHERE h.desired_state != 'deleted' AND h.updated_at <= ?
              AND (h.observed_state = 'awaiting_payment' OR h.desired_state = 'stopped') = EXISTS(
                SELECT 1 FROM billing_subscriptions s
@@ -832,147 +827,149 @@ export class HostedServerService {
                  AND (s.status IN ('active', 'trialing') OR (s.status = 'past_due' AND s.current_period_end > ?))
              )
            LIMIT ?`,
-          )
-          .bind(now - STUCK_AFTER_MS, now, TICK_BATCH_SIZE)
-          .all<HostedServerRow>(),
-      );
-      yield* run(planChanged.results, (row) =>
-        Effect.gen({ self: this }, function* () {
-          const change = yield* this.#applyPlan(row);
-          if (change === "provisioned") result.provisioned += 1;
-          if (change === "stopped") result.stopped += 1;
-        }),
-      );
-      const abandoned = yield* hostedCall(() =>
-        dependencies.database
-          .prepare(
-            `SELECT ${ROW_COLUMNS} FROM hosted_servers
+            )
+            .bind(now - STUCK_AFTER_MS, now, TICK_BATCH_SIZE)
+            .all<HostedServerRow>(),
+        );
+        yield* run(planChanged.results, (row) =>
+          Effect.gen({ self: this }, function* () {
+            const change = yield* this.#applyPlan(row);
+            if (change === "provisioned") result.provisioned += 1;
+            if (change === "stopped") result.stopped += 1;
+          }),
+        );
+        const abandoned = yield* hostedCall(() =>
+          dependencies.database
+            .prepare(
+              `SELECT ${ROW_COLUMNS} FROM hosted_servers
            WHERE observed_state = 'awaiting_payment' AND desired_state = 'running' AND updated_at <= ?
              AND NOT EXISTS(
                SELECT 1 FROM billing_subscriptions s
                WHERE s.server_id = hosted_servers.server_id AND s.status IN ${OPEN_STATUSES_SQL}
              )
            LIMIT ?`,
+            )
+            .bind(now - UNPAID_RETENTION_MS, TICK_BATCH_SIZE)
+            .all<HostedServerRow>(),
+        );
+        yield* run(abandoned.results, (row) =>
+          Effect.gen({ self: this }, function* () {
+            if (yield* this.#removeUnpaid(row, now)) result.abandoned += 1;
+          }),
+        );
+        const failedSetups = yield* hostedCall(() =>
+          dependencies.database
+            .prepare(
+              `SELECT ${ROW_COLUMNS} FROM hosted_servers
+           WHERE desired_state = 'running' AND observed_state = 'error' AND provider_sandbox_id IS NULL
+             AND updated_at <= ? LIMIT ?`,
+            )
+            .bind(now - SETUP_RETRY_AFTER_MS, TICK_BATCH_SIZE)
+            .all<HostedServerRow>(),
+        );
+        yield* run(failedSetups.results, (row) =>
+          Effect.gen({ self: this }, function* () {
+            if (yield* this.#retrySetup(row)) result.provisioned += 1;
+          }),
+        );
+      }
+      yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `UPDATE hosted_servers SET observed_state = 'error', observed_error = 'provider_error', claim_token_hash = NULL,
+           updated_at = ?
+         WHERE observed_state = 'creating' AND provider_sandbox_id IS NULL AND updated_at <= ?`,
           )
-          .bind(now - UNPAID_RETENTION_MS, TICK_BATCH_SIZE)
-          .all<HostedServerRow>(),
+          .bind(now, now - CREATE_LOST_AFTER_MS)
+          .run(),
       );
-      yield* run(abandoned.results, (row) =>
-        Effect.gen({ self: this }, function* () {
-          if (yield* this.#removeUnpaid(row, now)) result.abandoned += 1;
-        }),
-      );
-      const failedSetups = yield* hostedCall(() =>
+      // A running server with no use for 15 minutes stops. A state change also counts as use, so a new or
+      // resized server has time for its first client.
+      const unused = yield* hostedCall(() =>
         dependencies.database
           .prepare(
             `SELECT ${ROW_COLUMNS} FROM hosted_servers
-           WHERE desired_state = 'running' AND observed_state = 'error' AND provider_sandbox_id IS NULL
-             AND updated_at <= ? LIMIT ?`,
-          )
-          .bind(now - SETUP_RETRY_AFTER_MS, TICK_BATCH_SIZE)
-          .all<HostedServerRow>(),
-      );
-      yield* run(failedSetups.results, (row) =>
-        Effect.gen({ self: this }, function* () {
-          if (yield* this.#retrySetup(row)) result.provisioned += 1;
-        }),
-      );
-    }
-    yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `UPDATE hosted_servers SET observed_state = 'error', observed_error = 'provider_error', claim_token_hash = NULL,
-           updated_at = ?
-         WHERE observed_state = 'creating' AND provider_sandbox_id IS NULL AND updated_at <= ?`,
-        )
-        .bind(now, now - CREATE_LOST_AFTER_MS)
-        .run(),
-    );
-    // A running server with no use for 15 minutes stops. A state change also counts as use, so a new or
-    // resized server has time for its first client.
-    const unused = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state = 'running' AND observed_state = 'running' AND provider_sandbox_id IS NOT NULL
            AND COALESCE(last_active_at, 0) <= ? AND updated_at <= ?
            AND (next_run_at IS NULL OR next_run_at <= ? OR next_run_at > ?) LIMIT ?`,
-        )
-        .bind(now - IDLE_STOP_AFTER_MS, now - IDLE_STOP_AFTER_MS, now, now + SCHEDULE_WAKE_BEFORE_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.idle = yield* run(unused.results, (row) => this.#stopIdle(row, now));
-    // An idle server starts before its next routine run. The run is forgotten, so a server that does not
-    // report again is not started again for it.
-    const scheduled = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now - IDLE_STOP_AFTER_MS, now - IDLE_STOP_AFTER_MS, now, now + SCHEDULE_WAKE_BEFORE_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.idle = yield* run(unused.results, (row) => this.#stopIdle(row, now));
+      // An idle server starts before its next routine run. The run is forgotten, so a server that does not
+      // report again is not started again for it.
+      const scheduled = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state = 'idle' AND observed_state = 'stopped' AND next_run_at <= ? LIMIT ?`,
-        )
-        .bind(now + SCHEDULE_WAKE_BEFORE_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.scheduled = yield* run(scheduled.results, (row) => this.#wakeForSchedule(row, now));
-    // A server that must stop and still runs: the first stop did not happen.
-    const unstopped = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now + SCHEDULE_WAKE_BEFORE_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.scheduled = yield* run(scheduled.results, (row) => this.#wakeForSchedule(row, now));
+      // A server that must stop and still runs: the first stop did not happen.
+      const unstopped = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state IN ('idle', 'stopped') AND provider_sandbox_id IS NOT NULL
            AND observed_state IN ('starting', 'running', 'waking') AND updated_at <= ? LIMIT ?`,
-        )
-        .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.stopped += yield* run(unstopped.results, (row) => this.#stop(row));
-    // The webhook starts a stopped server at once. This catches a start that did not happen.
-    const stopped = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.stopped += yield* run(unstopped.results, (row) => this.#stop(row));
+      // The webhook starts a stopped server at once. This catches a start that did not happen.
+      const stopped = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state = 'running' AND observed_state = 'stopped' AND updated_at <= ? LIMIT ?`,
-        )
-        .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.restarted = yield* run(stopped.results, (row) => this.#wake(row, "restart"));
-    const stuck = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.restarted = yield* run(stopped.results, (row) => this.#wake(row, "restart"));
+      const stuck = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state != 'deleted' AND provider_sandbox_id IS NOT NULL
            AND observed_state IN ('starting', 'stopping', 'waking') AND updated_at <= ? LIMIT ?`,
-        )
-        .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.reconciled = yield* run(stuck.results, (row) => this.#refresh(row));
-    // The Stripe webhook starts a resize when the server is not in use. This catches a server that was in
-    // use or busy then, or a failed stop.
-    const resizing = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now - STUCK_AFTER_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.reconciled = yield* run(stuck.results, (row) => this.#refresh(row));
+      // The Stripe webhook starts a resize when the server is not in use. This catches a server that was in
+      // use or busy then, or a failed stop.
+      const resizing = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state = 'running' AND observed_state = 'running' AND pending_size IS NOT NULL
            AND provider_sandbox_id IS NOT NULL AND updated_at <= ? AND COALESCE(last_active_at, 0) <= ? LIMIT ?`,
-        )
-        .bind(now - STUCK_AFTER_MS, now - RESIZE_AFTER_NO_USE_MS, TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.resized = yield* run(resizing.results, (row) => this.#resize(row));
-    const deleting = yield* hostedCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT ${ROW_COLUMNS} FROM hosted_servers
+          )
+          .bind(now - STUCK_AFTER_MS, now - RESIZE_AFTER_NO_USE_MS, TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.resized = yield* run(resizing.results, (row) => this.#resize(row));
+      const deleting = yield* hostedCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT ${ROW_COLUMNS} FROM hosted_servers
          WHERE desired_state = 'deleted' AND observed_state != 'deleted' LIMIT ?`,
-        )
-        .bind(TICK_BATCH_SIZE)
-        .all<HostedServerRow>(),
-    );
-    result.deleted = yield* run(deleting.results, (row) => this.#finishDelete(row));
-    return result;
-  });
+          )
+          .bind(TICK_BATCH_SIZE)
+          .all<HostedServerRow>(),
+      );
+      result.deleted = yield* run(deleting.results, (row) => this.#finishDelete(row));
+      return result;
+    },
+    (operation, _now?: number) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** A Checkout page for a server that waits for payment, or none when the server needs no page. */
   readonly #checkout = Effect.fn("HostedServerService.checkout")(function* (
@@ -998,11 +995,11 @@ export class HostedServerService {
     }
     const previous = row.checkout_session_id;
     // Only one page can be open, so a user cannot pay twice for one server.
-    if (previous && (yield* hostedCall(() => billing.closeCheckout(previous))) === "paid") {
+    if (previous && (yield* billing.closeCheckout(previous).pipe(Effect.mapError(hostedFailure))) === "paid") {
       return { server: summary(yield* this.#requireRow(row.server_id)), checkoutUrl: null };
     }
-    const session = yield* hostedCall(() =>
-      billing.createCheckout({
+    const session = yield* billing
+      .createCheckout({
         user: { id: user.id, email: user.email },
         serverId: row.server_id,
         plan: row.plan,
@@ -1010,8 +1007,8 @@ export class HostedServerService {
         currency: row.currency,
         target: returnTo.target,
         origin: returnTo.origin,
-      }),
-    );
+      })
+      .pipe(Effect.mapError(hostedFailure));
     // A new plan choice changes the key of an unpaid server, so a page for the plan before it is not stored.
     const stored = yield* hostedCall(() =>
       dependencies.database
@@ -1048,7 +1045,7 @@ export class HostedServerService {
   ): Effect.fn.Return<HostedServerCheckout, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
     const previous = row.checkout_session_id;
-    if (previous && (yield* hostedCall(() => billing.closeCheckout(previous))) === "paid") {
+    if (previous && (yield* billing.closeCheckout(previous).pipe(Effect.mapError(hostedFailure))) === "paid") {
       // A retry of this request then returns the same server, and does not add a second one.
       yield* hostedCall(() =>
         dependencies.database
@@ -1141,7 +1138,7 @@ export class HostedServerService {
     );
     if (claimed.meta.changes !== 1) return;
     return yield* Effect.gen({ self: this }, function* () {
-      yield* hostedCall(() => boat.stopSandbox(sandboxId));
+      yield* boat.stopSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
     }).pipe(
       Effect.catch((error) =>
         Effect.gen({ self: this }, function* () {
@@ -1171,8 +1168,8 @@ export class HostedServerService {
   ): Effect.fn.Return<"provisioned" | "renewed" | "stopped" | null, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
     if (row.desired_state === "deleted") return null;
-    const entitlement = yield* hostedCall(() =>
-      getServerEntitlement(dependencies.database, row.server_id, dependencies.now()),
+    const entitlement = yield* getServerEntitlement(dependencies.database, row.server_id, dependencies.now()).pipe(
+      Effect.mapError(hostedFailure),
     );
     if (entitlement) {
       if (row.observed_state === "awaiting_payment") {
@@ -1210,8 +1207,8 @@ export class HostedServerService {
     }
     // The claim works from now, so its lifetime counts from the start of the sandbox, not from the payment page.
     // A VM that signed in during a lost attempt keeps its session, and the claim stays spent.
-    const claim = yield* hostedCall(() => hostedClaim(secret, row.server_id));
-    const claimHash = yield* hostedCall(() => sha256(claim));
+    const claim = yield* hostedClaim(secret, row.server_id).pipe(Effect.mapError(hostedFailure));
+    const claimHash = yield* sha256(claim).pipe(Effect.mapError(hostedFailure));
     // A retry sends the request of the first attempt, also after a deploy that changed the template.
     const from = row.provider_template ?? template;
     const now = dependencies.now();
@@ -1233,11 +1230,12 @@ export class HostedServerService {
     const request = createRequest(row, from, claim);
     return yield* Effect.gen({ self: this }, function* () {
       // The same idempotency key and request body make a retry safe: boat returns the sandbox that it made.
-      const sandbox = yield* hostedCall(() =>
-        boat.createSandbox(request).catch((error: unknown) => {
+      const sandbox = yield* boat.createSandbox(request).pipe(
+        Effect.catch((error) => {
           if (error instanceof BoatApiError && error.code === "network_error") return boat.createSandbox(request);
-          throw error;
+          return Effect.fail(error);
         }),
+        Effect.mapError(hostedFailure),
       );
       const stored = yield* hostedCall(() =>
         dependencies.database
@@ -1251,13 +1249,15 @@ export class HostedServerService {
       if (stored.meta.changes !== 1 && !(yield* this.#adopt(row, sandbox, claim))) {
         // The server was deleted after the cron gave up on this create. The sandbox costs money until it is deleted.
         console.warn("Hosted server sandbox has no row.", { serverId: row.server_id });
-        yield* hostedCall(() =>
-          boat.deleteSandbox(sandbox.id).catch((error: unknown) => {
-            console.warn("Hosted server sandbox delete failed.", {
-              serverId: row.server_id,
-              error: safeErrorCode(error),
-            });
-          }),
+        yield* boat.deleteSandbox(sandbox.id).pipe(
+          Effect.catch((error) =>
+            Effect.sync(() => {
+              console.warn("Hosted server sandbox delete failed.", {
+                serverId: row.server_id,
+                error: safeErrorCode(error),
+              });
+            }),
+          ),
         );
         return;
       }
@@ -1296,7 +1296,7 @@ export class HostedServerService {
     claim: string,
   ): Effect.fn.Return<boolean, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
-    const claimHash = yield* hostedCall(() => sha256(claim));
+    const claimHash = yield* sha256(claim).pipe(Effect.mapError(hostedFailure));
     const now = dependencies.now();
     const adopted = yield* hostedCall(() =>
       dependencies.database
@@ -1340,7 +1340,9 @@ export class HostedServerService {
           .first<{ email: string }>(),
       );
       if (!owner) return;
-      yield* hostedCall(() => boat.renameSandbox(sandboxId, sandboxName(row.plan, owner.email, row.server_id)));
+      yield* boat
+        .renameSandbox(sandboxId, sandboxName(row.plan, owner.email, row.server_id))
+        .pipe(Effect.mapError(hostedFailure));
     }).pipe(
       Effect.catch((error) =>
         Effect.sync(() => {
@@ -1358,7 +1360,11 @@ export class HostedServerService {
   ): Effect.fn.Return<boolean, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
     const checkoutId = row.checkout_session_id;
-    if (checkoutId && (yield* hostedCall(() => dependencies.billing?.closeCheckout(checkoutId))) === "paid") {
+    if (
+      checkoutId &&
+      dependencies.billing &&
+      (yield* dependencies.billing.closeCheckout(checkoutId).pipe(Effect.mapError(hostedFailure))) === "paid"
+    ) {
       return false;
     }
     const removed = yield* hostedCall(() =>
@@ -1384,14 +1390,10 @@ export class HostedServerService {
     const boat = dependencies.boat;
     const sandboxId = row.provider_sandbox_id;
     if (!boat || !sandboxId) return;
-    const state = yield* hostedCall(() =>
-      boat.getSandbox(sandboxId).then(
-        (sandbox) => sandbox.state,
-        (error: unknown) => {
-          if (error instanceof BoatApiError && error.status === 404) return "cancelled" as const;
-          throw error;
-        },
-      ),
+    const state = yield* boat.getSandbox(sandboxId).pipe(
+      Effect.map((sandbox) => sandbox.state),
+      Effect.catch((error) => (error.status === 404 ? Effect.succeed("cancelled" as const) : Effect.fail(error))),
+      Effect.mapError(hostedFailure),
     );
     yield* this.#observe(row, state, dependencies.now());
   });
@@ -1407,7 +1409,11 @@ export class HostedServerService {
   ): Effect.fn.Return<boolean, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
     if (row.desired_state !== "running" || row.observed_state !== "error" || row.provider_sandbox_id) return false;
-    if (!(yield* hostedCall(() => getServerEntitlement(dependencies.database, row.server_id, dependencies.now()))))
+    if (
+      !(yield* getServerEntitlement(dependencies.database, row.server_id, dependencies.now()).pipe(
+        Effect.mapError(hostedFailure),
+      ))
+    )
       return false;
     const reset = yield* hostedCall(() =>
       dependencies.database
@@ -1507,7 +1513,7 @@ export class HostedServerService {
     }
     const operationResult1 = yield* Effect.result(
       Effect.gen({ self: this }, function* () {
-        yield* hostedCall(() => boat.stopSandbox(sandboxId));
+        yield* boat.stopSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
       }),
     );
     if (Result.isFailure(operationResult1)) {
@@ -1581,7 +1587,7 @@ export class HostedServerService {
     const boat = dependencies.boat;
     if (!boat || !sandboxId || row.observed_state !== "running") return;
     if (row.lease_until !== null && row.lease_until - now > LEASE_EXTEND_BEFORE_MS) return;
-    yield* hostedCall(() => boat.extendSandbox(sandboxId, LEASE_TTL_SECONDS));
+    yield* boat.extendSandbox(sandboxId, LEASE_TTL_SECONDS).pipe(Effect.mapError(hostedFailure));
     yield* hostedCall(() =>
       dependencies.database
         .prepare("UPDATE hosted_servers SET lease_until = ? WHERE server_id = ?")
@@ -1614,7 +1620,7 @@ export class HostedServerService {
       );
     }
     return yield* Effect.gen({ self: this }, function* () {
-      yield* hostedCall(() => billing.cancelServerPlans(row.owner_user_id, row.server_id));
+      yield* billing.cancelServerPlans(row.owner_user_id, row.server_id).pipe(Effect.mapError(hostedFailure));
     }).pipe(
       Effect.catch((error) =>
         Effect.gen({ self: this }, function* () {
@@ -1648,7 +1654,9 @@ export class HostedServerService {
   ): Effect.fn.Return<"closed" | "paid" | null, HostedFailure, HostedServerDependencies> {
     const dependencies = yield* HostedServerDependencies;
     return yield* Effect.gen({ self: this }, function* () {
-      return (yield* hostedCall(() => dependencies.billing?.closeCheckout(sessionId))) ?? null;
+      return dependencies.billing
+        ? yield* dependencies.billing.closeCheckout(sessionId).pipe(Effect.mapError(hostedFailure))
+        : null;
     }).pipe(
       Effect.catch((error) =>
         Effect.sync(() => {
@@ -1688,8 +1696,8 @@ export class HostedServerService {
     // A VM that never signed in, or whose session the owner revoked, has its claim in its env file. The
     // claim works again for this start.
     const secret = yield* this.#claimKey();
-    const claim = secret ? yield* hostedCall(() => hostedClaim(secret, row.server_id)) : null;
-    const claimHash = claim ? yield* hostedCall(() => sha256(claim)) : null;
+    const claim = secret ? yield* hostedClaim(secret, row.server_id).pipe(Effect.mapError(hostedFailure)) : null;
+    const claimHash = claim ? yield* sha256(claim).pipe(Effect.mapError(hostedFailure)) : null;
     const waking = yield* hostedCall(() =>
       dependencies.database
         .prepare(
@@ -1731,7 +1739,7 @@ export class HostedServerService {
     const size = row.pending_size;
     const operationResult2 = yield* Effect.result(
       Effect.gen({ self: this }, function* () {
-        yield* hostedCall(() => boat.resumeSandbox(sandboxId, LEASE_TTL_SECONDS, size ?? undefined));
+        yield* boat.resumeSandbox(sandboxId, LEASE_TTL_SECONDS, size ?? undefined).pipe(Effect.mapError(hostedFailure));
       }),
     );
     if (Result.isFailure(operationResult2)) {
@@ -1840,7 +1848,7 @@ export class HostedServerService {
         return yield* new HostedServerServiceError(503, "hosting_not_configured", "Hosting is not configured.");
       const operationResult3 = yield* Effect.result(
         Effect.gen({ self: this }, function* () {
-          yield* hostedCall(() => boat.deleteSandbox(sandboxId));
+          yield* boat.deleteSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
         }),
       );
       if (Result.isFailure(operationResult3)) {
@@ -1854,7 +1862,8 @@ export class HostedServerService {
       }
     }
     // Before the row is final, so the cron removes the host again when this fails.
-    yield* hostedCall(() => dependencies.removeHost?.(row.owner_user_id, row.server_id));
+    if (dependencies.removeHost)
+      yield* dependencies.removeHost(row.owner_user_id, row.server_id).pipe(Effect.mapError(hostedFailure));
     const now = dependencies.now();
     yield* hostedCall(() =>
       dependencies.database.batch([
@@ -1886,8 +1895,12 @@ export class HostedServerService {
     const secret = yield* this.#claimKey();
     if (!boat || !secret || !providerTemplate) return null;
     return yield* Effect.gen({ self: this }, function* () {
-      const request = createRequest(row, providerTemplate, yield* hostedCall(() => hostedClaim(secret, row.server_id)));
-      return (yield* hostedCall(() => boat.createSandbox(request))).id;
+      const request = createRequest(
+        row,
+        providerTemplate,
+        yield* hostedClaim(secret, row.server_id).pipe(Effect.mapError(hostedFailure)),
+      );
+      return (yield* boat.createSandbox(request).pipe(Effect.mapError(hostedFailure))).id;
     }).pipe(
       Effect.catch((error) =>
         Effect.gen({ self: this }, function* () {
@@ -1914,7 +1927,9 @@ export class HostedServerService {
     const ticketKey = this.#ticketKey;
     if (!ticketKey) return null;
     const privateValue = yield* hostedValidate(() => ticketPrivateValue(ticketKey));
-    this.#claimSecret ??= yield* hostedCall(() => deriveSecret(privateValue, "openbot-hosted-claim-key:v1"));
+    this.#claimSecret ??= yield* deriveSecret(privateValue, "openbot-hosted-claim-key:v1").pipe(
+      Effect.mapError(hostedFailure),
+    );
     return this.#claimSecret;
   });
 
@@ -2025,7 +2040,7 @@ function isDeveloperKey(expected: string | undefined, provided: string | null | 
   return difference === 0;
 }
 
-async function hostedClaim(secret: string, serverId: string): Promise<string> {
+function hostedClaim(secret: string, serverId: string) {
   return hmacSha256(secret, `openbot-hosted-claim:v1:${serverId}`);
 }
 

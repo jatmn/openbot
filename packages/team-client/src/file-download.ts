@@ -6,7 +6,6 @@ import {
 } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
-import { runTeamEffect } from "./effect-boundary";
 import { FileTransferError, fileTransferError, MOBILE_ATTACHMENT_BYTES } from "./file-upload";
 
 function transferFailure(message: string): FileTransferError {
@@ -24,7 +23,7 @@ interface Download {
 }
 
 /** Receives the released file protocol; bytes are exposed only after digest validation. */
-export function createRemoteFileReceiver(send: (data: string) => Promise<void>) {
+export function createRemoteFileReceiver<E, R>(send: (data: string) => Effect.Effect<void, E, R>) {
   const downloads = new Map<string, Download>();
   const waiters = new Map<
     string,
@@ -56,7 +55,7 @@ export function createRemoteFileReceiver(send: (data: string) => Promise<void>) 
       waiter.timer = setTimeout(() => expire(id), 60_000);
     }
   }
-  const sendFrame = (data: string) => Effect.tryPromise({ try: () => send(data), catch: fileTransferError });
+  const sendFrame = (data: string) => send(data).pipe(Effect.mapError(fileTransferError));
   const take = Effect.fn("RemoteFileReceiver.take")(function* (id: string) {
     if (!downloads.get(id)?.complete) {
       if (waiters.has(id) || waiters.size >= 10)
@@ -187,9 +186,7 @@ export function createRemoteFileReceiver(send: (data: string) => Promise<void>) 
       }
       waiters.clear();
     },
-    takeEffect: take,
-    receiveEffect: receive,
-    take: (id: string) => runTeamEffect(take(id)),
-    receive: (data: string | ArrayBuffer) => runTeamEffect(receive(data)),
+    take,
+    receive,
   };
 }

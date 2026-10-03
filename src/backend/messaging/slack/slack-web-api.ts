@@ -1,7 +1,7 @@
 import { open, rm } from "node:fs/promises";
 import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
-import { Effect, Result, Schema } from "effect";
-import { MessagingConnectionError } from "../messaging-types";
+import { Effect, Schema } from "effect";
+import { MessagingAdapterError, MessagingConnectionError } from "../messaging-types";
 
 const SLACK_API_ORIGIN = "https://slack.com";
 
@@ -13,10 +13,6 @@ const REDIRECT_LIMIT = 3;
 
 const SlackEnvelope = Schema.Record(Schema.String, Schema.Unknown);
 export type SlackResponse = typeof SlackEnvelope.Type & { ok: true };
-
-export class SlackOperationFailed extends Schema.TaggedError<SlackOperationFailed>()("SlackOperationFailed", {
-  cause: Schema.Defect(),
-}) {}
 
 export class SlackApiError extends Error {
   constructor(
@@ -54,30 +50,17 @@ export class SlackWebApi {
     this.#delay = options.delay;
   }
 
-  call(method: string, params: DynamicRecord = {}): Promise<SlackResponse> {
-    return runSlack(this.callEffect(method, params));
-  }
-
-  readonly callEffect = Effect.fnUntraced(function* (this: SlackWebApi, method: string, params: DynamicRecord = {}) {
+  readonly call = Effect.fnUntraced(function* (this: SlackWebApi, method: string, params: DynamicRecord = {}) {
     const body = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
       if (value === undefined || value === null) continue;
       body.set(key, typeof value === "string" ? value : JSON.stringify(value));
     }
-    const { payload } = yield* this.#sendEffect(method, body);
+    const { payload } = yield* this.#send(method, body);
     return payload;
   });
 
-  /** A method that takes a file, such as `apps.icon.set`, as a multipart form. */
-  upload(
-    method: string,
-    params: Record<string, string>,
-    file: { field: string; name: string; type: string; bytes: Uint8Array },
-  ): Promise<SlackResponse> {
-    return runSlack(this.uploadEffect(method, params, file));
-  }
-
-  readonly uploadEffect = Effect.fnUntraced(function* (
+  readonly upload = Effect.fnUntraced(function* (
     this: SlackWebApi,
     method: string,
     params: Record<string, string>,
@@ -98,13 +81,8 @@ export class SlackWebApi {
     );
   });
 
-  /** `auth.test` with the granted scopes, which Slack sends only as a response header. */
-  authTest(): Promise<{ payload: SlackResponse; scopes: string[] }> {
-    return runSlack(this.authTestEffect());
-  }
-
-  readonly authTestEffect = Effect.fnUntraced(function* (this: SlackWebApi) {
-    const { payload, response } = yield* this.#sendEffect("auth.test", new URLSearchParams());
+  readonly authTest = Effect.fnUntraced(function* (this: SlackWebApi) {
+    const { payload, response } = yield* this.#send("auth.test", new URLSearchParams());
     const scopes = (response.headers.get("x-oauth-scopes") ?? "")
       .split(",")
       .map((scope) => scope.trim())
@@ -112,7 +90,7 @@ export class SlackWebApi {
     return { payload, scopes };
   });
 
-  readonly #sendEffect = Effect.fnUntraced(function* (this: SlackWebApi, method: string, body: URLSearchParams) {
+  readonly #send = Effect.fnUntraced(function* (this: SlackWebApi, method: string, body: URLSearchParams) {
     for (let attempt = 0; ; attempt += 1) {
       const result = yield* slackRequest(
         `${this.#origin}/api/${method}`,
@@ -145,12 +123,7 @@ export class SlackWebApi {
     }
   });
 
-  /** Uploads bytes only to the trusted Slack upload host. */
-  uploadBytes(uploadUrl: string, bytes: Uint8Array, mimeType: string): Promise<void> {
-    return runSlack(this.uploadBytesEffect(uploadUrl, bytes, mimeType));
-  }
-
-  readonly uploadBytesEffect = Effect.fnUntraced(function* (
+  readonly uploadBytes = Effect.fnUntraced(function* (
     this: SlackWebApi,
     uploadUrl: string,
     bytes: Uint8Array,
@@ -176,12 +149,7 @@ export class SlackWebApi {
     );
   });
 
-  /** Token forwarding, redirect count, and byte limits are checked before each file write. */
-  download(url: string, destination: string, maxBytes: number): Promise<void> {
-    return runSlack(this.downloadEffect(url, destination, maxBytes));
-  }
-
-  readonly downloadEffect = Effect.fnUntraced(function* (
+  readonly download = Effect.fnUntraced(function* (
     this: SlackWebApi,
     url: string,
     destination: string,
@@ -267,21 +235,21 @@ export class SlackWebApi {
 }
 
 // These operations deliberately have no tracing span: provider payloads and URLs can contain secrets.
-function slackIo<A>(run: () => Promise<A>): Effect.Effect<A, SlackOperationFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new SlackOperationFailed({ cause }) });
+function slackIo<A>(run: () => Promise<A>): Effect.Effect<A, MessagingAdapterError> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new MessagingAdapterError({ cause }) });
 }
 
-function slackFailure(cause: Error): Effect.Effect<never, SlackOperationFailed> {
-  return Effect.fail(new SlackOperationFailed({ cause }));
+function slackFailure(cause: Error): Effect.Effect<never, MessagingAdapterError> {
+  return Effect.fail(new MessagingAdapterError({ cause }));
 }
 
 const slackPayload = Effect.fnUntraced(function* (
   method: string,
   response: Response,
-): Effect.fn.Return<SlackResponse, SlackOperationFailed> {
+): Effect.fn.Return<SlackResponse, MessagingAdapterError> {
   const payload = yield* slackIo((): Promise<unknown> => response.json()).pipe(
     Effect.flatMap(Schema.decodeUnknownEffect(SlackEnvelope)),
-    Effect.mapError(() => new SlackOperationFailed({ cause: new SlackApiError(method, `http_${response.status}`) })),
+    Effect.mapError(() => new MessagingAdapterError({ cause: new SlackApiError(method, `http_${response.status}`) })),
   );
   if (payload.ok !== true) {
     const code = isString(payload.error) ? payload.error : `http_${response.status}`;
@@ -295,17 +263,11 @@ const slackPayload = Effect.fnUntraced(function* (
 function slackRequest<A>(
   url: string,
   init: RequestInit,
-  use: (response: Response) => Effect.Effect<A, SlackOperationFailed>,
-): Effect.Effect<A, SlackOperationFailed> {
+  use: (response: Response) => Effect.Effect<A, MessagingAdapterError>,
+): Effect.Effect<A, MessagingAdapterError> {
   return Effect.acquireUseRelease(
     Effect.sync(() => new AbortController()),
     (controller) => slackIo(() => fetch(url, { ...init, signal: controller.signal })).pipe(Effect.flatMap(use)),
     (controller) => Effect.sync(() => controller.abort()),
   );
-}
-
-async function runSlack<A>(operation: Effect.Effect<A, SlackOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

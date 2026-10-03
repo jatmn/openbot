@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { AgentEvent, AgentSummary, DuplicateAgentResult, SidebarLayoutSnapshot } from "@openbot/contracts/ipc";
+import type { AgentEvent, AgentSummary, SidebarLayoutSnapshot } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, Result, Schema } from "effect";
 import type { AgentService } from "../agent-service";
 import { type AgentStore, duplicationProfileSignature } from "../agent-store";
 import type { MailboxStore } from "../mailbox-store";
@@ -14,7 +14,7 @@ export interface DuplicationHooks {
   emit(event: AgentEvent): void;
   listAgents(): AgentSummary[];
   /** Removes a half-written copy: its workspace, mailbox rows and provider sessions. */
-  deleteAgentData(agent: AgentSummary): Promise<void>;
+  deleteAgentData(agent: AgentSummary): Effect.Effect<void, AgentDuplicationFailed>;
   /** A agent with an outstanding question is not idle, even with an empty queue. */
   hasAttentionFor(agentId: string): boolean;
   /** Re-arms a queue this gate held, so a message that waited out a copy is not stranded. */
@@ -55,7 +55,7 @@ export class DuplicationGate {
   readonly #pendingAgents = new Set<string>();
   readonly #pendingOperations = new Map<string, { operationId: string; sourceAgentId: string }>();
   readonly #pendingReleases = new Map<string, () => void>();
-  #commitQueue: Promise<void> = Promise.resolve();
+  #commitQueue: Deferred.Deferred<void> | null = null;
 
   constructor(options: DuplicationGateOptions) {
     this.#store = options.store;
@@ -93,18 +93,12 @@ export class DuplicationGate {
     return agents.filter((agent) => !this.#pendingAgents.has(agent.id));
   }
 
-  async duplicate(sourceAgentId: string, operationId: string = randomUUID()): Promise<AgentSummary> {
-    const result = await Effect.runPromise(Effect.result(this.duplicateEffect(sourceAgentId, operationId)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly duplicateEffect = Effect.fn("Agent.duplicate")(function* (
+  readonly duplicate = Effect.fn("Agent.duplicate")(function* (
     this: DuplicationGate,
     sourceAgentId: string,
     operationId: string = randomUUID(),
   ) {
-    const releaseDuplication = yield* duplicationIo(() => this.#acquireCommitLock());
+    const releaseDuplication = yield* this.#acquireCommitLock();
     let releaseOnExit = true;
     let duplicate: AgentSummary | null = null;
     return yield* Effect.gen({ self: this }, function* () {
@@ -116,7 +110,9 @@ export class DuplicationGate {
       });
       const signature = yield* duplicationStep(() => this.#sourceSignature(sourceAgentId));
       this.#duplicatingAgents.add(sourceAgentId);
-      duplicate = yield* duplicationIo(() => this.#store.duplicateAgent(sourceAgentId, operationId));
+      duplicate = yield* this.#store
+        .duplicateAgent(sourceAgentId, operationId)
+        .pipe(Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })));
       const copied = duplicate;
       let completedDuplicate = copied;
       yield* duplicationStep(() => {
@@ -144,11 +140,17 @@ export class DuplicationGate {
         return this.#store.list().find((candidate) => candidate.id === copied.id) ?? completedDuplicate;
       });
     }).pipe(
+      Effect.catchDefect((cause) => Effect.fail(new AgentDuplicationFailed({ cause }))),
       Effect.catch((failure) =>
         Effect.gen({ self: this }, function* () {
           if (!duplicate) return yield* failure;
           const abandoned = duplicate;
-          const rollback = yield* Effect.result(duplicationIo(() => this.#hooks.deleteAgentData(abandoned)));
+          const rollback = yield* Effect.result(
+            this.#hooks.deleteAgentData(abandoned).pipe(
+              Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })),
+              Effect.catchDefect((cause) => Effect.fail(new AgentDuplicationFailed({ cause }))),
+            ),
+          );
           if (Result.isSuccess(rollback)) {
             this.#pendingAgents.delete(abandoned.id);
             this.#pendingOperations.delete(abandoned.id);
@@ -175,13 +177,7 @@ export class DuplicationGate {
     );
   }, Effect.uninterruptible);
 
-  async commit(agentId: string, layout: SidebarLayoutSnapshot): Promise<DuplicateAgentResult> {
-    const result = await Effect.runPromise(Effect.result(this.commitEffect(agentId, layout)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly commitEffect = Effect.fn("Agent.commitDuplication")(function* (
+  readonly commit = Effect.fn("Agent.commitDuplication")(function* (
     this: DuplicationGate,
     agentId: string,
     layout: SidebarLayoutSnapshot,
@@ -193,27 +189,28 @@ export class DuplicationGate {
       return operation;
     });
     const releaseDuplication = this.#pendingReleases.get(agentId);
-    return yield* duplicationIo(() =>
-      this.#store.commitAgentDuplication(agentId, operation.operationId, operation.sourceAgentId, layout),
-    ).pipe(
-      Effect.flatMap((result) =>
-        duplicationStep(() => {
-          this.#pendingAgents.delete(agentId);
-          this.#pendingOperations.delete(agentId);
-          this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
-          if (this.#memories.listFor(result.agent.id).length > 0) this.#memories.stateChanged(result.agent.id);
-          if (this.#routines.listFor(result.agent.id).length > 0) this.#routines.stateChanged(result.agent.id);
-          this.#routines.arm();
-          return result;
-        }),
-      ),
-      Effect.ensuring(
-        Effect.sync(() => {
-          this.#pendingReleases.delete(agentId);
-          releaseDuplication?.();
-        }),
-      ),
-    );
+    return yield* this.#store
+      .commitAgentDuplication(agentId, operation.operationId, operation.sourceAgentId, layout)
+      .pipe(Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })))
+      .pipe(
+        Effect.flatMap((result) =>
+          duplicationStep(() => {
+            this.#pendingAgents.delete(agentId);
+            this.#pendingOperations.delete(agentId);
+            this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
+            if (this.#memories.listFor(result.agent.id).length > 0) this.#memories.stateChanged(result.agent.id);
+            if (this.#routines.listFor(result.agent.id).length > 0) this.#routines.stateChanged(result.agent.id);
+            this.#routines.arm();
+            return result;
+          }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#pendingReleases.delete(agentId);
+            releaseDuplication?.();
+          }),
+        ),
+      );
   }, Effect.uninterruptible);
 
   /**
@@ -263,16 +260,15 @@ export class DuplicationGate {
     }
   }
 
-  async #acquireCommitLock(): Promise<() => void> {
+  readonly #acquireCommitLock = Effect.fn("DuplicationGate.acquireCommitLock")(function* (this: DuplicationGate) {
     const previous = this.#commitQueue;
-    let release = (): void => undefined;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.#commitQueue = previous.then(() => current);
-    await previous;
-    return release;
-  }
+    const current = Deferred.makeUnsafe<void>();
+    this.#commitQueue = current;
+    if (previous) yield* Deferred.await(previous);
+    return () => {
+      Deferred.doneUnsafe(current, Effect.void);
+    };
+  });
 
   /**
    * Signs the same profile the store signs, so the two layers cannot disagree about what "changed"
@@ -305,50 +301,46 @@ type DuplicateSidebar = Pick<SidebarLayoutStore, "placeDuplicateAfter" | "remove
  * if placing or committing fails, the half-made copy has to go, or the user keeps an agent they never
  * asked for.
  */
-export async function duplicateAgentIntoLayout(
-  agents: DuplicatingAgents,
-  sidebar: DuplicateSidebar,
-  sourceAgentId: string,
-  operationId?: string,
-): Promise<DuplicateAgentResult> {
-  const result = await Effect.runPromise(
-    Effect.result(duplicateAgentIntoLayoutEffect(agents, sidebar, sourceAgentId, operationId)),
-  );
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
 export class AgentDuplicationFailed extends Schema.TaggedError<AgentDuplicationFailed>()("AgentDuplicationFailed", {
   cause: Schema.Defect(),
 }) {}
 
 /** A cancelled caller must not leave an uncommitted copy or interrupt its rollback. */
-export const duplicateAgentIntoLayoutEffect = Effect.fn("Agent.duplicateIntoLayout")(function* (
+export const duplicateAgentIntoLayout = Effect.fn("Agent.duplicateIntoLayout")(function* (
   agents: DuplicatingAgents,
   sidebar: DuplicateSidebar,
   sourceAgentId: string,
   operationId?: string,
 ) {
-  const agent = yield* Effect.tryPromise({
-    try: () => agents.duplicateAgent(sourceAgentId, operationId),
-    catch: (cause) => new AgentDuplicationFailed({ cause }),
-  });
+  const agent = yield* agents
+    .duplicateAgent(sourceAgentId, operationId)
+    .pipe(Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })));
   return yield* Effect.gen(function* () {
-    const layout = yield* Effect.tryPromise({
-      try: () => sidebar.placeDuplicateAfter(sourceAgentId, agent.id, [...agents.sidebarChatIds(), agent.id]),
-      catch: (cause) => new AgentDuplicationFailed({ cause }),
-    });
-    return yield* Effect.tryPromise({
-      try: () => agents.commitAgentDuplication(agent.id, layout),
-      catch: (cause) => new AgentDuplicationFailed({ cause }),
-    });
+    const layout = yield* sidebar
+      .placeDuplicateAfter(sourceAgentId, agent.id, [...agents.sidebarChatIds(), agent.id])
+      .pipe(Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })));
+    return yield* agents
+      .commitAgentDuplication(agent.id, layout)
+      .pipe(Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })));
   }).pipe(
+    Effect.catchDefect((cause) => Effect.fail(new AgentDuplicationFailed({ cause }))),
     Effect.catch((failure) =>
       Effect.gen(function* () {
         const rollbacks = yield* Effect.all(
           [
-            Effect.result(duplicationIo(() => agents.deleteAgent(agent.id))),
-            Effect.result(duplicationIo(() => sidebar.removeAgent(agent.id)).pipe(Effect.asVoid)),
+            Effect.result(
+              agents.deleteAgent(agent.id).pipe(
+                Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })),
+                Effect.catchDefect((cause) => Effect.fail(new AgentDuplicationFailed({ cause }))),
+              ),
+            ),
+            Effect.result(
+              sidebar.removeAgent(agent.id).pipe(
+                Effect.mapError((failure) => new AgentDuplicationFailed({ cause: failure.cause })),
+                Effect.catchDefect((cause) => Effect.fail(new AgentDuplicationFailed({ cause }))),
+                Effect.asVoid,
+              ),
+            ),
           ],
           { concurrency: "unbounded" },
         );
@@ -366,8 +358,4 @@ export const duplicateAgentIntoLayoutEffect = Effect.fn("Agent.duplicateIntoLayo
 
 function duplicationStep<A>(operation: () => A): Effect.Effect<A, AgentDuplicationFailed> {
   return Effect.try({ try: operation, catch: (cause) => new AgentDuplicationFailed({ cause }) });
-}
-
-function duplicationIo<A>(operation: () => Promise<A>): Effect.Effect<A, AgentDuplicationFailed> {
-  return Effect.tryPromise({ try: operation, catch: (cause) => new AgentDuplicationFailed({ cause }) });
 }

@@ -14,10 +14,10 @@ import {
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { isUuidV4, legacyAgentId } from "@openbot/contracts/validation";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
-import { writeFileAtomicallyEffect } from "./atomic-json-file";
+import { Effect, Exit, Result, Semaphore } from "effect";
+import { writeFileAtomically } from "./atomic-json-file";
 import { isMissingFileError } from "./file-errors";
-import { runStored, StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
+import { StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
 
 interface StoredSidebarLayout extends SidebarLayoutSnapshot {
   version: 2;
@@ -42,45 +42,46 @@ const DEFAULT_LAYOUT: SidebarLayoutSnapshot = {
 export class SidebarLayoutStore extends EventEmitter<SidebarLayoutStoreEvents> {
   readonly #path: string;
   #layout = structuredClone(DEFAULT_LAYOUT);
-  #operationQueue: Promise<void> = Promise.resolve();
+  readonly #operationQueue = Semaphore.makeUnsafe(1);
 
   constructor(path: string) {
     super();
     this.#path = path;
   }
 
-  initialize(): Promise<void> {
-    return runStored(
-      Effect.gen({ self: this }, function* () {
-        yield* storedIO(() => mkdir(dirname(this.#path), { recursive: true, mode: 0o700 }));
-        const loaded = yield* Effect.result(
-          Effect.gen({ self: this }, function* () {
-            const contents = yield* storedIO(() => readFile(this.#path, "utf8"));
-            return yield* storedSync(() => {
-              const parsed = JSON.parse(contents);
-              if (isStoredSidebarLayout(parsed)) return snapshotFromStored(parsed);
-              if (isLegacyStoredSidebarLayout(parsed)) return { ...snapshotFromLegacyStored(parsed), agentOrder: [] };
-              throw new Error("Invalid sidebar layout state.");
-            });
-          }),
-        );
-        if (Result.isSuccess(loaded)) {
-          this.#layout = loaded.success;
-          return;
-        }
-        if (isMissingFileError(loaded.failure.cause)) return;
-        const backupPath = `${this.#path}.corrupt-${Date.now()}`;
-        yield* storedIO(() => rename(this.#path, backupPath)).pipe(Effect.catch(() => Effect.void));
-        this.#layout = structuredClone(DEFAULT_LAYOUT);
-      }),
-    );
+  initialize() {
+    return Effect.gen({ self: this }, function* () {
+      yield* storedIO(() => mkdir(dirname(this.#path), { recursive: true, mode: 0o700 }));
+      const loaded = yield* Effect.result(
+        Effect.gen({ self: this }, function* () {
+          const contents = yield* storedIO(() => readFile(this.#path, "utf8"));
+          return yield* storedSync(() => {
+            const parsed = JSON.parse(contents);
+            if (isStoredSidebarLayout(parsed)) return snapshotFromStored(parsed);
+            if (isLegacyStoredSidebarLayout(parsed)) return { ...snapshotFromLegacyStored(parsed), agentOrder: [] };
+            throw new Error("Invalid sidebar layout state.");
+          });
+        }),
+      );
+      if (Result.isSuccess(loaded)) {
+        this.#layout = loaded.success;
+        return;
+      }
+      if (isMissingFileError(loaded.failure.cause)) return;
+      const backupPath = `${this.#path}.corrupt-${Date.now()}`;
+      yield* storedIO(() => rename(this.#path, backupPath)).pipe(Effect.catch(() => Effect.void));
+      this.#layout = structuredClone(DEFAULT_LAYOUT);
+    });
   }
 
   getSnapshot(): SidebarLayoutSnapshot {
     return structuredClone(this.#layout);
   }
 
-  mutate(action: SidebarLayoutAction, agentIds: ReadonlySet<string>): Promise<SidebarLayoutSnapshot> {
+  mutate(
+    action: SidebarLayoutAction,
+    agentIds: ReadonlySet<string>,
+  ): Effect.Effect<SidebarLayoutSnapshot, StoredStateFailure> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         const next = yield* storedSync(() => applySidebarLayoutAction(this.#layout, action, agentIds));
@@ -91,38 +92,36 @@ export class SidebarLayoutStore extends EventEmitter<SidebarLayoutStoreEvents> {
     );
   }
 
-  withProfileAssignment<T>(
+  withProfileAssignment<T, E>(
     sectionId: string | null,
-    operation: (assign: (agentId: string) => Promise<SidebarLayoutSnapshot>) => Promise<T>,
-  ): Promise<T> {
+    operation: (
+      assign: (agentId: string) => Effect.Effect<SidebarLayoutSnapshot, StoredStateFailure>,
+    ) => Effect.Effect<T, E>,
+  ): Effect.Effect<T, E | StoredStateFailure> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         if (sectionId !== null) yield* storedSync(() => requireCustomSection(this.#layout, sectionId));
         const previous = this.getSnapshot();
-        const result = yield* Effect.result(
-          storedIO(() =>
-            operation((agentId) =>
-              runStored(
-                Effect.gen({ self: this }, function* () {
-                  const next = yield* storedSync(() =>
-                    applySidebarLayoutAction(this.#layout, { type: "assign", agentId, sectionId }, new Set([agentId])),
-                  );
-                  if (next !== this.#layout) yield* this.#commit(next);
-                  return this.getSnapshot();
-                }),
-              ),
-            ),
+        const result = yield* Effect.exit(
+          operation((agentId) =>
+            Effect.gen({ self: this }, function* () {
+              const next = yield* storedSync(() =>
+                applySidebarLayoutAction(this.#layout, { type: "assign", agentId, sectionId }, new Set([agentId])),
+              );
+              if (next !== this.#layout) yield* this.#commit(next);
+              return this.getSnapshot();
+            }),
           ),
         );
-        if (Result.isSuccess(result)) return result.success;
+        if (Exit.isSuccess(result)) return result.value;
         if (this.#layout.revision !== previous.revision)
           yield* this.#commit({ ...previous, revision: this.#layout.revision + 1 });
-        return yield* result.failure;
+        return yield* Effect.failCause(result.cause);
       }),
     );
   }
 
-  removeAgent(agentId: string): Promise<SidebarLayoutSnapshot> {
+  removeAgent(agentId: string): Effect.Effect<SidebarLayoutSnapshot, StoredStateFailure> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         if (!(agentId in this.#layout.agentAssignments) && !this.#layout.agentOrder.includes(agentId)) {
@@ -145,7 +144,7 @@ export class SidebarLayoutStore extends EventEmitter<SidebarLayoutStoreEvents> {
     sourceAgentId: string,
     duplicateAgentId: string,
     orderedAgentIds: readonly string[],
-  ): Promise<SidebarLayoutSnapshot> {
+  ): Effect.Effect<SidebarLayoutSnapshot, StoredStateFailure> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         const agentIds = new Set(orderedAgentIds);
@@ -182,7 +181,7 @@ export class SidebarLayoutStore extends EventEmitter<SidebarLayoutStoreEvents> {
    * "these agents no longer exist" and commit the deletion, so a user with a dozen agents in named groups
    * comes back to all of them unassigned, in an order they never chose, with nothing to undo it.
    */
-  reconcileAgents(agentIds: ReadonlySet<string>): Promise<SidebarLayoutSnapshot> {
+  reconcileAgents(agentIds: ReadonlySet<string>): Effect.Effect<SidebarLayoutSnapshot, StoredStateFailure> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         const renamedFrom = new Map<string, string>();
@@ -225,19 +224,13 @@ export class SidebarLayoutStore extends EventEmitter<SidebarLayoutStoreEvents> {
     );
   }
 
-  #enqueue<T>(operation: Effect.Effect<T, StoredStateFailure>): Promise<T> {
-    const execute = () => runStored(operation.pipe(Effect.uninterruptible));
-    const result = this.#operationQueue.then(execute, execute);
-    this.#operationQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  #enqueue<T, E>(operation: Effect.Effect<T, E>): Effect.Effect<T, E> {
+    return this.#operationQueue.withPermit(operation.pipe(Effect.uninterruptible));
   }
 
   #commit = Effect.fn("SidebarLayout.commit")(function* (this: SidebarLayoutStore, next: SidebarLayoutSnapshot) {
     const stored: StoredSidebarLayout = { version: 2, ...next };
-    yield* writeFileAtomicallyEffect(this.#path, `${JSON.stringify(stored)}\n`).pipe(
+    yield* writeFileAtomically(this.#path, `${JSON.stringify(stored)}\n`).pipe(
       Effect.mapError(({ cause }) => new StoredStateFailure({ cause })),
     );
     this.#layout = next;

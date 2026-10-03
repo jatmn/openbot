@@ -13,7 +13,7 @@ import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect
 import { decodeRemoteSession, decodeRemoteSessionTicket } from "@openbot/contracts/remote-control-plane";
 import { isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Schema, Semaphore } from "effect";
+import { Deferred, Effect, Schema, Semaphore } from "effect";
 import { runTeamEffect } from "./effect-boundary";
 import type { TeamClientFetch } from "./index";
 
@@ -144,11 +144,7 @@ export class RemoteTeamDirectoryClient {
     };
   }
 
-  listHosts(): Promise<RemoteTeamHost[]> {
-    return runTeamEffect(this.listHostsEffect());
-  }
-
-  listHostsEffect(): Effect.Effect<RemoteTeamHost[], DirectoryFailure> {
+  listHosts(): Effect.Effect<RemoteTeamHost[], DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<RemoteTeamHost[], DirectoryFailure> {
       const value = yield* this.#request("/v2/remote/hosts/");
       if (!isDynamicRecord(value) || !Array.isArray(value.hosts))
@@ -202,11 +198,7 @@ export class RemoteTeamDirectoryClient {
     });
   }
 
-  listMembers(hostId: string): Promise<RemoteTeamMember[]> {
-    return runTeamEffect(this.listMembersEffect(hostId));
-  }
-
-  listMembersEffect(hostId: string): Effect.Effect<RemoteTeamMember[], DirectoryFailure> {
+  listMembers(hostId: string): Effect.Effect<RemoteTeamMember[], DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<RemoteTeamMember[], DirectoryFailure> {
       const value = yield* this.#request(`/v2/remote/hosts/${encodeURIComponent(hostId)}/members/`);
       if (!isDynamicRecord(value) || !Array.isArray(value.members))
@@ -216,11 +208,7 @@ export class RemoteTeamDirectoryClient {
     });
   }
 
-  listInvites(hostId: string): Promise<RemoteTeamInvite[]> {
-    return runTeamEffect(this.listInvitesEffect(hostId));
-  }
-
-  listInvitesEffect(hostId: string): Effect.Effect<RemoteTeamInvite[], DirectoryFailure> {
+  listInvites(hostId: string): Effect.Effect<RemoteTeamInvite[], DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<RemoteTeamInvite[], DirectoryFailure> {
       const value = yield* this.#request(`/v2/remote/hosts/${encodeURIComponent(hostId)}/invites`);
       if (!isDynamicRecord(value) || !Array.isArray(value.invites))
@@ -231,13 +219,6 @@ export class RemoteTeamDirectoryClient {
   }
 
   createInvite(
-    host: { hostId: string; devicePublicKey: string },
-    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
-  ): Promise<{ inviteId: string; inviteUrl: string; expiresAt: number }> {
-    return runTeamEffect(this.createInviteEffect(host, input));
-  }
-
-  createInviteEffect(
     host: { hostId: string; devicePublicKey: string },
     input: { role: "admin" | "member"; email?: string; permanent?: boolean },
   ): Effect.Effect<{ inviteId: string; inviteUrl: string; expiresAt: number }, DirectoryFailure> {
@@ -276,25 +257,18 @@ export class RemoteTeamDirectoryClient {
   sendInviteEmail(
     host: { hostId: string; devicePublicKey: string; name: string },
     input: { role: "admin" | "member"; email: string },
-  ): Promise<{ inviteId: string; inviteUrl: string; expiresAt: number }> {
-    return runTeamEffect(this.sendInviteEmailEffect(host, input));
-  }
-
-  sendInviteEmailEffect(
-    host: { hostId: string; devicePublicKey: string; name: string },
-    input: { role: "admin" | "member"; email: string },
   ): Effect.Effect<{ inviteId: string; inviteUrl: string; expiresAt: number }, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       { inviteId: string; inviteUrl: string; expiresAt: number },
       DirectoryFailure
     > {
-      const invite = yield* this.createInviteEffect(host, input);
+      const invite = yield* this.createInvite(host, input);
       yield* this.#request("/v1/team-invitations/email", {
         method: "POST",
         body: { ...input, serverName: host.name, inviteUrl: invite.inviteUrl },
       }).pipe(
         Effect.catch((error) =>
-          this.revokeInviteEffect(invite.inviteId).pipe(
+          this.revokeInvite(invite.inviteId).pipe(
             Effect.catch(() => Effect.void),
             Effect.andThen(Effect.fail(error)),
           ),
@@ -304,21 +278,13 @@ export class RemoteTeamDirectoryClient {
     });
   }
 
-  revokeInvite(inviteId: string): Promise<void> {
-    return runTeamEffect(this.revokeInviteEffect(inviteId));
-  }
-
-  revokeInviteEffect(inviteId: string): Effect.Effect<void, DirectoryFailure> {
+  revokeInvite(inviteId: string): Effect.Effect<void, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, DirectoryFailure> {
       yield* this.#request(`/v2/remote/invites/${encodeURIComponent(inviteId)}`, { method: "DELETE" });
     });
   }
 
-  updateMember(hostId: string, membershipId: string, role: "admin" | "member", reactivate = false): Promise<void> {
-    return runTeamEffect(this.updateMemberEffect(hostId, membershipId, role, reactivate));
-  }
-
-  updateMemberEffect(
+  updateMember(
     hostId: string,
     membershipId: string,
     role: "admin" | "member",
@@ -335,11 +301,7 @@ export class RemoteTeamDirectoryClient {
     });
   }
 
-  leaveHost(hostId: string, membershipId: string): Promise<void> {
-    return runTeamEffect(this.leaveHostEffect(hostId, membershipId));
-  }
-
-  leaveHostEffect(hostId: string, membershipId: string): Effect.Effect<void, DirectoryFailure> {
+  leaveHost(hostId: string, membershipId: string): Effect.Effect<void, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, DirectoryFailure> {
       yield* this.#request(
         `/v2/remote/hosts/${encodeURIComponent(hostId)}/members/${encodeURIComponent(membershipId)}`,
@@ -352,14 +314,6 @@ export class RemoteTeamDirectoryClient {
   }
 
   createBootstrap(
-    hostId: string,
-    clientPublicKey: string,
-    existingSessionId: string | null = null,
-  ): Promise<RemoteTeamBootstrap> {
-    return runTeamEffect(this.createBootstrapEffect(hostId, clientPublicKey, existingSessionId));
-  }
-
-  createBootstrapEffect(
     hostId: string,
     clientPublicKey: string,
     existingSessionId: string | null = null,
@@ -379,7 +333,7 @@ export class RemoteTeamDirectoryClient {
       const session = yield* directoryDecode(() => decodeRemoteSession(value));
       return yield* this.#ticket(session.sessionId, clientPublicKey).pipe(
         Effect.catch((error) =>
-          this.endSessionEffect(session.sessionId).pipe(
+          this.endSession(session.sessionId).pipe(
             Effect.catch(() => Effect.void),
             Effect.andThen(Effect.fail(error)),
           ),
@@ -400,21 +354,13 @@ export class RemoteTeamDirectoryClient {
       : url.toString();
   }
 
-  endSession(sessionId: string): Promise<void> {
-    return runTeamEffect(this.endSessionEffect(sessionId));
-  }
-
-  endSessionEffect(sessionId: string): Effect.Effect<void, DirectoryFailure> {
+  endSession(sessionId: string): Effect.Effect<void, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, DirectoryFailure> {
       yield* this.#request(`/v2/remote/sessions/${encodeURIComponent(sessionId)}/end`, { method: "POST" });
     });
   }
 
-  previewInvite(inviteUrl: string): Promise<RemoteInvitePreview> {
-    return runTeamEffect(this.previewInviteEffect(inviteUrl));
-  }
-
-  previewInviteEffect(inviteUrl: string): Effect.Effect<RemoteInvitePreview, DirectoryFailure> {
+  previewInvite(inviteUrl: string): Effect.Effect<RemoteInvitePreview, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<RemoteInvitePreview, DirectoryFailure> {
       const invite = yield* directoryDecode(() => parseInviteUrl(inviteUrl, this.#inviteLinks));
       const inviteOrigin = new URL(invite.apiUrl).origin;
@@ -440,14 +386,10 @@ export class RemoteTeamDirectoryClient {
     });
   }
 
-  acceptInvite(inviteUrl: string): Promise<RemoteTeamHost> {
-    return runTeamEffect(this.acceptInviteEffect(inviteUrl));
-  }
-
-  acceptInviteEffect(inviteUrl: string): Effect.Effect<RemoteTeamHost, DirectoryFailure> {
+  acceptInvite(inviteUrl: string): Effect.Effect<RemoteTeamHost, DirectoryFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<RemoteTeamHost, DirectoryFailure> {
       const invite = yield* directoryDecode(() => parseInviteUrl(inviteUrl, this.#inviteLinks));
-      const preview = yield* this.previewInviteEffect(inviteUrl);
+      const preview = yield* this.previewInvite(inviteUrl);
       if (!preview.devicePublicKey) return yield* directoryFailure(sourceText("error.remote.inviteHostKeyMissing"));
       // Save the pin before consuming the one-use token, including across app restarts.
       yield* this.#pinHostKey(invite.serverId, preview.devicePublicKey);
@@ -623,29 +565,35 @@ function decodeInvite(value: unknown): RemoteTeamInvite {
 export const REMOTE_ACCOUNT_CHECK_INTERVAL_MS = 15 * 60_000;
 
 /** The caller starts this watcher in the foreground and stops it on background entry. */
-export function watchRemoteDirectory(refresh: () => Promise<void>): () => void {
-  const timer = setInterval(() => void refresh().catch(() => undefined), REMOTE_ACCOUNT_CHECK_INTERVAL_MS);
+export function watchRemoteDirectory<E>(refresh: () => Effect.Effect<void, E>): () => void {
+  const timer = setInterval(
+    () => void runTeamEffect(refresh()).catch(() => undefined),
+    REMOTE_ACCOUNT_CHECK_INTERVAL_MS,
+  );
   return () => clearInterval(timer);
 }
 
 /** Refresh on demand or foreground entry; coalesce requests and rate-limit automatic retries. */
-export function createRemoteDirectoryRefresh(load: () => Promise<void>, now = Date.now) {
-  let pending: Promise<void> | null = null;
+export function createRemoteDirectoryRefresh<E, R>(load: () => Effect.Effect<void, E, R>, now = Date.now) {
+  let pending: Deferred.Deferred<void, E> | null = null;
   let lastAttempt = Number.NEGATIVE_INFINITY;
-  return {
-    refresh(force = false): Promise<void> {
-      if (pending) return pending;
-      if (!force && now() - lastAttempt < REMOTE_ACCOUNT_CHECK_INTERVAL_MS) return Promise.resolve();
-      lastAttempt = now();
-      const operation = load();
-      pending = operation;
-      void operation
-        .finally(() => {
+  const refresh = Effect.fn("RemoteDirectory.refresh")(function* (force = false) {
+    if (pending) return yield* Deferred.await(pending);
+    if (!force && now() - lastAttempt < REMOTE_ACCOUNT_CHECK_INTERVAL_MS) return;
+    lastAttempt = now();
+    const operation = Deferred.makeUnsafe<void, E>();
+    pending = operation;
+    return yield* load().pipe(
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          yield* Deferred.done(operation, exit);
           if (pending === operation) pending = null;
-        })
-        .catch(() => undefined);
-      return operation;
-    },
+        }),
+      ),
+    );
+  });
+  return {
+    refresh,
     invalidate(): void {
       pending = null;
       lastAttempt = Number.NEGATIVE_INFINITY;

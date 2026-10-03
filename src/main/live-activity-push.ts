@@ -20,7 +20,7 @@ import {
   liveActivityKeys,
   sealLiveActivity,
 } from "@openbot/team-client/live-activity-seal";
-import { Effect, Schema } from "effect";
+import { Effect, Exit, Schema, Scope } from "effect";
 import type { TeamApiAgents } from "./team-api/dependencies";
 import type { markerExclusionsForCapabilities } from "./team-api/request-helpers";
 
@@ -43,7 +43,7 @@ export type LiveActivityPushAgents = Pick<TeamApiAgents, "on" | "off" | "getRunt
 export interface LiveActivityPushOptions {
   agents: LiveActivityPushAgents;
   /** Sends one update through the account service. `gone` means Apple refused the token. */
-  send(push: LiveActivityRelayPush): Promise<"sent" | "gone">;
+  send(push: LiveActivityRelayPush): Effect.Effect<"sent" | "gone", LiveActivitySendFailure>;
   now?: () => number;
   randomBytes(size: number): Uint8Array;
   /** Whether the member is still a member and not disabled. A removed member gets no more updates. */
@@ -94,7 +94,7 @@ export class LiveActivityPushService {
   readonly #listener = () => {
     for (const registration of this.#registrations.values()) this.#schedule(registration, EVENT_DELAY_MS);
   };
-  readonly #pending = new Set<Promise<void>>();
+  #scope = Scope.makeUnsafe();
   #listening = false;
 
   constructor(options: LiveActivityPushOptions) {
@@ -148,10 +148,11 @@ export class LiveActivityPushService {
     if (registration) this.#stop(registration);
   }
 
-  dispose(): Promise<void> {
+  readonly dispose = Effect.fn("LiveActivityPush.dispose")(function* (this: LiveActivityPushService) {
     for (const registration of [...this.#registrations.values()]) this.#stop(registration);
-    return Promise.all(this.#pending).then(() => undefined);
-  }
+    yield* Scope.close(this.#scope, Exit.void);
+    this.#scope = Scope.makeUnsafe();
+  }, Effect.uninterruptible);
 
   /** Runs an update after `delay`, or keeps an earlier one that is already planned. */
   #schedule(registration: Registration, delay: number): void {
@@ -163,8 +164,12 @@ export class LiveActivityPushService {
       at,
       handle: setTimeout(() => {
         registration.timer = null;
-        const pending = Effect.runPromise(this.#update(registration)).finally(() => this.#pending.delete(pending));
-        this.#pending.add(pending);
+        Effect.runFork(
+          this.#update(registration).pipe(
+            Effect.uninterruptible,
+            Effect.forkIn(this.#scope, { startImmediately: true }),
+          ),
+        );
       }, at - this.#now()),
     };
   }
@@ -209,10 +214,7 @@ export class LiveActivityPushService {
     };
     registration.sending = true;
     registration.sent = { key, mode, at: now };
-    yield* Effect.tryPromise({
-      try: () => this.#options.send(push),
-      catch: (cause) => new LiveActivitySendFailure({ cause }),
-    }).pipe(
+    yield* this.#options.send(push).pipe(
       Effect.tap((result) =>
         Effect.sync(() => {
           registration.failures = 0;
@@ -326,6 +328,6 @@ function phoneText(locale: string) {
   return mobileTranslateFor(resolveLocale("system", locale));
 }
 
-class LiveActivitySendFailure extends Schema.TaggedError<LiveActivitySendFailure>()("LiveActivitySendFailure", {
+export class LiveActivitySendFailure extends Schema.TaggedError<LiveActivitySendFailure>()("LiveActivitySendFailure", {
   cause: Schema.Defect(),
 }) {}

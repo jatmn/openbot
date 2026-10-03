@@ -64,11 +64,7 @@ export class AgentDatabaseSupervisor {
     this.#queueWaitMs = options.queueWaitMs ?? AGENT_DATABASE_LIMITS.queueWaitMs;
   }
 
-  send(request: AgentDatabaseRequestInput): Promise<AgentDatabaseOutcome> {
-    return Effect.runPromise(this.sendEffect(request));
-  }
-
-  sendEffect(request: AgentDatabaseRequestInput): Effect.Effect<AgentDatabaseOutcome> {
+  send(request: AgentDatabaseRequestInput): Effect.Effect<AgentDatabaseOutcome> {
     return Effect.callback<AgentDatabaseOutcome>((resume) => {
       if (this.#disposed) {
         resume(Effect.succeed(shuttingDown()));

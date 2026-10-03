@@ -4,11 +4,11 @@ import { readFile, rm } from "node:fs/promises";
 import type { AgentProviderId, ProviderApiKeyStatus } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Result, Schema, Semaphore } from "effect";
 import { z } from "zod";
-import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
+import { writeFileAtomically } from "../backend/atomic-json-file";
 
-class CredentialStoreFailure extends Schema.TaggedError<CredentialStoreFailure>()("CredentialStoreFailure", {
+export class CredentialStoreFailure extends Schema.TaggedError<CredentialStoreFailure>()("CredentialStoreFailure", {
   cause: Schema.Defect(),
 }) {}
 
@@ -18,12 +18,6 @@ function credentialIO<A>(operation: () => Promise<A>): Effect.Effect<A, Credenti
 
 function credentialSync<A>(operation: () => A): Effect.Effect<A, CredentialStoreFailure> {
   return Effect.try({ try: operation, catch: (cause) => new CredentialStoreFailure({ cause }) });
-}
-
-async function runCredential<A>(operation: Effect.Effect<A, CredentialStoreFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }
 
 /**
@@ -60,7 +54,7 @@ export class ProviderCredentialStore {
   #loaded = false;
   /** Why the file on disk could not be read. Until the user saves or removes a key, it is kept. */
   #loadError: Error | null = null;
-  #writeChain: Promise<void> = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
 
   constructor(path: string, cipher: SecretCipher) {
     this.#path = path;
@@ -74,22 +68,20 @@ export class ProviderCredentialStore {
    * key, and the file stays as it is: a keychain that refuses once must not cost the user the key,
    * so only an explicit save or removal replaces it.
    */
-  load(): Promise<Error | null> {
-    return runCredential(
-      Effect.gen({ self: this }, function* () {
-        this.#keys = new Map();
-        this.#loadError = null;
-        const result = yield* Effect.result(this.#read());
-        if (Result.isSuccess(result)) this.#keys = result.success;
-        else {
-          const error = result.failure.cause;
-          this.#loadError =
-            error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
-        }
-        this.#loaded = true;
-        return this.#loadError;
-      }),
-    );
+  load(): Effect.Effect<Error | null> {
+    return Effect.gen({ self: this }, function* () {
+      this.#keys = new Map();
+      this.#loadError = null;
+      const result = yield* Effect.result(this.#read());
+      if (Result.isSuccess(result)) this.#keys = result.success;
+      else {
+        const error = result.failure.cause;
+        this.#loadError =
+          error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
+      }
+      this.#loaded = true;
+      return this.#loadError;
+    });
   }
 
   /** The stored key, or `null`. Throws when `load` has not run, rather than reporting no key. */
@@ -104,16 +96,16 @@ export class ProviderCredentialStore {
     return this.#loadError ? "unreadable" : "missing";
   }
 
-  async set(provider: AgentProviderId, key: string): Promise<void> {
-    registerSecretValue(key);
-    await this.#edit((keys) => {
+  set(provider: AgentProviderId, key: string): Effect.Effect<void, CredentialStoreFailure> {
+    return this.#edit((keys) => {
+      registerSecretValue(key);
       keys.set(provider, key);
       return true;
     });
   }
 
-  async clear(provider: AgentProviderId): Promise<void> {
-    await this.#edit((keys) => {
+  clear(provider: AgentProviderId): Effect.Effect<void, CredentialStoreFailure> {
+    return this.#edit((keys) => {
       if (this.status(provider) === "missing") return false;
       keys.delete(provider);
       return true;
@@ -125,17 +117,13 @@ export class ProviderCredentialStore {
    * two providers can change their keys at the same time; each edit must start from the keys the
    * previous edit committed, or the last write drops the other provider's key.
    */
-  async #edit(change: (keys: Map<string, string>) => boolean): Promise<void> {
-    const operation = this.#writeChain.then(() =>
-      runCredential(
-        Effect.gen({ self: this }, function* () {
-          const next = yield* credentialSync(() => this.#editableKeys());
-          if (yield* credentialSync(() => change(next))) yield* this.#commit(next);
-        }).pipe(Effect.uninterruptible),
-      ),
+  #edit(change: (keys: Map<string, string>) => boolean): Effect.Effect<void, CredentialStoreFailure> {
+    return this.#writes.withPermit(
+      Effect.gen({ self: this }, function* () {
+        const next = yield* credentialSync(() => this.#editableKeys());
+        if (yield* credentialSync(() => change(next))) yield* this.#commit(next);
+      }).pipe(Effect.uninterruptible),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    await operation;
   }
 
   /**
@@ -192,7 +180,7 @@ export class ProviderCredentialStore {
       for (const [provider, key] of keys) credentials[provider] = this.#cipher.encrypt(key).toString("base64");
       return `${JSON.stringify({ version: 1, credentials })}\n`;
     });
-    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
+    yield* writeFileAtomically(this.#path, content, { createDirectory: true }).pipe(
       Effect.mapError(({ cause }) => new CredentialStoreFailure({ cause })),
     );
   });

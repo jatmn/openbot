@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Effect, Result } from "effect";
 import { z } from "zod";
-import { PreferenceFileFailure, readPreferenceFile, runPreference, writePreferenceFile } from "./preference-file";
+import { PreferenceFileFailure, readPreferenceFile, writePreferenceFile } from "./preference-file";
 
 const storedSecretSchema = z.object({ version: z.literal(1), value: z.string() });
 const runtimeCredentialsSchema = z.object({ username: z.string().min(1), password: z.string().min(1) });
@@ -11,14 +11,7 @@ interface SecretCipher {
   decrypt: (value: Buffer) => string;
 }
 
-export function loadOrCreateRemoteDesktopCredentials(
-  path: string,
-  cipher: SecretCipher,
-): Promise<{ username: string; password: string }> {
-  return runPreference(loadOrCreateRemoteDesktopCredentialsEffect(path, cipher));
-}
-
-export const loadOrCreateRemoteDesktopCredentialsEffect = Effect.fn("RemoteDesktopCredentials.loadOrCreate")(function* (
+export const loadOrCreateRemoteDesktopCredentials = Effect.fn("RemoteDesktopCredentials.loadOrCreate")(function* (
   path: string,
   cipher: SecretCipher,
 ) {

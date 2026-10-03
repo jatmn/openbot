@@ -6,7 +6,7 @@
 // `percent` and an ISO `resetsAt`.
 
 import type { DynamicRecord } from "@openbot/contracts/runtime-values";
-import { Effect, Option, Result, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { type AccountRateLimitsReadResult, type AccountRateLimitWindowResult, getRecord, getString } from "./protocol";
 
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
@@ -23,17 +23,11 @@ const NO_USAGE: AccountRateLimitsReadResult = { rateLimits: null, rateLimitsByLi
  * No key, a key the console rejects, and a key with no Go subscription all read as no usage, so the
  * dock hides the row instead of showing an error for the free catalog.
  */
-export async function readOpenCodeGoUsage(apiKey: string | null): Promise<AccountRateLimitsReadResult> {
-  const result = await Effect.runPromise(Effect.result(readOpenCodeGoUsageEffect(apiKey)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
 export class OpenCodeUsageFailed extends Schema.TaggedError<OpenCodeUsageFailed>()("OpenCodeUsageFailed", {
   cause: Schema.Defect(),
 }) {}
 
-export const readOpenCodeGoUsageEffect = Effect.fn("OpenCode.readGoUsage")(function* (apiKey: string | null) {
+export const readOpenCodeGoUsage = Effect.fn("OpenCode.readGoUsage")(function* (apiKey: string | null) {
   if (!apiKey) return NO_USAGE;
   return yield* Effect.acquireUseRelease(
     Effect.sync(() => new AbortController()),

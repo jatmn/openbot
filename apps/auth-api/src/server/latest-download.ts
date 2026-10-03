@@ -1,6 +1,5 @@
 import { Effect, Schema } from "effect";
 import { OPENBOT_LINKS } from "../lib/landing-links";
-import { runApiEffect } from "./effect-runtime";
 
 export type AvailableDownloadPlatform = "linux" | "macos" | "windows";
 
@@ -94,10 +93,8 @@ export function latestDownloadResponse(
   platform: AvailableDownloadPlatform,
   fetcher: typeof fetch = fetch,
   macArchitecture: MacDownloadArchitecture = "arm64",
-): Promise<Response> {
-  return runApiEffect(
-    latestDownload(platform, fetcher, macArchitecture).pipe(
-      Effect.catch(() => Effect.sync(() => fallbackToReleases(platform, "the manifest request failed"))),
-    ),
+) {
+  return latestDownload(platform, fetcher, macArchitecture).pipe(
+    Effect.catch(() => Effect.sync(() => fallbackToReleases(platform, "the manifest request failed"))),
   );
 }

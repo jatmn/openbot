@@ -5,15 +5,14 @@ import { basename, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { ATTACHMENT_LIMITS } from "@openbot/contracts/input-limits";
 import { redactText } from "@openbot/logging";
-import { Effect } from "effect";
+import { Effect, Exit, Fiber, Scope } from "effect";
 import {
   type AttachmentOperationError,
   attachmentCall,
   attachmentFailure,
-  attachmentResult,
   attachmentSync,
-  runAttachmentEffect,
 } from "../attachment-effects";
+import type { BrowserOperationError } from "../browser-effects";
 import { parseBrowserToolArguments } from "../browser-tools";
 import type { GeneratedAttachmentSource } from "../mailbox-store";
 import type { DynamicToolCallParams, DynamicToolResult } from "../protocol";
@@ -43,18 +42,27 @@ interface BrowserUploadReservation {
 export interface BrowserUploadHooks {
   onUploadTargetResolved?: (inputId: string, documentId: string) => void;
   onUploadAssigned?: (inputId: string, documentId: string) => void;
-  onUploadOperationStarted?: (completion: Promise<void>) => void;
+  onUploadOperationStarted?: (completion: Fiber.Fiber<void, BrowserOperationError>) => void;
 }
 
 /** The browser surface staging needs. `BrowserHost` satisfies it. */
 export interface BrowserUploadTarget {
-  resolveUploadTarget(params: DynamicToolCallParams): Promise<{ inputId: string; documentId: string }>;
-  handleDynamicTool(params: DynamicToolCallParams, hooks?: BrowserUploadHooks): Promise<DynamicToolResult>;
+  resolveUploadTarget(
+    params: DynamicToolCallParams,
+  ): Effect.Effect<{ inputId: string; documentId: string }, BrowserOperationError>;
+  handleDynamicTool(
+    params: DynamicToolCallParams,
+    hooks?: BrowserUploadHooks,
+  ): Effect.Effect<DynamicToolResult, BrowserOperationError>;
 }
 
 /** The file-opening half of `AttachmentGateway`, which owns the path policy this controller asks for. */
 export interface BrowserUploadSources {
-  openSources(agentId: string, paths: string[], scope: AttachmentSourceScope): Promise<GeneratedAttachmentSource[]>;
+  openSources(
+    agentId: string,
+    paths: string[],
+    scope: AttachmentSourceScope,
+  ): Effect.Effect<GeneratedAttachmentSource[], AttachmentOperationError>;
 }
 
 export interface BrowserUploadsOptions {
@@ -106,6 +114,7 @@ export class BrowserUploads {
   readonly #attachments: BrowserUploadSources;
   readonly #isStopping: () => boolean;
   readonly #hasTakeover: (agentId: string) => boolean;
+  #scope = Scope.makeUnsafe();
   readonly #roots = new Map<string, Map<string, BrowserUploadRoot[]>>();
   readonly #reservations = new Map<string, Map<symbol, BrowserUploadReservation>>();
 
@@ -116,28 +125,21 @@ export class BrowserUploads {
     this.#hasTakeover = options.hasTakeover;
   }
 
-  uploadFiles(agentId: string, params: DynamicToolCallParams): Promise<DynamicToolResult> {
-    return runAttachmentEffect(this.uploadFilesEffect(agentId, params));
-  }
-
-  readonly uploadFilesEffect = Effect.fn("BrowserUploads.uploadFiles")(function* (
+  readonly uploadFiles = Effect.fn("BrowserUploads.uploadFiles")(function* (
     this: BrowserUploads,
     agentId: string,
     params: DynamicToolCallParams,
   ): Effect.fn.Return<DynamicToolResult, AttachmentOperationError> {
-    try {
-      return attachmentResult(yield* Effect.result(this.#stageAndAssignEffect(agentId, params)));
-    } catch (error) {
-      // `BrowserHost.handleDynamicTool` redacts what it *returns*, but everything this controller does
-      // around that call -- resolving the target, opening the sources, the quotas, staging -- throws
-      // past it to the facade, which forwards `String(error)` to the provider unchanged. The page picks
-      // some of that text: an ambiguous semantic target names both candidates by accessible name, so
-      // two inputs labelled `Upload password=hunter2` put the password in the error.
-      return yield* attachmentFailure(new Error(redactText(error instanceof Error ? error.message : String(error))));
-    }
+    return yield* this.#stageAndAssign(agentId, params).pipe(
+      Effect.mapError((error) =>
+        attachmentFailure(
+          new Error(redactText(error.cause instanceof Error ? error.cause.message : String(error.cause))),
+        ),
+      ),
+    );
   });
 
-  readonly #stageAndAssignEffect = Effect.fn("BrowserUploads.stageAndAssign")(function* (
+  readonly #stageAndAssign = Effect.fn("BrowserUploads.stageAndAssign")(function* (
     this: BrowserUploads,
     agentId: string,
     params: DynamicToolCallParams,
@@ -145,15 +147,17 @@ export class BrowserUploads {
     const args = yield* attachmentSync(() => parseBrowserToolArguments("upload_files", params.arguments));
     const tabId = args.tabId;
     const paths = args.paths;
-    const uploadTarget = yield* attachmentCall(() => this.#browser.resolveUploadTarget(params));
+    const uploadTarget = yield* this.#browser
+      .resolveUploadTarget(params)
+      .pipe(Effect.mapError((error) => attachmentFailure(error.cause)));
     return yield* Effect.acquireUseRelease(
-      attachmentCall(() => this.#attachments.openSources(agentId, paths, UPLOAD_SCOPE)),
+      this.#attachments.openSources(agentId, paths, UPLOAD_SCOPE),
       (sources) =>
         Effect.gen({ self: this }, function* () {
           let stagingRoot: string | null = null;
           const reservationId = Symbol("browser-upload");
           let reservation: BrowserUploadReservation | null = null;
-          const uploadState: { completion?: Promise<void> } = {};
+          const uploadState: { completion?: Fiber.Fiber<void, BrowserOperationError> } = {};
           const releaseReservation = () => {
             if (!reservation) return;
             this.#releaseReservation(tabId, reservationId);
@@ -229,8 +233,8 @@ export class BrowserUploads {
             }
             if (reservation.invalidated)
               return yield* attachmentFailure(new Error("The browser document changed during upload staging."));
-            return yield* attachmentCall(() =>
-              this.#browser.handleDynamicTool(
+            return yield* this.#browser
+              .handleDynamicTool(
                 { ...params, arguments: { ...args, paths: stagedPaths } },
                 {
                   onUploadTargetResolved: (inputId, documentId) => {
@@ -272,27 +276,29 @@ export class BrowserUploads {
                     uploadState.completion = completion;
                   },
                 },
-              ),
-            );
+              )
+              .pipe(Effect.mapError((error) => attachmentFailure(error.cause)));
           }).pipe(
             Effect.ensuring(
               Effect.gen({ self: this }, function* () {
                 if (stagingRoot) {
                   const unassignedRoot = stagingRoot;
-                  const cleanup = () =>
-                    runAttachmentEffect(
-                      Effect.gen({ self: this }, function* () {
-                        if (stagingRoot !== unassignedRoot) return;
-                        stagingRoot = null;
-                        if (reservation) reservation.root = null;
-                        releaseReservation();
-                        yield* removeUploadRoot(unassignedRoot);
-                      }),
-                    );
+                  const cleanup = Effect.gen({ self: this }, function* () {
+                    if (stagingRoot !== unassignedRoot) return;
+                    stagingRoot = null;
+                    if (reservation) reservation.root = null;
+                    releaseReservation();
+                    yield* removeUploadRoot(unassignedRoot);
+                  });
                   // The tool can reject while the input-setting operation is still reading the staged files, so
                   // cleanup waits for it rather than pulling the directory out from under the renderer.
-                  if (uploadState.completion) void uploadState.completion.then(cleanup, cleanup);
-                  else yield* attachmentCall(() => cleanup());
+                  if (uploadState.completion)
+                    yield* Effect.forkIn(
+                      Fiber.await(uploadState.completion).pipe(Effect.andThen(cleanup)),
+                      this.#scope,
+                      { startImmediately: true, uninterruptible: true },
+                    );
+                  else yield* cleanup;
                 } else releaseReservation();
               }).pipe(Effect.orDie),
             ),
@@ -304,39 +310,42 @@ export class BrowserUploads {
   });
 
   /** A closed tab can never read its staged files again, so the tab roster shrinking frees them. */
-  retainTabs(tabs: readonly { id: string }[]): void {
+  readonly retainTabs = Effect.fn("BrowserUploads.retainTabs")(function* (
+    this: BrowserUploads,
+    tabs: readonly { id: string }[],
+  ) {
     const open = new Set(tabs.map((tab) => tab.id));
     for (const tabId of new Set([...this.#roots.keys(), ...this.#reservations.keys()])) {
       if (open.has(tabId)) continue;
-      this.#discardTab(tabId);
+      yield* this.#discardTab(tabId);
     }
-  }
+  });
 
   /**
    * Cancels staging for a removed document. Assigned files stay: a surviving parent document can
    * retain File objects from the document that navigated. The byte quotas continue to bound them.
    */
-  retainDocuments(tabId: string, documentIds: ReadonlySet<string>): void {
+  readonly retainDocuments = Effect.fn("BrowserUploads.retainDocuments")(function* (
+    this: BrowserUploads,
+    tabId: string,
+    documentIds: ReadonlySet<string>,
+  ) {
     const reservations = this.#reservations.get(tabId);
     if (reservations) {
       for (const [id, reservation] of reservations) {
         if (documentIds.has(reservation.documentId)) continue;
         reservations.delete(id);
         reservation.invalidated = true;
-        if (reservation.root) void Effect.runPromise(removeUploadRoot(reservation.root));
+        if (reservation.root) yield* removeUploadRoot(reservation.root);
       }
       if (reservations.size === 0) this.#reservations.delete(tabId);
     }
-  }
+  });
 
-  /** Deletes every staging directory. Awaited, because after this the process is expected to exit. */
-  dispose(): Promise<void> {
-    return runAttachmentEffect(this.disposeEffect());
-  }
-
-  readonly disposeEffect = Effect.fn("BrowserUploads.dispose")(function* (
+  readonly dispose = Effect.fn("BrowserUploads.dispose")(function* (
     this: BrowserUploads,
   ): Effect.fn.Return<void, AttachmentOperationError> {
+    yield* Scope.close(this.#scope, Exit.void);
     const roots = [...this.#roots.values()].flatMap((values) => [...values.values()].flat().map((root) => root.path));
     const reserved = [...this.#reservations.values()].flatMap((values) =>
       [...values.values()].flatMap((reservation) => {
@@ -347,7 +356,8 @@ export class BrowserUploads {
     this.#roots.clear();
     this.#reservations.clear();
     yield* Effect.forEach([...roots, ...reserved], removeUploadRoot, { concurrency: "unbounded" });
-  });
+    this.#scope = Scope.makeUnsafe();
+  }, Effect.uninterruptible);
 
   #reserve(tabId: string, id: symbol, reservation: BrowserUploadReservation): void {
     const roots = this.#roots.get(tabId);
@@ -392,17 +402,17 @@ export class BrowserUploads {
     if (reservations.size === 0) this.#reservations.delete(tabId);
   }
 
-  #discardTab(tabId: string): void {
+  readonly #discardTab = Effect.fn("BrowserUploads.discardTab")(function* (this: BrowserUploads, tabId: string) {
     const roots = this.#roots.get(tabId);
     this.#roots.delete(tabId);
     for (const root of [...(roots?.values() ?? [])].flat()) {
-      void Effect.runPromise(removeUploadRoot(root.path));
+      yield* removeUploadRoot(root.path);
     }
     const reservations = this.#reservations.get(tabId);
     this.#reservations.delete(tabId);
     for (const reservation of reservations?.values() ?? []) {
       reservation.invalidated = true;
-      if (reservation.root) void Effect.runPromise(removeUploadRoot(reservation.root));
+      if (reservation.root) yield* removeUploadRoot(reservation.root);
     }
-  }
+  });
 }

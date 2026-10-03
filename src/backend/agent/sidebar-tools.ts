@@ -3,8 +3,8 @@ import type { SidebarLayoutAction } from "@openbot/contracts/ipc";
 import { Effect } from "effect";
 import { z } from "zod";
 import type { SidebarLayoutStore } from "../sidebar-layout-store";
-import { type OpenBotToolResponse, openBotToolResult } from "./routine-tools";
-import { runTool, ToolOperationFailed, toolIo, toolStep } from "./tool-operation";
+import { openBotToolResult } from "./routine-tools";
+import { ToolOperationFailed, toolStep } from "./tool-operation";
 
 const sectionId = z.string().min(1).max(INPUT_LIMITS.identifier);
 const name = z.string().trim().min(1).max(INPUT_LIMITS.sidebarSectionName);
@@ -20,16 +20,7 @@ export const assignAgentSectionToolSchema = z
 
 export type AgentSidebar = Pick<SidebarLayoutStore, "getSnapshot" | "mutate" | "withProfileAssignment">;
 
-export function handleSidebarTool(
-  tool: string,
-  args: unknown,
-  sidebar: AgentSidebar | null,
-  agentIds: ReadonlySet<string>,
-): Promise<OpenBotToolResponse | null> {
-  return runTool(handleSidebarToolEffect(tool, args, sidebar, agentIds));
-}
-
-export const handleSidebarToolEffect = Effect.fn("SidebarTools.handle")(function* (
+export const handleSidebarTool = Effect.fn("SidebarTools.handle")(function* (
   tool: string,
   args: unknown,
   sidebar: AgentSidebar | null,
@@ -56,6 +47,10 @@ export const handleSidebarToolEffect = Effect.fn("SidebarTools.handle")(function
       return null;
   }
   if (!sidebar) return yield* new ToolOperationFailed({ cause: new Error("Sidebar sections are unavailable.") });
-  const layout = action ? yield* toolIo(() => sidebar.mutate(action, agentIds)) : sidebar.getSnapshot();
+  const layout = action
+    ? yield* sidebar
+        .mutate(action, agentIds)
+        .pipe(Effect.mapError((failure) => new ToolOperationFailed({ cause: failure.cause })))
+    : sidebar.getSnapshot();
   return openBotToolResult(layout);
 });

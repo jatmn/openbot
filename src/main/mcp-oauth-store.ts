@@ -1,30 +1,21 @@
+import { McpOperationError } from "../backend/mcp-effects";
 // The OAuth registrations and tokens of the http MCP servers this machine has signed in to,
 // encrypted at rest by the operating system.
 
 import { readFile, rm } from "node:fs/promises";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Result, Semaphore } from "effect";
 import { z } from "zod";
-import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
+import { writeFileAtomically } from "../backend/atomic-json-file";
 import { type McpOAuthRecord, type McpOAuthStorage, mcpOAuthRecordSchema } from "../backend/mcp-oauth-provider";
 import type { SecretCipher } from "./provider-credential-store";
 
-class McpStoreFailure extends Schema.TaggedError<McpStoreFailure>()("McpStoreFailure", {
-  cause: Schema.Defect(),
-}) {}
-
-function mcpIO<A>(operation: () => Promise<A>): Effect.Effect<A, McpStoreFailure> {
-  return Effect.tryPromise({ try: operation, catch: (cause) => new McpStoreFailure({ cause }) });
+function mcpIO<A>(operation: () => Promise<A>): Effect.Effect<A, McpOperationError> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new McpOperationError({ cause }) });
 }
 
-function mcpSync<A>(operation: () => A): Effect.Effect<A, McpStoreFailure> {
-  return Effect.try({ try: operation, catch: (cause) => new McpStoreFailure({ cause }) });
-}
-
-async function runMcp<A>(operation: Effect.Effect<A, McpStoreFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
+function mcpSync<A>(operation: () => A): Effect.Effect<A, McpOperationError> {
+  return Effect.try({ try: operation, catch: (cause) => new McpOperationError({ cause }) });
 }
 
 /**
@@ -65,7 +56,7 @@ export class McpOAuthStore implements McpOAuthStorage {
    */
   #unreadableServers: Record<string, string> | null = null;
   /** The change in progress, so a read-modify-write never overlaps another. See `#enqueue`. */
-  #queue: Promise<void> = Promise.resolve();
+  #queue = Semaphore.makeUnsafe(1);
 
   constructor(path: string, cipher: SecretCipher) {
     this.#path = path;
@@ -79,23 +70,21 @@ export class McpOAuthStore implements McpOAuthStorage {
    * its own headers still starts, and the file stays as it is: a keychain that refuses once must
    * not cost the user six sign-ins, so only a sign-in that succeeds replaces it.
    */
-  load(): Promise<Error | null> {
-    return runMcp(
-      Effect.gen({ self: this }, function* () {
-        this.#records = new Map();
-        this.#loadError = null;
-        this.#unreadableServers = null;
-        const result = yield* Effect.result(this.#read());
-        if (Result.isSuccess(result)) this.#records = result.success;
-        else
-          this.#loadError =
-            result.failure.cause instanceof Error
-              ? result.failure.cause
-              : new Error(sourceText("error.mcp.signInFileUnreadable"));
-        this.#loaded = true;
-        return this.#loadError;
-      }),
-    );
+  load(): Effect.Effect<Error | null> {
+    return Effect.gen({ self: this }, function* () {
+      this.#records = new Map();
+      this.#loadError = null;
+      this.#unreadableServers = null;
+      const result = yield* Effect.result(this.#read());
+      if (Result.isSuccess(result)) this.#records = result.success;
+      else
+        this.#loadError =
+          result.failure.cause instanceof Error
+            ? result.failure.cause
+            : new Error(sourceText("error.mcp.signInFileUnreadable"));
+      this.#loaded = true;
+      return this.#loadError;
+    });
   }
 
   /** The stored record, or `null`. Throws when `load` has not run, rather than reporting none. */
@@ -104,7 +93,7 @@ export class McpOAuthStore implements McpOAuthStorage {
     return this.#records.get(resource) ?? null;
   }
 
-  write(resource: string, record: McpOAuthRecord): Promise<void> {
+  write(resource: string, record: McpOAuthRecord): Effect.Effect<void, McpOperationError> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         yield* this.#reloadIfUnreadable();
@@ -114,7 +103,7 @@ export class McpOAuthStore implements McpOAuthStorage {
         // already gave a temporarily locked keychain its chance, and a corrupt file (nothing to
         // keep) still takes the replacement path below.
         if (this.#loadError && this.#unreadableServers) {
-          return yield* new McpStoreFailure({ cause: new Error(sourceText("error.mcp.signInFileUnreadable")) });
+          return yield* new McpOperationError({ cause: new Error(sourceText("error.mcp.signInFileUnreadable")) });
         }
         const next = yield* mcpSync(() => this.#editableRecords());
         // An empty record is the absence of one. `invalidateCredentials("all")` arrives as a clear, and
@@ -130,11 +119,11 @@ export class McpOAuthStore implements McpOAuthStorage {
     );
   }
 
-  clear(resource: string): Promise<void> {
+  clear(resource: string): Effect.Effect<void, McpOperationError> {
     return this.#enqueue(
       Effect.gen({ self: this }, function* () {
         if (!this.#loaded)
-          return yield* new McpStoreFailure({ cause: new Error("The MCP sign-in store is not loaded.") });
+          return yield* new McpOperationError({ cause: new Error("The MCP sign-in store is not loaded.") });
         yield* this.#reloadIfUnreadable();
         // An envelope this build cannot read holds nothing this can remove, and the file stays where
         // it is: removing one server row is not the user asking to lose the sign-ins of the other
@@ -173,12 +162,8 @@ export class McpOAuthStore implements McpOAuthStorage {
    * and rename the same temporary file. Chaining makes the copy a change starts from the one the
    * change before it wrote.
    */
-  #enqueue(change: Effect.Effect<void, McpStoreFailure>): Promise<void> {
-    const execute = () => runMcp(change.pipe(Effect.uninterruptible));
-    const result = this.#queue.then(execute, execute);
-    // A change that fails must not fail the one after it; its own caller still sees the rejection.
-    this.#queue = result.catch(() => undefined);
-    return result;
+  #enqueue(change: Effect.Effect<void, McpOperationError>): Effect.Effect<void, McpOperationError> {
+    return this.#queue.withPermit(Effect.uninterruptible(change));
   }
 
   /**
@@ -208,7 +193,7 @@ export class McpOAuthStore implements McpOAuthStorage {
       Effect.catch(({ cause }) =>
         cause instanceof Error && "code" in cause && cause.code === "ENOENT"
           ? Effect.succeed(null)
-          : Effect.fail(new McpStoreFailure({ cause })),
+          : Effect.fail(new McpOperationError({ cause })),
       ),
     );
     if (source === null) {
@@ -251,8 +236,8 @@ export class McpOAuthStore implements McpOAuthStorage {
         servers[resource] = this.#cipher.encrypt(JSON.stringify(record)).toString("base64");
       return `${JSON.stringify({ version: 1, servers })}\n`;
     });
-    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
-      Effect.mapError(({ cause }) => new McpStoreFailure({ cause })),
+    yield* writeFileAtomically(this.#path, content, { createDirectory: true }).pipe(
+      Effect.mapError(({ cause }) => new McpOperationError({ cause })),
     );
   });
 }

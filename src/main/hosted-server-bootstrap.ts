@@ -15,7 +15,7 @@ import { parseHostedServerList } from "@openbot/contracts/hosted-servers";
 import type { CentralAuthState, CentralAuthUser } from "@openbot/contracts/ipc";
 import { Effect } from "effect";
 import type { CentralAuthManager } from "./central-auth-manager";
-import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
+import { RemoteWorkflowError } from "./remote-service-effects";
 import type { TeamStore } from "./team-store";
 
 const HOST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -46,23 +46,20 @@ export function takeHostedServerEnvironment(
 export interface HostedServerAccountOptions {
   environment: HostedServerEnvironment;
   centralAuth: Pick<CentralAuthManager, "canPersistSession" | "redeemHostedServerClaim" | "requestAuthorized">;
-  centralAuthInitialization: Promise<CentralAuthState>;
+  centralAuthInitialization: Effect.Effect<CentralAuthState, RemoteWorkflowError>;
   teamStore: Pick<
     TeamStore,
     "activateAccount" | "configured" | "configureWithAccount" | "getIdentity" | "setEnabledOnLaunch"
   >;
 }
 
-export function applyHostedServerAccount(input: HostedServerAccountOptions): Promise<void> {
-  return runRemoteWorkflow(applyHostedServerAccountEffect(input));
-}
-export const applyHostedServerAccountEffect = Effect.fn("HostedServer.applyAccount")(function* ({
+export const applyHostedServerAccount = Effect.fn("HostedServer.applyAccount")(function* ({
   environment,
   centralAuth,
   centralAuthInitialization,
   teamStore,
 }: HostedServerAccountOptions) {
-  const state = yield* remoteCall(() => centralAuthInitialization);
+  const state = yield* centralAuthInitialization;
   let user: CentralAuthUser;
   let serverName: string | null = null;
   if (state.status === "signed_in") {
@@ -81,18 +78,20 @@ export const applyHostedServerAccountEffect = Effect.fn("HostedServer.applyAccou
         cause: new Error("The hosted server has no secret storage for its session."),
       });
     const claim = environment.claim;
-    const redeemed = yield* remoteCall(() => centralAuth.redeemHostedServerClaim(claim));
+    const redeemed = yield* centralAuth
+      .redeemHostedServerClaim(claim)
+      .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
     if (redeemed.hostId !== environment.hostId)
       return yield* new RemoteWorkflowError({ cause: new Error("The claim is for a different hosted server.") });
     user = redeemed.user;
     serverName = redeemed.name;
   }
-  yield* remoteCall(() => teamStore.activateAccount(user));
+  yield* teamStore.activateAccount(user);
   if (!teamStore.configured) {
     // A start that stopped after the claim and before this point has a session and no name.
-    serverName ??= yield* hostedServerNameEffect(centralAuth, environment.hostId);
+    serverName ??= yield* hostedServerName(centralAuth, environment.hostId);
     const name = serverName;
-    yield* remoteCall(() => teamStore.configureWithAccount(name, user, undefined, { serverId: environment.hostId }));
+    yield* teamStore.configureWithAccount(name, user, undefined, { serverId: environment.hostId });
   }
   const identity = teamStore.getIdentity();
   if (identity?.serverId !== environment.hostId) {
@@ -100,20 +99,20 @@ export const applyHostedServerAccountEffect = Effect.fn("HostedServer.applyAccou
       cause: new Error("The configured host is not the hosted server that this VM was created for."),
     });
   }
-  if (!identity.enabledOnLaunch) yield* remoteCall(() => teamStore.setEnabledOnLaunch(identity.serverId, true));
+  if (!identity.enabledOnLaunch) yield* teamStore.setEnabledOnLaunch(identity.serverId, true);
 });
 
-const hostedServerNameEffect = Effect.fn("HostedServer.name")(function* (
+const hostedServerName = Effect.fn("HostedServer.name")(function* (
   centralAuth: Pick<CentralAuthManager, "requestAuthorized">,
   hostId: string,
 ) {
-  const list = yield* remoteCall(() =>
-    centralAuth.requestAuthorized("/v2/hosting/servers/", { method: "GET" }, (value) => {
+  const list = yield* centralAuth
+    .requestAuthorized("/v2/hosting/servers/", { method: "GET" }, (value) => {
       const parsed = parseHostedServerList(value);
       if (!parsed) throw new Error("Invalid hosted server list.");
       return parsed;
-    }),
-  );
+    })
+    .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
   const server = list.servers.find((entry) => entry.serverId === hostId);
   if (!server)
     return yield* new RemoteWorkflowError({

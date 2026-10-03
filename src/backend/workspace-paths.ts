@@ -5,12 +5,7 @@ import type { AgentSummary } from "@openbot/contracts/ipc";
 import { legacyAgentId } from "@openbot/contracts/validation";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
-import {
-  type AttachmentOperationError,
-  attachmentCall,
-  attachmentFailure,
-  runAttachmentEffect,
-} from "./attachment-effects";
+import { type AttachmentOperationError, attachmentCall, attachmentFailure } from "./attachment-effects";
 import { isRecord } from "./protocol";
 
 export interface ResolvedSharedFile {
@@ -103,11 +98,7 @@ function decodePath(value: string): string {
     return value;
   }
 }
-
-export function resolveSharedFile(sharedRootPath: string, inputPath: string): Promise<ResolvedSharedFile> {
-  return runAttachmentEffect(resolveSharedFileEffect(sharedRootPath, inputPath));
-}
-export const resolveSharedFileEffect = Effect.fn("Workspace.resolveSharedFile")(function* (
+export const resolveSharedFile = Effect.fn("Workspace.resolveSharedFile")(function* (
   sharedRootPath: string,
   inputPath: string,
 ): Effect.fn.Return<ResolvedSharedFile, AttachmentOperationError> {
@@ -121,33 +112,20 @@ export const resolveSharedFileEffect = Effect.fn("Workspace.resolveSharedFile")(
   if (!metadata.isFile()) return yield* attachmentFailure(new Error(sourceText("error.backend.sharedPathNotFile")));
   return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size };
 });
-
-/**
- * `allowOutside` is for the local desktop only, and only for an agent with full computer access: that
- * agent could already read the file. The Team API and the web client never pass it, so a remote member
- * still reaches nothing outside the workspace.
- */
-export function resolveWorkspaceFile(
-  agent: Pick<AgentSummary, "id" | "workspacePath">,
-  inputPath: string,
-  options: { allowOutside?: boolean } = {},
-): Promise<ResolvedWorkspaceFile> {
-  return runAttachmentEffect(resolveWorkspaceFileEffect(agent, inputPath, options));
-}
-export const resolveWorkspaceFileEffect = Effect.fn("Workspace.resolveWorkspaceFile")(function* (
+export const resolveWorkspaceFile = Effect.fn("Workspace.resolveWorkspaceFile")(function* (
   agent: Pick<AgentSummary, "id" | "workspacePath">,
   inputPath: string,
   options: { allowOutside?: boolean } = {},
 ): Effect.fn.Return<ResolvedWorkspaceFile, AttachmentOperationError> {
   const workspaceRoot = yield* attachmentCall(() => realpath(agent.workspacePath));
   const candidatePath = workspacePathFromInput(agent.workspacePath, agent.id, inputPath);
-  const resolvedPath = yield* realpathWithLegacyRootEffect(agent, candidatePath).pipe(
+  const resolvedPath = yield* realpathWithLegacyRoot(agent, candidatePath).pipe(
     Effect.catch((error) => {
       // The literal path goes first, so a real file named `notes:2` still opens.
       const withoutLocation = candidatePath.replace(LOCATION_SUFFIX, "");
       if (!isRecord(error.cause) || error.cause.code !== "ENOENT" || withoutLocation === candidatePath)
         return Effect.fail(error);
-      return realpathWithLegacyRootEffect(agent, withoutLocation);
+      return realpathWithLegacyRoot(agent, withoutLocation);
     }),
   );
   const insideWorkspace = isWithin(workspaceRoot, resolvedPath);
@@ -159,7 +137,7 @@ export const resolveWorkspaceFileEffect = Effect.fn("Workspace.resolveWorkspaceF
   return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size, insideWorkspace };
 });
 
-const realpathWithLegacyRootEffect = Effect.fn("Workspace.realpathWithLegacyRoot")(function* (
+const realpathWithLegacyRoot = Effect.fn("Workspace.realpathWithLegacyRoot")(function* (
   agent: Pick<AgentSummary, "id" | "workspacePath">,
   candidatePath: string,
 ): Effect.fn.Return<string, AttachmentOperationError> {

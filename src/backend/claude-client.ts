@@ -17,7 +17,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { defaultProviderModel } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import {
   type ClaudePlanState,
   foldClaudePlanCall,
@@ -33,8 +33,8 @@ import {
   CLAUDE_WORKSPACE_MANAGED_SETTINGS,
   claudeWorkspaceHooks,
   claudeWorkspaceSandbox,
-  claudeWorkspaceSkillPluginEffect,
-  claudeWriteOutsideRootsEffect,
+  claudeWorkspaceSkillPlugin,
+  claudeWriteOutsideRoots,
 } from "./claude-workspace-sandbox";
 import { type ClaudeCliInfo, claudeTakesPromptSnapshotFlag, cliSpawnTarget } from "./cli";
 import { isClaudeTaskNotification } from "./conversation-snapshots";
@@ -67,7 +67,7 @@ import {
   type TurnResponse,
 } from "./protocol";
 import {
-  type ProviderClientOperationError,
+  ProviderClientOperationError,
   providerCall,
   providerFailure,
   providerResult,
@@ -133,7 +133,7 @@ interface ThreadRuntime {
   input: AsyncMessageQueue;
   query: ClaudeQuery;
   activeTurn: ActiveTurn | null;
-  consume: Promise<void>;
+  consume: Fiber.Fiber<void, ProviderClientOperationError> | null;
   idleRelease: ReturnType<typeof setTimeout> | null;
   idleSince: number;
   /** The plan Claude keeps with its todo and task tools, which OpenBot shows as a task list. */
@@ -199,6 +199,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
   readonly #agentEnvironment: ((inherited?: NodeJS.ProcessEnv) => Readonly<Record<string, string>>) | undefined;
   /** Threads whose process was closed for being idle keep the config that resumes them. */
   readonly #threads = new IdleThreadPool<ThreadRuntime, ThreadConfig>({
+    scope: () => this.#scope,
     releaseAfterMs: CLAUDE_THREAD_IDLE_RELEASE_MS,
     idleLimit: CLAUDE_IDLE_THREAD_LIMIT,
     // A session that is not persisted has nothing on disk to resume from.
@@ -211,8 +212,9 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
   readonly #modelEffortCapabilities = new Map<string, ClaudeEffortCapability>();
   readonly #modelSdkValues = new Map<string, string>();
   /** Resumes of one thread run one after another: two at once would leave a query nobody closes. */
-  readonly #threadResumes = new Map<string, Promise<void>>();
+  readonly #threadResumes = new Map<string, Deferred.Deferred<void, ProviderClientOperationError>>();
   #running = false;
+  #scope = Scope.makeUnsafe();
 
   constructor(
     cli: ClaudeCliInfo,
@@ -244,14 +246,12 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
   }
 
   start(): void {
+    if (this.#running) return;
+    if (this.#scope.state._tag === "Closed") this.#scope = Scope.makeUnsafe();
     this.#running = true;
   }
 
-  stop(): Promise<void> {
-    return runProviderClientEffect(this.#stopOperation());
-  }
-
-  readonly #stopOperation = Effect.fn("ClaudeAgentClient.stop")(function* (
+  readonly stop = Effect.fn("ClaudeAgentClient.stop")(function* (
     this: ClaudeAgentClient,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#running = false;
@@ -260,12 +260,17 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       runtime.input.close();
       runtime.query.close();
     }
-    yield* providerCall(() => Promise.allSettled(runtimes.map((runtime) => runtime.consume)));
+    yield* Effect.forEach(
+      runtimes,
+      (runtime) => (runtime.consume ? Fiber.join(runtime.consume).pipe(Effect.ignore) : Effect.void),
+      { concurrency: "unbounded", discard: true },
+    );
+    yield* Scope.close(this.#scope, Exit.void);
     this.#serverRequests.rejectAll("Claude session stopped.");
   });
 
-  releaseIdleThreads(): void {
-    this.#threads.releaseIdle();
+  releaseIdleThreads(): Effect.Effect<void, ProviderClientOperationError> {
+    return this.#threads.releaseIdle();
   }
 
   /**
@@ -273,25 +278,20 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
    * of that thread, so the close is what ends those child processes. The caller releases an idle
    * thread: a turn that still runs would end with the query that carries it.
    */
-  releaseThread(threadId: string): Promise<void> {
-    return runProviderClientEffect(this.#releaseThreadOperation(threadId));
-  }
 
-  readonly #releaseThreadOperation = Effect.fn("ClaudeAgentClient.releaseThread")(function* (
+  readonly releaseThread = Effect.fn("ClaudeAgentClient.releaseThread")(function* (
     this: ClaudeAgentClient,
     threadId: string,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#threads.forget(threadId);
     const runtime = this.#threads.get(threadId);
     if (!runtime) return;
-    yield* providerCall(() => this.#threads.close(runtime));
+    yield* this.#threads
+      .close(runtime)
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
   });
 
-  #closeRuntime(runtime: ThreadRuntime): Promise<void> {
-    return runProviderClientEffect(this.#closeRuntimeEffect(runtime));
-  }
-
-  readonly #closeRuntimeEffect = Effect.fn("ClaudeAgentClient.closeRuntime")(function* (
+  readonly #closeRuntime = Effect.fn("ClaudeAgentClient.closeRuntime")(function* (
     this: ClaudeAgentClient,
     runtime: ThreadRuntime,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
@@ -299,15 +299,10 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     runtime.query.close();
     // The consumer rejects when the query ends in the middle of a turn. The runtime is already gone
     // from the map, so there is nothing left to report it against.
-    yield* providerCall(() => runtime.consume.catch(() => undefined));
+    if (runtime.consume) yield* Fiber.join(runtime.consume).pipe(Effect.ignore);
   });
 
-  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T>;
-  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
-    return runProviderClientEffect(this.#requestOperation(method, params, decoder, timeoutMs));
-  }
-
-  readonly #requestOperation = Effect.fn("ClaudeAgentClient.request")(function* <T>(
+  readonly request = Effect.fn("ClaudeAgentClient.request")(function* <T>(
     this: ClaudeAgentClient,
     method: string,
     params: unknown,
@@ -318,7 +313,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
 
     switch (method) {
       case "initialize":
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       case "account/read": {
         const response = yield* this.#readAccountEffect();
         return yield* providerSync(() => decoder(response));
@@ -332,28 +327,26 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         return yield* providerSync(() => decoder(response));
       }
       case "plugin/list":
-        return yield* providerCall(() => decoder({ marketplaces: [] }));
+        return yield* providerSync(() => decoder({ marketplaces: [] }));
       case "thread/start": {
         const threadId = randomUUID();
-        yield* this.#startThreadEffect(threadId, readThreadConfig(params), false);
-        return yield* providerCall(() => decoder({ thread: { id: threadId } }));
+        yield* this.#startThread(threadId, readThreadConfig(params), false);
+        return yield* providerSync(() => decoder({ thread: { id: threadId } }));
       }
       case "thread/resume": {
         const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         const config = readThreadConfig(params);
-        const previous = this.#threadResumes.get(threadId) ?? Promise.resolve();
-        const resume = previous.catch(() => undefined).then(() => this.#resumeThread(threadId, config));
-        this.#threadResumes.set(threadId, resume);
+        const previous = this.#threadResumes.get(threadId);
+        const completion = Deferred.makeUnsafe<void, ProviderClientOperationError>();
+        this.#threadResumes.set(threadId, completion);
         yield* Effect.gen({ self: this }, function* () {
-          yield* providerCall(() => resume);
-        }).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (this.#threadResumes.get(threadId) === resume) this.#threadResumes.delete(threadId);
-            }),
-          ),
-        );
-        return yield* providerCall(() => decoder({ thread: { id: threadId } }));
+          if (previous) yield* Deferred.await(previous).pipe(Effect.ignore);
+          const exit = yield* Effect.exit(this.#resumeThread(threadId, config));
+          yield* Deferred.done(completion, exit);
+          if (this.#threadResumes.get(threadId) === completion) this.#threadResumes.delete(threadId);
+          yield* exit;
+        }).pipe(Effect.uninterruptible);
+        return yield* providerSync(() => decoder({ thread: { id: threadId } }));
       }
       case "thread/read": {
         const response = yield* this.#readThreadEffect(requiredString(params, "threadId"));
@@ -370,14 +363,14 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       case "turn/interrupt": {
         const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         // A released thread has no turn to stop.
-        if (this.#threads.isReleased(threadId)) return yield* providerCall(() => decoder({}));
+        if (this.#threads.isReleased(threadId)) return yield* providerSync(() => decoder({}));
         const runtime = yield* providerSync(() => this.#requireThread(threadId));
         yield* providerCall(() => runtime.query.interrupt());
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       }
       case "thread/compact/start":
         // Claude Code manages its own context compaction.
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       default:
         return yield* providerFailure(new Error(`Claude adapter does not implement ${method}.`));
     }
@@ -423,24 +416,16 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         options: this.#probeOptions(),
       }),
     );
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     return yield* Effect.gen({ self: this }, function* () {
-      const discovery = claudeQuery.supportedModels();
-      const discovered =
-        timeoutMs === undefined
-          ? yield* providerCall(() => discovery)
-          : yield* providerCall(() =>
-              Promise.race([
-                discovery,
-                new Promise<ModelInfo[]>((_, reject) => {
-                  timeout = setTimeout(() => {
-                    input.close();
-                    claudeQuery.close();
-                    reject(new RequestTimeoutError("Claude", "model/list"));
-                  }, timeoutMs);
-                }),
-              ]),
-            );
+      const discovery = providerCall(() => claudeQuery.supportedModels());
+      const discovered = yield* timeoutMs === undefined
+        ? discovery
+        : discovery.pipe(
+            Effect.timeoutOrElse({
+              duration: timeoutMs,
+              orElse: () => Effect.fail(providerFailure(new RequestTimeoutError("Claude", "model/list"))),
+            }),
+          );
       const models = new Map<string, (typeof discovered)[number]>();
       for (const model of discovered) {
         const id = model.resolvedModel?.trim() || model.value.trim();
@@ -476,11 +461,10 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       this.#modelSdkValues.clear();
       for (const [id, capability] of effortCapabilities) this.#modelEffortCapabilities.set(id, capability);
       for (const [id, value] of sdkValues) this.#modelSdkValues.set(id, value);
-      return yield* providerCall(() => result);
+      return yield* providerSync(() => result);
     }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
-          if (timeout) clearTimeout(timeout);
           input.close();
           claudeQuery.close();
         }),
@@ -500,27 +484,19 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         options: this.#probeOptions(),
       }),
     );
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     return yield* Effect.gen({ self: this }, function* () {
       const readUsage = claudeQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
       if (!readUsage) return { rateLimits: null, rateLimitsByLimitId: null };
-      const usage = yield* providerCall(() =>
-        Promise.race([
-          readUsage.call(claudeQuery),
-          new Promise<unknown>((_, reject) => {
-            timeout = setTimeout(() => {
-              input.close();
-              claudeQuery.close();
-              reject(new RequestTimeoutError("Claude", "account/rateLimits/read"));
-            }, timeoutMs);
-          }),
-        ]),
+      const usage = yield* providerCall(() => readUsage.call(claudeQuery)).pipe(
+        Effect.timeoutOrElse({
+          duration: timeoutMs,
+          orElse: () => Effect.fail(providerFailure(new RequestTimeoutError("Claude", "account/rateLimits/read"))),
+        }),
       );
-      return yield* providerCall(() => claudeRateLimits(usage, model));
+      return yield* providerSync(() => claudeRateLimits(usage, model));
     }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
-          if (timeout) clearTimeout(timeout);
           input.close();
           claudeQuery.close();
         }),
@@ -573,18 +549,14 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       stdout = isRecord(error) ? error.stdout : undefined;
     }
     const status = parseAuthStatus(stdout);
-    if (status && (failure === null || status.loggedIn === false)) return yield* providerCall(() => status);
+    if (status && (failure === null || status.loggedIn === false)) return yield* providerSync(() => status);
     // `execFile` marks a child it stopped at its timeout: a busy computer, not a failed check.
     if (isDynamicRecord(failure) && failure.killed === true)
       return yield* providerFailure(new RequestTimeoutError("Claude", "account/read"));
     return yield* providerFailure(failure ?? new Error("Claude returned an unreadable sign-in status."));
   });
 
-  #resumeThread(threadId: string, config: ThreadConfig): Promise<void> {
-    return runProviderClientEffect(this.#resumeThreadEffect(threadId, config));
-  }
-
-  readonly #resumeThreadEffect = Effect.fn("ClaudeAgentClient.resumeThread")(function* (
+  readonly #resumeThread = Effect.fn("ClaudeAgentClient.resumeThread")(function* (
     this: ClaudeAgentClient,
     threadId: string,
     config: ThreadConfig,
@@ -592,24 +564,26 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     // A turn can open a released thread again at each await here: that query is the one to
     // compare, not a second one, so the check runs again until this resume opens the thread.
     for (;;) {
-      yield* providerCall(() => this.#threads.opened(threadId));
+      yield* this.#threads.opened(threadId);
       const current = this.#threads.get(threadId);
       if (current && JSON.stringify(current.config) === JSON.stringify(config)) return;
       if (current) {
         if (current.activeTurn) return yield* providerFailure(new Error(sourceText("error.provider.claudeTurnActive")));
-        yield* providerCall(() => this.#threads.close(current));
+        yield* this.#threads
+          .close(current)
+          .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
         continue;
       }
-      if (yield* providerCall(() => this.#threads.opening(threadId, () => this.#startThread(threadId, config, true))))
+      if (
+        yield* this.#threads
+          .opening(threadId, () => this.#startThread(threadId, config, true))
+          .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })))
+      )
         return;
     }
   });
 
-  #startThread(threadId: string, config: ThreadConfig, resume: boolean): Promise<void> {
-    return runProviderClientEffect(this.#startThreadEffect(threadId, config, resume));
-  }
-
-  readonly #startThreadEffect = Effect.fn("ClaudeAgentClient.startThread")(function* (
+  readonly #startThread = Effect.fn("ClaudeAgentClient.startThread")(function* (
     this: ClaudeAgentClient,
     threadId: string,
     config: ThreadConfig,
@@ -622,7 +596,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         Effect.gen({ self: this }, function* () {
           if (config.profileGeneration) return { behavior: "deny", message: "Profile generation has no tools." };
           if (config.workspaceOnly) {
-            const outside = yield* claudeWriteOutsideRootsEffect(
+            const outside = yield* claudeWriteOutsideRoots(
               toolName,
               toolInput,
               config.cwd,
@@ -650,19 +624,15 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     const handoff = config.profileGeneration
       ? null
       : claudeMcpServers(
-          yield* providerCall(() =>
-            usableMcpServers(
-              agentMcpServers(this.#mcpServers(), config.computerUse),
-              this.#mcpToolRuntimes?.(),
-              this.#mcpAuthorization,
-            ),
-          ),
+          yield* usableMcpServers(
+            agentMcpServers(this.#mcpServers(), config.computerUse),
+            this.#mcpToolRuntimes?.(),
+            this.#mcpAuthorization,
+          ).pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause }))),
         );
     const stateDirectory = this.#stateDirectory;
     const skillPlugin =
-      config.workspaceOnly && stateDirectory
-        ? yield* claudeWorkspaceSkillPluginEffect(stateDirectory, config.cwd)
-        : null;
+      config.workspaceOnly && stateDirectory ? yield* claudeWorkspaceSkillPlugin(stateDirectory, config.cwd) : null;
     // `stop()` may have run during the await: a query created now would outlive the client.
     if (!this.#running) return yield* providerFailure(new Error("Claude Agent SDK is not running."));
     if (handoff) this.#reportMcpDrops?.(this.provider, handoff.dropped);
@@ -736,12 +706,12 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       input,
       query: claudeQuery,
       activeTurn: null,
-      consume: Promise.resolve(),
+      consume: null,
       idleRelease: null,
       idleSince: 0,
       plan: newClaudePlanState(),
     };
-    runtime.consume = this.#consume(runtime);
+    runtime.consume = yield* Effect.forkIn(this.#consume(runtime), this.#scope, { startImmediately: true });
     this.#threads.add(runtime);
   });
 
@@ -750,19 +720,19 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     params: unknown,
   ): Effect.fn.Return<TurnResponse, ProviderClientOperationError> {
     const threadId = yield* providerSync(() => requiredString(params, "threadId"));
-    return yield* providerCall(() => this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params)));
+    return yield* this.#threads
+      .startTurn(threadId, () => this.#openTurn(threadId, params))
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
   });
 
-  #openTurn(threadId: string, params: unknown): Promise<TurnResponse> {
-    return runProviderClientEffect(this.#openTurnEffect(threadId, params));
-  }
-
-  readonly #openTurnEffect = Effect.fn("ClaudeAgentClient.openTurn")(function* (
+  readonly #openTurn = Effect.fn("ClaudeAgentClient.openTurn")(function* (
     this: ClaudeAgentClient,
     threadId: string,
     params: unknown,
   ): Effect.fn.Return<TurnResponse, ProviderClientOperationError> {
-    yield* providerCall(() => this.#threads.wake(threadId));
+    yield* this.#threads
+      .wake(threadId)
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     const runtime = yield* providerSync(() => this.#requireThread(threadId));
     if (runtime.activeTurn) return yield* providerFailure(new Error("The Claude thread already has an active turn."));
 
@@ -845,11 +815,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     return { turnId: runtime.activeTurn.id };
   });
 
-  #consume(runtime: ThreadRuntime): Promise<void> {
-    return runProviderClientEffect(this.#consumeEffect(runtime));
-  }
-
-  readonly #consumeEffect = Effect.fn("ClaudeAgentClient.consume")(function* (
+  readonly #consume = Effect.fn("ClaudeAgentClient.consume")(function* (
     this: ClaudeAgentClient,
     runtime: ThreadRuntime,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
@@ -867,7 +833,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
                     complete = true;
                     break;
                   }
-                  yield* providerSync(() => this.#handleMessage(runtime, next.value));
+                  yield* this.#handleMessage(runtime, next.value);
                 }
               }),
             (iterator) => (complete ? Effect.void : providerCall(() => iterator.return?.()).pipe(Effect.asVoid)),
@@ -880,7 +846,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     } catch (error) {
       if (!this.#running || this.#threads.get(runtime.id) !== runtime) return;
       const activeTurn = runtime.activeTurn;
-      if (activeTurn) this.#completeTurn(runtime, "failed", error);
+      if (activeTurn) yield* this.#completeTurn(runtime, "failed", error);
       this.#fail(error instanceof Error ? error : new Error(String(error)));
     }
   });
@@ -891,7 +857,11 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     this.emit("exit", error);
   }
 
-  #handleMessage(runtime: ThreadRuntime, message: ClaudeStreamMessage): void {
+  readonly #handleMessage = Effect.fn("ClaudeAgentClient.handleMessage")(function* (
+    this: ClaudeAgentClient,
+    runtime: ThreadRuntime,
+    message: ClaudeStreamMessage,
+  ) {
     if (message.type === "stream_event" && message.parent_tool_use_id === null) {
       const event = message.event;
       const delta = isRecord(event) ? event.delta : null;
@@ -997,8 +967,8 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       message.terminal_reason === "aborted_tools" ||
       errors.some((error) => /interrupt|abort/i.test(error));
     const status = interrupted ? "interrupted" : message.subtype === "success" ? "completed" : "failed";
-    this.#completeTurn(runtime, status, errors.length > 0 ? errors.join("\n") : null);
-  }
+    yield* this.#completeTurn(runtime, status, errors.length > 0 ? errors.join("\n") : null);
+  });
 
   #emitToolCall(runtime: ThreadRuntime, id: string, name: string, completed: boolean): void {
     const turn = runtime.activeTurn;
@@ -1142,7 +1112,12 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     turn.text = turn.text.slice(text.length);
   }
 
-  #completeTurn(runtime: ThreadRuntime, status: string, error: unknown): void {
+  readonly #completeTurn = Effect.fn("ClaudeAgentClient.completeTurn")(function* (
+    this: ClaudeAgentClient,
+    runtime: ThreadRuntime,
+    status: string,
+    error: unknown,
+  ) {
     const turn = runtime.activeTurn;
     if (!turn) return;
     if (turn.thinkingStarted) {
@@ -1174,8 +1149,8 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       params: { threadId: runtime.id, turn: { id: turn.id, status } },
     });
     runtime.activeTurn = null;
-    this.#threads.markIdle(runtime);
-  }
+    yield* this.#threads.markIdle(runtime);
+  });
 
   readonly #readThreadEffect = Effect.fn("ClaudeAgentClient.readThread")(function* (
     this: ClaudeAgentClient,
@@ -1274,7 +1249,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
 
   #createOpenBotServers(threadId: string) {
     const call = (namespace: string, name: string, args: unknown) =>
-      this.#callDynamicTool(threadId, namespace, name, args);
+      runProviderClientEffect(this.#callDynamicTool(threadId, namespace, name, args));
     return {
       openbot_browser: createSdkMcpServer({
         name: OPENBOT_BROWSER_NAMESPACE,
@@ -1298,11 +1273,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     };
   }
 
-  #callDynamicTool(threadId: string, namespace: string, name: string, args: unknown): Promise<CallToolResult> {
-    return runProviderClientEffect(this.#callDynamicToolEffect(threadId, namespace, name, args));
-  }
-
-  readonly #callDynamicToolEffect = Effect.fn("ClaudeAgentClient.callDynamicTool")(function* (
+  readonly #callDynamicTool = Effect.fn("ClaudeAgentClient.callDynamicTool")(function* (
     this: ClaudeAgentClient,
     threadId: string,
     namespace: string,
@@ -1310,16 +1281,16 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     args: unknown,
   ): Effect.fn.Return<CallToolResult, ProviderClientOperationError> {
     const runtime = yield* providerSync(() => this.#requireThread(threadId));
-    const result = yield* providerCall(() =>
-      this.#serverRequests.call("item/tool/call", {
+    const result = yield* this.#serverRequests
+      .call("item/tool/call", {
         threadId,
         turnId: runtime.activeTurn?.id ?? randomUUID(),
         callId: randomUUID(),
         namespace,
         tool: name,
         arguments: args,
-      }),
-    );
+      })
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     if (!isRecord(result)) return { content: [{ type: "text" as const, text: String(result) }] };
     const content: CallToolResult["content"] = [];
     if (Array.isArray(result.contentItems)) {
@@ -1342,14 +1313,14 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       question: isString(question.question) ? question.question : "Claude needs more information.",
       options: Array.isArray(question.options) ? question.options : undefined,
     }));
-    const result = yield* providerCall(() =>
-      this.#serverRequests.call("item/tool/requestUserInput", {
+    const result = yield* this.#serverRequests
+      .call("item/tool/requestUserInput", {
         threadId,
         turnId: runtime.activeTurn?.id ?? randomUUID(),
         itemId: toolUseId,
         questions,
-      }),
-    );
+      })
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     const responseAnswers = isRecord(result) && isRecord(result.answers) ? result.answers : {};
     const answers = Object.fromEntries(
       questions.map((question) => {
@@ -1373,14 +1344,14 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     toolInput: DynamicRecord,
     toolUseId: string,
   ): Effect.fn.Return<PermissionResult, ProviderClientOperationError> {
-    const result = yield* providerCall(() =>
-      this.#serverRequests.call("item/fileChange/requestApproval", {
+    const result = yield* this.#serverRequests
+      .call("item/fileChange/requestApproval", {
         threadId,
         turnId: this.#threads.get(threadId)?.activeTurn?.id ?? randomUUID(),
         itemId: toolUseId,
         reason: sourceText("status.agent.claudeWriteOutside", { path }),
-      }),
-    );
+      })
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     if (isRecord(result) && result.decision === "accept") return { behavior: "allow", updatedInput: toolInput };
     return { behavior: "deny", message: "The user did not allow this write outside the workspace." };
   });

@@ -14,11 +14,11 @@ import {
 import { isBoolean, isDynamicRecord, isFunction, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { normalizeEmailAddress } from "@openbot/contracts/validation";
 import { OpenPanelBase, type OpenPanelOptions } from "@openpanel/web";
-import { Effect } from "effect";
+import { Effect, Exit, Scope } from "effect";
 import { parse as parseDomain } from "tldts";
 import type { ToolUsageSignal } from "../backend/agent/thread-items";
 import type { BrowserSiteVisit } from "../backend/browser-host";
-import { analyticsIO, analyticsSync, runAnalytics } from "./analytics-effects";
+import { type AnalyticsOperationFailure, analyticsIO, analyticsSync } from "./analytics-effects";
 
 const OPENPANEL_API_URL = "https://analytics.openbot.run/api";
 const OPENPANEL_CLIENT_ID = "6c989975-87ef-4f0c-857e-ab449a65b5c2";
@@ -111,7 +111,7 @@ export interface HostAnalyticsOptions {
    */
   resolveMcpServer?: (name: string) => { slug: string | null } | null;
   resolveRoutineRun?: (agentId: string, routineId: string, runId: string) => AnalyticsRoutineRun | null;
-  resolveInventory?: () => Promise<AnalyticsInventory>;
+  resolveInventory?: () => Effect.Effect<AnalyticsInventory, AnalyticsOperationFailure>;
   inventoryDay?: AnalyticsInventoryDayStore;
 }
 
@@ -136,8 +136,8 @@ export interface AnalyticsInventory {
 
 /** The local day of the last inventory event. `malformed` counts as sent today. */
 export interface AnalyticsInventoryDayStore {
-  read(): Promise<string | "missing" | "malformed">;
-  write(day: string): Promise<void>;
+  read(): Effect.Effect<string | "missing" | "malformed", AnalyticsOperationFailure>;
+  write(day: string): Effect.Effect<void, AnalyticsOperationFailure>;
 }
 
 const AGENT_PROPERTY_NAMES = ["provider", "model", "reasoning_effort", "agent_source", "agent_listing"] as const;
@@ -204,9 +204,9 @@ export class HostAnalytics {
   readonly #routineRunOwners = new Map<string, AnalyticsIdentity | null>();
   readonly #routineRunReports = new Set<string>();
   #closed = false;
-  #draining: Promise<void> | null = null;
+  readonly #scope = Scope.makeUnsafe();
   #inventoryDay: string | null = null;
-  #inventoryCheck: Promise<void> | null = null;
+  #inventoryCheck = false;
   readonly #operationQueue: AnalyticsOperationQueue = { active: false, operations: [] };
 
   constructor(options: HostAnalyticsOptions, createClient: ClientFactory = createOpenPanelClient) {
@@ -536,12 +536,13 @@ export class HostAnalytics {
     const store = this.#inventoryDayStore;
     if (!this.#client || !this.#trackingEnabled || !resolveInventory || !store) return;
     if (!normalizeAnalyticsIdentity(this.#resolveOwner())) return;
-    this.#inventoryCheck = runAnalytics(
+    this.#inventoryCheck = true;
+    Effect.runFork(
       Effect.gen({ self: this }, function* () {
-        const stored = yield* analyticsIO(() => store.read());
+        const stored = yield* store.read();
         if (stored === "malformed") {
           // A damaged file counts as sent today. It is written again, so the next day sends.
-          yield* analyticsIO(() => store.write(today));
+          yield* store.write(today);
           this.#inventoryDay = today;
           return;
         }
@@ -549,10 +550,10 @@ export class HostAnalytics {
           this.#inventoryDay = today;
           return;
         }
-        const inventory = yield* analyticsIO(resolveInventory);
+        const inventory = yield* resolveInventory();
         if (this.#closed || !this.#trackingEnabled || !normalizeAnalyticsIdentity(this.#resolveOwner())) return;
         // The day is stored before the send, so a failed write sends nothing and a crash cannot send twice.
-        yield* analyticsIO(() => store.write(today));
+        yield* store.write(today);
         this.#inventoryDay = today;
         const owner = normalizeAnalyticsIdentity(this.#resolveOwner());
         if (!owner || !this.#trackingEnabled) return;
@@ -572,14 +573,17 @@ export class HostAnalytics {
           },
           owner,
         );
-      }),
-    )
-      .catch(() => {
-        // Analytics must never change host behavior. The next check tries again.
-      })
-      .finally(() => {
-        this.#inventoryCheck = null;
-      });
+      }).pipe(
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#inventoryCheck = false;
+          }),
+        ),
+        Effect.uninterruptible,
+        Effect.forkIn(this.#scope, { startImmediately: true }),
+      ),
+    );
   }
 
   #trackForOwner(name: HostEventName, properties: HostProperties, owner: AnalyticsIdentity, flushPending = true): void {
@@ -680,9 +684,9 @@ export class HostAnalytics {
     this.#operationQueue.operations.push({ kind, run });
     if (this.#operationQueue.active) return;
     this.#operationQueue.active = true;
-    this.#draining = runAnalytics(this.#drainQueue()).finally(() => {
-      this.#draining = null;
-    });
+    Effect.runFork(
+      this.#drainQueue().pipe(Effect.uninterruptible, Effect.forkIn(this.#scope, { startImmediately: true })),
+    );
   }
 
   #drainQueue = Effect.fn("Analytics.drainQueue")(function* (this: HostAnalytics) {
@@ -698,17 +702,10 @@ export class HostAnalytics {
   });
 
   /** Stop accepting events, then finish work already owned by this service. */
-  close(): Promise<void> {
+  readonly close = Effect.fn("HostAnalytics.close")(function* (this: HostAnalytics) {
     this.#closed = true;
-    return runAnalytics(
-      Effect.gen({ self: this }, function* () {
-        const inventory = this.#inventoryCheck;
-        if (inventory) yield* analyticsIO(() => inventory);
-        const draining = this.#draining;
-        if (draining) yield* analyticsIO(() => draining);
-      }),
-    );
-  }
+    yield* Scope.close(this.#scope, Exit.void);
+  }, Effect.uninterruptible);
 }
 
 /** Runs a resolver whose failure must not reach the host, which has already done its work. */

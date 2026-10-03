@@ -1,4 +1,4 @@
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 // Access and auto-approve of one agent, as this computer holds them. The local IPC handlers and the
 // `agent-admin-v1` host routes share this, so a remote admin changes the same state as the local
 // window does, through the same writers.
@@ -21,7 +21,7 @@ export interface AgentAdminSettingsDependencies {
 
 export interface AgentAdminSettingsService {
   read(agentId: string): AgentAdminSettings;
-  update(input: UpdateAgentAdminSettingsInput): Promise<AgentAdminSettings>;
+  update(input: UpdateAgentAdminSettingsInput): Effect.Effect<AgentAdminSettings, AgentSettingsFailure>;
 }
 
 export class AgentNotFoundError extends Error {}
@@ -46,33 +46,28 @@ export function createAgentAdminSettings({
   return {
     read: (agentId) => settings(requireAgent(agentId)),
     update(input) {
-      return runSettings(update(input));
+      return update(input);
     },
   };
-  function runSettings(
-    operation: Effect.Effect<AgentAdminSettings, AgentSettingsFailure>,
-  ): Promise<AgentAdminSettings> {
-    return Effect.runPromise(Effect.result(operation)).then((result) => {
-      if (Result.isFailure(result)) throw result.failure.cause;
-      return result.success;
-    });
-  }
   function update({ agentId, access, autoApprove }: UpdateAgentAdminSettingsInput) {
     return Effect.fn("AgentAdminSettings.update")(function* () {
       let agent = yield* Effect.try({
         try: () => requireAgent(agentId),
         catch: (cause) => new AgentSettingsFailure({ cause }),
       });
-      if (access !== undefined) agent = yield* settingsIO(() => agents.updateAgent({ agentId, access }));
-      if (autoApprove !== undefined) yield* settingsIO(() => approvalAutomation.set({ agentId, autoApprove }));
+      if (access !== undefined)
+        agent = yield* agents
+          .updateAgent({ agentId, access })
+          .pipe(Effect.mapError((error) => new AgentSettingsFailure({ cause: error.cause })));
+      if (autoApprove !== undefined)
+        yield* approvalAutomation
+          .set({ agentId, autoApprove })
+          .pipe(Effect.mapError((error) => new AgentSettingsFailure({ cause: error.cause })));
       return settings(agent);
     })().pipe(Effect.uninterruptible);
   }
 }
 
-class AgentSettingsFailure extends Schema.TaggedError<AgentSettingsFailure>()("AgentSettingsFailure", {
+export class AgentSettingsFailure extends Schema.TaggedError<AgentSettingsFailure>()("AgentSettingsFailure", {
   cause: Schema.Defect(),
 }) {}
-function settingsIO<A>(operation: () => Promise<A>): Effect.Effect<A, AgentSettingsFailure> {
-  return Effect.tryPromise({ try: operation, catch: (cause) => new AgentSettingsFailure({ cause }) });
-}

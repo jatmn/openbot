@@ -12,10 +12,10 @@ import { delimiter, extname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { CUSTOM_AGENT_LIMITS } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import { runInLoginShell } from "./cli";
 import { pickWindowsExecutable } from "./mcp-provider-shapes";
-import { providerCall, providerFailure, runProviderClientEffect } from "./provider-client-effects";
+import { providerCall, providerFailure } from "./provider-client-effects";
 
 const execFileAsync = promisify(execFile);
 
@@ -81,11 +81,7 @@ export interface ResolveAgentCommandOptions {
  * The file that a command starts, or null when there is none now. Throws for a command text that is
  * not an accepted form, so the form can say what is wrong rather than "not found".
  */
-export function resolveAgentCommand(command: string, options: ResolveAgentCommandOptions = {}): Promise<string | null> {
-  return runProviderClientEffect(resolveAgentCommandEffect(command, options));
-}
-
-export const resolveAgentCommandEffect = Effect.fn("AcpAgentCommand.resolve")(function* (
+export const resolveAgentCommand = Effect.fn("AcpAgentCommand.resolve")(function* (
   command: string,
   options: ResolveAgentCommandOptions = {},
 ) {
@@ -98,7 +94,7 @@ export const resolveAgentCommandEffect = Effect.fn("AcpAgentCommand.resolve")(fu
     return (yield* isExecutableFile(path, platform)) ? path : null;
   }
   if (platform === "win32" && !options.searchPath) return yield* whereExe(command);
-  const folders = options.searchPath ?? (yield* providerCall(searchPath));
+  const folders = options.searchPath ?? (yield* searchPath());
   for (const folder of folders) {
     if (!isAbsolute(folder)) continue;
     const candidate = join(folder, command);
@@ -107,28 +103,29 @@ export const resolveAgentCommandEffect = Effect.fn("AcpAgentCommand.resolve")(fu
   return null;
 });
 
-let loginPath: { value: Promise<readonly string[]>; readAt: number } | null = null;
+let loginPath: { value: Deferred.Deferred<readonly string[]>; readAt: number } | null = null;
 
 /**
  * The login shell's `PATH`, then this process's. The script is fixed: no user text reaches the
  * shell. A packaged app starts with a short `PATH`, and a version manager adds its folders in the
  * profile that only a login shell reads.
  */
-function searchPath(): Promise<readonly string[]> {
-  if (loginPath && Date.now() - loginPath.readAt < LOGIN_PATH_TTL_MS) return loginPath.value;
-  const value = runProviderClientEffect(
-    providerCall(() => runInLoginShell('printf %s "$PATH"')).pipe(
+const searchPath = Effect.fn("AcpAgentCommand.searchPath")(function* () {
+  if (loginPath && Date.now() - loginPath.readAt < LOGIN_PATH_TTL_MS) return yield* Deferred.await(loginPath.value);
+  const value = Deferred.makeUnsafe<readonly string[]>();
+  loginPath = { value, readAt: Date.now() };
+  const exit = yield* Effect.exit(
+    runInLoginShell('printf %s "$PATH"').pipe(
       Effect.catch(() => Effect.succeed("")),
-      // `printf` writes no newline; profiles can print lines before the PATH.
       Effect.map((stdout) => stdout.split(/\r?\n/u).pop()?.trim() ?? ""),
       Effect.map((shellPath) => [
         ...new Set([...shellPath.split(delimiter), ...(process.env.PATH ?? "").split(delimiter)].filter(Boolean)),
       ]),
     ),
   );
-  loginPath = { value, readAt: Date.now() };
-  return value;
-}
+  yield* Deferred.done(value, exit);
+  return yield* exit;
+}, Effect.uninterruptible);
 
 const whereExe = Effect.fn("AcpAgentCommand.whereExe")((command: string) =>
   providerCall(() => execFileAsync("where.exe", [command], { timeout: 5_000, maxBuffer: 64 * 1024 })).pipe(

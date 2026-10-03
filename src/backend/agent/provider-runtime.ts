@@ -22,14 +22,14 @@ import {
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, Exit, Fiber, Result, Schema, Scope, Semaphore } from "effect";
 import { startAcpAuthentication } from "./../acp-sign-in";
 import { type AgentClient, AgentProcessExitError, type AgentProvider, RequestTimeoutError } from "./../agent-client";
 import { CodexAppServerClient } from "./../app-server-client";
 import { type AgentCliInfo, type BundledProviderExecutables, CodexCliError } from "./../cli";
 import { McpHandoffLog } from "./../mcp-handoff-log";
 import { openCodeSignInMessage } from "./../opencode-config";
-import { readOpenCodeGoUsageEffect } from "./../opencode-usage";
+import { readOpenCodeGoUsage } from "./../opencode-usage";
 import type { ProcessConfinement } from "../process-confinement";
 import {
   type AccountLoginCompletedResult,
@@ -41,6 +41,7 @@ import {
   getString,
   type ModelListResponse,
 } from "./../protocol";
+import type { ProviderClientOperationError } from "../provider-client-effects";
 import {
   BUILT_IN_PROVIDER_DRIVERS,
   type ProviderClientContext,
@@ -52,8 +53,8 @@ import { shortenDiagnostic } from "./../stderr-diagnostics";
 import { stopProcessTree } from "../windows-process-tree";
 import { TimeoutError } from "../with-timeout";
 import { normalizeAccountUsage } from "./account-usage";
-import { type CliCodeLogin, startCliCodeLogin } from "./cli-code-login";
-import { CodexLoginFlow } from "./codex-login";
+import { type CliCodeLogin, type CliCodeLoginFailed, startCliCodeLogin } from "./cli-code-login";
+import { CodexLoginFailed, CodexLoginFlow } from "./codex-login";
 import type { ConversationRuntime } from "./conversation-runtime";
 import {
   createAcpRequestEchoReader,
@@ -79,6 +80,7 @@ import {
   PREFERRED_MODEL_ORDER,
 } from "./provider-models";
 import {
+  type ProviderProcessFailed,
   providerFailureStatus,
   setProviderStatus,
   updateProviderStatus,
@@ -168,7 +170,8 @@ function usageWindowHasReset(limit: AccountUsage["limits"][number]): boolean {
 interface PendingCliLogin {
   child: ChildProcess;
   cli: AgentCliInfo;
-  task: Promise<void> | null;
+  task: Fiber.Fiber<void, ProviderOperationFailed> | null;
+  scope: Scope.Closeable;
   /** A code sign-in: what the CLI printed for the user, and the prompt a pasted code goes to. */
   code?: Pick<CliCodeLogin, "prompt" | "submit">;
 }
@@ -198,7 +201,7 @@ export interface ProviderHooks {
    * Runs after a connect or an activation leaves at least one client ready. Collapses the tail
    * that #connect and #activateProviderClient each carried a copy of.
    */
-  onProvidersReady(): Promise<void>;
+  onProvidersReady(): Effect.Effect<void, ProviderOperationFailed>;
   /** The cleanup #handleExit used to inline: prompts, approvals, takeovers, compaction, browser. */
   onProviderLost(client: AgentClient): void;
   /**
@@ -208,7 +211,7 @@ export interface ProviderHooks {
    * takeovers, or complete the turns it ran. It runs after the stop, so a request the process sent
    * while it stopped is cleared too.
    */
-  onClientStopped(client: AgentClient): void;
+  onClientStopped(client: AgentClient): Effect.Effect<void>;
   /** True once stop() has begun, so a client exiting during shutdown does not trigger a restart. */
   isStopping(): boolean;
   /** True while a turn on this provider runs or starts, which replacing its CLI would cut short. */
@@ -221,7 +224,7 @@ export interface ProviderHooks {
    * Runs when the own process of a Workspace only agent exits by itself. The provider's shared
    * process still runs, so nothing restarts: the next turn of this agent starts a new process.
    */
-  onAgentClientLost(agentId: string, client: AgentClient): void;
+  onAgentClientLost(agentId: string, client: AgentClient): Effect.Effect<void>;
   /** The shared folder, which every Workspace only agent may write besides its workspace. */
   sharedRoot(): string;
   /** Runs after a CLI replacement, so deliveries held back during it are delivered. */
@@ -232,7 +235,7 @@ export interface ProviderHooks {
    * never reaches this: what the caller hears is that the process now answering read the files as
    * they were at `configRevision`, which is what `captureConfigRevision` answered when it spawned.
    */
-  onProviderActivated(provider: AgentProvider, configRevision: number): void;
+  onProviderActivated(provider: AgentProvider, configRevision: number): Effect.Effect<void, ProviderOperationFailed>;
   /**
    * The configuration a process spawning now reads. A CLI reads the endpoint files once, at spawn,
    * so a change made while it starts is not in the process that arrives.
@@ -294,14 +297,14 @@ export class ProviderRuntime implements ProviderPort {
   readonly #clients = new Map<AgentProvider, AgentClient>();
   /** By agent id. See `ConfinedClient`. */
   readonly #confined = new Map<string, ConfinedClient>();
-  readonly #confinedStarts = new Map<string, Promise<AgentClient>>();
+  readonly #confinedStarts = new Map<string, Deferred.Deferred<AgentClient, ProviderOperationFailed>>();
   /**
    * Counts the shared clients that replaced another one for a reason other than an idle release: a
    * new CLI, a stored key, the endpoints or the MCP servers. An agent's own process that started
    * before the count changed read the old values, so its next turn starts it again.
    */
   readonly #activations = new Map<AgentProvider, number>();
-  readonly #usageLimitRefreshes = new WeakMap<AgentClient, Promise<void>>();
+  readonly #usageLimitRefreshes = new WeakSet<AgentClient>();
   /**
    * What this app has already handed to a provider process.
    *
@@ -333,8 +336,8 @@ export class ProviderRuntime implements ProviderPort {
    */
   readonly #cliSources = new Map<AgentProvider, AgentCliInfo["source"]>();
   readonly #accounts = new Map<AgentProvider, AccountReadResult["account"]>();
-  readonly #providerStarts = new Map<AgentProvider, Promise<void>>();
-  readonly #providerConnectionCommands = new Map<AgentProvider, Promise<void>>();
+  readonly #providerStarts = new Map<AgentProvider, Deferred.Deferred<void, ProviderOperationFailed>>();
+  readonly #providerConnectionCommands = new Map<AgentProvider, Deferred.Deferred<void, ProviderOperationFailed>>();
   readonly #replacingCli = new Set<AgentProvider>();
   /**
    * Providers whose idle process was stopped to give its memory back. Each one keeps its status,
@@ -368,10 +371,11 @@ export class ProviderRuntime implements ProviderPort {
   readonly #usageUnreported = new Set<AgentProvider>();
   #idleCheck: NodeJS.Timeout | null = null;
   #status: AgentStatus = structuredClone(INITIAL_STATUS);
-  #providerRefresh: Promise<AgentStatus> | null = null;
+  #providerRefresh: Deferred.Deferred<AgentStatus, ProviderOperationFailed> | null = null;
   readonly #codexLogin: CodexLoginFlow;
   readonly #cliLogins = new Map<AgentProvider, PendingCliLogin>();
-  #providerActivation = Promise.resolve();
+  #providerActivation = Semaphore.makeUnsafe(1);
+  #scope = Scope.makeUnsafe();
   #preferredProvider: AgentProvider;
   /**
    * The model setup chose beside the preferred provider, or `null` for that provider's own default.
@@ -433,7 +437,9 @@ export class ProviderRuntime implements ProviderPort {
       },
       hasActiveClient: (client) => (client ? this.#clients.get("codex") === client : this.#clients.has("codex")),
       activate: (client, cli, account, activateOptions) =>
-        this.#activateProviderClient("codex", client, cli, account, activateOptions),
+        this.#activateProviderClient("codex", client, cli, account, activateOptions).pipe(
+          Effect.mapError((failure) => new CodexLoginFailed({ cause: failure.cause })),
+        ),
       setConnecting: () => this.#setProviderConnectionState("codex", "connecting"),
       isConnecting: () =>
         this.#status.providers?.find((provider) => provider.id === "codex")?.connectionState === "connecting",
@@ -472,7 +478,7 @@ export class ProviderRuntime implements ProviderPort {
   }
 
   /** Resolve a provider's binary and keep who owns it, whether or not the provider is signed in. */
-  readonly #resolveProviderCliEffect = Effect.fn("ProviderRuntime.resolveCli")(function* (
+  readonly #resolveProviderCli = Effect.fn("ProviderRuntime.resolveCli")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
@@ -482,11 +488,11 @@ export class ProviderRuntime implements ProviderPort {
           cause: new CodexCliError(sourceText("error.provider.customAgentNone"), "missing"),
         });
       }
-      const cli = yield* providerIo(() =>
-        requireProviderDriver(provider).resolveCli({
+      const cli = yield* requireProviderDriver(provider)
+        .resolveCli({
           bundledExecutable: this.#bundledExecutables[provider],
-        }),
-      );
+        })
+        .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
       this.#cliSources.set(provider, cli.source);
       return cli;
     }).pipe(
@@ -532,17 +538,12 @@ export class ProviderRuntime implements ProviderPort {
    * hundreds of megabytes, and every signed-in provider starts at launch whether an agent uses it
    * or not. Its threads are unloaded, so the next turn resumes them on the process that replaces it.
    */
-  #releaseIdleProviders(): Promise<void> {
-    return runProviderEffect(this.#releaseIdleProvidersEffect());
-  }
 
-  readonly #releaseIdleProvidersEffect = Effect.fn("ProviderRuntime.releaseIdleProviders")(function* (
-    this: ProviderRuntime,
-  ) {
+  readonly #releaseIdleProviders = Effect.fn("ProviderRuntime.releaseIdleProviders")(function* (this: ProviderRuntime) {
     if (this.#hooks.isStopping() || this.#status.phase !== "ready") return;
-    if (this.#customAgentsReloadPending && !this.#hooks.isProviderBusy("acp")) void this.reloadCustomAgents();
+    if (this.#customAgentsReloadPending && !this.#hooks.isProviderBusy("acp")) yield* this.reloadCustomAgents();
     for (const provider of this.#environmentReloadPending) {
-      if (!this.#hooks.isProviderBusy(provider)) void this.#reloadAgentEnvironment(provider);
+      if (!this.#hooks.isProviderBusy(provider)) yield* this.#reloadAgentEnvironment(provider);
     }
     const now = Date.now();
     for (const [provider, client] of this.#clients) {
@@ -572,22 +573,25 @@ export class ProviderRuntime implements ProviderPort {
       this.#released.add(provider);
       this.#conversation.unloadClientThreads(client);
       logger.info("Stopped an idle provider CLI.", { provider });
-      yield* providerIo(() => client.stop()).pipe(Effect.ignore);
-      this.#hooks.onClientStopped(client);
+      yield* client
+        .stop()
+        .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+        .pipe(Effect.ignore);
+      yield* this.#hooks.onClientStopped(client);
     }
     for (const [agentId, confined] of this.#confined) {
       if (this.#hooks.isAgentBusy(agentId)) confined.lastUsed = now;
       if (now - confined.lastUsed < PROVIDER_IDLE_RELEASE_MS) continue;
       logger.info("Stopped an idle Workspace only provider process.", { provider: confined.client.provider, agentId });
-      yield* this.#stopConfinedEffect(agentId, confined);
+      yield* this.#stopConfined(agentId, confined);
     }
   }, Effect.uninterruptible);
 
   /** Closes the idle threads of each client and each Workspace only process, when memory is low. */
-  releaseIdleThreads(): void {
-    for (const client of this.#clients.values()) client.releaseIdleThreads?.();
-    for (const confined of this.#confined.values()) confined.client.releaseIdleThreads?.();
-  }
+  readonly releaseIdleThreads = Effect.fn("ProviderRuntime.releaseIdleThreads")(function* (this: ProviderRuntime) {
+    for (const client of this.#clients.values()) if (client.releaseIdleThreads) yield* client.releaseIdleThreads();
+    for (const { client } of this.#confined.values()) if (client.releaseIdleThreads) yield* client.releaseIdleThreads();
+  }).bind(this);
 
   listModels(): AgentModelOption[] {
     return structuredClone(this.#models);
@@ -615,13 +619,8 @@ export class ProviderRuntime implements ProviderPort {
    * provider that can report usage, then a broadcast. Scoped to one agent it answers for that
    * agent's own model and stays quiet, so it must not overwrite the list every other view shows.
    */
-  async usage(scope?: { provider: AgentProvider; model: string }): Promise<AccountUsage> {
-    const result = await Effect.runPromise(Effect.result(this.usageEffect(scope)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
 
-  readonly usageEffect = Effect.fn("ProviderRuntime.usage")(function* (
+  readonly usage = Effect.fn("ProviderRuntime.usage")(function* (
     this: ProviderRuntime,
     scope?: { provider: AgentProvider; model: string },
   ) {
@@ -646,7 +645,7 @@ export class ProviderRuntime implements ProviderPort {
             if (provider === "opencode") {
               // The Go quota is one HTTPS request with the saved key, so do not start OpenCode for it.
               usage = normalizeAccountUsage(
-                yield* readOpenCodeGoUsageEffect(this.#credentials.apiKey("opencode")).pipe(
+                yield* readOpenCodeGoUsage(this.#credentials.apiKey("opencode")).pipe(
                   Effect.mapError((error) => new ProviderOperationFailed({ cause: error.cause })),
                   deadline,
                 ),
@@ -659,12 +658,12 @@ export class ProviderRuntime implements ProviderPort {
                 return;
               }
               if (this.#released.has(provider) && this.#usageUnreported.has(provider)) return;
-              if (!this.#clients.has(provider)) yield* this.ensureProviderEffect(provider);
+              if (!this.#clients.has(provider)) yield* this.ensureProvider(provider);
               const client = this.#clients.get(provider);
               if (!client) return;
               const model =
                 provider === "codex" ? undefined : agentProviderDescriptor(provider).defaultModel || undefined;
-              usage = yield* this.#refreshUsageEffect(client, model, false).pipe(deadline);
+              usage = yield* this.#refreshUsage(client, model, false).pipe(deadline);
             }
             const limit = usage.limits[0];
             if (!limit || (!limit.primary && !limit.secondary)) {
@@ -694,62 +693,50 @@ export class ProviderRuntime implements ProviderPort {
     }
     const client = this.#clients.get(scope.provider);
     if (!client || !accountUsageCoversModel(scope.provider, scope.model)) return { limits: [] };
-    return yield* this.#refreshUsageEffect(client, scope.model, false);
-  });
+    return yield* this.#refreshUsage(client, scope.model, false);
+  }).bind(this);
 
-  async start(): Promise<void> {
-    const result = await Effect.runPromise(Effect.result(this.startEffect()));
-    if (Result.isFailure(result)) throw result.failure.cause;
-  }
-
-  readonly startEffect = Effect.fn("ProviderRuntime.start")(function* (this: ProviderRuntime) {
-    this.#idleCheck ??= setInterval(() => void this.#releaseIdleProviders(), PROVIDER_IDLE_CHECK_MS);
+  readonly start = Effect.fn("ProviderRuntime.start")(function* (this: ProviderRuntime) {
+    if (this.#scope.state._tag === "Closed") this.#scope = Scope.makeUnsafe();
+    this.#idleCheck ??= setInterval(
+      () => Effect.runFork(this.#releaseIdleProviders().pipe(Effect.forkIn(this.#scope))),
+      PROVIDER_IDLE_CHECK_MS,
+    );
     this.#idleCheck.unref?.();
-    yield* this.#connectEffect(
+    yield* this.#connect(
       "starting",
       BUILT_IN_PROVIDER_DRIVERS.map((driver) => driver.id),
     );
-  });
+  }).bind(this);
 
-  async setPreferredProvider(provider: AgentProvider, initialized: boolean, model: AgentModelId | null): Promise<void> {
+  readonly setPreferredProvider = Effect.fn("ProviderRuntime.setPreferredProvider")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+    initialized: boolean,
+    model: AgentModelId | null,
+  ) {
     this.#preferredProvider = provider;
     // The two travel together: a provider chosen without a model means that provider's default, so
     // the model of an earlier choice must not survive the new one.
     this.#preferredModel = model;
     if (!initialized) return;
-    await this.ensureProvider(provider).catch(() => undefined);
+    yield* this.ensureProvider(provider).pipe(Effect.ignore);
     const account = this.#accounts.get(provider);
     if (!this.#clients.has(provider) || !account) return;
     this.#setStatus({
       cliVersion: this.#cli.get(provider)?.version ?? null,
       auth: requireProviderDriver(provider).authState(account),
     });
-  }
+  }).bind(this);
 
-  async ensureProvider(provider: AgentProvider): Promise<void> {
-    const result = await Effect.runPromise(Effect.result(this.ensureProviderEffect(provider)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-  }
-
-  readonly ensureProviderEffect = Effect.fn("ProviderRuntime.ensureProvider")(function* (
+  readonly ensureProvider = Effect.fn("ProviderRuntime.ensureProvider")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
     this.#lastUsed.set(provider, Date.now());
     if (this.#clients.has(provider)) return;
-    let start = this.#providerStarts.get(provider);
-    if (!start) {
-      // Waking a released provider is not a start: `onProvidersReady` is restart recovery, and it
-      // would settle the live deliveries of every other provider.
-      const wake = this.#released.has(provider);
-      start = this.#connect("starting", [provider], wake ? { notifyReady: false } : {}).finally(() => {
-        this.#providerStarts.delete(provider);
-      });
-      this.#providerStarts.set(provider, start);
-      recordRestartActivity();
-    }
-    const pending = start;
-    yield* providerIo(() => pending);
+    const wake = this.#released.has(provider);
+    yield* this.#startProvider(provider, wake ? { notifyReady: false } : {});
     if (this.#clients.has(provider)) return;
     const status = this.#status.providers?.find((candidate) => candidate.id === provider);
     return yield* new ProviderOperationFailed({
@@ -757,38 +744,45 @@ export class ProviderRuntime implements ProviderPort {
         status?.message ?? sourceText("error.provider.cliNotReady", { provider: providerLabel(provider) }),
       ),
     });
-  });
+  }).bind(this);
 
-  refreshProviders(): Promise<AgentStatus> {
-    if (this.#providerRefresh) return this.#providerRefresh;
-    if (this.#status.phase === "starting" || this.#status.phase === "restarting") {
-      return Promise.resolve(this.status());
-    }
+  readonly refreshProviders = Effect.fn("ProviderRuntime.refreshProviders")(function* (this: ProviderRuntime) {
+    if (this.#providerRefresh) return yield* Deferred.await(this.#providerRefresh);
+    if (this.#status.phase === "starting" || this.#status.phase === "restarting") return this.status();
+    const completion = Deferred.makeUnsafe<AgentStatus, ProviderOperationFailed>();
+    this.#providerRefresh = completion;
+    const exit = yield* Effect.exit(this.#refreshProviders());
+    yield* Deferred.done(completion, exit);
+    if (this.#providerRefresh === completion) this.#providerRefresh = null;
+    return yield* exit;
+  }, Effect.uninterruptible).bind(this);
 
-    const refresh = this.#refreshProviders().finally(() => {
-      if (this.#providerRefresh === refresh) this.#providerRefresh = null;
-    });
-    this.#providerRefresh = refresh;
-    return refresh;
-  }
-
-  async refreshProvider(provider: AgentProvider): Promise<AgentStatus> {
+  readonly refreshProvider = Effect.fn("ProviderRuntime.refreshProvider")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+  ) {
     if (this.#clients.has(provider)) return this.status();
     this.#resetRestarts(provider);
-    let start = this.#providerStarts.get(provider);
-    if (!start) {
-      start = this.#connect("starting", [provider], {
-        preserveCheckErrors: true,
-        refreshRuntimeInBackground: true,
-      }).finally(() => {
-        this.#providerStarts.delete(provider);
-      });
-      this.#providerStarts.set(provider, start);
-      recordRestartActivity();
-    }
-    await start;
+    yield* this.#startProvider(provider, { preserveCheckErrors: true, refreshRuntimeInBackground: true });
     return this.status();
-  }
+  }).bind(this);
+
+  readonly #startProvider = Effect.fn("ProviderRuntime.startProvider")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+    options: { notifyReady?: boolean; preserveCheckErrors?: boolean; refreshRuntimeInBackground?: boolean },
+    phase: "starting" | "restarting" = "starting",
+  ) {
+    const pending = this.#providerStarts.get(provider);
+    if (pending) return yield* Deferred.await(pending);
+    const completion = Deferred.makeUnsafe<void, ProviderOperationFailed>();
+    this.#providerStarts.set(provider, completion);
+    recordRestartActivity();
+    const exit = yield* Effect.exit(this.#connect(phase, [provider], options));
+    yield* Deferred.done(completion, exit);
+    if (this.#providerStarts.get(provider) === completion) this.#providerStarts.delete(provider);
+    return yield* exit;
+  }, Effect.uninterruptible);
 
   /**
    * Signs the user in to one provider, in the way that provider's driver declares. `openExternal`
@@ -796,20 +790,22 @@ export class ProviderRuntime implements ProviderPort {
    * opens its own browser window from the CLI OpenBot spawns, and an `external` sign-in happens
    * outside OpenBot, so Connect only asks the provider again.
    */
-  async connectProvider(provider: AgentProvider, openExternal: (url: string) => Promise<void>): Promise<AgentStatus> {
+  readonly connectProvider = Effect.fn("ProviderRuntime.connectProvider")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+    openExternal: (url: string) => Promise<void>,
+  ) {
     const start = this.#providerStarts.get(provider);
-    if (start) await start;
+    if (start) yield* Deferred.await(start);
     if (start && this.#clients.has(provider) && this.#accounts.has(provider)) return this.status();
     if (this.#providerRefresh || (!start && ["starting", "restarting"].includes(this.#status.phase))) {
-      return Promise.resolve(this.status());
+      return this.status();
     }
     const signIn = requireProviderDriver(provider).signIn;
-    return this.#runProviderConnectionCommand(provider, () =>
-      runProviderEffect(this.#signInEffect(provider, signIn, openExternal)),
-    );
-  }
+    return yield* this.#runProviderConnectionCommand(provider, () => this.#signIn(provider, signIn, openExternal));
+  }).bind(this);
 
-  readonly #signInEffect = Effect.fn("ProviderRuntime.signIn")(function* (
+  readonly #signIn = Effect.fn("ProviderRuntime.signIn")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     signIn: ReturnType<typeof requireProviderDriver>["signIn"],
@@ -817,40 +813,43 @@ export class ProviderRuntime implements ProviderPort {
   ) {
     switch (signIn.kind) {
       case "browser":
-        yield* this.#codexLogin.cancelEffect(null);
+        yield* this.#codexLogin.cancel(null);
         yield* this.#codexLogin
-          .startBrowserEffect(openExternal)
+          .startBrowser(openExternal)
           .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
         return this.status();
       case "cli-command":
-        yield* this.#cancelCliLoginEffect(provider, null);
-        return yield* providerIo(() =>
-          this.#startCliLogin(provider, (cli) => {
-            const child = spawn(cli.executable, [...signIn.command.argv], {
-              cwd: process.cwd(),
-              env: { ...process.env, ...signIn.command.env(cli) },
-              stdio: "ignore",
-              shell: false,
-              windowsHide: process.platform === "win32",
-            });
+        yield* this.#cancelCliLogin(provider, null);
+        return yield* this.#startCliLogin(provider, (cli) =>
+          Effect.gen(function* () {
+            const child = yield* Effect.acquireRelease(
+              providerStep(() =>
+                spawn(cli.executable, [...signIn.command.argv], {
+                  cwd: process.cwd(),
+                  env: { ...process.env, ...signIn.command.env(cli) },
+                  stdio: "ignore",
+                  shell: false,
+                  windowsHide: process.platform === "win32",
+                }),
+              ),
+              (child) => stopProcessTree(child).pipe(Effect.orDie),
+            );
             return { child, done: waitForSuccessfulProcess(child, signIn.command.timeoutMs) };
           }),
-        );
+        ).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
       case "acp-authenticate":
-        yield* this.#cancelCliLoginEffect(provider, null);
-        return yield* providerIo(() =>
-          this.#startCliLogin(provider, (cli) =>
-            startAcpAuthentication({
-              executable: cli.executable,
-              argv: signIn.argv,
-              env: { ...signIn.env },
-              methodId: signIn.methodId,
-              timeoutMs: signIn.timeoutMs,
-            }),
-          ),
-        );
+        yield* this.#cancelCliLogin(provider, null);
+        return yield* this.#startCliLogin(provider, (cli) =>
+          startAcpAuthentication({
+            executable: cli.executable,
+            argv: signIn.argv,
+            env: { ...signIn.env },
+            methodId: signIn.methodId,
+            timeoutMs: signIn.timeoutMs,
+          }),
+        ).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
       case "external":
-        return yield* this.#reprobeProviderEffect(provider);
+        return yield* this.#reprobeProvider(provider);
     }
   });
 
@@ -862,32 +861,33 @@ export class ProviderRuntime implements ProviderPort {
    * not a reason to refuse: asking for a code while signed in is how the user reaches a different
    * account, and the one in use keeps working until the new sign-in finishes.
    */
-  async startProviderCodeLogin(provider: AgentProvider): Promise<ProviderCodeLoginStart> {
+  readonly startProviderCodeLogin = Effect.fn("ProviderRuntime.startProviderCodeLogin")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+  ) {
     const codeSignIn = requireProviderDriver(provider).codeSignIn;
     if (!codeSignIn) {
       throw new Error(sourceText("error.provider.noCodeSignIn", { provider: providerLabel(provider) }));
     }
     const start = this.#providerStarts.get(provider);
-    if (start) await start;
-    return this.#runProviderConnectionCommand(provider, () =>
-      runProviderEffect(this.#startProviderCodeEffect(provider, codeSignIn)),
-    );
-  }
+    if (start) yield* Deferred.await(start);
+    return yield* this.#runProviderConnectionCommand(provider, () => this.#startProviderCode(provider, codeSignIn));
+  }).bind(this);
 
-  readonly #startProviderCodeEffect = Effect.fn("ProviderRuntime.startCodeLogin")(function* (
+  readonly #startProviderCode = Effect.fn("ProviderRuntime.startCodeLogin")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     codeSignIn: NonNullable<ReturnType<typeof requireProviderDriver>["codeSignIn"]>,
   ): Effect.fn.Return<ProviderCodeLoginStart, ProviderOperationFailed> {
     if (codeSignIn.kind === "codex-device") {
-      yield* this.#codexLogin.cancelEffect(null);
+      yield* this.#codexLogin.cancel(null);
       return yield* this.#codexLogin
-        .startDeviceEffect()
+        .startDevice()
         .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
     }
-    yield* this.#cancelCliLoginEffect(provider, null);
+    yield* this.#cancelCliLogin(provider, null);
     const { command, flow } = codeSignIn;
-    yield* this.#startCliLoginEffect(provider, (cli) =>
+    yield* this.#startCliLogin(provider, (cli) =>
       startCliCodeLogin({
         flow,
         executable: cli.executable,
@@ -900,7 +900,9 @@ export class ProviderRuntime implements ProviderPort {
     if (!code)
       return yield* new ProviderOperationFailed({ cause: new Error(sourceText("error.provider.codeLoginNoLink")) });
     const expiresAt = Date.now() + command.timeoutMs;
-    const prompt = yield* providerIo(() => code.prompt);
+    const prompt = yield* code.prompt.pipe(
+      Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+    );
     return prompt.flow === "paste"
       ? { kind: "paste", verificationUrl: prompt.verificationUrl, expiresAt }
       : {
@@ -925,15 +927,20 @@ export class ProviderRuntime implements ProviderPort {
   }
 
   /** Abandons a code sign-in. The provider is told, so the code cannot be used after this returns. */
-  async cancelProviderCodeLogin(provider: AgentProvider): Promise<AgentStatus> {
+  readonly cancelProviderCodeLogin = Effect.fn("ProviderRuntime.cancelCodeLogin")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+  ) {
     const codeSignIn = requireProviderDriver(provider).codeSignIn;
     if (!codeSignIn) return this.status();
-    return this.#runProviderConnectionCommand(provider, async () => {
-      if (codeSignIn.kind === "codex-device") await this.#codexLogin.cancel(null);
-      else await this.#cancelCliLogin(provider, null);
-      return this.status();
-    });
-  }
+    return yield* this.#runProviderConnectionCommand(provider, () =>
+      Effect.gen({ self: this }, function* () {
+        if (codeSignIn.kind === "codex-device") yield* this.#codexLogin.cancel(null);
+        else yield* this.#cancelCliLogin(provider, null);
+        return this.status();
+      }),
+    );
+  }).bind(this);
 
   /**
    * The custom-endpoint wording, when there is a custom endpoint to talk about.
@@ -965,21 +972,20 @@ export class ProviderRuntime implements ProviderPort {
    * fails - an endpoint OpenCode refuses at spawn - is reported the way every other connection
    * failure is, as an error state and a message on the provider's own status.
    */
-  reloadOpenCodeConfig(): Promise<CustomProviderRestart> {
-    return runProviderEffect(this.reloadOpenCodeConfigEffect());
-  }
 
-  readonly reloadOpenCodeConfigEffect = Effect.fn("ProviderRuntime.reloadOpenCodeConfig")(function* (
+  readonly reloadOpenCodeConfig = Effect.fn("ProviderRuntime.reloadOpenCodeConfig")(function* (
     this: ProviderRuntime,
   ): Effect.fn.Return<CustomProviderRestart> {
     if (!this.#clients.has("opencode")) return "not-running";
     if (this.#hooks.isProviderBusy("opencode")) return "skipped-busy";
     const result = yield* Effect.result(
-      providerIo(() => this.#runProviderConnectionCommand("opencode", () => this.#reprobeProvider("opencode"))),
+      this.#runProviderConnectionCommand("opencode", () => this.#reprobeProvider("opencode")).pipe(
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+      ),
     );
     if (Result.isFailure(result) && this.#hooks.isProviderBusy("opencode")) return "skipped-busy";
     return "restarted";
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Restarts each running process that read the agent environment when it started, so the next
@@ -987,24 +993,17 @@ export class ProviderRuntime implements ProviderPort {
    * delays is applied by the idle check after the turn stops. A Workspace only process is replaced
    * at its next turn, because its key names the activation.
    */
-  reloadAgentEnvironment(): Promise<void> {
-    return runProviderEffect(this.reloadAgentEnvironmentEffect());
-  }
 
-  readonly reloadAgentEnvironmentEffect = Effect.fn("ProviderRuntime.reloadAgentEnvironment")(function* (
+  readonly reloadAgentEnvironment = Effect.fn("ProviderRuntime.reloadAgentEnvironment")(function* (
     this: ProviderRuntime,
   ) {
-    yield* Effect.forEach(SPAWN_ENVIRONMENT_PROVIDERS, (provider) => this.#reloadAgentEnvironmentEffect(provider), {
+    yield* Effect.forEach(SPAWN_ENVIRONMENT_PROVIDERS, (provider) => this.#reloadAgentEnvironment(provider), {
       concurrency: "unbounded",
       discard: true,
     });
-  });
+  }).bind(this);
 
-  #reloadAgentEnvironment(provider: AgentProvider): Promise<void> {
-    return runProviderEffect(this.#reloadAgentEnvironmentEffect(provider));
-  }
-
-  readonly #reloadAgentEnvironmentEffect = Effect.fn("ProviderRuntime.reloadEnvironmentForProvider")(function* (
+  readonly #reloadAgentEnvironment = Effect.fn("ProviderRuntime.reloadEnvironmentForProvider")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
@@ -1015,7 +1014,9 @@ export class ProviderRuntime implements ProviderPort {
       return;
     }
     const result = yield* Effect.result(
-      providerIo(() => this.#runProviderConnectionCommand(provider, () => this.#reprobeProvider(provider))),
+      this.#runProviderConnectionCommand(provider, () => this.#reprobeProvider(provider)).pipe(
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+      ),
     );
     if (Result.isFailure(result) && this.#hooks.isProviderBusy(provider)) this.#environmentReloadPending.add(provider);
   }, Effect.uninterruptible);
@@ -1026,40 +1027,39 @@ export class ProviderRuntime implements ProviderPort {
    * first saved agent starts the provider; with the last one removed, the provider stops. A change
    * that a turn delays is applied by the idle check after the turn stops, as the saved message says.
    */
-  reloadCustomAgents(): Promise<CustomProviderRestart> {
-    return runProviderEffect(this.reloadCustomAgentsEffect());
-  }
 
-  readonly reloadCustomAgentsEffect = Effect.fn("ProviderRuntime.reloadCustomAgents")(function* (
-    this: ProviderRuntime,
-  ) {
+  readonly reloadCustomAgents = Effect.fn("ProviderRuntime.reloadCustomAgents")(function* (this: ProviderRuntime) {
     this.#customAgentsReloadPending = false;
-    const result = yield* this.#reloadCustomAgentsEffect();
+    const result = yield* this.#reloadCustomAgents();
     if (result === "skipped-busy") this.#customAgentsReloadPending = true;
     return result;
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  readonly #reloadCustomAgentsEffect = Effect.fn("ProviderRuntime.reloadCustomAgentProcess")(function* (
+  readonly #reloadCustomAgents = Effect.fn("ProviderRuntime.reloadCustomAgentProcess")(function* (
     this: ProviderRuntime,
   ): Effect.fn.Return<CustomProviderRestart, ProviderOperationFailed> {
     if (!this.#clients.has("acp")) {
       if (this.#released.has("acp") || savedCustomAgents(this.#credentials).length === 0) return "not-running";
-      yield* providerIo(() => this.refreshProvider("acp"));
+      yield* this.refreshProvider("acp").pipe(
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+      );
       return this.#clients.has("acp") ? "restarted" : "not-running";
     }
     if (this.#hooks.isProviderBusy("acp")) return "skipped-busy";
     const result = yield* Effect.result(
-      providerIo(() => this.#runProviderConnectionCommand("acp", () => this.#reprobeProvider("acp"))),
+      this.#runProviderConnectionCommand("acp", () => this.#reprobeProvider("acp")).pipe(
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+      ),
     );
     if (Result.isFailure(result)) {
       if (this.#hooks.isProviderBusy("acp")) return "skipped-busy";
-      if (savedCustomAgents(this.#credentials).length === 0) yield* this.#stopProviderClientEffect("acp");
+      if (savedCustomAgents(this.#credentials).length === 0) yield* this.#stopProviderClient("acp");
     }
     return "restarted";
   }, Effect.uninterruptible);
 
   /** Stops a provider's shared process and every Workspace only process of it, with no restart. */
-  readonly #stopProviderClientEffect = Effect.fn("ProviderRuntime.stopProviderClient")(function* (
+  readonly #stopProviderClient = Effect.fn("ProviderRuntime.stopProviderClient")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
@@ -1072,11 +1072,14 @@ export class ProviderRuntime implements ProviderPort {
       this.#accounts.delete(provider);
       this.#conversation.unloadClientThreads(client);
     });
-    yield* providerIo(() => client.stop()).pipe(Effect.catch(() => Effect.void));
-    yield* providerStep(() => this.#hooks.onClientStopped(client));
+    yield* client
+      .stop()
+      .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+      .pipe(Effect.catch(() => Effect.void));
+    yield* this.#hooks.onClientStopped(client);
     yield* Effect.forEach(
       [...this.#confined].filter(([, confined]) => confined.client.provider === provider),
-      ([agentId, confined]) => this.#stopConfinedEffect(agentId, confined),
+      ([agentId, confined]) => this.#stopConfined(agentId, confined),
       { concurrency: "unbounded", discard: true },
     );
   }, Effect.uninterruptible);
@@ -1091,26 +1094,27 @@ export class ProviderRuntime implements ProviderPort {
    * deliveries from the busy check to the restart, so no turn can start on the old process in
    * between. Success means that a new process runs with the new credential.
    */
-  changeProviderCredential(provider: AgentProvider, change: () => Promise<void>): Promise<AgentStatus> {
-    return this.#runProviderConnectionCommand(provider, () =>
-      runProviderEffect(this.#changeCredentialEffect(provider, change)),
-    );
+  changeProviderCredential(
+    provider: AgentProvider,
+    change: () => Effect.Effect<void, ProviderOperationFailed>,
+  ): Effect.Effect<AgentStatus, ProviderOperationFailed> {
+    return this.#runProviderConnectionCommand(provider, () => this.#changeCredential(provider, change));
   }
 
-  readonly #changeCredentialEffect = Effect.fn("ProviderRuntime.changeCredential")(function* (
+  readonly #changeCredential = Effect.fn("ProviderRuntime.changeCredential")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
-    change: () => Promise<void>,
+    change: () => Effect.Effect<void, ProviderOperationFailed>,
   ) {
     const start = this.#providerStarts.get(provider);
-    if (start) yield* providerIo(() => start);
+    if (start) yield* Deferred.await(start);
     if (this.#hooks.isProviderBusy(provider))
       return yield* new ProviderOperationFailed({
         cause: new Error(sourceText("error.provider.cliBusyRetry", { provider: providerLabel(provider) })),
       });
     this.#replacingCli.add(provider);
     recordRestartActivity();
-    yield* providerIo(change).pipe(
+    yield* change().pipe(
       Effect.tapError(() =>
         Effect.sync(() => {
           this.#replacingCli.delete(provider);
@@ -1118,23 +1122,24 @@ export class ProviderRuntime implements ProviderPort {
         }),
       ),
     );
-    return yield* this.#reprobeProviderEffect(provider);
+    return yield* this.#reprobeProvider(provider);
   }, Effect.uninterruptible);
 
   /** Keeps this provider idle until its managed runtime is installed and activated. */
-  updateProviderCli(provider: AgentProvider, install: () => Promise<string>): Promise<AgentStatus> {
-    return this.#runProviderConnectionCommand(provider, () =>
-      runProviderEffect(this.#updateProviderCliEffect(provider, install)),
-    );
+  updateProviderCli(
+    provider: AgentProvider,
+    install: () => Effect.Effect<string, ProviderOperationFailed>,
+  ): Effect.Effect<AgentStatus, ProviderOperationFailed> {
+    return this.#runProviderConnectionCommand(provider, () => this.#updateProviderCli(provider, install));
   }
 
-  readonly #updateProviderCliEffect = Effect.fn("ProviderRuntime.updateCli")(function* (
+  readonly #updateProviderCli = Effect.fn("ProviderRuntime.updateCli")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
-    install: () => Promise<string>,
+    install: () => Effect.Effect<string, ProviderOperationFailed>,
   ) {
     const start = this.#providerStarts.get(provider);
-    if (start) yield* providerIo(() => start);
+    if (start) yield* Deferred.await(start);
     yield* providerStep(() => {
       if ((provider === "codex" && this.#codexLogin.pending) || this.#cliLogins.has(provider))
         throw new Error(sourceText("error.provider.cliSigningIn", { provider: providerLabel(provider) }));
@@ -1152,15 +1157,15 @@ export class ProviderRuntime implements ProviderPort {
       }),
       () =>
         Effect.gen({ self: this }, function* () {
-          const executable = yield* providerIo(install);
+          const executable = yield* install();
           installed = true;
           this.#bundledExecutables[provider] = executable;
-          const cli = yield* this.#resolveProviderCliEffect(provider);
+          const cli = yield* this.#resolveProviderCli(provider);
           if (cli.source !== "managed" || cli.executable !== executable)
             return yield* new ProviderOperationFailed({
               cause: new Error(sourceText("error.provider.cliSelectFailed")),
             });
-          yield* this.#reloadProviderCliEffect(provider, cli);
+          yield* this.#reloadProviderCli(provider, cli);
         }).pipe(
           Effect.mapError((error) => {
             this.#bundledExecutables[provider] = previousExecutable;
@@ -1220,19 +1225,16 @@ export class ProviderRuntime implements ProviderPort {
    * The process for this agent's next turn, started when it is needed. Call it only while the agent
    * runs no turn: it stops the agent's own process when that process no longer matches the agent.
    */
-  ensureAgentClient(agent: AgentSummary): Promise<AgentClient> {
-    return runProviderEffect(this.ensureAgentClientEffect(agent));
-  }
 
-  readonly ensureAgentClientEffect = Effect.fn("ProviderRuntime.ensureAgentClient")(function* (
+  readonly ensureAgentClient = Effect.fn("ProviderRuntime.ensureAgentClient")(function* (
     this: ProviderRuntime,
     agent: AgentSummary,
   ) {
     const provider = providerForAgent(agent);
-    yield* this.ensureProviderEffect(provider);
+    yield* this.ensureProvider(provider);
     for (let pending = this.#confinedStarts.get(agent.id); pending; pending = this.#confinedStarts.get(agent.id)) {
       const currentStart = pending;
-      yield* providerIo(() => currentStart).pipe(Effect.ignore);
+      yield* Deferred.await(currentStart).pipe(Effect.ignore);
     }
     const confinement = this.#confinementFor(agent);
     const current = this.#confined.get(agent.id);
@@ -1241,14 +1243,15 @@ export class ProviderRuntime implements ProviderPort {
       current.lastUsed = Date.now();
       return current.client;
     }
-    if (current) yield* this.#stopConfinedEffect(agent.id, current);
+    if (current) yield* this.#stopConfined(agent.id, current);
     if (!confinement || !key) return yield* providerStep(() => this.requireReadyClient(provider));
-    const start = this.#startConfined(agent.id, provider, confinement, key).finally(() => {
-      this.#confinedStarts.delete(agent.id);
-    });
-    this.#confinedStarts.set(agent.id, start);
-    return yield* providerIo(() => start);
-  }, Effect.uninterruptible);
+    const completion = Deferred.makeUnsafe<AgentClient, ProviderOperationFailed>();
+    this.#confinedStarts.set(agent.id, completion);
+    const exit = yield* Effect.exit(this.#startConfined(agent.id, provider, confinement, key));
+    yield* Deferred.done(completion, exit);
+    if (this.#confinedStarts.get(agent.id) === completion) this.#confinedStarts.delete(agent.id);
+    return yield* exit;
+  }, Effect.uninterruptible).bind(this);
 
   #countActivation(provider: AgentProvider): void {
     this.#activations.set(provider, (this.#activations.get(provider) ?? 0) + 1);
@@ -1276,20 +1279,7 @@ export class ProviderRuntime implements ProviderPort {
     ]);
   }
 
-  async #startConfined(
-    agentId: string,
-    provider: AgentProvider,
-    confinement: ProcessConfinement,
-    key: string,
-  ): Promise<AgentClient> {
-    const result = await Effect.runPromise(
-      Effect.result(this.#startConfinedEffect(agentId, provider, confinement, key)),
-    );
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly #startConfinedEffect = Effect.fn("ProviderRuntime.startConfined")(function* (
+  readonly #startConfined = Effect.fn("ProviderRuntime.startConfined")(function* (
     this: ProviderRuntime,
     agentId: string,
     provider: AgentProvider,
@@ -1302,9 +1292,12 @@ export class ProviderRuntime implements ProviderPort {
         cause: new Error(sourceText("error.provider.cliNotReady", { provider: providerLabel(provider) })),
       });
     const disposals = this.#disposals;
-    const { client } = yield* this.#authenticateClientEffect(provider, cli, { confinement });
+    const { client } = yield* this.#authenticateClient(provider, cli, { confinement });
     if (disposals !== this.#disposals || this.#hooks.isStopping()) {
-      yield* providerIo(() => client.stop()).pipe(Effect.catch(() => Effect.void));
+      yield* client
+        .stop()
+        .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+        .pipe(Effect.catch(() => Effect.void));
       return yield* new ProviderOperationFailed({
         cause: new Error(sourceText("error.provider.stoppedBeforeAgentProcess", { provider: providerLabel(provider) })),
       });
@@ -1315,7 +1308,7 @@ export class ProviderRuntime implements ProviderPort {
   }, Effect.uninterruptible);
 
   /** Out of the map before it stops, so the exit reads as expected, not as a crash. */
-  readonly #stopConfinedEffect = Effect.fn("ProviderRuntime.stopConfined")(function* (
+  readonly #stopConfined = Effect.fn("ProviderRuntime.stopConfined")(function* (
     this: ProviderRuntime,
     agentId: string,
     confined: ConfinedClient,
@@ -1324,8 +1317,11 @@ export class ProviderRuntime implements ProviderPort {
       if (this.#confined.get(agentId) === confined) this.#confined.delete(agentId);
       this.#conversation.unloadClientThreads(confined.client);
     });
-    yield* providerIo(() => confined.client.stop()).pipe(Effect.catch(() => Effect.void));
-    yield* providerStep(() => this.#hooks.onClientStopped(confined.client));
+    yield* confined.client
+      .stop()
+      .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+      .pipe(Effect.catch(() => Effect.void));
+    yield* this.#hooks.onClientStopped(confined.client);
   }, Effect.uninterruptible);
 
   /** True when `client` was an agent's own process. Its exit restarts nothing; see `onAgentClientLost`. */
@@ -1335,9 +1331,9 @@ export class ProviderRuntime implements ProviderPort {
     const [agentId] = entry;
     this.#confined.delete(agentId);
     if (this.#hooks.isStopping()) return true;
-    void client.stop().catch(() => undefined);
+    Effect.runFork(client.stop().pipe(Effect.ignore, Effect.forkIn(this.#scope)));
     this.#conversation.unloadClientThreads(client);
-    this.#hooks.onAgentClientLost(agentId, client);
+    Effect.runFork(this.#hooks.onAgentClientLost(agentId, client).pipe(Effect.forkIn(this.#scope)));
     this.#emitProviderError(client.provider, "exited", new Error(this.#redactMcp(error.message)), agentId);
     return true;
   }
@@ -1356,13 +1352,7 @@ export class ProviderRuntime implements ProviderPort {
    * It answers when the restart is scheduled. A provider with no process is checked again at once:
    * a stopped idle one starts, and one that failed or is signed out is asked again.
    */
-  async restartProviderWhenIdle(provider: AgentProvider): Promise<AgentStatus> {
-    const result = await Effect.runPromise(Effect.result(this.#restartProviderWhenIdleEffect(provider)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly #restartProviderWhenIdleEffect = Effect.fn("ProviderRuntime.restartProviderWhenIdle")(function* (
+  readonly restartProviderWhenIdle = Effect.fn("ProviderRuntime.restartProviderWhenIdle")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
@@ -1370,19 +1360,23 @@ export class ProviderRuntime implements ProviderPort {
     if (!this.#clients.has(provider)) {
       if (this.#released.has(provider)) {
         // A failed start is reported on the provider status, as for a turn that wakes it.
-        yield* providerIo(() => this.ensureProvider(provider)).pipe(Effect.ignore);
+        yield* this.ensureProvider(provider)
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+          .pipe(Effect.ignore);
         return this.status();
       }
-      return yield* providerIo(() => this.refreshProvider(provider));
+      return yield* this.refreshProvider(provider).pipe(
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+      );
     }
     yield* providerStep(() => {
       this.#restartsWhenIdle.set(provider, null);
       recordRestartActivity();
       this.#setStatus({});
-      this.#checkRestartWhenIdle(provider);
     });
+    yield* this.#checkRestartWhenIdle(provider);
     return this.status();
-  });
+  }).bind(this);
 
   /** Removes a restart that still waits for turns to end. One that already runs goes on. */
   cancelProviderRestart(provider: AgentProvider): AgentStatus {
@@ -1393,7 +1387,10 @@ export class ProviderRuntime implements ProviderPort {
     return this.status();
   }
 
-  #checkRestartWhenIdle(provider: AgentProvider): void {
+  readonly #checkRestartWhenIdle = Effect.fn("ProviderRuntime.checkRestartWhenIdle")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+  ): Effect.fn.Return<void> {
     if (!this.#restartsWhenIdle.has(provider)) return;
     const waiting =
       this.#status.phase !== "ready" ||
@@ -1404,29 +1401,28 @@ export class ProviderRuntime implements ProviderPort {
       this.#cliLogins.has(provider) ||
       (provider === "codex" && this.#codexLogin.pending);
     if (waiting) {
-      const timer = setTimeout(() => this.#checkRestartWhenIdle(provider), PROVIDER_RESTART_POLL_MS);
+      const timer = setTimeout(
+        () => Effect.runFork(this.#checkRestartWhenIdle(provider).pipe(Effect.forkIn(this.#scope))),
+        PROVIDER_RESTART_POLL_MS,
+      );
       timer.unref?.();
       this.#restartsWhenIdle.set(provider, timer);
       return;
     }
     this.#restartsWhenIdle.set(provider, null);
     const disposals = this.#disposals;
-    void this.#runProviderConnectionCommand(provider, async () => {
-      // A process that stopped meanwhile is started again by its own recovery.
-      if (this.#clients.has(provider)) await this.#reprobeProvider(provider);
-    })
-      .then(
-        () => true,
-        // `#reprobeProvider` has already reported the failure on the provider's status. A turn that
-        // started in the gap before the command ran makes it refuse; the restart then waits again.
-        () => !this.#hooks.isProviderBusy(provider),
-      )
-      .then((done) => {
-        if (disposals !== this.#disposals || !this.#restartsWhenIdle.has(provider)) return;
-        if (done) this.#endRestartWhenIdle(provider);
-        else this.#checkRestartWhenIdle(provider);
-      });
-  }
+    yield* this.#runProviderConnectionCommand(provider, () =>
+      this.#clients.has(provider) ? this.#reprobeProvider(provider).pipe(Effect.asVoid) : Effect.void,
+    ).pipe(
+      Effect.match({ onSuccess: () => true, onFailure: () => !this.#hooks.isProviderBusy(provider) }),
+      Effect.flatMap((done) => {
+        if (disposals !== this.#disposals || !this.#restartsWhenIdle.has(provider)) return Effect.void;
+        if (done) return Effect.sync(() => this.#endRestartWhenIdle(provider));
+        return this.#checkRestartWhenIdle(provider);
+      }),
+      Effect.forkIn(this.#scope),
+    );
+  });
 
   #endRestartWhenIdle(provider: AgentProvider): void {
     this.#restartsWhenIdle.delete(provider);
@@ -1445,21 +1441,16 @@ export class ProviderRuntime implements ProviderPort {
   }
 
   /** Router arm: the CLI reports a finished ChatGPT browser login. */
-  completeCodexLogin(
+  readonly completeCodexLogin = Effect.fn("ProviderRuntime.completeCodexLogin")(function* (
+    this: ProviderRuntime,
     params: unknown,
     source: AgentClient,
     decode: (params: unknown) => AccountLoginCompletedResult,
-  ): void {
-    try {
-      const completion = decode(params);
-      void this.#runProviderConnectionCommand("codex", async () => {
-        await this.#codexLogin.complete(completion, source);
-        return this.status();
-      });
-    } catch {
-      void this.#codexLogin.failUnverified();
-    }
-  }
+  ) {
+    const decoded = yield* Effect.result(providerStep(() => decode(params)));
+    if (Result.isFailure(decoded)) return yield* this.#codexLogin.failUnverified();
+    yield* this.#runProviderConnectionCommand("codex", () => this.#codexLogin.complete(decoded.success, source));
+  }).bind(this);
 
   /**
    * Pushed by the main process, which owns the Computer Use driver.
@@ -1473,31 +1464,31 @@ export class ProviderRuntime implements ProviderPort {
   }
 
   /** Router arm: the CLI pushed new rate limits. */
-  refreshCodexUsage(): void {
+  readonly refreshCodexUsage = Effect.fn("ProviderRuntime.refreshCodexUsage")(function* (this: ProviderRuntime) {
     const client = this.#clients.get("codex");
-    if (client) void this.#refreshUsage(client, undefined, false).catch(() => undefined);
-  }
+    if (client) yield* this.#refreshUsage(client, undefined, false).pipe(Effect.ignore);
+  }).bind(this);
 
   /** Refresh the notice once when one provider reports the same exhausted balance several ways. */
-  refreshUsageAfterLimit(source: AgentClient): void {
+  readonly refreshUsageAfterLimit = Effect.fn("ProviderRuntime.refreshUsageAfterLimit")(function* (
+    this: ProviderRuntime,
+    source: AgentClient,
+  ) {
     const client = this.#clients.get(source.provider);
     if (!client || this.#usageLimitRefreshes.has(client)) return;
-    const refresh = this.#refreshUsage(client)
-      .then(
-        () => undefined,
-        () => undefined,
-      )
-      .finally(() => {
-        if (this.#usageLimitRefreshes.get(client) === refresh) this.#usageLimitRefreshes.delete(client);
-      });
-    this.#usageLimitRefreshes.set(client, refresh);
-  }
+    this.#usageLimitRefreshes.add(client);
+    yield* this.#refreshUsage(client).pipe(
+      Effect.ignore,
+      Effect.ensuring(Effect.sync(() => this.#usageLimitRefreshes.delete(client))),
+      Effect.forkIn(this.#scope),
+    );
+  }).bind(this);
 
   /**
    * The provider half of stop(). Returns the clients the caller still has to await, because
    * stop() interleaves that wait with the mailbox and image-generation teardown.
    */
-  dispose(): AgentClient[] {
+  readonly dispose = Effect.fn("ProviderRuntime.dispose")(function* (this: ProviderRuntime) {
     this.#disposals += 1;
     for (const timer of this.#restartTimers.values()) clearTimeout(timer);
     this.#restartTimers.clear();
@@ -1511,7 +1502,8 @@ export class ProviderRuntime implements ProviderPort {
     this.#cliLogins.clear();
     this.#providerConnectionCommands.clear();
     for (const login of cliLogins) {
-      stopProcessTree(login.child);
+      yield* stopProcessTree(login.child).pipe(Effect.ignore);
+      yield* Scope.close(login.scope, Exit.void);
     }
     const clients = [
       ...this.#clients.values(),
@@ -1520,51 +1512,40 @@ export class ProviderRuntime implements ProviderPort {
     ];
     this.#clients.clear();
     this.#confined.clear();
+    yield* Scope.close(this.#scope, Exit.void);
     return clients;
-  }
+  }, Effect.uninterruptible).bind(this);
 
   markStopped(): void {
     this.#setStatus({ phase: "stopped", message: null });
   }
 
-  async #runProviderConnectionCommand<T>(provider: AgentProvider, command: () => Promise<T>): Promise<T> {
-    const previous = this.#providerConnectionCommands.get(provider) ?? Promise.resolve();
-    const run = previous.catch(() => undefined).then(() => command());
-    // What the queue holds is the turn, not its answer: a later command only waits for this one to
-    // be over, and swallowing the failure here is what keeps a refused sign-in from surfacing a
-    // second time as an unhandled rejection nobody is left awaiting.
-    const current = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.#providerConnectionCommands.set(provider, current);
+  readonly #runProviderConnectionCommand = Effect.fn("ProviderRuntime.connectionCommand")(function* <T>(
+    this: ProviderRuntime,
+    provider: AgentProvider,
+    command: () => Effect.Effect<T, ProviderOperationFailed>,
+  ) {
+    const previous = this.#providerConnectionCommands.get(provider);
+    const completion = Deferred.makeUnsafe<void, ProviderOperationFailed>();
+    this.#providerConnectionCommands.set(provider, completion);
     recordRestartActivity();
-    try {
-      return await run;
-    } finally {
-      if (this.#providerConnectionCommands.get(provider) === current) {
-        this.#providerConnectionCommands.delete(provider);
-      }
-    }
-  }
+    if (previous) yield* Deferred.await(previous).pipe(Effect.ignore);
+    const exit = yield* Effect.exit(Effect.suspend(command));
+    yield* Deferred.done(completion, Exit.asVoid(exit));
+    if (this.#providerConnectionCommands.get(provider) === completion)
+      this.#providerConnectionCommands.delete(provider);
+    return yield* exit;
+  }, Effect.uninterruptible);
 
-  async #refreshProviders(): Promise<AgentStatus> {
-    const result = await Effect.runPromise(Effect.result(this.#refreshProvidersEffect()));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly #refreshProvidersEffect = Effect.fn("ProviderRuntime.refreshProviders")(function* (this: ProviderRuntime) {
+  readonly #refreshProviders = Effect.fn("ProviderRuntime.refreshProviders")(function* (this: ProviderRuntime) {
     yield* Effect.forEach(
       BUILT_IN_PROVIDER_DRIVERS,
       (driver) =>
-        providerIo(() =>
-          this.#runProviderConnectionCommand(driver.id, () =>
-            driver.signIn.kind === "browser"
-              ? this.#codexLogin.settleForRefresh()
-              : this.#cancelCliLogin(driver.id, null),
-          ),
-        ),
+        this.#runProviderConnectionCommand(driver.id, () =>
+          driver.signIn.kind === "browser"
+            ? this.#codexLogin.settleForRefresh()
+            : this.#cancelCliLogin(driver.id, null),
+        ).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause }))),
       { concurrency: "unbounded", discard: true },
     );
 
@@ -1582,7 +1563,7 @@ export class ProviderRuntime implements ProviderPort {
       }
       this.#setStatus({ providers });
     }
-    yield* Effect.forEach(activeClients, ([provider, client]) => this.#refreshAccountEffect(provider, client), {
+    yield* Effect.forEach(activeClients, ([provider, client]) => this.#refreshAccount(provider, client), {
       concurrency: "unbounded",
       discard: true,
     });
@@ -1591,38 +1572,35 @@ export class ProviderRuntime implements ProviderPort {
     // Join earlier starts before claiming their provider slots.
     const pendingStarts = () => providers.flatMap((provider) => this.#providerStarts.get(provider) ?? []);
     for (let pending = pendingStarts(); pending.length > 0; pending = pendingStarts()) {
-      yield* Effect.forEach(pending, (start) => providerIo(() => start).pipe(Effect.ignore), {
+      yield* Effect.forEach(pending, (start) => Deferred.await(start).pipe(Effect.ignore), {
         concurrency: "unbounded",
         discard: true,
       });
     }
     const starting = providers.filter((provider) => !this.#clients.has(provider));
     for (const provider of starting) this.#resetRestarts(provider);
-    // Keep the promise as the shared join handle for native callers.
-    const start = this.#connect("starting", providers, { preserveCheckErrors: true, refreshRuntimeInBackground: true });
-    for (const provider of starting) this.#providerStarts.set(provider, start);
-    yield* providerIo(() => start).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          for (const provider of starting) {
-            if (this.#providerStarts.get(provider) === start) this.#providerStarts.delete(provider);
-          }
-        }),
-      ),
+    const completion = Deferred.makeUnsafe<void, ProviderOperationFailed>();
+    for (const provider of starting) this.#providerStarts.set(provider, completion);
+    const exit = yield* Effect.exit(
+      this.#connect("starting", providers, { preserveCheckErrors: true, refreshRuntimeInBackground: true }),
     );
+    yield* Deferred.done(completion, exit);
+    for (const provider of starting)
+      if (this.#providerStarts.get(provider) === completion) this.#providerStarts.delete(provider);
+    yield* exit;
     return this.status();
   }, Effect.uninterruptible);
 
-  readonly #refreshAccountEffect = Effect.fn("ProviderRuntime.refreshAccount")(function* (
+  readonly #refreshAccount = Effect.fn("ProviderRuntime.refreshAccount")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     client: AgentClient,
   ) {
     const result = yield* Effect.result(
       Effect.gen({ self: this }, function* () {
-        const account = yield* providerIo(() =>
-          client.request("account/read", { refreshToken: true }, decodeAccountReadResult, 5_000),
-        );
+        const account = yield* client
+          .request("account/read", { refreshToken: true }, decodeAccountReadResult, 5_000)
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
         // An activation can replace this client while the account request is pending.
         if (this.#clients.get(provider) !== client) return;
         if (account.account) {
@@ -1643,11 +1621,14 @@ export class ProviderRuntime implements ProviderPort {
         this.#clients.delete(provider);
         this.#cli.delete(provider);
         this.#accounts.delete(provider);
-        yield* providerIo(() => client.stop()).pipe(Effect.ignore);
-        this.#hooks.onClientStopped(client);
+        yield* client
+          .stop()
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+          .pipe(Effect.ignore);
+        yield* this.#hooks.onClientStopped(client);
         yield* Effect.forEach(
           [...this.#confined].filter(([, confined]) => confined.client.provider === provider),
-          ([agentId, confined]) => this.#stopConfinedEffect(agentId, confined),
+          ([agentId, confined]) => this.#stopConfined(agentId, confined),
           { concurrency: "unbounded", discard: true },
         );
       }),
@@ -1671,7 +1652,7 @@ export class ProviderRuntime implements ProviderPort {
     return error instanceof AgentProcessExitError ? error.withDetail(this.#redactMcp) : error;
   }
 
-  readonly #authenticateClientEffect = Effect.fn("ProviderRuntime.authenticateClient")(
+  readonly #authenticateClient = Effect.fn("ProviderRuntime.authenticateClient")(
     function* (
       this: ProviderRuntime,
       provider: AgentProvider,
@@ -1692,8 +1673,8 @@ export class ProviderRuntime implements ProviderPort {
               this.#bindClient(client);
               client.start();
             });
-            yield* providerIo(() =>
-              client.request(
+            yield* client
+              .request(
                 "initialize",
                 {
                   clientInfo: { name: "openbot", title: "OpenBot", version: "0.1.0" },
@@ -1701,12 +1682,12 @@ export class ProviderRuntime implements ProviderPort {
                 },
                 decodeRecordResponse,
                 startTimeoutMs,
-              ),
-            );
+              )
+              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
             yield* providerStep(() => client.notify("initialized"));
-            const response = yield* providerIo(() =>
-              client.request("account/read", { refreshToken: true }, decodeAccountReadResult),
-            );
+            const response = yield* client
+              .request("account/read", { refreshToken: true }, decodeAccountReadResult)
+              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
             const account = response.account;
             if (!account)
               return yield* new ProviderOperationFailed({
@@ -1719,110 +1700,110 @@ export class ProviderRuntime implements ProviderPort {
             transferred = true;
             return { client, account };
           }),
-        (client) => (transferred ? Effect.void : providerIo(() => client.stop()).pipe(Effect.catch(() => Effect.void))),
+        (client) =>
+          transferred
+            ? Effect.void
+            : client
+                .stop()
+                .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+                .pipe(Effect.catch(() => Effect.void)),
       );
     },
     Effect.mapError((failure) => new ProviderOperationFailed({ cause: this.#withExitDetail(failure.cause) })),
   );
 
-  async #activateProviderClient(
-    provider: AgentProvider,
-    client: AgentClient,
-    cli: AgentCliInfo,
-    account: NonNullable<AccountReadResult["account"]>,
-    options: { isCurrent?: () => boolean; notifyReady?: boolean } = {},
-  ): Promise<void> {
-    // Keep the existing cross-provider activation queue. Effects own each activation's
-    // catalog refresh and replacement cleanup within that queue.
-    const activation = this.#providerActivation
-      .catch(() => undefined)
-      .then(async () => {
-        const result = await Effect.runPromise(
-          Effect.result(this.#activateProviderClientEffect(provider, client, cli, account, options)),
-        );
-        if (Result.isFailure(result)) throw result.failure.cause;
-      });
-    this.#providerActivation = activation.catch(() => undefined);
-    await activation;
-  }
-
-  readonly #activateProviderClientEffect = Effect.fn("ProviderRuntime.activateClient")(function* (
+  readonly #activateProviderClient = Effect.fn("ProviderRuntime.activateClient")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     client: AgentClient,
     cli: AgentCliInfo,
     account: NonNullable<AccountReadResult["account"]>,
-    options: { isCurrent?: () => boolean; notifyReady?: boolean },
+    options: { isCurrent?: () => boolean; notifyReady?: boolean } = {},
   ) {
-    const { isCurrent, notifyReady = true } = options;
-    const stopCandidate = providerIo(() => client.stop()).pipe(Effect.catch(() => Effect.void));
-    if (isCurrent && !isCurrent()) {
-      yield* stopCandidate;
-      return;
-    }
-    const previousClient = this.#clients.get(provider);
-    const previousCli = this.#cli.get(provider);
-    const previousAccount = this.#accounts.get(provider);
-    const wasReleased = this.#released.delete(provider);
-    if (!wasReleased && previousClient !== client) this.#countActivation(provider);
-    this.#clients.set(provider, client);
-    this.#cli.set(provider, cli);
-    this.#accounts.set(provider, account);
-    const restorePrevious = Effect.gen({ self: this }, function* () {
-      if (previousClient) this.#clients.set(provider, previousClient);
-      else this.#clients.delete(provider);
-      if (previousCli) this.#cli.set(provider, previousCli);
-      else this.#cli.delete(provider);
-      if (previousAccount) this.#accounts.set(provider, previousAccount);
-      else this.#accounts.delete(provider);
-      if (client !== previousClient) yield* stopCandidate;
-    });
-    const updated = yield* Effect.result(
+    return yield* this.#providerActivation.withPermit(
       Effect.gen({ self: this }, function* () {
-        const freshCatalogs = yield* this.#refreshModelCatalogEffect();
-        if (isCurrent && !isCurrent()) return false;
-        yield* providerStep(() => {
-          const primaryProvider = this.#clients.has(this.#preferredProvider)
-            ? this.#preferredProvider
-            : this.#clients.has("codex")
-              ? "codex"
-              : provider;
-          const primaryAccount = this.#accounts.get(primaryProvider);
-          this.#conversation.clearLoadedThreads();
-          this.#setStatus({
-            phase: "ready",
-            cliVersion: this.#cli.get(primaryProvider)?.version ?? null,
-            auth: requireProviderDriver(primaryProvider).authState(primaryAccount ?? null),
-            providers: updateProviderStatus(this.#status.providers, provider, {
-              state: "available",
-              version: cli.version,
-              message: null,
-              email: account.email ?? null,
-            }),
-            capabilities: { ...this.#status.capabilities, chat: "ready", browser: "ready" },
-            message: null,
-          });
-          // Only the catalog reported by this client proves that an endpoint is available.
-          if (freshCatalogs.has(provider))
-            this.#hooks.onProviderActivated(provider, this.#configRevisions.get(client) ?? 0);
+        const { isCurrent, notifyReady = true } = options;
+        const stopCandidate = client
+          .stop()
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+          .pipe(Effect.catch(() => Effect.void));
+        if (isCurrent && !isCurrent()) {
+          yield* stopCandidate;
+          return;
+        }
+        const previousClient = this.#clients.get(provider);
+        const previousCli = this.#cli.get(provider);
+        const previousAccount = this.#accounts.get(provider);
+        const wasReleased = this.#released.delete(provider);
+        if (!wasReleased && previousClient !== client) this.#countActivation(provider);
+        this.#clients.set(provider, client);
+        this.#cli.set(provider, cli);
+        this.#accounts.set(provider, account);
+        const restorePrevious = Effect.gen({ self: this }, function* () {
+          if (previousClient) this.#clients.set(provider, previousClient);
+          else this.#clients.delete(provider);
+          if (previousCli) this.#cli.set(provider, previousCli);
+          else this.#cli.delete(provider);
+          if (previousAccount) this.#accounts.set(provider, previousAccount);
+          else this.#accounts.delete(provider);
+          if (client !== previousClient) yield* stopCandidate;
         });
-        return true;
+        const updated = yield* Effect.result(
+          Effect.gen({ self: this }, function* () {
+            const freshCatalogs = yield* this.#refreshModelCatalog();
+            if (isCurrent && !isCurrent()) return false;
+            yield* providerStep(() => {
+              const primaryProvider = this.#clients.has(this.#preferredProvider)
+                ? this.#preferredProvider
+                : this.#clients.has("codex")
+                  ? "codex"
+                  : provider;
+              const primaryAccount = this.#accounts.get(primaryProvider);
+              this.#conversation.clearLoadedThreads();
+              this.#setStatus({
+                phase: "ready",
+                cliVersion: this.#cli.get(primaryProvider)?.version ?? null,
+                auth: requireProviderDriver(primaryProvider).authState(primaryAccount ?? null),
+                providers: updateProviderStatus(this.#status.providers, provider, {
+                  state: "available",
+                  version: cli.version,
+                  message: null,
+                  email: account.email ?? null,
+                }),
+                capabilities: { ...this.#status.capabilities, chat: "ready", browser: "ready" },
+                message: null,
+              });
+            });
+            // Only the catalog reported by this client proves that an endpoint is available.
+            if (freshCatalogs.has(provider))
+              yield* this.#hooks
+                .onProviderActivated(provider, this.#configRevisions.get(client) ?? 0)
+                .pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
+            return true;
+          }),
+        );
+        if (Result.isFailure(updated)) {
+          yield* restorePrevious;
+          return yield* updated.failure;
+        }
+        if (!updated.success) {
+          yield* restorePrevious;
+          return;
+        }
+        if (previousClient && previousClient !== client) {
+          yield* previousClient
+            .stop()
+            .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+            .pipe(Effect.catch(() => Effect.void));
+          yield* this.#hooks.onClientStopped(previousClient);
+        }
+        if (provider === "codex") yield* this.#refreshUsage(client).pipe(Effect.ignore, Effect.forkIn(this.#scope));
+        if (notifyReady)
+          yield* this.#hooks
+            .onProvidersReady()
+            .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
       }),
     );
-    if (Result.isFailure(updated)) {
-      yield* restorePrevious;
-      return yield* updated.failure;
-    }
-    if (!updated.success) {
-      yield* restorePrevious;
-      return;
-    }
-    if (previousClient && previousClient !== client) {
-      yield* providerIo(() => previousClient.stop()).pipe(Effect.catch(() => Effect.void));
-      yield* providerStep(() => this.#hooks.onClientStopped(previousClient));
-    }
-    if (provider === "codex") void this.#refreshUsage(client).catch(() => undefined);
-    if (notifyReady) yield* providerIo(() => this.#hooks.onProvidersReady());
   }, Effect.uninterruptible);
 
   #setProviderConnectionState(provider: AgentProvider, connectionState: "connecting"): void {
@@ -1891,7 +1872,7 @@ export class ProviderRuntime implements ProviderPort {
   }
 
   /** Puts a provider back on the binary that is on disk now, after a managed update. */
-  readonly #reloadProviderCliEffect = Effect.fn("ProviderRuntime.reloadProviderCli")(function* (
+  readonly #reloadProviderCli = Effect.fn("ProviderRuntime.reloadProviderCli")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     cli: AgentCliInfo,
@@ -1902,7 +1883,7 @@ export class ProviderRuntime implements ProviderPort {
         this.#cli.delete(provider);
       });
       // Other providers can have live turns. Replacement must not run start recovery.
-      yield* this.#connectEffect("starting", [provider], {
+      yield* this.#connect("starting", [provider], {
         preserveCheckErrors: true,
         notifyReady: false,
         startTimeoutMs: INSTALLED_CLI_START_TIMEOUT_MS,
@@ -1915,12 +1896,12 @@ export class ProviderRuntime implements ProviderPort {
       }
       return;
     }
-    const candidate = yield* this.#authenticateClientEffect(provider, cli, {
+    const candidate = yield* this.#authenticateClient(provider, cli, {
       startTimeoutMs: INSTALLED_CLI_START_TIMEOUT_MS,
     });
-    yield* providerIo(() =>
-      this.#activateProviderClient(provider, candidate.client, cli, candidate.account, { notifyReady: false }),
-    );
+    yield* this.#activateProviderClient(provider, candidate.client, cli, candidate.account, {
+      notifyReady: false,
+    }).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
   }, Effect.uninterruptible);
 
   /**
@@ -1928,13 +1909,8 @@ export class ProviderRuntime implements ProviderPort {
    * provider's own CLI in a terminal, so this only starts a fresh client and asks the provider
    * which account it now has. A provider with a free tier answers with an account either way.
    */
-  async #reprobeProvider(provider: AgentProvider): Promise<AgentStatus> {
-    const result = await Effect.runPromise(Effect.result(this.#reprobeProviderEffect(provider)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
 
-  readonly #reprobeProviderEffect = Effect.fn("ProviderRuntime.reprobeProvider")(function* (
+  readonly #reprobeProvider = Effect.fn("ProviderRuntime.reprobeProvider")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
   ) {
@@ -1952,14 +1928,12 @@ export class ProviderRuntime implements ProviderPort {
       }),
       () =>
         Effect.gen({ self: this }, function* () {
-          const resolved = yield* this.#resolveProviderCliEffect(provider);
+          const resolved = yield* this.#resolveProviderCli(provider);
           cli = resolved;
-          const candidate = yield* this.#authenticateClientEffect(provider, resolved);
-          yield* providerIo(() =>
-            this.#activateProviderClient(provider, candidate.client, resolved, candidate.account, {
-              notifyReady: false,
-            }),
-          );
+          const candidate = yield* this.#authenticateClient(provider, resolved);
+          yield* this.#activateProviderClient(provider, candidate.client, resolved, candidate.account, {
+            notifyReady: false,
+          }).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
           yield* providerStep(() => this.#clearProviderConnectionState(provider));
           return this.status();
         }).pipe(
@@ -1975,40 +1949,48 @@ export class ProviderRuntime implements ProviderPort {
     );
   }, Effect.uninterruptible);
 
-  #startCliLogin(
-    provider: AgentProvider,
-    start: (
-      cli: AgentCliInfo,
-    ) => { child: ChildProcess; done: Promise<void> } & Partial<Pick<CliCodeLogin, "prompt" | "submit">>,
-  ): Promise<AgentStatus> {
-    return runProviderEffect(this.#startCliLoginEffect(provider, start));
-  }
-
-  readonly #startCliLoginEffect = Effect.fn("ProviderRuntime.startCliLogin")(function* (
+  readonly #startCliLogin = Effect.fn("ProviderRuntime.startCliLogin")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
-    start: (
-      cli: AgentCliInfo,
-    ) => { child: ChildProcess; done: Promise<void> } & Partial<Pick<CliCodeLogin, "prompt" | "submit">>,
+    start: (cli: AgentCliInfo) => Effect.Effect<
+      {
+        child: ChildProcess;
+        done: Effect.Effect<void, ProviderClientOperationError | CliCodeLoginFailed | ProviderProcessFailed>;
+      } & Partial<Pick<CliCodeLogin, "prompt" | "submit">>,
+      ProviderClientOperationError | CliCodeLoginFailed | ProviderOperationFailed,
+      Scope.Scope
+    >,
   ) {
     let cli: AgentCliInfo | null = null;
     this.#setProviderConnectionState(provider, "connecting");
     return yield* Effect.gen({ self: this }, function* () {
-      const resolved = yield* this.#resolveProviderCliEffect(provider);
+      const resolved = yield* this.#resolveProviderCli(provider);
       cli = resolved;
-      const { child, done, prompt, submit } = yield* providerStep(() => start(resolved));
+      const scope = Scope.makeUnsafe();
+      const { child, done, prompt, submit } = yield* start(resolved).pipe(
+        Effect.provideService(Scope.Scope, scope),
+        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+        Effect.onError(() => Scope.close(scope, Exit.void)),
+      );
       const pending: PendingCliLogin = {
         child,
         cli: resolved,
+        scope,
         task: null,
         ...(prompt && submit ? { code: { prompt, submit } } : {}),
       };
       this.#cliLogins.set(provider, pending);
       recordRestartActivity();
       // The login outlives the request; dispose/cancel owns the registered child and task.
-      pending.task = done
-        .then(() => runProviderEffect(this.#completeCliLoginEffect(provider, pending)))
-        .catch((error) => this.#failCliLogin(provider, pending, error));
+      pending.task = yield* Effect.forkIn(
+        done.pipe(
+          Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+          Effect.flatMap(() => this.#completeCliLogin(provider, pending)),
+          Effect.catch((failure) => this.#failCliLogin(provider, pending, failure.cause)),
+          Effect.ensuring(Scope.close(scope, Exit.void)),
+        ),
+        this.#scope,
+      );
       return this.status();
     }).pipe(
       Effect.tapError((failure) =>
@@ -2017,39 +1999,49 @@ export class ProviderRuntime implements ProviderPort {
     );
   }, Effect.uninterruptible);
 
-  readonly #completeCliLoginEffect = Effect.fn("ProviderRuntime.completeCliLogin")(function* (
+  readonly #completeCliLogin = Effect.fn("ProviderRuntime.completeCliLogin")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     pending: PendingCliLogin,
   ) {
     if (this.#cliLogins.get(provider) !== pending) return;
     yield* Effect.gen({ self: this }, function* () {
-      const candidate = yield* this.#authenticateClientEffect(provider, pending.cli);
+      const candidate = yield* this.#authenticateClient(provider, pending.cli);
       if (this.#cliLogins.get(provider) !== pending) {
-        yield* providerIo(() => candidate.client.stop()).pipe(Effect.ignore);
+        yield* candidate.client
+          .stop()
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+          .pipe(Effect.ignore);
         return;
       }
-      yield* providerIo(() =>
-        this.#activateProviderClient(provider, candidate.client, pending.cli, candidate.account, {
-          isCurrent: () => this.#cliLogins.get(provider) === pending,
-        }),
-      );
+      yield* this.#activateProviderClient(provider, candidate.client, pending.cli, candidate.account, {
+        isCurrent: () => this.#cliLogins.get(provider) === pending,
+      }).pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
       if (this.#cliLogins.get(provider) === pending) this.#cliLogins.delete(provider);
-    }).pipe(Effect.catch((failure) => providerIo(() => this.#failCliLogin(provider, pending, failure.cause))));
+    }).pipe(
+      Effect.catch((failure) =>
+        this.#failCliLogin(provider, pending, failure.cause).pipe(
+          Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+        ),
+      ),
+    );
   }, Effect.uninterruptible);
 
-  async #failCliLogin(provider: AgentProvider, pending: PendingCliLogin, error: unknown): Promise<void> {
+  readonly #failCliLogin = Effect.fn("ProviderRuntime.failCliLogin")(function* (
+    this: ProviderRuntime,
+    provider: AgentProvider,
+    pending: PendingCliLogin,
+    error: unknown,
+  ) {
     if (this.#cliLogins.get(provider) !== pending) return;
     this.#cliLogins.delete(provider);
-    stopProcessTree(pending.child);
+    yield* stopProcessTree(pending.child).pipe(
+      Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+    );
     this.#setProviderConnectionFailure(provider, error, pending.cli.version);
-  }
+  });
 
-  #cancelCliLogin(provider: AgentProvider, message: string | null): Promise<void> {
-    return runProviderEffect(this.#cancelCliLoginEffect(provider, message));
-  }
-
-  readonly #cancelCliLoginEffect = Effect.fn("ProviderRuntime.cancelCliLogin")(function* (
+  readonly #cancelCliLogin = Effect.fn("ProviderRuntime.cancelCliLogin")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     message: string | null,
@@ -2057,29 +2049,17 @@ export class ProviderRuntime implements ProviderPort {
     const pending = this.#cliLogins.get(provider);
     if (!pending) return;
     this.#cliLogins.delete(provider);
-    yield* providerStep(() => stopProcessTree(pending.child));
+    yield* stopProcessTree(pending.child).pipe(
+      Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
+    );
+    yield* Scope.close(pending.scope, Exit.void);
     const task = pending.task;
-    if (task) yield* providerIo(() => task).pipe(Effect.ignore);
+    if (task) yield* Fiber.join(task).pipe(Effect.ignore);
     if (message) this.#setProviderConnectionFailure(provider, new Error(message), pending.cli.version);
     else this.#clearProviderConnectionState(provider);
   }, Effect.uninterruptible);
 
-  async #connect(
-    phase: "starting" | "restarting",
-    requestedProviders: readonly AgentProvider[],
-    options: {
-      preserveCheckErrors?: boolean;
-      refreshRuntimeInBackground?: boolean;
-      notifyReady?: boolean;
-      /** How long `initialize` may take, the request timeout when not set. */
-      startTimeoutMs?: number;
-    } = {},
-  ): Promise<void> {
-    const result = await Effect.runPromise(Effect.result(this.#connectEffect(phase, requestedProviders, options)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-  }
-
-  readonly #connectEffect = Effect.fn("ProviderRuntime.connect")(function* (
+  readonly #connect = Effect.fn("ProviderRuntime.connect")(function* (
     this: ProviderRuntime,
     phase: "starting" | "restarting",
     requestedProviders: readonly AgentProvider[],
@@ -2138,7 +2118,7 @@ export class ProviderRuntime implements ProviderPort {
         return Effect.gen({ self: this }, function* () {
           if (this.#clients.has(provider)) return null;
           const driver = requireProviderDriver(provider);
-          const resolvedCli = yield* this.#resolveProviderCliEffect(provider);
+          const resolvedCli = yield* this.#resolveProviderCli(provider);
           cli = resolvedCli;
           logger.info("Resolved a provider CLI.", {
             provider,
@@ -2159,8 +2139,8 @@ export class ProviderRuntime implements ProviderPort {
             this.#bindClient(candidate);
             candidate.start();
           });
-          yield* providerIo(() =>
-            candidate.request(
+          yield* candidate
+            .request(
               "initialize",
               {
                 clientInfo: { name: "openbot", title: "OpenBot", version: "0.1.0" },
@@ -2168,19 +2148,22 @@ export class ProviderRuntime implements ProviderPort {
               },
               decodeRecordResponse,
               options.startTimeoutMs,
-            ),
-          );
+            )
+            .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
           yield* providerStep(() => candidate.notify("initialized"));
           logger.info("A provider answered initialize.", { provider, durationMs: stageMs() });
           stage = "account";
           stageStartedAt = performance.now();
-          const account = yield* providerIo(() =>
-            candidate.request("account/read", { refreshToken: false }, decodeAccountReadResult, 5_000),
-          );
+          const account = yield* candidate
+            .request("account/read", { refreshToken: false }, decodeAccountReadResult, 5_000)
+            .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
           if (!account.account) {
             const message =
               this.#customProviderSignInMessage(provider) ?? agentProviderDescriptor(provider).signInMessage;
-            yield* providerIo(() => candidate.stop()).pipe(Effect.catch(() => Effect.void));
+            yield* candidate
+              .stop()
+              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+              .pipe(Effect.catch(() => Effect.void));
             this.#setStatus({
               providers: updateProviderStatus(this.#status.providers, provider, {
                 state: "sign-in-required",
@@ -2195,7 +2178,10 @@ export class ProviderRuntime implements ProviderPort {
           yield* providerStep(() => driver.validateAccount(authenticated));
           // `stop()` does not wait for a start: a client added after its `dispose()` would run on.
           if (disposed()) {
-            yield* providerIo(() => candidate.stop()).pipe(Effect.catch(() => Effect.void));
+            yield* candidate
+              .stop()
+              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+              .pipe(Effect.catch(() => Effect.void));
             return null;
           }
           if (!this.#released.has(provider)) this.#countActivation(provider);
@@ -2216,7 +2202,11 @@ export class ProviderRuntime implements ProviderPort {
           Effect.catch((problem) =>
             Effect.gen({ self: this }, function* () {
               const failedClient = client;
-              if (failedClient) yield* providerIo(() => failedClient.stop()).pipe(Effect.catch(() => Effect.void));
+              if (failedClient)
+                yield* failedClient
+                  .stop()
+                  .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+                  .pipe(Effect.catch(() => Effect.void));
               const thrown = problem.cause;
               // Another start of this provider, such as a turn's during a refresh, finished first. Its
               // client runs and its row is current, so this failure describes nothing the app uses.
@@ -2259,7 +2249,10 @@ export class ProviderRuntime implements ProviderPort {
           Effect.onInterrupt(() => {
             const interruptedClient = client;
             return interruptedClient && this.#clients.get(provider) !== interruptedClient
-              ? providerIo(() => interruptedClient.stop()).pipe(Effect.catch(() => Effect.void))
+              ? interruptedClient
+                  .stop()
+                  .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
+                  .pipe(Effect.catch(() => Effect.void))
               : Effect.void;
           }),
         );
@@ -2310,27 +2303,34 @@ export class ProviderRuntime implements ProviderPort {
     });
     const refreshRuntime = Effect.gen({ self: this }, function* () {
       const codexClient = this.#clients.get("codex");
-      const freshCatalogs = yield* this.#refreshModelCatalogEffect();
+      const freshCatalogs = yield* this.#refreshModelCatalog();
       for (const provider of activated) {
         const client = this.#clients.get(provider);
         // The same condition as the other activation site: a stale catalogue proves nothing about
         // the endpoints the process now answering was given.
         if (client && freshCatalogs.has(provider)) {
-          this.#hooks.onProviderActivated(provider, this.#configRevisions.get(client) ?? 0);
+          yield* this.#hooks
+            .onProviderActivated(provider, this.#configRevisions.get(client) ?? 0)
+            .pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
         }
       }
       // The catalogue is read off the status, so discovery that found new models has to publish one.
       // This used to ride along with a Computer Use probe that no longer exists.
       this.#setStatus({});
-      if (codexClient) void this.#refreshUsage(codexClient).catch(() => undefined);
-      if (options.notifyReady !== false) yield* providerIo(() => this.#hooks.onProvidersReady());
+      if (codexClient) yield* this.#refreshUsage(codexClient).pipe(Effect.ignore, Effect.forkIn(this.#scope));
+      if (options.notifyReady !== false)
+        yield* this.#hooks
+          .onProvidersReady()
+          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
     });
     if (options.refreshRuntimeInBackground) {
-      void Effect.runPromise(Effect.result(refreshRuntime))
-        .then((result) => {
-          if (Result.isFailure(result)) this.#emitError("provider_metadata_refresh_failed", result.failure.cause);
-        })
-        .catch((error) => this.#emitError("provider_metadata_refresh_failed", error));
+      yield* refreshRuntime.pipe(
+        Effect.catch((failure) =>
+          Effect.sync(() => this.#emitError("provider_metadata_refresh_failed", failure.cause)),
+        ),
+        Effect.catchDefect((error) => Effect.sync(() => this.#emitError("provider_metadata_refresh_failed", error))),
+        Effect.forkIn(this.#scope),
+      );
       return;
     }
     yield* refreshRuntime;
@@ -2401,7 +2401,7 @@ export class ProviderRuntime implements ProviderPort {
       }
       if (isUsageLimitDiagnostic(message)) {
         stderrLogger.warn("A provider reported an exhausted usage limit.", { provider: client.provider, message });
-        this.refreshUsageAfterLimit(client);
+        Effect.runFork(this.refreshUsageAfterLimit(client));
         return;
       }
       if (isGlogBelowErrorDiagnostic(message)) {
@@ -2444,7 +2444,7 @@ export class ProviderRuntime implements ProviderPort {
     if (this.#handleConfinedExit(client, error)) return;
     if (this.#clients.get(client.provider) !== client || this.#hooks.isStopping()) return;
     this.#clients.delete(client.provider);
-    void client.stop().catch(() => undefined);
+    Effect.runFork(client.stop().pipe(Effect.ignore, Effect.forkIn(this.#scope)));
     this.#conversation.clearLoadedThreads();
     this.#hooks.onProviderLost(client);
     this.#exitRecovery.add(client.provider);
@@ -2508,7 +2508,7 @@ export class ProviderRuntime implements ProviderPort {
       provider,
       setTimeout(() => {
         this.#restartTimers.delete(provider);
-        void this.#restart(provider, afterTimeout);
+        Effect.runFork(this.#restart(provider, afterTimeout).pipe(Effect.forkIn(this.#scope)));
       }, delayMs),
     );
   }
@@ -2520,11 +2520,7 @@ export class ProviderRuntime implements ProviderPort {
     this.#restartTimers.delete(provider);
   }
 
-  #restart(provider: AgentProvider, afterTimeout = false): Promise<void> {
-    return runProviderEffect(this.#restartEffect(provider, afterTimeout));
-  }
-
-  readonly #restartEffect = Effect.fn("ProviderRuntime.restart")(function* (
+  readonly #restart = Effect.fn("ProviderRuntime.restart")(function* (
     this: ProviderRuntime,
     provider: AgentProvider,
     afterTimeout = false,
@@ -2535,17 +2531,14 @@ export class ProviderRuntime implements ProviderPort {
     // added exits before the start ends, so the retry waits for it rather than being dropped.
     for (let pending = this.#providerStarts.get(provider); pending; pending = this.#providerStarts.get(provider)) {
       const currentStart = pending;
-      yield* providerIo(() => currentStart).pipe(Effect.ignore);
+      yield* Deferred.await(currentStart).pipe(Effect.ignore);
     }
     if (this.#hooks.isStopping() || disposals !== this.#disposals || this.#clients.has(provider)) return;
     const notifyReady =
       !afterTimeout || this.#exitRecovery.has(provider) || (this.#clients.size === 0 && this.#released.size === 0);
-    const start = this.#connect("restarting", [provider], { notifyReady })
-      .catch((error) => this.#emitProviderError(provider, "restart_failed", error))
-      .finally(() => {
-        this.#providerStarts.delete(provider);
-      });
-    this.#providerStarts.set(provider, start);
+    yield* this.#startProvider(provider, { notifyReady }, "restarting").pipe(
+      Effect.catch((failure) => Effect.sync(() => this.#emitProviderError(provider, "restart_failed", failure.cause))),
+    );
     recordRestartActivity();
   }, Effect.uninterruptible);
 
@@ -2572,9 +2565,7 @@ export class ProviderRuntime implements ProviderPort {
    * already had. That is the right catalogue to keep answering with, but it is not proof of what the
    * process now running serves, so its id is absent from the set and no caller may treat it as proof.
    */
-  readonly #refreshModelCatalogEffect = Effect.fn("ProviderRuntime.refreshModelCatalog")(function* (
-    this: ProviderRuntime,
-  ) {
+  readonly #refreshModelCatalog = Effect.fn("ProviderRuntime.refreshModelCatalog")(function* (this: ProviderRuntime) {
     const errorSerialAtStart = this.#errorSerial;
     const discovered = yield* Effect.forEach(
       BUILT_IN_PROVIDER_DRIVERS,
@@ -2599,8 +2590,8 @@ export class ProviderRuntime implements ProviderPort {
             const cursors = new Set<string>();
             let cursor: string | undefined;
             do {
-              const response = yield* providerIo(() =>
-                client.request(
+              const response = yield* client
+                .request(
                   "model/list",
                   { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) },
                   decodeModelListResponse,
@@ -2609,8 +2600,8 @@ export class ProviderRuntime implements ProviderPort {
                   // servers does. It answers inside the normal timeout, and a list that timed out kept
                   // that agent out of the catalogue.
                   client.provider === "acp" ? this.#requestTimeoutMs : 5_000,
-                ),
-              );
+                )
+                .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
               // Every model the CLI reports is offered, the ones it marks hidden included; only the
               // stored-key drop below keeps a model out. A CLI hides a model it still accepts -- a new release such
               // as `gpt-6-astra` is hidden until its own launch -- and this app has no way to tell
@@ -2749,25 +2740,19 @@ export class ProviderRuntime implements ProviderPort {
     logger.warn("A provider failed.", { provider, message });
   }
 
-  async #refreshUsage(client: AgentClient, model?: string, emit = true): Promise<AccountUsage> {
-    const result = await Effect.runPromise(Effect.result(this.#refreshUsageEffect(client, model, emit)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly #refreshUsageEffect = Effect.fn("ProviderRuntime.refreshUsage")(function* (
+  readonly #refreshUsage = Effect.fn("ProviderRuntime.refreshUsage")(function* (
     this: ProviderRuntime,
     client: AgentClient,
     model?: string,
     emit = true,
   ) {
-    const rateLimits = yield* providerIo(() =>
-      client.request(
+    const rateLimits = yield* client
+      .request(
         "account/rateLimits/read",
         client.provider === "codex" ? undefined : { model },
         decodeAccountRateLimitsReadResult,
-      ),
-    );
+      )
+      .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })));
     const usage = normalizeAccountUsage(rateLimits, client.provider === "codex" ? model : undefined);
     if (emit) this.#emit({ type: "usage-changed", usage: structuredClone(usage) });
     return structuredClone(usage);
@@ -2793,16 +2778,6 @@ export class ProviderOperationFailed extends Schema.TaggedError<ProviderOperatio
   cause: Schema.Defect(),
 }) {}
 
-function providerIo<A>(run: () => Promise<A>): Effect.Effect<A, ProviderOperationFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new ProviderOperationFailed({ cause }) });
-}
-
 function providerStep<A>(run: () => A): Effect.Effect<A, ProviderOperationFailed> {
   return Effect.try({ try: run, catch: (cause) => new ProviderOperationFailed({ cause }) });
-}
-
-async function runProviderEffect<A>(effect: Effect.Effect<A, ProviderOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(effect));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

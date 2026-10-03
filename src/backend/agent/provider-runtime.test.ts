@@ -3,9 +3,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
 import { teeLogLines } from "@openbot/logging";
+import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentProcessExitError, type AgentProvider } from "../agent-client";
-import type { AgentService } from "../agent-service";
+import { AgentLifecycleFailed, type AgentService } from "../agent-service";
 import {
   CREATE_AGENT_INPUT,
   createFakeClaude,
@@ -25,6 +26,7 @@ import {
   waitForQueue,
 } from "../agent-service-test-harness";
 import type { AgentStore } from "../agent-store";
+import { runTestEffect } from "../effect-test-runtime";
 import { McpServerStore } from "../mcp-server-store";
 import type { CustomProviderConfig } from "../opencode-config";
 import { getString } from "../protocol";
@@ -61,18 +63,22 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const openExternal = vi.fn(async () => undefined);
-    await service.connectProvider("opencode", openExternal);
+    await runTestEffect(service.connectProvider("opencode", openExternal));
     expect(openExternal).not.toHaveBeenCalled();
     expect(clients).toHaveLength(2);
     expect(clients[0]?.running).toBe(false);
     expect(clients[1]?.running).toBe(true);
-    await store.getOrCreate("chief");
-    await service.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" });
-    await service.sendMessage({ agentId: "chief", text: "Start a task." });
+    await runTestEffect(store.getOrCreate("chief"));
+    await runTestEffect(
+      service.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" }),
+    );
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Start a task." }));
     await waitFor(() => clients[1]?.requests.some((request) => request.method === "turn/start") === true);
-    await expect(service.connectProvider("opencode", openExternal)).rejects.toThrow("Wait for it to finish");
+    await expect(runTestEffect(service.connectProvider("opencode", openExternal))).rejects.toThrow(
+      "Wait for it to finish",
+    );
     expect(clients).toHaveLength(2);
     expect(clients[1]?.running).toBe(true);
   });
@@ -84,13 +90,13 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "codex",
     });
     service = agentService;
-    await service.sendMessage({ agentId: "chief", text: "Keep working." });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
     const running = service;
-    await waitFor(async () => Boolean((await running.readConversation("chief")).activeTurnId));
-    const turnId = (await service.readConversation("chief")).activeTurnId;
-    await service.connectProvider("opencode", vi.fn());
+    await waitFor(async () => Boolean((await runTestEffect(running.readConversation("chief"))).activeTurnId));
+    const turnId = (await runTestEffect(service.readConversation("chief"))).activeTurnId;
+    await runTestEffect(service.connectProvider("opencode", vi.fn()));
     expect(service.listQueue("chief").deliveries[0]?.status).toBe("running");
-    expect((await service.readConversation("chief")).activeTurnId).toBe(turnId);
+    expect((await runTestEffect(service.readConversation("chief"))).activeTurnId).toBe(turnId);
   });
 
   it.each([false, true])("holds queued OpenCode turns during reconnect and resumes them (failure=%s)", async (fail) => {
@@ -118,17 +124,31 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
-    await store.getOrCreate("chief");
-    await service.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" });
+    await runTestEffect(service.initialize());
+    await runTestEffect(store.getOrCreate("chief"));
+    await runTestEffect(
+      service.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" }),
+    );
     reconnecting = true;
-    const connection = service.connectProvider("opencode", vi.fn());
+    const connection = runTestEffect(service.connectProvider("opencode", vi.fn()));
     await waitFor(() => checkingAccount);
-    const drain = vi.spyOn(DrainScheduler.prototype, "drainAgent");
+    let drained = false;
+    const drainAgent = DrainScheduler.prototype.drainAgent;
+    const drain = vi.spyOn(DrainScheduler.prototype, "drainAgent").mockImplementation(function (
+      this: DrainScheduler,
+      agentId,
+    ) {
+      return drainAgent.call(this, agentId).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            drained = true;
+          }),
+        ),
+      );
+    });
     try {
-      await service.sendMessage({ agentId: "chief", text: "Run after reconnect." });
-      await waitFor(() => drain.mock.calls.length > 0);
-      await drain.mock.results[0]?.value;
+      await runTestEffect(service.sendMessage({ agentId: "chief", text: "Run after reconnect." }));
+      await waitFor(() => drained);
       expect(clients[0]?.requests.filter((request) => request.method === "turn/start")).toEqual([]);
     } finally {
       drain.mockRestore();
@@ -193,7 +213,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
 
     await Promise.race([
-      service.initialize(),
+      runTestEffect(service.initialize()),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Provider account checks did not start concurrently.")), 3_000),
       ),
@@ -245,13 +265,17 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
       bundledExecutables: {},
-      prepareAgentWorkspace: async () => undefined,
+      prepareAgentWorkspace: () =>
+        Effect.try({
+          try: () => undefined,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
       hostedSites: null,
       sidebarLayout: null,
       preferredModel: null,
       credentials: { apiKey: () => storedKey, customProviders: () => [], mcpServers: () => [] },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     return service
       .listModels()
       .filter((model) => model.provider === "opencode")
@@ -331,7 +355,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "opencode", state: "sign-in-required" }),
     );
-    await service.connectProvider("opencode", vi.fn());
+    await runTestEffect(service.connectProvider("opencode", vi.fn()));
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "opencode", state: "available" }),
     );
@@ -405,17 +429,28 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
       bundledExecutables: {},
-      prepareAgentWorkspace: async () => undefined,
+      prepareAgentWorkspace: () =>
+        Effect.try({
+          try: () => undefined,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
       hostedSites: null,
       sidebarLayout: null,
       preferredModel: null,
       credentials: { apiKey: () => storedKey, customProviders: () => [], mcpServers: () => [] },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
-    await service.changeProviderCredential("opencode", async () => {
-      storedKey = "go-key";
-    });
+    await runTestEffect(
+      service.changeProviderCredential("opencode", () =>
+        Effect.try({
+          try: () => {
+            storedKey = "go-key";
+          },
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
+      ),
+    );
 
     // A CLI reads its key at spawn, so only a new process can list what the key buys. The paid
     // Zen model leaves the catalog only when that process is the one reporting it, while the
@@ -446,7 +481,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       },
     });
     const fallback = service.listModels();
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const catalog = service.listModels();
     const byProviderAndId = (models: typeof catalog) =>
       [...models].sort((left, right) => left.provider.localeCompare(right.provider) || left.id.localeCompare(right.id));
@@ -485,7 +520,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         preferredProvider: provider,
         clientFactory: (candidate) => (candidate === provider ? client : new FakeAgentClient(candidate)),
       });
-      await service.initialize();
+      await runTestEffect(service.initialize());
       const catalog = () => service?.listModels().filter((model) => model.provider === provider);
       // A model the CLI marks hidden is still offered: the CLI runs it, so the picker lists it.
       expect(catalog()).toEqual([
@@ -519,7 +554,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
           };
           current.on("event", listener);
         });
-        await current.refreshProviders();
+        await runTestEffect(current.refreshProviders());
         await published;
       };
       failure = true;
@@ -553,7 +588,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "codex",
       clientFactory: () => client,
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     expect(
       service
         .listModels()
@@ -580,7 +615,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "claude",
       clientFactory: () => client,
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     expect(
       service
         .listModels()
@@ -605,7 +640,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "codex",
       clientFactory: () => client,
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     expect(
       service
         .listModels()
@@ -619,8 +654,8 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     const previous = service.listModels();
     repeat = true;
     // initialize awaits metadata discovery, unlike the background provider Refresh action.
-    await service.stop();
-    await service.initialize();
+    await runTestEffect(service.stop());
+    await runTestEffect(service.initialize());
     expect(service.listModels()).toEqual(previous);
   });
 
@@ -643,12 +678,12 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "codex", state: "sign-in-required" }),
     );
-    const connecting = await service.connectProvider("codex", openExternal);
+    const connecting = await runTestEffect(service.connectProvider("codex", openExternal));
 
     expect(connecting.providers).toContainEqual(
       expect.objectContaining({
@@ -670,7 +705,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       },
     });
 
-    await service.connectProvider("codex", openExternal);
+    await runTestEffect(service.connectProvider("codex", openExternal));
     expect(openExternal).toHaveBeenCalledTimes(2);
     expect(codexClients).toHaveLength(3);
     expect(codexClients[1]?.requests).toContainEqual({
@@ -710,13 +745,13 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return new FakeAgentClient(provider, "DONE", true, authenticated);
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: target, state: "sign-in-required" }),
     );
 
-    const connecting = await service.connectProvider(target, async () => undefined);
+    const connecting = await runTestEffect(service.connectProvider(target, async () => undefined));
 
     expect(connecting.providers).toContainEqual(
       expect.objectContaining({ id: target, state: "sign-in-required", connectionState: "connecting" }),
@@ -738,7 +773,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     service = agentService;
 
     await expect(
-      service.connectProvider("codex", async () => Promise.reject(new Error("browser failed"))),
+      runTestEffect(service.connectProvider("codex", async () => Promise.reject(new Error("browser failed")))),
     ).rejects.toThrow("could not open");
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "codex", state: "sign-in-required" }),
@@ -756,10 +791,10 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "codex",
       clientFactory: (provider) => new FakeAgentClient(provider, "DONE", true, true),
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     service.setComputerUseCapability("ready");
 
-    await service.connectProvider("codex", async () => undefined);
+    await runTestEffect(service.connectProvider("codex", async () => undefined));
 
     expect(service.getStatus().capabilities.computerUse).toBe("ready");
   });
@@ -777,9 +812,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     vi.useFakeTimers();
-    await service.connectProvider("codex", async () => undefined);
+    await runTestEffect(service.connectProvider("codex", async () => undefined));
 
     await vi.advanceTimersByTimeAsync(10 * 60_000);
 
@@ -814,9 +849,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
-    const started = await service.startProviderCodeLogin("codex");
+    const started = await runTestEffect(service.startProviderCodeLogin("codex"));
 
     expect(started).toEqual({
       kind: "code",
@@ -857,10 +892,10 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
-    await service.startProviderCodeLogin("codex");
+    await runTestEffect(service.initialize());
+    await runTestEffect(service.startProviderCodeLogin("codex"));
 
-    await service.cancelProviderCodeLogin("codex");
+    await runTestEffect(service.cancelProviderCodeLogin("codex"));
 
     expect(codexClients[1]?.requests).toContainEqual({
       method: "account/login/cancel",
@@ -880,7 +915,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     service = agentService;
 
-    expect(await service.startProviderCodeLogin("codex")).toEqual({
+    expect(await runTestEffect(service.startProviderCodeLogin("codex"))).toEqual({
       kind: "code",
       userCode: "TEST-CODE",
       verificationUrl: "https://auth.openai.test/device",
@@ -898,7 +933,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     service = agentService;
 
-    await expect(service.startProviderCodeLogin("opencode")).rejects.toThrow("cannot be signed in with a code");
+    await expect(runTestEffect(service.startProviderCodeLogin("opencode"))).rejects.toThrow(
+      "cannot be signed in with a code",
+    );
   });
 
   it("runs provider logins independently and Refresh cancels both generations", async () => {
@@ -917,11 +954,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
     await Promise.all([
-      service.connectProvider("codex", async () => undefined),
-      service.connectProvider("claude", async () => undefined),
+      runTestEffect(service.connectProvider("codex", async () => undefined)),
+      runTestEffect(service.connectProvider("claude", async () => undefined)),
     ]);
     expect(service.getStatus().providers).toEqual(
       expect.arrayContaining([
@@ -931,7 +968,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     );
     await waitFor(async () => (await readTextOrEmpty(claudeLoginLog)).includes("started"));
 
-    await service.connectProvider("claude", async () => undefined);
+    await runTestEffect(service.connectProvider("claude", async () => undefined));
     await waitFor(async () => {
       const log = await readTextOrEmpty(claudeLoginLog);
       return log.match(/^started$/gmu)?.length === 2 && log.includes("stopped");
@@ -940,7 +977,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       expect.objectContaining({ id: "claude", connectionState: "connecting" }),
     );
 
-    await service.refreshProviders();
+    await runTestEffect(service.refreshProviders());
 
     expect(codexClients[1]?.requests).toContainEqual({
       method: "account/login/cancel",
@@ -960,7 +997,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     // that `refreshProviders` runs, so awaiting the refresh proves the service
     // processed it and still refused to sign the cancelled generation in.
     codexClients[1]?.completeLogin(true);
-    await service.refreshProviders();
+    await runTestEffect(service.refreshProviders());
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "codex", state: "sign-in-required" }),
     );
@@ -981,9 +1018,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const activeClient = codexClients[0];
-    await service.sendMessage({ agentId: "chief", text: "Ask before the reconnect" });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Ask before the reconnect" }));
     await waitFor(() => events.some((event) => event.type === "turn-started"));
     const threadId = store.activeProviderSession("chief")?.externalSessionId;
     const turnId = events.find((event) => event.type === "turn-started")?.turnId;
@@ -995,7 +1032,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     await waitFor(() => events.some((event) => event.type === "approval"));
 
-    await service.connectProvider("codex", async () => undefined);
+    await runTestEffect(service.connectProvider("codex", async () => undefined));
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "codex", state: "available", connectionState: "connecting" }),
     );
@@ -1006,7 +1043,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       expect.objectContaining({ id: "codex", state: "available", message: expect.stringContaining("not completed") }),
     );
 
-    await service.connectProvider("codex", async () => undefined);
+    await runTestEffect(service.connectProvider("codex", async () => undefined));
     codexClients[2]?.completeLogin(true);
     await waitFor(
       () =>
@@ -1036,10 +1073,15 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         preferredProvider: target,
       });
       service = agentService;
-      await service.connectProvider(target, async () => undefined);
-      const install = vi.fn(async () => managed);
+      await runTestEffect(service.connectProvider(target, async () => undefined));
+      const install = vi.fn(() =>
+        Effect.try({
+          try: () => managed,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
+      );
 
-      await expect(service.updateProviderCli(target, install)).rejects.toThrow(
+      await expect(runTestEffect(service.updateProviderCli(target, install))).rejects.toThrow(
         "Finish or cancel sign-in, then update.",
       );
       expect(install).not.toHaveBeenCalled();
@@ -1050,14 +1092,21 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       const other = target === "codex" ? "claude" : "codex";
       const otherCli = other === "codex" ? await createFakeCodex(root) : await createFakeClaude(root);
       process.env[`OPENBOT_${other.toUpperCase()}_PATH`] = join(root, "missing-other-override");
-      const otherUpdated = await service.updateProviderCli(other, async () => otherCli);
+      const otherUpdated = await runTestEffect(
+        service.updateProviderCli(other, () =>
+          Effect.try({
+            try: () => otherCli,
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      );
       expect(otherUpdated.providers).toContainEqual(
         expect.objectContaining({ id: other, state: "available", cliSource: "managed" }),
       );
 
-      await service.refreshProviders();
+      await runTestEffect(service.refreshProviders());
       process.env[`OPENBOT_${target.toUpperCase()}_PATH`] = join(root, "missing-override");
-      const updated = await service.updateProviderCli(target, install);
+      const updated = await runTestEffect(service.updateProviderCli(target, install));
       expect(updated.providers).toContainEqual(
         expect.objectContaining({ id: target, state: "available", cliSource: "managed" }),
       );
@@ -1079,12 +1128,19 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const managed = await createFakeClaude(root);
     await writeFile(managed, (await readFile(managed, "utf8")).replaceAll("2.1.246", "2.1.263"));
     // Remove the test's explicit override to model automatic system discovery at startup.
     process.env.OPENBOT_CLAUDE_PATH = join(root, "missing-claude");
-    const status = await service.updateProviderCli("claude", async () => managed);
+    const status = await runTestEffect(
+      service.updateProviderCli("claude", () =>
+        Effect.try({
+          try: () => managed,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
+      ),
+    );
     expect(await readTextOrEmpty(system.started)).toBe("");
     expect(status.providers).toContainEqual(
       expect.objectContaining({ id: "claude", state: "available", version: "2.1.263", cliSource: "managed" }),
@@ -1115,18 +1171,25 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const replaced = clients[0];
     if (!replaced) throw new Error("Claude did not start.");
     const readsBefore = replaced.requests.filter((request) => request.method === "account/read").length;
     heldClient = replaced;
-    const refresh = service.refreshProviders();
+    const refresh = runTestEffect(service.refreshProviders());
     await waitFor(() => replaced.requests.filter((request) => request.method === "account/read").length > readsBefore);
 
     const managed = await createFakeClaude(root);
     await writeFile(managed, (await readFile(managed, "utf8")).replaceAll("2.1.246", "2.1.263"));
     process.env.OPENBOT_CLAUDE_PATH = join(root, "missing-claude");
-    await service.updateProviderCli("claude", async () => managed);
+    await runTestEffect(
+      service.updateProviderCli("claude", () =>
+        Effect.try({
+          try: () => managed,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
+      ),
+    );
     replaced.accountSignedIn = false;
     releaseRead();
     const status = await refresh;
@@ -1153,8 +1216,17 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       },
       bundledExecutables: { claude: managed },
     });
-    await service.initialize();
-    await expect(service.updateProviderCli("claude", async () => managed)).rejects.toThrow();
+    await runTestEffect(service.initialize());
+    await expect(
+      runTestEffect(
+        service.updateProviderCli("claude", () =>
+          Effect.try({
+            try: () => managed,
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
+    ).rejects.toThrow();
     expect(clients[0]?.running).toBe(true);
     expect(clients[1]?.running).toBe(false);
     expect(service.getStatus().providers).toContainEqual(
@@ -1176,11 +1248,20 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         }),
       bundledExecutables: { claude: managed },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
     const message =
       "OpenBot could not update the Claude CLI. Claude stopped before it answered (exit code 3). Error: bad config";
-    await expect(service.updateProviderCli("claude", async () => managed)).rejects.toThrow(message);
+    await expect(
+      runTestEffect(
+        service.updateProviderCli("claude", () =>
+          Effect.try({
+            try: () => managed,
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
+    ).rejects.toThrow(message);
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "claude", state: "error", message }),
     );
@@ -1209,7 +1290,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       },
       bundledExecutables: { claude: managed },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     new McpServerStore(store.database).save({
       id: "",
       name: "Filesystem",
@@ -1225,7 +1306,16 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
 
     const message = `OpenBot could not update the Claude CLI. Claude stopped before it answered (exit code 3). ${"x".repeat(285)} rejected •••`;
-    await expect(service.updateProviderCli("claude", async () => managed)).rejects.toThrow(message);
+    await expect(
+      runTestEffect(
+        service.updateProviderCli("claude", () =>
+          Effect.try({
+            try: () => managed,
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
+    ).rejects.toThrow(message);
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "claude", state: "available", message }),
     );
@@ -1243,7 +1333,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         }),
       bundledExecutables: {},
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     new McpServerStore(store.database).save({
       id: "",
       name: "Filesystem",
@@ -1260,7 +1350,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     const lines: string[] = [];
     const removeTee = teeLogLines(["provider-runtime"], (line) => lines.push(line));
     try {
-      await service.getUsage();
+      await runTestEffect(service.getUsage());
     } finally {
       removeTee();
     }
@@ -1283,7 +1373,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
       bundledExecutables: {},
-      prepareAgentWorkspace: async () => undefined,
+      prepareAgentWorkspace: () =>
+        Effect.try({
+          try: () => undefined,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
       hostedSites: null,
       sidebarLayout: null,
       preferredModel: null,
@@ -1311,7 +1405,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
 
@@ -1348,31 +1442,33 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
-    service.saveMcpServer({
-      config: {
-        id: "",
-        name: "Filesystem",
-        transport: "stdio",
-        enabled: true,
-        command: "/bin/echo",
-        args: [],
-        env: [{ key: "API_KEY", value: "abcdef123456" }],
-        envPassthrough: [],
-        workingDirectory: "",
-        url: "",
-        headers: [],
-      },
-    });
+    await runTestEffect(
+      service.saveMcpServer({
+        config: {
+          id: "",
+          name: "Filesystem",
+          transport: "stdio",
+          enabled: true,
+          command: "/bin/echo",
+          args: [],
+          env: [{ key: "API_KEY", value: "abcdef123456" }],
+          envPassthrough: [],
+          workingDirectory: "",
+          url: "",
+          headers: [],
+        },
+      }),
+    );
     // What a spawn reads. The running process keeps this credential until it stops.
     expect(service.enabledMcpServers()).toHaveLength(1);
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
 
     // The user removes the server while that process runs, so the store no longer names the value.
-    service.removeMcpServer({ mcpServerId: service.listMcpServers()[0]?.id ?? "" });
+    await runTestEffect(service.removeMcpServer({ mcpServerId: service.listMcpServers()[0]?.id ?? "" }));
     client.emit("diagnostic", "Failed to spawn MCP server 'Filesystem': rejected abcdef123456");
 
     await waitFor(() => events.filter((event) => event.type === "error").length === 1);
@@ -1397,24 +1493,26 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
-    service.saveMcpServer({
-      config: {
-        id: "",
-        name: "Filesystem",
-        transport: "stdio",
-        enabled: true,
-        command: "/bin/echo",
-        args: [],
-        env: [{ key: "API_KEY", value: "abcdef123456" }],
-        envPassthrough: [],
-        workingDirectory: "",
-        url: "",
-        headers: [],
-      },
-    });
+    await runTestEffect(
+      service.saveMcpServer({
+        config: {
+          id: "",
+          name: "Filesystem",
+          transport: "stdio",
+          enabled: true,
+          command: "/bin/echo",
+          args: [],
+          env: [{ key: "API_KEY", value: "abcdef123456" }],
+          envPassthrough: [],
+          workingDirectory: "",
+          url: "",
+          headers: [],
+        },
+      }),
+    );
     // What a spawn reads. The process holds this server, so its failure stays visible to the user.
     expect(service.enabledMcpServers()).toHaveLength(1);
     const events: AgentEvent[] = [];
@@ -1444,24 +1542,26 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
-    service.saveMcpServer({
-      config: {
-        id: "",
-        name: "Filesystem",
-        transport: "stdio",
-        enabled: true,
-        command: "/bin/echo",
-        args: [],
-        env: [{ key: "API_KEY", value: "abcdef123456" }],
-        envPassthrough: [],
-        workingDirectory: "",
-        url: "",
-        headers: [],
-      },
-    });
+    await runTestEffect(
+      service.saveMcpServer({
+        config: {
+          id: "",
+          name: "Filesystem",
+          transport: "stdio",
+          enabled: true,
+          command: "/bin/echo",
+          args: [],
+          env: [{ key: "API_KEY", value: "abcdef123456" }],
+          envPassthrough: [],
+          workingDirectory: "",
+          url: "",
+          headers: [],
+        },
+      }),
+    );
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
 
@@ -1491,24 +1591,26 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         return client;
       },
     });
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
-    service.saveMcpServer({
-      config: {
-        id: "",
-        name: "Filesystem",
-        transport: "stdio",
-        enabled: true,
-        command: "/bin/echo",
-        args: [],
-        env: [{ key: "API_KEY", value: "abcdef123456" }],
-        envPassthrough: [],
-        workingDirectory: "",
-        url: "",
-        headers: [],
-      },
-    });
+    await runTestEffect(
+      service.saveMcpServer({
+        config: {
+          id: "",
+          name: "Filesystem",
+          transport: "stdio",
+          enabled: true,
+          command: "/bin/echo",
+          args: [],
+          env: [{ key: "API_KEY", value: "abcdef123456" }],
+          envPassthrough: [],
+          workingDirectory: "",
+          url: "",
+          headers: [],
+        },
+      }),
+    );
     const messages: (string | null)[] = [];
     service.on("event", (event) => {
       if (event.type !== "status") return;
@@ -1541,9 +1643,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await store.getOrCreate("chief");
-    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    await runTestEffect(service.initialize());
+    await runTestEffect(store.getOrCreate("chief"));
+    await runTestEffect(service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" }));
     const client = clients.get("grok");
     if (!client) throw new Error("Grok did not start.");
 
@@ -1563,7 +1665,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     ]);
 
     // The chat is on Grok and still runs a turn: the export failed, the agent's work did not.
-    await service.sendMessage({ agentId: "chief", text: "Continue on Grok." });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Continue on Grok." }));
     await waitForQueue(service, "chief", (queue) =>
       queue.deliveries.every((delivery) => delivery.status === "completed"),
     );
@@ -1585,7 +1687,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("Codex did not start.");
 
@@ -1622,9 +1724,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await store.getOrCreate("chief");
-    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    await runTestEffect(service.initialize());
+    await runTestEffect(store.getOrCreate("chief"));
+    await runTestEffect(service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" }));
     const client = clients.get("grok");
     if (!client) throw new Error("Grok did not start.");
 
@@ -1657,7 +1759,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("Codex did not start.");
 
@@ -1724,9 +1826,9 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await store.getOrCreate("chief");
-    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    await runTestEffect(service.initialize());
+    await runTestEffect(store.getOrCreate("chief"));
+    await runTestEffect(service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" }));
     const client = clients.get("grok");
     if (!client) throw new Error("Grok did not start.");
     client.accountRateLimits = {
@@ -1785,9 +1887,10 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
     const client = clients.get("codex");
     if (!client) throw new Error("The fake provider did not start.");
+    await waitFor(() => events.some((event) => event.type === "usage-changed"));
     const usageReadsBefore = client.requests.filter((request) => request.method === "account/rateLimits/read").length;
     events.length = 0;
 
@@ -1805,7 +1908,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     report("Reconnecting... 1/5", { responseStreamDisconnected: { httpStatusCode: null } }, true);
     report("The model endpoint rejected the request.", "badRequest", false);
 
-    await waitFor(() => events.some((event) => event.type === "error"));
+    await waitFor(() => events.some((event) => event.type === "usage-changed"));
     expect(events.filter((event) => event.type === "error")).toEqual([
       expect.objectContaining({ message: "The model endpoint rejected the request." }),
     ]);
@@ -1824,15 +1927,22 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await service.sendMessage({ agentId: "chief", text: "Keep working." });
+    await runTestEffect(service.initialize());
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
     await waitFor(() => events.some((event) => event.type === "turn-started"));
 
     // The updater would replace the binary under the running turn, so it is not started at all.
     await expect(
-      service.updateProviderCli("codex", async () => {
-        throw new Error("Busy provider started an install.");
-      }),
+      runTestEffect(
+        service.updateProviderCli("codex", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("Busy provider started an install.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow(/working on a turn/u);
 
     expect(service.getStatus().providers).toContainEqual(
@@ -1850,17 +1960,24 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await service.sendMessage({ agentId: "chief", text: "Keep working." });
+    await runTestEffect(service.initialize());
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
     await waitFor(() => events.some((event) => event.type === "turn-started"));
 
     // Writing the key and then failing to restart would leave a key on disk that no process uses,
     // under a dialog that reports the save as failed. So a busy provider is refused first.
     let changed = false;
     await expect(
-      service.changeProviderCredential("codex", async () => {
-        changed = true;
-      }),
+      runTestEffect(
+        service.changeProviderCredential("codex", () =>
+          Effect.try({
+            try: () => {
+              changed = true;
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow(/working on a turn/u);
     expect(changed).toBe(false);
   });
@@ -1875,17 +1992,24 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
+    await runTestEffect(service.initialize());
 
     await expect(
-      service.changeProviderCredential("codex", async () => {
-        throw new Error("System secret storage is unavailable.");
-      }),
+      runTestEffect(
+        service.changeProviderCredential("codex", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("System secret storage is unavailable.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow("System secret storage is unavailable.");
 
     // The change holds deliveries while it runs. A failed save must release them, or the agent
     // stays silent until the app restarts.
-    await service.sendMessage({ agentId: "chief", text: "Still there?" });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Still there?" }));
     await waitFor(() => events.some((event) => event.type === "turn-completed"));
   });
 
@@ -1895,34 +2019,38 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       preferredProvider: "codex",
     });
     service = agentService;
-    await store.getOrCreate("chief");
+    await runTestEffect(store.getOrCreate("chief"));
     const actor = { id: "human", name: "Alex" };
-    await service.channels.command(
-      {
-        type: "save",
-        channelId: "channel-1",
-        operationId: "create",
-        draft: {
-          name: "Project",
-          title: "",
-          instructions: "Shared work",
-          members: [{ agentId: "chief" }],
-          leadAgentId: "chief",
+    await runTestEffect(
+      service.channels.command(
+        {
+          type: "save",
+          channelId: "channel-1",
+          operationId: "create",
+          draft: {
+            name: "Project",
+            title: "",
+            instructions: "Shared work",
+            members: [{ agentId: "chief" }],
+            leadAgentId: "chief",
+          },
         },
-      },
-      actor,
+        actor,
+      ),
     );
-    await service.channels.command(
-      {
-        type: "send",
-        channelId: "channel-1",
-        operationId: "send",
-        text: "Work in the channel.",
-        recipientAgentId: "chief",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
+    await runTestEffect(
+      service.channels.command(
+        {
+          type: "send",
+          channelId: "channel-1",
+          operationId: "send",
+          text: "Work in the channel.",
+          recipientAgentId: "chief",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
     );
     // A channel turn runs on a thread of its own, so the conversation of the agent holds no turn id
     // while the CLI works. The delivery has reached its turn, so no counter reports it either.
@@ -1932,9 +2060,16 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     await waitFor(() => service?.channels.store.assignments("channel-1").some((item) => item.turnId));
 
     await expect(
-      service.updateProviderCli("codex", async () => {
-        throw new Error("Busy provider started an install.");
-      }),
+      runTestEffect(
+        service.updateProviderCli("codex", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("Busy provider started an install.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow(/working on a turn/u);
   });
 
@@ -1954,14 +2089,21 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         }),
     });
     service = agentService;
-    void service.sendMessage({ agentId: "chief", text: "Keep working." });
+    void runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
     // The delivery has no turn id yet, and the client it is about to prompt must not be replaced.
     await waitFor(() => turnStartReached);
 
     await expect(
-      service.updateProviderCli("codex", async () => {
-        throw new Error("Busy provider started an install.");
-      }),
+      runTestEffect(
+        service.updateProviderCli("codex", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("Busy provider started an install.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow(/working on a turn/u);
 
     releaseTurnStart?.();
@@ -1991,8 +2133,8 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const events: AgentEvent[] = [];
     service.on("event", (event) => events.push(event));
-    await service.initialize();
-    await service.sendMessage({ agentId: "chief", text: "First large task" });
+    await runTestEffect(service.initialize());
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "First large task" }));
     await waitFor(() => events.some((event) => event.type === "turn-completed"));
 
     // A pressured thread compacts before its next message, and that compaction is a provider turn
@@ -2004,13 +2146,20 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         tokenUsage: { last: { totalTokens: 82_000 }, modelContextWindow: 100_000 },
       },
     });
-    void service.sendMessage({ agentId: "chief", text: "Run after compaction" });
+    void runTestEffect(service.sendMessage({ agentId: "chief", text: "Run after compaction" }));
     await waitFor(() => compactionReached);
 
     await expect(
-      service.updateProviderCli("codex", async () => {
-        throw new Error("Busy provider started an install.");
-      }),
+      runTestEffect(
+        service.updateProviderCli("codex", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("Busy provider started an install.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow(/working on a turn/u);
 
     releaseCompaction?.();
@@ -2035,21 +2184,28 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     service.on("event", (event) => {
       if (event.type === "turn-started") started.push(event.agentId);
     });
-    await service.initialize();
-    const agent = await service.createAgent(CREATE_AGENT_INPUT);
+    await runTestEffect(service.initialize());
+    const agent = await runTestEffect(service.createAgent(CREATE_AGENT_INPUT));
     // The agent's own first message has to be delivered and finished, or it is the turn the
     // assertion below sees.
     await waitFor(() => started.includes(agent.id));
-    await waitFor(async () => (await running.readConversation(agent.id)).activeTurnId === null);
+    await waitFor(async () => (await runTestEffect(running.readConversation(agent.id))).activeTurnId === null);
     const turnsBefore = started.filter((agentId) => agentId === agent.id).length;
 
     let installing = false;
-    const update = service.updateProviderCli("claude", () => {
-      installing = true;
-      return gate;
-    });
+    const update = runTestEffect(
+      service.updateProviderCli("claude", () =>
+        Effect.tryPromise({
+          try: () => {
+            installing = true;
+            return gate;
+          },
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test install", cause }),
+        }),
+      ),
+    );
     await waitFor(() => installing);
-    await service.sendMessage({ agentId: agent.id, text: "Take this when you are back." });
+    await runTestEffect(service.sendMessage({ agentId: agent.id, text: "Take this when you are back." }));
     // The CLI under the client is being replaced, so the delivery waits in the mailbox.
     expect(started.filter((agentId) => agentId === agent.id)).toHaveLength(turnsBefore);
 
@@ -2079,18 +2235,25 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       const running = service;
       const events: AgentEvent[] = [];
       service.on("event", (event) => events.push(event));
-      await service.initialize();
-      await service.sendMessage({ agentId: "chief", text: "Keep working." });
+      await runTestEffect(service.initialize());
+      await runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
       await waitFor(() => events.some((event) => event.type === "turn-started"));
-      const turnId = (await running.readConversation("chief")).activeTurnId;
+      const turnId = (await runTestEffect(running.readConversation("chief"))).activeTurnId;
 
       // Claude is idle, so its CLI is replaced. Restart recovery would settle every unresolved
       // delivery, and this one belongs to a turn Codex is still running.
       process.env.OPENBOT_CLAUDE_PATH = join(root, "missing-claude");
-      await service.updateProviderCli("claude", async () => claude.executable);
+      await runTestEffect(
+        service.updateProviderCli("claude", () =>
+          Effect.try({
+            try: () => claude.executable,
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      );
 
       expect(running.listQueue("chief").deliveries[0]?.status).toBe("running");
-      expect((await running.readConversation("chief")).activeTurnId).toBe(turnId);
+      expect((await runTestEffect(running.readConversation("chief"))).activeTurnId).toBe(turnId);
     });
   }
 
@@ -2118,9 +2281,16 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     service = agentService;
     await expect(
-      service.updateProviderCli("claude", async () => {
-        throw new Error("Runtime verification failed.");
-      }),
+      runTestEffect(
+        service.updateProviderCli("claude", () =>
+          Effect.try({
+            try: () => {
+              throw new Error("Runtime verification failed.");
+            },
+            catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+          }),
+        ),
+      ),
     ).rejects.toThrow("Runtime verification failed.");
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "claude", state: "available", version: "2.1.246" }),
@@ -2155,7 +2325,11 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
         return client;
       },
       bundledExecutables: {},
-      prepareAgentWorkspace: async () => undefined,
+      prepareAgentWorkspace: () =>
+        Effect.try({
+          try: () => undefined,
+          catch: (cause) => new AgentLifecycleFailed({ operation: "test adapter", cause }),
+        }),
       hostedSites: null,
       sidebarLayout: null,
       preferredModel: null,
@@ -2174,17 +2348,19 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
     const fixture = startWithEndpoints(endpoints, clients);
     service = fixture.service;
     const running = service;
-    await running.initialize();
-    await fixture.store.getOrCreate("chief");
-    await running.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" });
-    await running.sendMessage({ agentId: "chief", text: "First task." });
+    await runTestEffect(running.initialize());
+    await runTestEffect(fixture.store.getOrCreate("chief"));
+    await runTestEffect(
+      running.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" }),
+    );
+    await runTestEffect(running.sendMessage({ agentId: "chief", text: "First task." }));
     await waitFor(() => running.listQueue("chief").deliveries[0]?.status === "completed");
     const first = clients.at(-1);
     const session = fixture.store.activeProviderSession("chief")?.externalSessionId;
     expect(session).toBeTruthy();
 
     endpoints.push(STUDIO_LOCAL);
-    await expect(running.reloadOpenCodeConfig()).resolves.toBe("restarted");
+    await expect(runTestEffect(running.reloadOpenCodeConfig())).resolves.toBe("restarted");
 
     const replacement = clients.at(-1);
     expect(replacement).not.toBe(first);
@@ -2195,7 +2371,7 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
 
     // The thread outlives the process: the loaded threads are cleared, so the next delivery resumes
     // the same provider session on the new client instead of reusing a session it never opened.
-    await running.sendMessage({ agentId: "chief", text: "Second task." });
+    await runTestEffect(running.sendMessage({ agentId: "chief", text: "Second task." }));
     await waitFor(() => replacement?.requests.some((request) => request.method === "turn/start") === true);
     const resumed = replacement?.requests.find((request) => request.method === "thread/resume");
     expect(getString(resumed?.params, "threadId")).toBe(session);
@@ -2210,13 +2386,15 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
     const fixture = startWithEndpoints([STUDIO_LOCAL], clients, { autoComplete: false });
     service = fixture.service;
     const running = service;
-    await running.initialize();
-    await fixture.store.getOrCreate("chief");
-    await running.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" });
-    await running.sendMessage({ agentId: "chief", text: "Keep working." });
+    await runTestEffect(running.initialize());
+    await runTestEffect(fixture.store.getOrCreate("chief"));
+    await runTestEffect(
+      running.updateAgent({ agentId: "chief", provider: "opencode", model: "opencode/example-model" }),
+    );
+    await runTestEffect(running.sendMessage({ agentId: "chief", text: "Keep working." }));
     await waitFor(() => clients[0]?.requests.some((request) => request.method === "turn/start") === true);
 
-    await expect(running.reloadOpenCodeConfig()).resolves.toBe("skipped-busy");
+    await expect(runTestEffect(running.reloadOpenCodeConfig())).resolves.toBe("skipped-busy");
     expect(clients).toHaveLength(1);
     expect(clients[0]?.running).toBe(true);
   });
@@ -2229,7 +2407,7 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
     const clients: FakeAgentClient[] = [];
     service = startWithEndpoints([STUDIO_LOCAL], clients, { preferred: "codex", openCodeSignedIn: false }).service;
     const running = service;
-    await running.initialize();
+    await runTestEffect(running.initialize());
 
     expect(running.getStatus().providers).toContainEqual(
       expect.objectContaining({
@@ -2241,7 +2419,7 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
     );
     // Signed out, OpenCode keeps no client. A save must not read as a failure: the next spawn - the
     // next Connect press - reads the config.
-    await expect(running.reloadOpenCodeConfig()).resolves.toBe("not-running");
+    await expect(runTestEffect(running.reloadOpenCodeConfig())).resolves.toBe("not-running");
   });
 });
 
@@ -2256,7 +2434,7 @@ describe.sequential("ProviderRuntime: idle release", () => {
     service = started.service;
     const running = service;
     const first = started.client;
-    await service.sendMessage({ agentId: "chief", text: "First task." });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "First task." }));
     await waitFor(() => running.listQueue("chief").deliveries[0]?.status === "completed");
     expect(first.requests.map((request) => request.method)).toContain("thread/start");
     const session = started.store.activeProviderSession("chief")?.externalSessionId;
@@ -2270,7 +2448,7 @@ describe.sequential("ProviderRuntime: idle release", () => {
 
     // The fake hands out the same client object again, so only the requests after the restart count.
     const afterRelease = () => first.requests.slice(firstRequests).map((request) => request.method);
-    await service.sendMessage({ agentId: "chief", text: "Second task." });
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Second task." }));
     await waitFor(() => afterRelease().includes("turn/start"));
     expect(started.clients.filter((made) => made.provider === "codex")).toHaveLength(2);
     const resumed = first.requests.slice(firstRequests).find((request) => request.method === "thread/resume");
@@ -2283,7 +2461,7 @@ describe.sequential("ProviderRuntime: idle release", () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
     const started = await startService(root, { provider: "codex", output: "DONE" });
     service = started.service;
-    expect((await started.store.getOrCreate("chief")).provider).toBe("codex");
+    expect((await runTestEffect(started.store.getOrCreate("chief"))).provider).toBe("codex");
     const opencode = started.clientFor("opencode");
     expect(opencode?.running).toBe(true);
 
@@ -2298,8 +2476,8 @@ describe.sequential("ProviderRuntime: idle release", () => {
     const started = await startService(root, { provider: "codex", output: "", autoComplete: false });
     service = started.service;
     const running = service;
-    await service.sendMessage({ agentId: "chief", text: "Keep working." });
-    await waitFor(async () => Boolean((await running.readConversation("chief")).activeTurnId));
+    await runTestEffect(service.sendMessage({ agentId: "chief", text: "Keep working." }));
+    await waitFor(async () => Boolean((await runTestEffect(running.readConversation("chief"))).activeTurnId));
 
     await vi.advanceTimersByTimeAsync(PROVIDER_IDLE_RELEASE_MS + 2 * 60_000);
     expect(started.client.running).toBe(true);

@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type AgentModelOption,
-  type AgentProfileDraft,
   decodeAgentProfileDraft,
   type GenerateAgentProfileInput,
   type SidebarSection,
@@ -26,32 +25,18 @@ const GENERATION_TIMEOUT_MS = 120_000;
 const CANCELLED_MESSAGE = sourceText("error.agent.profileEndpointsChanged");
 
 /** Owns a disposable provider session; no durable agent, tools, workspace or conversation is involved. */
-export async function generateProfile(
-  client: AgentClient,
-  model: AgentModelOption,
-  input: GenerateAgentProfileInput,
-  sections: SidebarSection[],
-  cancelled?: () => boolean,
-): Promise<AgentProfileDraft> {
-  const result = await Effect.runPromise(
-    Effect.result(generateProfileEffect(client, model, input, sections, cancelled)),
-  );
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
 export class ProfileGenerationFailed extends Schema.TaggedError<ProfileGenerationFailed>()("ProfileGenerationFailed", {
   cause: Schema.Defect(),
 }) {}
 
-export const generateProfileEffect = Effect.fn("Agent.generateProfile")(function* (
+export const generateProfile = Effect.fn("Agent.generateProfile")(function* (
   client: AgentClient,
   model: AgentModelOption,
   input: GenerateAgentProfileInput,
   sections: SidebarSection[],
   cancelled?: () => boolean,
 ) {
-  const result = yield* generateTextWithoutToolsEffect(client, model, profilePrompt(input, sections), cancelled);
+  const result = yield* generateTextWithoutTools(client, model, profilePrompt(input, sections), cancelled);
   const parsed = yield* Effect.try({
     try: () => extractJsonObject(result),
     catch: (cause) =>
@@ -71,21 +56,7 @@ export const generateProfileEffect = Effect.fn("Agent.generateProfile")(function
   return draft;
 });
 
-export async function generateTextWithoutTools(
-  client: AgentClient,
-  model: AgentModelOption,
-  prompt: string,
-  cancelled: () => boolean = () => false,
-): Promise<string> {
-  const result = await Effect.runPromise(
-    Effect.result(generateTextWithoutToolsEffect(client, model, prompt, cancelled)),
-  );
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
-/** Owns the temporary workspace, generation listeners, and disposable client until cleanup ends. */
-export const generateTextWithoutToolsEffect = Effect.fn("Agent.generateTextWithoutTools")(function* (
+export const generateTextWithoutTools = Effect.fn("Agent.generateTextWithoutTools")(function* (
   client: AgentClient,
   model: AgentModelOption,
   prompt: string,
@@ -101,30 +72,32 @@ export const generateTextWithoutToolsEffect = Effect.fn("Agent.generateTextWitho
         // window in which an endpoint change finds a client with no process to stop.
         if (cancelled()) return yield* new ProfileGenerationFailed({ cause: new Error(CANCELLED_MESSAGE) });
         yield* Effect.try({ try: () => client.start(), catch: (cause) => new ProfileGenerationFailed({ cause }) });
-        yield* profileIo(() =>
-          client.request(
+        yield* client
+          .request(
             "initialize",
             {
               clientInfo: { name: "openbot-profile", title: "OpenBot profile generation", version: "0.1.0" },
               capabilities: { experimentalApi: true },
             },
             decodeRecordResponse,
-          ),
-        );
+          )
+          .pipe(Effect.mapError((failure) => new ProfileGenerationFailed({ cause: failure.cause })));
         yield* Effect.try({
           try: () => client.notify("initialized"),
           catch: (cause) => new ProfileGenerationFailed({ cause }),
         });
         const providerConfig =
           client.provider === "codex"
-            ? yield* profileIo(() => client.request("config/read", { includeLayers: false }, decodeRecordResponse))
+            ? yield* client
+                .request("config/read", { includeLayers: false }, decodeRecordResponse)
+                .pipe(Effect.mapError((failure) => new ProfileGenerationFailed({ cause: failure.cause })))
             : {};
         const configuredServers = getRecord(getRecord(providerConfig, "config"), "mcp_servers");
         const disabledServers = Object.fromEntries(
           Object.keys(configuredServers ?? {}).map((name) => [name, { enabled: false }]),
         );
-        const thread = yield* profileIo(() =>
-          client.request(
+        const thread = yield* client
+          .request(
             "thread/start",
             {
               cwd,
@@ -176,13 +149,13 @@ export const generateTextWithoutToolsEffect = Effect.fn("Agent.generateTextWitho
               },
             },
             decodeRecordResponse,
-          ),
-        );
+          )
+          .pipe(Effect.mapError((failure) => new ProfileGenerationFailed({ cause: failure.cause })));
         const threadId = getString(getRecord(thread, "thread"), "id");
         if (!threadId)
           return yield* new ProfileGenerationFailed({ cause: new Error(sourceText("error.agent.profileNotStarted")) });
-        yield* profileIo(() =>
-          client.request(
+        yield* client
+          .request(
             "turn/start",
             {
               threadId,
@@ -191,8 +164,8 @@ export const generateTextWithoutToolsEffect = Effect.fn("Agent.generateTextWitho
               effort: model.defaultReasoningEffort,
             },
             decodeRecordResponse,
-          ),
-        );
+          )
+          .pipe(Effect.mapError((failure) => new ProfileGenerationFailed({ cause: failure.cause })));
         return yield* Fiber.join(completion);
       }).pipe(
         Effect.timeoutOrElse({
@@ -204,7 +177,12 @@ export const generateTextWithoutToolsEffect = Effect.fn("Agent.generateTextWitho
       ),
     (cwd) =>
       Effect.gen(function* () {
-        const stopped = yield* Effect.result(profileIo(() => client.stop()));
+        const stopped = yield* Effect.result(
+          client.stop().pipe(
+            Effect.mapError((failure) => new ProfileGenerationFailed({ cause: failure.cause })),
+            Effect.catchDefect((cause) => Effect.fail(new ProfileGenerationFailed({ cause }))),
+          ),
+        );
         const removed = yield* Effect.result(profileIo(() => rm(cwd, { recursive: true, force: true })));
         // The original finally block reported removal failure first, then stop failure.
         if (Result.isFailure(removed)) cleanupFailure = removed.failure;

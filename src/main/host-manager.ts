@@ -1,18 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, Result, Schema } from "effect";
+import { Context, Deferred, Effect, Result, Schema } from "effect";
 import type { HostManagerConfig, HostTenantStatus, HostUpdateState } from "../../packages/contracts/src/host-manager";
 import { isMissingFileError } from "../backend/file-errors";
 import {
   HOST_HEARTBEAT_TIMEOUT_MS,
   HOST_IDLE_GRACE_MS,
   hostStateSchema,
-  readHostConfigEffect,
-  readOwnedJsonEffect,
+  readHostConfig,
+  readOwnedJson,
   tenantStatusSchema,
-  verifyTenantDirectoryEffect,
-  writeProtocolJsonEffect,
+  verifyTenantDirectory,
+  writeProtocolJson,
 } from "./host-update-files";
 
 export interface HostManagerOperations {
@@ -43,27 +43,24 @@ class HostInstallation extends Context.Service<
     applicationInUse(): Effect.Effect<boolean, HostMaintenanceError>;
   }
 >()("openbot/main/HostInstallation") {
-  static layer(operations: HostManagerOperations) {
-    return Layer.succeed(
-      HostInstallation,
-      HostInstallation.of({
-        stageLatest: () => maintenanceCall(() => operations.stageLatest()),
-        install: (version) => maintenanceCall(() => operations.install(version)),
-        installedVersion: () => maintenanceCall(() => operations.installedVersion()),
-        runningTenants: () => maintenanceCall(() => operations.runningTenants()),
-        applicationInUse: () => maintenanceCall(() => operations.applicationInUse()),
-      }),
-    );
+  static make(operations: HostManagerOperations) {
+    return HostInstallation.of({
+      stageLatest: () => maintenanceCall(() => operations.stageLatest()),
+      install: (version) => maintenanceCall(() => operations.install(version)),
+      installedVersion: () => maintenanceCall(() => operations.installedVersion()),
+      runningTenants: () => maintenanceCall(() => operations.runningTenants()),
+      applicationInUse: () => maintenanceCall(() => operations.applicationInUse()),
+    });
   }
 }
 
 /** Owned by one launchd system job. No tenant election and no tenant-supplied control input. */
 export class HostManager {
   readonly #directory: string;
-  readonly #operations: HostManagerOperations;
+  readonly #installation: typeof HostInstallation.Service;
   readonly #hostUid: number;
   readonly #now: () => number;
-  #pending: Promise<void> | null = null;
+  #pending: Deferred.Deferred<void, HostMaintenanceError> | null = null;
   #initialized = false;
   #state: HostUpdateState = { phase: "idle", cycle: "", version: null, updatedAt: 0, error: null };
   #idle = new Map<number, { since: number; reportedSince: number; pid: number }>();
@@ -77,24 +74,26 @@ export class HostManager {
     options: { hostUid?: number; now?: () => number } = {},
   ) {
     this.#directory = directory;
-    this.#operations = operations;
+    this.#installation = HostInstallation.make(operations);
     this.#hostUid = options.hostUid ?? 0;
     this.#now = options.now ?? Date.now;
   }
 
-  tick(): Promise<void> {
-    if (this.#pending) return this.#pending;
-    this.#pending = Effect.runPromise(
-      this.#tickEffect().pipe(Effect.provide(HostInstallation.layer(this.#operations)), Effect.result),
-    )
-      .then((result) => {
-        if (Result.isFailure(result)) throw result.failure.cause;
-      })
-      .finally(() => {
-        this.#pending = null;
-      });
-    return this.#pending;
-  }
+  readonly tick = Effect.fn("HostManager.tick")(function* (this: HostManager) {
+    if (this.#pending) return yield* Deferred.await(this.#pending);
+    const pending = Deferred.makeUnsafe<void, HostMaintenanceError>();
+    this.#pending = pending;
+    yield* this.#cycle().pipe(
+      Effect.provideService(HostInstallation, this.#installation),
+      Effect.onExit((exit) =>
+        Effect.gen({ self: this }, function* () {
+          yield* Deferred.done(pending, exit);
+          this.#pending = null;
+        }),
+      ),
+      Effect.uninterruptible,
+    );
+  });
 
   readonly #publishEffect = Effect.fn("HostManager.publish")(function* (
     this: HostManager,
@@ -103,7 +102,7 @@ export class HostManager {
   ): Effect.fn.Return<void, HostMaintenanceError, HostInstallation> {
     if (phase !== this.#state.phase) this.#phaseStartedAt = this.#now();
     this.#state = { ...this.#state, phase, error, updatedAt: this.#now() };
-    yield* writeProtocolJsonEffect(join(this.#directory, "state.json"), this.#state).pipe(
+    yield* writeProtocolJson(join(this.#directory, "state.json"), this.#state).pipe(
       Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
     );
   });
@@ -123,10 +122,10 @@ export class HostManager {
     yield* this.#publishEffect("aborted", error);
   });
 
-  readonly #tickEffect = Effect.fn("HostManager.tick")(function* (
+  readonly #cycle = Effect.fn("HostManager.cycle")(function* (
     this: HostManager,
   ): Effect.fn.Return<void, HostMaintenanceError, HostInstallation> {
-    const config = yield* readHostConfigEffect(this.#directory, this.#hostUid).pipe(
+    const config = yield* readHostConfig(this.#directory, this.#hostUid).pipe(
       Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
     );
     if (!config?.managed) {
@@ -137,11 +136,9 @@ export class HostManager {
     }
     if (!this.#initialized) {
       const attempt1 = yield* Effect.gen({ self: this }, function* () {
-        this.#state = yield* readOwnedJsonEffect(
-          join(this.#directory, "state.json"),
-          this.#hostUid,
-          hostStateSchema,
-        ).pipe(Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })));
+        this.#state = yield* readOwnedJson(join(this.#directory, "state.json"), this.#hostUid, hostStateSchema).pipe(
+          Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
+        );
       }).pipe(Effect.result);
       if (Result.isFailure(attempt1)) {
         const error = attempt1.failure.cause;
@@ -194,10 +191,10 @@ export class HostManager {
     uid: number,
   ): Effect.fn.Return<HostTenantStatus | null, HostMaintenanceError, HostInstallation> {
     return yield* Effect.gen({ self: this }, function* () {
-      const directory = yield* verifyTenantDirectoryEffect(this.#directory, uid, this.#hostUid).pipe(
+      const directory = yield* verifyTenantDirectory(this.#directory, uid, this.#hostUid).pipe(
         Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
       );
-      const status = yield* readOwnedJsonEffect(join(directory, "status.json"), uid, tenantStatusSchema).pipe(
+      const status = yield* readOwnedJson(join(directory, "status.json"), uid, tenantStatusSchema).pipe(
         Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
       );
       const age = this.#now() - status.heartbeatAt;
@@ -262,7 +259,7 @@ export class HostManager {
       yield* this.#publishEffect("stopping");
       return;
     }
-    const currentConfig = yield* readHostConfigEffect(this.#directory, this.#hostUid).pipe(
+    const currentConfig = yield* readHostConfig(this.#directory, this.#hostUid).pipe(
       Effect.mapError(({ cause }) => new HostMaintenanceError({ cause })),
     );
     if (!currentConfig?.managed || JSON.stringify(currentConfig.tenants) !== JSON.stringify(config.tenants)) {

@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Effect } from "effect";
 
 /**
  * One timeout for every routine owner. Two schedulers each holding their own `setTimeout` would
@@ -12,7 +12,7 @@ import { Effect, Schema } from "effect";
 export interface RoutineDueSource {
   nextDueAt(): string | null;
   /** `active` turns false when the system suspends during the pass; stop before the next routine. */
-  processDue(now: Date, active: () => boolean): Promise<void>;
+  processDue(now: Date, active: () => boolean): Effect.Effect<void, { readonly cause: unknown }>;
 }
 
 /** `setTimeout` rejects a delay above this and fires at once instead, which would spin. */
@@ -45,7 +45,7 @@ export class RoutineTimer {
     const delay = Math.max(0, Math.min(new Date(earliest).getTime() - Date.now(), MAX_DELAY));
     this.#timer = setTimeout(() => {
       this.#timer = null;
-      void this.#fire();
+      Effect.runFork(this.#fire());
     }, delay);
     this.#timer.unref?.();
   }
@@ -104,21 +104,17 @@ export class RoutineTimer {
    * Every source is asked, and one that throws must not stop the others or stop the re-arm: a
    * failure to fire an agent routine would otherwise leave the process asleep for good.
    */
-  #fire(): Promise<void> {
-    return Effect.runPromise(this.#fireEffect());
-  }
 
-  readonly #fireEffect = Effect.fn("RoutineTimer.fire")(function* (this: RoutineTimer) {
+  readonly #fire = Effect.fn("RoutineTimer.fire")(function* (this: RoutineTimer) {
     const now = new Date();
     this.#firing = true;
     yield* Effect.gen({ self: this }, function* () {
       for (const source of this.sources()) {
         // A suspend or a hold can arrive while an enqueue awaits. The rest stays due and fires later.
         if (this.#paused()) break;
-        yield* Effect.tryPromise({
-          try: () => source.processDue(now, () => !this.#paused()),
-          catch: (cause) => new RoutinePassFailed({ cause }),
-        }).pipe(Effect.catch((failure) => Effect.sync(() => this.onError("routine_scheduler_failed", failure.cause))));
+        yield* source
+          .processDue(now, () => !this.#paused())
+          .pipe(Effect.catch((failure) => Effect.sync(() => this.onError("routine_scheduler_failed", failure.cause))));
       }
     }).pipe(
       Effect.ensuring(
@@ -130,7 +126,3 @@ export class RoutineTimer {
     );
   }, Effect.uninterruptible);
 }
-
-class RoutinePassFailed extends Schema.TaggedError<RoutinePassFailed>()("RoutinePassFailed", {
-  cause: Schema.Defect(),
-}) {}

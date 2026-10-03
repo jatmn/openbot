@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
 /** Every stored JSON file carries a schema version, so a later release can read an older one. */
 export interface VersionedJsonFile {
@@ -18,7 +18,7 @@ export function writeJsonFileAtomically<Content extends VersionedJsonFile>(
   path: string,
   value: Content,
   options: WriteJsonFileOptions = {},
-): Promise<void> {
+): Effect.Effect<void, AtomicFileWriteError> {
   return writeFileAtomically(path, `${JSON.stringify(value)}\n`, options);
 }
 
@@ -29,15 +29,6 @@ export function writeJsonFileAtomically<Content extends VersionedJsonFile>(
  * previous file or the new one, never a truncated one. Each call has its own temporary name, so
  * overlapping writes never share a file, and a failed write removes its temporary file.
  */
-export async function writeFileAtomically(
-  path: string,
-  content: string | Uint8Array,
-  options: WriteJsonFileOptions = {},
-): Promise<void> {
-  const result = await Effect.runPromise(Effect.result(writeFileAtomicallyEffect(path, content, options)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-}
-
 /** The native cause stays at the adapter; callers must not export it without redaction. */
 export class AtomicFileWriteError extends Schema.TaggedError<AtomicFileWriteError>()("AtomicFileWriteError", {
   operation: Schema.Literals(["directory", "write", "rename"]),
@@ -45,7 +36,7 @@ export class AtomicFileWriteError extends Schema.TaggedError<AtomicFileWriteErro
 }) {}
 
 /** Keep the write and rename together even when the caller interrupts the operation. */
-export const writeFileAtomicallyEffect = Effect.fn("AtomicFile.write")(function* (
+export const writeFileAtomically = Effect.fn("AtomicFile.write")(function* (
   path: string,
   content: string | Uint8Array,
   options: WriteJsonFileOptions = {},

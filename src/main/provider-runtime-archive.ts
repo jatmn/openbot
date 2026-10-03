@@ -8,25 +8,12 @@ import { promisify } from "node:util";
 import { crc32, createInflateRaw } from "node:zlib";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
-import { ProviderRuntimeFailure, runRuntime, runtimeIO } from "./provider-runtime-effects";
+import { ProviderRuntimeFailure, runtimeIO } from "./provider-runtime-effects";
 
 const execFileAsync = promisify(execFile);
 
 const MAX_ARCHIVE_LIST_BYTES = 16 * 1024 * 1024;
-
-/**
- * The archive checks a provider runtime shares. They are here rather than in the manager because
- * the per-provider staging steps in `provider-runtime-descriptors.ts` are what call them, and a
- * provider must not be able to skip them by writing its own extraction.
- *
- * `allowedRoots` is the set of top-level names the archive may contain: an archive that unpacks
- * anything else is rejected before extraction, so a changed upstream layout is a loud failure
- * rather than a file written where OpenBot did not expect one.
- */
-export function assertSafeArchive(path: string, allowedRoots: readonly string[], message: string): Promise<void> {
-  return runRuntime(assertSafeArchiveEffect(path, allowedRoots, message));
-}
-export const assertSafeArchiveEffect = Effect.fn("ProviderArchive.assertSafeArchive")(function* (
+export const assertSafeArchive = Effect.fn("ProviderArchive.assertSafeArchive")(function* (
   path: string,
   allowedRoots: readonly string[],
   message: string,
@@ -63,11 +50,7 @@ export const assertSafeArchiveEffect = Effect.fn("ProviderArchive.assertSafeArch
     if (!allowedRoots.includes(parts[0] ?? "")) return yield* new ProviderRuntimeFailure({ cause: new Error(message) });
   }
 });
-
-export function extractArchive(archive: string, destination: string): Promise<void> {
-  return runRuntime(extractArchiveEffect(archive, destination));
-}
-export const extractArchiveEffect = Effect.fn("ProviderArchive.extractArchive")(function* (
+export const extractArchive = Effect.fn("ProviderArchive.extractArchive")(function* (
   archive: string,
   destination: string,
 ): Effect.fn.Return<void, ProviderRuntimeFailure> {
@@ -94,25 +77,7 @@ const ZIP_END_MAX_BYTES = 22 + 0xffff;
 const ZIP_UNIX_TYPE_MASK = 0o170000;
 const ZIP_UNIX_REGULAR_FILE = 0o100000;
 const ZIP_UNIX_DIRECTORY = 0o040000;
-
-/**
- * Unpacks the named files of a flat zip archive into `destination`.
- *
- * `tar` cannot do this on every target: GNU tar on Linux reads no zip. The central directory is read
- * first, and the archive is rejected before one byte is written when it has a name outside `names`,
- * a directory, a link, an encrypted entry, a Zip64 size or a second copy of a name. Each file is
- * inflated by zlib as a stream, so a 1 GB program does not have to fit in memory, and its CRC-32 and
- * size must match the directory.
- */
-export function extractZipFiles(
-  archive: string,
-  destination: string,
-  names: readonly string[],
-  message: string,
-): Promise<void> {
-  return runRuntime(extractZipFilesEffect(archive, destination, names, message));
-}
-export const extractZipFilesEffect = Effect.fn("ProviderArchive.extractZipFiles")(function* (
+export const extractZipFiles = Effect.fn("ProviderArchive.extractZipFiles")(function* (
   archive: string,
   destination: string,
   names: readonly string[],
@@ -132,16 +97,7 @@ export const extractZipFilesEffect = Effect.fn("ProviderArchive.extractZipFiles"
     (handle) => runtimeIO(() => handle.close()).pipe(Effect.orDie),
   );
 });
-
-/**
- * Unpacks a zip archive with folders into `destination`. Every name must be a relative path under
- * the folder `root`, with no `.`, `..`, empty or drive part, so no entry is written outside
- * `destination`. The other checks are those of `extractZipFiles`.
- */
-export function extractZipTree(archive: string, destination: string, root: string, message: string): Promise<void> {
-  return runRuntime(extractZipTreeEffect(archive, destination, root, message));
-}
-export const extractZipTreeEffect = Effect.fn("ProviderArchive.extractZipTree")(function* (
+export const extractZipTree = Effect.fn("ProviderArchive.extractZipTree")(function* (
   archive: string,
   destination: string,
   root: string,
@@ -288,11 +244,7 @@ const readAtEffect = Effect.fn("ProviderArchive.readAt")(function* (
     return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.archiveUnreadable")) });
   return buffer;
 });
-
-export function rejectNonRegularFiles(root: string): Promise<void> {
-  return runRuntime(rejectNonRegularFilesEffect(root));
-}
-export const rejectNonRegularFilesEffect = Effect.fn("ProviderArchive.rejectNonRegularFiles")(function* (
+export const rejectNonRegularFiles = Effect.fn("ProviderArchive.rejectNonRegularFiles")(function* (
   root: string,
 ): Effect.fn.Return<void, ProviderRuntimeFailure> {
   const entries = yield* runtimeIO(() => readdir(root, { withFileTypes: true }));
@@ -305,7 +257,7 @@ export const rejectNonRegularFilesEffect = Effect.fn("ProviderArchive.rejectNonR
           return yield* new ProviderRuntimeFailure({
             cause: new Error(sourceText("error.provider.runtimeSpecialFile")),
           });
-        if (entry.isDirectory()) yield* rejectNonRegularFilesEffect(path);
+        if (entry.isDirectory()) yield* rejectNonRegularFiles(path);
       }),
     { concurrency: "unbounded", discard: true },
   );

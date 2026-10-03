@@ -58,7 +58,9 @@ adding a module or moving ownership between workspaces.
 - Wrap expected I/O failures with `Effect.tryPromise` or `Effect.try` at the adapter.
   Keep causes private and safe. Preserve public error codes and localized messages.
 - Run Effects at framework boundaries. Keep routing, request schemas, rendering, and callbacks native.
-  Shared client Promise and event interfaces must remain compatible with browser and mobile callers.
+  Expose one Effect-returning operation per async service method. Do not add paired Promise methods
+  or run an Effect only to wrap its Promise in another Effect. Adapt browser and mobile native
+  callbacks at their call sites; preserve released wire and event contracts.
 - Reuse process-owned managed runtimes and await disposal in existing shutdown paths. Preserve
   desktop teardown ordinals. Worker bindings and background I/O belong to their invocation;
   retain `waitUntil` and streaming lifetimes rather than adding a process shutdown hook.

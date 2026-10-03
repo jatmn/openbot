@@ -41,7 +41,7 @@ import {
   encodeTeamProtocolV5WebRtcHttpResponse,
 } from "@openbot/contracts/team-protocol/v5-webrtc-adapter";
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, ManagedRuntime } from "effect";
 import type * as Ws from "ws";
 import type { VerifiedRemoteSessionTicket } from "./central-auth-manager";
 import { contentDispositionFileName } from "./content-disposition";
@@ -68,8 +68,8 @@ export interface TeamWebRtcHostPeerOptions {
   store: TeamStore;
   appVersion: string;
   transferDirectory: string;
-  closeSession?: (sessionId: string) => Promise<void>;
-  verifyClientTicket?: (ticket: string) => Promise<VerifiedRemoteSessionTicket>;
+  closeSession?: (sessionId: string) => Effect.Effect<void, RemoteWorkflowError>;
+  verifyClientTicket?: (ticket: string) => Effect.Effect<VerifiedRemoteSessionTicket, RemoteWorkflowError>;
 }
 
 export interface IncomingConnection {
@@ -93,15 +93,18 @@ class HostPeerTransport extends Context.Service<
 export class TeamWebRtcHostPeer {
   readonly #bridge: TeamWebRtcBridge;
   readonly #runtime: ManagedRuntime.ManagedRuntime<HostPeerTransport, never>;
-  readonly #operations = new Set<Promise<unknown>>();
-  #disposal: Promise<void> | null = null;
+  readonly #operations = new Set<Fiber.Fiber<void, RemoteWorkflowError>>();
+  readonly #closingSessions = new Set<Fiber.Fiber<void>>();
+  #disposal: Fiber.Fiber<void> | null = null;
   readonly #store: TeamStore;
   readonly #appVersion: string;
   readonly #files: TeamWebRtcFileTransfer;
-  readonly #closeSession: (sessionId: string) => Promise<void>;
-  readonly #verifyClientTicket: ((ticket: string) => Promise<VerifiedRemoteSessionTicket>) | null;
+  readonly #closeSession: (sessionId: string) => Effect.Effect<void, RemoteWorkflowError>;
+  readonly #verifyClientTicket:
+    | ((ticket: string) => Effect.Effect<VerifiedRemoteSessionTicket, RemoteWorkflowError>)
+    | null;
   readonly #responses = new Map<string, TeamProtocolV2RpcFrame>();
-  readonly #responsesInFlight = new Map<string, Promise<TeamProtocolV2RpcFrame>>();
+  readonly #responsesInFlight = new Map<string, Fiber.Fiber<TeamProtocolV2RpcFrame, RemoteWorkflowError>>();
   readonly #events = new Map<number, string>();
   #peerCapabilities = new Set<string>();
   #peerId: string | null = null;
@@ -115,7 +118,7 @@ export class TeamWebRtcHostPeer {
   #nextEventSequence = 1;
   readonly #desktopSockets = new Map<string, Ws.WebSocket>();
   #sessionExpirationTimer: ReturnType<typeof setTimeout> | null = null;
-  #sessionPreparation: Promise<void> | null = null;
+  #sessionPreparation: Deferred.Deferred<void, RemoteWorkflowError> | null = null;
   #pendingConnection: IncomingConnection | null = null;
   #peerBinding: { localFingerprint: string; remoteFingerprint: string } | null = null;
   #sessionBinding: { localFingerprint: string; remoteFingerprint: string } | null = null;
@@ -134,7 +137,7 @@ export class TeamWebRtcHostPeer {
       Layer.succeed(
         HostPeerTransport,
         HostPeerTransport.of({
-          send: (...args) => remoteCall(() => options.bridge.send(...args)),
+          send: (...args) => options.bridge.send(...args),
           fetch: (input, init) =>
             Effect.tryPromise({
               try: (signal) => fetch(input, { ...init, signal }),
@@ -151,70 +154,75 @@ export class TeamWebRtcHostPeer {
       undefined,
       (peerId) => peerId === this.#peerId && this.#localSessionToken !== null,
     );
-    this.#closeSession = options.closeSession ?? (() => Promise.resolve());
+    this.#closeSession = options.closeSession ?? (() => Effect.void);
     this.#verifyClientTicket = options.verifyClientTicket ?? null;
     this.#bridge.on("connected", this.#onConnected);
     this.#bridge.on("data", this.#onData);
     this.#bridge.on("disconnected", this.#onDisconnected);
   }
 
-  async revokeSession(sessionId: string): Promise<void> {
+  readonly revokeSession = Effect.fn("TeamHostPeer.revokeSession")(function* (
+    this: TeamWebRtcHostPeer,
+    sessionId: string,
+  ) {
     if (sessionId !== this.#localSessionId && sessionId !== this.#pendingConnection?.sessionId) return;
     const peerId = this.#peerId;
-    // Revocation can be an RPC on this peer. Start teardown now; waiting for all RPCs
-    // here would wait for the revocation response that this method must first return.
-    void this.dispose();
-    if (peerId) await this.#bridge.disconnectPeer(peerId).catch(() => undefined);
-  }
+    // An RPC can revoke itself. Start disposal without waiting for that RPC's response.
+    yield* this.#beginDisposal();
+    if (peerId) yield* this.#bridge.disconnectPeer(peerId).pipe(Effect.catch(() => Effect.void));
+  }).bind(this);
 
   /** Whether this device has a file transfer moving right now, either direction. */
   hasActiveTransfers(): boolean {
     return this.#files.hasActiveTransfers();
   }
 
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, HostPeerTransport>): Promise<A> {
-    const promise = this.#runtime.runPromise(Effect.result(operation)).then((result) => {
-      if (Result.isFailure(result)) throw result.failure.cause;
-      return result.success;
-    });
-    this.#operations.add(promise);
-    void promise.then(
-      () => this.#operations.delete(promise),
-      () => this.#operations.delete(promise),
-    );
-    return promise;
+  // Execution is limited to native bridge and WebSocket callbacks.
+  #dispatch(operation: Effect.Effect<void, RemoteWorkflowError, HostPeerTransport>): void {
+    const fiber = this.#runtime.runFork(operation);
+    this.#operations.add(fiber);
+    fiber.addObserver(() => this.#operations.delete(fiber));
   }
 
-  dispose(): Promise<void> {
+  readonly dispose = Effect.fn("TeamHostPeer.dispose")(function* (this: TeamWebRtcHostPeer) {
+    const fiber = yield* this.#beginDisposal();
+    yield* Fiber.join(fiber);
+  }, Effect.uninterruptible).bind(this);
+
+  readonly #beginDisposal = Effect.fn("TeamHostPeer.beginDisposal")(function* (this: TeamWebRtcHostPeer) {
     if (this.#disposal) return this.#disposal;
     this.#bridge.off("connected", this.#onConnected);
     this.#bridge.off("data", this.#onData);
     this.#bridge.off("disconnected", this.#onDisconnected);
-    // Transport teardown is not logout. A new peer may already be resuming the
-    // same device's logical session; ending it here would revoke the new ticket.
-    this.#closeLocalSession(false);
+    // Transport teardown must not revoke a logical session resumed by another peer.
+    yield* this.#closeLocalSession(false);
     this.#peerId = null;
     this.#pendingConnection = null;
     this.#peerBinding = null;
-    this.#disposal = this.#disposeRuntime();
-    return this.#disposal;
-  }
+    const disposal = yield* Effect.forkDetach(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#files.stop().pipe(Effect.catch(() => Effect.void));
+        yield* Fiber.awaitAll([...this.#operations, ...this.#closingSessions]);
+        yield* this.#runtime.disposeEffect;
+      }),
+      { startImmediately: false },
+    );
+    this.#disposal = disposal;
+    return disposal;
+  }, Effect.uninterruptible);
 
-  async #disposeRuntime(): Promise<void> {
-    await this.#files.stop().catch(() => undefined);
-    await Promise.allSettled([...this.#operations]);
-    await this.#runtime.dispose();
-  }
-
-  incoming(connection: IncomingConnection): void {
+  readonly incoming = Effect.fn("TeamHostPeer.incoming")(function* (
+    this: TeamWebRtcHostPeer,
+    connection: IncomingConnection,
+  ) {
     if (!this.#peerId || connection.hostId !== this.#hostId) return;
     if (connection.sessionId === this.#localSessionId && this.#localSessionToken) {
       this.#pendingConnection = connection;
       return;
     }
-    this.#closeLocalSession();
+    yield* this.#closeLocalSession();
     this.#pendingConnection = connection;
-  }
+  }).bind(this);
 
   readonly #onConnected = (peerId: string, binding?: { localFingerprint: string; remoteFingerprint: string }): void => {
     if (peerId !== this.#peerId) return;
@@ -235,20 +243,17 @@ export class TeamWebRtcHostPeer {
       this.#files.setPeerAuthenticated(peerId, true);
       return;
     }
-    this.#closeLocalSession(false);
+    this.#dispatch(this.#closeLocalSession(false));
   };
 
-  #openIncomingSession(peerId: string, connection: Omit<IncomingConnection, "connectionId">): Promise<void> {
-    return this.#run(this.#openIncomingSessionEffect(peerId, connection));
-  }
-  readonly #openIncomingSessionEffect = Effect.fn("TeamHostPeer.openIncomingSession")(function* (
+  readonly #openIncomingSession = Effect.fn("TeamHostPeer.openIncomingSession")(function* (
     this: TeamWebRtcHostPeer,
     peerId: string,
     connection: Omit<IncomingConnection, "connectionId">,
   ): Effect.fn.Return<void, RemoteWorkflowError, HostPeerTransport> {
     if (peerId !== this.#peerId) return;
     if (connection.sessionId === this.#localSessionId && this.#localSessionToken) return;
-    this.#closeLocalSession();
+    // incoming already cleared the prior session; retain the active authentication gate.
     this.#events.clear();
     this.#responses.clear();
     this.#nextEventSequence = 1;
@@ -263,7 +268,7 @@ export class TeamWebRtcHostPeer {
   #scheduleSessionExpiration(expiresAt: number): void {
     const remaining = expiresAt - Date.now();
     if (remaining <= 0) {
-      this.#closeLocalSession();
+      this.#dispatch(this.#closeLocalSession());
       return;
     }
     // Persistent sessions exceed Node's signed 32-bit timer range. Recheck in
@@ -283,27 +288,35 @@ export class TeamWebRtcHostPeer {
     if (peerId !== this.#peerId) return;
     const authFrame = channel === "rpc" && isString(data) ? authenticationFrame(data) : null;
     if (authFrame?.type === "auth-init") {
-      void this.#handleAuthentication(peerId, authFrame).catch(() => this.#failProtocol(peerId));
+      this.#dispatch(
+        this.#handleAuthentication(peerId, authFrame).pipe(Effect.catchCause(() => this.#failProtocol(peerId))),
+      );
       return;
     }
     if (authFrame?.type === "auth-complete") {
-      void this.#completeAuthentication(peerId, authFrame).catch(() => this.#failProtocol(peerId));
+      this.#dispatch(
+        this.#completeAuthentication(peerId, authFrame).pipe(Effect.catchCause(() => this.#failProtocol(peerId))),
+      );
       return;
     }
     if (!this.#localSessionToken) {
-      this.#failProtocol(peerId);
+      this.#dispatch(this.#failProtocol(peerId));
       return;
     }
     if (channel === "desktop") {
-      void this.#handleDesktopSignal(data).catch(() => this.#closeDesktopSockets());
+      this.#dispatch(
+        this.#handleDesktopSignal(data).pipe(Effect.catchCause(() => Effect.sync(() => this.#closeDesktopSockets()))),
+      );
       return;
     }
     if (!isString(data)) {
-      if (channel === "rpc" || channel === "events") this.#failProtocol(peerId);
+      if (channel === "rpc" || channel === "events") this.#dispatch(this.#failProtocol(peerId));
       return;
     }
-    if (channel === "rpc") void this.#handleRpc(data).catch(() => this.#failProtocol(peerId));
-    else if (channel === "events") void this.#handleEventControl(data).catch(() => this.#failProtocol(peerId));
+    if (channel === "rpc")
+      this.#dispatch(this.#handleRpc(data).pipe(Effect.catchCause(() => this.#failProtocol(peerId))));
+    else if (channel === "events")
+      this.#dispatch(this.#handleEventControl(data).pipe(Effect.catchCause(() => this.#failProtocol(peerId))));
   };
 
   readonly #onDisconnected = (peerId: string): void => {
@@ -314,14 +327,11 @@ export class TeamWebRtcHostPeer {
       this.#peerBinding = null;
       this.#peerCapabilities.clear();
       this.#authenticationCompletion = null;
-      this.#closeLocalSession(false);
+      this.#dispatch(this.#closeLocalSession(false));
     }
   };
 
-  #handleAuthentication(peerId: string, frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-init" }>): Promise<void> {
-    return this.#run(this.#handleAuthenticationEffect(peerId, frame));
-  }
-  readonly #handleAuthenticationEffect = Effect.fn("TeamHostPeer.handleAuthentication")(function* (
+  readonly #handleAuthentication = Effect.fn("TeamHostPeer.handleAuthentication")(function* (
     this: TeamWebRtcHostPeer,
     peerId: string,
     frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-init" }>,
@@ -332,7 +342,7 @@ export class TeamWebRtcHostPeer {
     if (!pending || !binding || !verifyClientTicket || this.#authenticationCompletion || this.#sessionPreparation) {
       return yield* new RemoteWorkflowError({ cause: new Error("Remote authentication is not ready.") });
     }
-    const claims = yield* remoteCall(() => verifyClientTicket(frame.ticket));
+    const claims = yield* verifyClientTicket(frame.ticket);
     if (this.#peerId !== peerId || this.#pendingConnection !== pending || this.#peerBinding !== binding) {
       return yield* new RemoteWorkflowError({ cause: new Error("Remote authentication was cancelled.") });
     }
@@ -392,13 +402,7 @@ export class TeamWebRtcHostPeer {
     );
   });
 
-  #completeAuthentication(
-    peerId: string,
-    frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-complete" }>,
-  ): Promise<void> {
-    return this.#run(this.#completeAuthenticationEffect(peerId, frame));
-  }
-  readonly #completeAuthenticationEffect = Effect.fn("TeamHostPeer.completeAuthentication")(function* (
+  readonly #completeAuthentication = Effect.fn("TeamHostPeer.completeAuthentication")(function* (
     this: TeamWebRtcHostPeer,
     peerId: string,
     frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-complete" }>,
@@ -413,8 +417,11 @@ export class TeamWebRtcHostPeer {
       return yield* new RemoteWorkflowError({ cause: new Error("The authentication completion is invalid.") });
     }
     this.#authenticationCompletion = null;
-    this.#sessionPreparation = this.#openIncomingSession(peerId, completion.claims);
-    yield* remoteCall(() => this.#sessionPreparation ?? Promise.resolve());
+    const preparation = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    this.#sessionPreparation = preparation;
+    yield* this.#openIncomingSession(peerId, completion.claims).pipe(
+      Effect.onExit((exit) => Effect.sync(() => Deferred.doneUnsafe(preparation, exit))),
+    );
     this.#sessionPreparation = null;
     if (!this.#localSessionToken)
       return yield* new RemoteWorkflowError({ cause: new Error("The remote session did not open.") });
@@ -437,14 +444,11 @@ export class TeamWebRtcHostPeer {
     this.#pendingConnection = null;
   });
 
-  #handleRpc(data: string): Promise<void> {
-    return this.#run(this.#handleRpcEffect(data));
-  }
-  readonly #handleRpcEffect = Effect.fn("TeamHostPeer.handleRpc")(function* (
+  readonly #handleRpc = Effect.fn("TeamHostPeer.handleRpc")(function* (
     this: TeamWebRtcHostPeer,
     data: string,
   ): Effect.fn.Return<void, RemoteWorkflowError, HostPeerTransport> {
-    yield* remoteCall(() => this.#sessionPreparation ?? Promise.resolve());
+    if (this.#sessionPreparation) yield* Deferred.await(this.#sessionPreparation);
     const peerId = this.#peerId;
     if (!peerId) return;
     const request = yield* remoteDecode(() => {
@@ -465,29 +469,32 @@ export class TeamWebRtcHostPeer {
     const inFlightKey = `${sessionId}\0${request.requestId}`;
     let responseOperation = this.#responsesInFlight.get(inFlightKey);
     if (!responseOperation) {
-      responseOperation = this.#createRpcResponse(request).then((response) => {
-        if (this.#localSessionId === sessionId) {
-          this.#responses.set(request.requestId, response);
-          while (this.#responses.size > 1_000) deleteOldest(this.#responses);
-        }
-        return response;
-      });
+      responseOperation = yield* Effect.forkIn(
+        this.#createRpcResponse(request).pipe(
+          Effect.tap((response) =>
+            Effect.sync(() => {
+              if (this.#localSessionId === sessionId) {
+                this.#responses.set(request.requestId, response);
+                while (this.#responses.size > 1_000) deleteOldest(this.#responses);
+              }
+            }),
+          ),
+        ),
+        this.#runtime.scope,
+        { startImmediately: false },
+      );
       this.#responsesInFlight.set(inFlightKey, responseOperation);
-      const clearPending = () => {
-        if (this.#responsesInFlight.get(inFlightKey) === responseOperation) this.#responsesInFlight.delete(inFlightKey);
-      };
-      void responseOperation.then(clearPending, clearPending);
+      const pending = responseOperation;
+      pending.addObserver(() => {
+        if (this.#responsesInFlight.get(inFlightKey) === pending) this.#responsesInFlight.delete(inFlightKey);
+      });
     }
-    const operation = responseOperation;
-    const response = yield* remoteCall(() => operation);
+    const response = yield* Fiber.join(responseOperation);
     if (this.#peerId !== peerId || this.#localSessionId !== sessionId) return;
     yield* HostPeerTransport.use((transport) => transport.send(peerId, "rpc", encodeTeamProtocolV2Frame(response)));
   });
 
-  #createRpcResponse(request: Extract<TeamProtocolV2RpcFrame, { type: "request" }>): Promise<TeamProtocolV2RpcFrame> {
-    return this.#run(this.#createRpcResponseEffect(request));
-  }
-  readonly #createRpcResponseEffect = Effect.fn("TeamHostPeer.createRpcResponse")(function* (
+  readonly #createRpcResponse = Effect.fn("TeamHostPeer.createRpcResponse")(function* (
     this: TeamWebRtcHostPeer,
     request: Extract<TeamProtocolV2RpcFrame, { type: "request" }>,
   ): Effect.fn.Return<TeamProtocolV2RpcFrame, RemoteWorkflowError, HostPeerTransport> {
@@ -552,7 +559,7 @@ export class TeamWebRtcHostPeer {
     // An uploaded body stays on disk: the request reads it from the file, and the file is removed
     // after the response is complete.
     if (input.bodyTransferId) {
-      return yield* this.#files.useReceivedEffect(peerId, input.bodyTransferId, (uploaded) =>
+      return yield* this.#files.useReceived(peerId, input.bodyTransferId, (uploaded) =>
         this.#forwardHttpEffect(input, request, uploaded),
       );
     }
@@ -637,7 +644,7 @@ export class TeamWebRtcHostPeer {
             const name = contentDispositionFileName(response.headers.get("content-disposition"), "remote-file");
             // The body goes to disk in chunks and not to one buffer, so a 100 MB download does not stay in
             // main for the minutes that the data channel needs to send it.
-            const { transferId, size } = yield* this.#files.sendStreamEffect(peerId, {
+            const { transferId, size } = yield* this.#files.sendStream(peerId, {
               name,
               mimeType: contentType || "application/octet-stream",
               body: response.body ?? [],
@@ -752,14 +759,11 @@ export class TeamWebRtcHostPeer {
     }, delay);
   }
 
-  #handleEventControl(data: string): Promise<void> {
-    return this.#run(this.#handleEventControlEffect(data));
-  }
-  readonly #handleEventControlEffect = Effect.fn("TeamHostPeer.handleEventControl")(function* (
+  readonly #handleEventControl = Effect.fn("TeamHostPeer.handleEventControl")(function* (
     this: TeamWebRtcHostPeer,
     data: string,
   ): Effect.fn.Return<void, RemoteWorkflowError, HostPeerTransport> {
-    yield* remoteCall(() => this.#sessionPreparation ?? Promise.resolve());
+    if (this.#sessionPreparation) yield* Deferred.await(this.#sessionPreparation);
     const frame = yield* remoteDecode(() => decodeTeamProtocolV2EventFrame(data));
     if (!this.#eventsSocket && this.#localSessionToken) this.#connectLocalEvents(this.#localSessionToken);
     if (frame.type === "event-control") {
@@ -786,21 +790,18 @@ export class TeamWebRtcHostPeer {
     }
   });
 
-  #failProtocol(peerId: string): void {
+  readonly #failProtocol = Effect.fn("TeamHostPeer.failProtocol")(function* (this: TeamWebRtcHostPeer, peerId: string) {
     if (peerId !== this.#peerId) return;
     this.#files.setPeerAuthenticated(peerId, false);
-    this.#closeLocalSession();
-    void this.#run(remoteCall(() => this.#bridge.disconnectPeer(peerId)).pipe(Effect.catch(() => Effect.void)));
-  }
+    yield* this.#closeLocalSession();
+    yield* this.#bridge.disconnectPeer(peerId).pipe(Effect.catch(() => Effect.void));
+  });
 
-  #handleDesktopSignal(data: string | ArrayBuffer): Promise<void> {
-    return this.#run(this.#handleDesktopSignalEffect(data));
-  }
-  readonly #handleDesktopSignalEffect = Effect.fn("TeamHostPeer.handleDesktopSignal")(function* (
+  readonly #handleDesktopSignal = Effect.fn("TeamHostPeer.handleDesktopSignal")(function* (
     this: TeamWebRtcHostPeer,
     data: string | ArrayBuffer,
   ): Effect.fn.Return<void, RemoteWorkflowError, HostPeerTransport> {
-    yield* remoteCall(() => this.#sessionPreparation ?? Promise.resolve());
+    if (this.#sessionPreparation) yield* Deferred.await(this.#sessionPreparation);
     const peerId = this.#peerId;
     if (!peerId || !this.#localApiPort || !this.#localSessionId) return;
     if (!isString(data)) {
@@ -812,7 +813,7 @@ export class TeamWebRtcHostPeer {
     }
     const control = yield* remoteDecode(() => decodeRemoteDesktopSignalControl(data));
     if (control.type === "open") {
-      this.#openDesktopSocket(peerId, control.streamId, control.path);
+      yield* this.#openDesktopSocket(peerId, control.streamId, control.path);
       return;
     }
     const socket = this.#desktopSockets.get(control.streamId);
@@ -829,27 +830,36 @@ export class TeamWebRtcHostPeer {
    * Moonlight session runs. Each stream keeps its own socket, and only the paths named here are
    * reachable -- the tunnel opens sockets on the host's own port, so its allowlist is the boundary.
    */
-  #openDesktopSocket(peerId: string, streamId: string, path: string): void {
-    const url = new URL(path, `ws://127.0.0.1:${this.#localApiPort}`);
+  readonly #openDesktopSocket = Effect.fn("TeamHostPeer.openDesktopSocket")(function* (
+    this: TeamWebRtcHostPeer,
+    peerId: string,
+    streamId: string,
+    path: string,
+  ) {
+    const url = yield* remoteDecode(() => new URL(path, `ws://127.0.0.1:${this.#localApiPort}`));
     const allowed =
       url.origin === `ws://127.0.0.1:${this.#localApiPort}` &&
       (/^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/u.test(url.pathname) ||
         browserViewStreamSessionId(url.pathname) !== null);
     if (!allowed || this.#desktopSockets.size >= MAXIMUM_DESKTOP_STREAMS) {
-      this.#sendRecoverable(
-        peerId,
-        "desktop",
-        encodeRemoteDesktopSignalControl({
-          type: "error",
-          streamId,
-          message: allowed ? sourceText("error.remote.tooManyStreams") : "The remote desktop signal path is invalid.",
-        }),
-      );
+      yield* HostPeerTransport.use((transport) =>
+        transport.send(
+          peerId,
+          "desktop",
+          encodeRemoteDesktopSignalControl({
+            type: "error",
+            streamId,
+            message: allowed ? sourceText("error.remote.tooManyStreams") : "The remote desktop signal path is invalid.",
+          }),
+        ),
+      ).pipe(Effect.catch(() => Effect.void));
       return;
     }
     this.#closeDesktopSocket(streamId);
     const sessionId = this.#localSessionId ?? "";
-    const socket = new webSockets.WebSocket(url, { headers: { "X-OpenBot-WebRTC-Session": sessionId } });
+    const socket = yield* remoteDecode(
+      () => new webSockets.WebSocket(url, { headers: { "X-OpenBot-WebRTC-Session": sessionId } }),
+    );
     this.#desktopSockets.set(streamId, socket);
     socket.once("open", () => {
       this.#sendRecoverable(peerId, "desktop", encodeRemoteDesktopSignalControl({ type: "opened", streamId }));
@@ -886,9 +896,13 @@ export class TeamWebRtcHostPeer {
         }),
       );
     });
-  }
+  });
 
-  #closeLocalSession(endLogicalSession = true): void {
+  readonly #closeLocalSession = Effect.fn("TeamHostPeer.closeLocalSession")(function* (
+    this: TeamWebRtcHostPeer,
+    endLogicalSession = true,
+  ) {
+    const closingSessionId = this.#localSessionId;
     if (this.#peerId) this.#files.setPeerAuthenticated(this.#peerId, false);
     if (this.#sessionExpirationTimer) clearTimeout(this.#sessionExpirationTimer);
     this.#sessionExpirationTimer = null;
@@ -899,9 +913,6 @@ export class TeamWebRtcHostPeer {
     this.#eventsSocket?.close();
     this.#eventsSocket = null;
     if (this.#localSessionId) {
-      const sessionId = this.#localSessionId;
-      if (endLogicalSession)
-        void this.#run(remoteCall(() => this.#closeSession(sessionId)).pipe(Effect.catch(() => Effect.void)));
       this.#store.closeRemoteSession(this.#localSessionId);
     }
     this.#localSessionId = null;
@@ -909,11 +920,21 @@ export class TeamWebRtcHostPeer {
     this.#sessionBinding = null;
     this.#sessionPreparation = null;
     this.#authenticationCompletion = null;
-  }
+    if (endLogicalSession && closingSessionId) {
+      // Invalidate local access immediately. Remote logout must not delay the next handshake.
+      const closing = yield* Effect.forkIn(
+        this.#closeSession(closingSessionId).pipe(Effect.catch(() => Effect.void)),
+        this.#runtime.scope,
+        { startImmediately: false },
+      );
+      this.#closingSessions.add(closing);
+      closing.addObserver(() => this.#closingSessions.delete(closing));
+    }
+  });
 
   #sendRecoverable(peerId: string, channel: "events" | "desktop", data: string | ArrayBuffer): void {
     if (peerId !== this.#peerId) return;
-    void this.#run(
+    this.#dispatch(
       HostPeerTransport.use((transport) => transport.send(peerId, channel, data)).pipe(Effect.catch(() => Effect.void)),
     );
   }

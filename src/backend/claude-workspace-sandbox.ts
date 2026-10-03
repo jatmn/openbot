@@ -56,10 +56,7 @@ export const CLAUDE_WORKSPACE_MANAGED_SETTINGS: NonNullable<Options["managedSett
  * `/<name>` still works. The plugin folder is in `stateDirectory`, outside every root the agent can
  * write: a plugin can also start hooks and language servers, which run outside the sandbox.
  */
-export function claudeWorkspaceSkillPlugin(stateDirectory: string, cwd: string): Promise<SdkPluginConfig> {
-  return runProviderClientEffect(claudeWorkspaceSkillPluginEffect(stateDirectory, cwd));
-}
-export const claudeWorkspaceSkillPluginEffect = Effect.fn("ClaudeWorkspace.skillPlugin")(function* (
+export const claudeWorkspaceSkillPlugin = Effect.fn("ClaudeWorkspace.skillPlugin")(function* (
   stateDirectory: string,
   cwd: string,
 ): Effect.fn.Return<SdkPluginConfig, ProviderClientOperationError> {
@@ -95,7 +92,9 @@ export function claudeWorkspaceHooks(cwd: string, roots: readonly string[]): Non
     hooks: [
       async (input) => {
         if (input.hook_event_name !== "PreToolUse") return {};
-        const target = await claudeWriteOutsideRoots(input.tool_name, input.tool_input, cwd, roots);
+        const target = await runProviderClientEffect(
+          claudeWriteOutsideRoots(input.tool_name, input.tool_input, cwd, roots),
+        );
         if (!target) return {};
         return {
           hookSpecificOutput: {
@@ -117,15 +116,7 @@ export function claudeWorkspaceHooks(cwd: string, roots: readonly string[]): Non
  * resolved counts as outside. Claude's own settings files in a root count as outside too: Workspace
  * only ignores them, but a Full access session or Claude in a terminal loads them and runs their hooks.
  */
-export function claudeWriteOutsideRoots(
-  toolName: string,
-  toolInput: unknown,
-  cwd: string,
-  roots: readonly string[],
-): Promise<string | null> {
-  return runProviderClientEffect(claudeWriteOutsideRootsEffect(toolName, toolInput, cwd, roots));
-}
-export const claudeWriteOutsideRootsEffect = Effect.fn("ClaudeWorkspace.writeOutsideRoots")(function* (
+export const claudeWriteOutsideRoots = Effect.fn("ClaudeWorkspace.writeOutsideRoots")(function* (
   toolName: string,
   toolInput: unknown,
   cwd: string,

@@ -2,7 +2,6 @@ import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { isCanonicalInviteUrl } from "@openbot/contracts/invite-links";
 import { isValidHostname as isSharedValidHostname } from "@openbot/contracts/validation";
 import { Effect, Fiber, Result, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 import { type RenderedEmail, renderSignInCodeEmail, renderTeamInviteEmail } from "./email-templates";
 
 export interface SmtpEmailConfig {
@@ -61,7 +60,7 @@ class SmtpError extends Schema.TaggedError<SmtpError>()("SmtpError", { message: 
     super({ message });
   }
 }
-type SmtpFailure = SmtpError | SmtpReplyError;
+export type SmtpFailure = SmtpError | SmtpReplyError;
 function smtpCall<A>(operation: () => Promise<A>): Effect.Effect<A, SmtpFailure> {
   return Effect.tryPromise({ try: operation, catch: normalizeSmtpError });
 }
@@ -89,65 +88,64 @@ const SMTP_CLOSE_TIMEOUT_MS = 250;
 const SMTP_MAX_ATTEMPTS = 3;
 const EMAIL_PATTERN = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+$/iu;
 
-export async function sendPrivateEmailCode(
+export const sendPrivateEmailCode = Effect.fn("Smtp.sendPrivateEmailCode ")(function* (
   config: SmtpEmailConfig,
   message: SmtpEmailMessage,
   connector?: SmtpConnector,
-): Promise<void> {
-  validateConfig(config);
-  validateEmail(message.email, "recipient");
-  if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/u.test(message.code)) {
-    throw new Error("smtp_invalid_code");
-  }
-
-  return runApiEffect(
-    sendPrivateEmail(
-      config,
-      {
-        email: message.email,
-        content: renderSignInCodeEmail({
-          code: message.code,
-          expiresInMinutes: Math.max(1, Math.ceil((message.expiresAt - Date.now()) / 60_000)),
-        }),
-      },
-      connector,
-    ),
+) {
+  yield* smtpValidate(() => {
+    validateConfig(config);
+    validateEmail(message.email, "recipient");
+    if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/u.test(message.code)) {
+      throw new Error("smtp_invalid_code");
+    }
+  });
+  return yield* sendPrivateEmail(
+    config,
+    {
+      email: message.email,
+      content: renderSignInCodeEmail({
+        code: message.code,
+        expiresInMinutes: Math.max(1, Math.ceil((message.expiresAt - Date.now()) / 60_000)),
+      }),
+    },
+    connector,
   );
-}
+});
 
-export function sendPrivateTeamInvite(
+export const sendPrivateTeamInvite = Effect.fn("Smtp.sendPrivateTeamInvite ")(function* (
   config: SmtpEmailConfig,
   message: SmtpTeamInviteMessage,
   connector?: SmtpConnector,
-): Promise<void> {
-  validateEmail(message.email, "recipient");
-  validateEmail(message.inviterEmail, "inviter");
-  if (
-    !message.serverName.trim() ||
-    message.serverName.length > INPUT_LIMITS.serverName ||
-    hasHeaderBreak(message.serverName)
-  ) {
-    throw new Error("smtp_invalid_server_name");
-  }
-  if (!isCanonicalInviteUrl(message.inviteUrl)) {
-    throw new Error("smtp_invalid_invite_url");
-  }
-  return runApiEffect(
-    sendPrivateEmail(
-      config,
-      {
-        email: message.email,
-        content: renderTeamInviteEmail({
-          inviterEmail: message.inviterEmail,
-          serverName: message.serverName,
-          inviteUrl: message.inviteUrl,
-          role: message.role,
-        }),
-      },
-      connector,
-    ),
+) {
+  yield* smtpValidate(() => {
+    validateEmail(message.email, "recipient");
+    validateEmail(message.inviterEmail, "inviter");
+    if (
+      !message.serverName.trim() ||
+      message.serverName.length > INPUT_LIMITS.serverName ||
+      hasHeaderBreak(message.serverName)
+    ) {
+      throw new Error("smtp_invalid_server_name");
+    }
+    if (!isCanonicalInviteUrl(message.inviteUrl)) {
+      throw new Error("smtp_invalid_invite_url");
+    }
+  });
+  return yield* sendPrivateEmail(
+    config,
+    {
+      email: message.email,
+      content: renderTeamInviteEmail({
+        inviterEmail: message.inviterEmail,
+        serverName: message.serverName,
+        inviteUrl: message.inviteUrl,
+        role: message.role,
+      }),
+    },
+    connector,
   );
-}
+});
 
 const sendPrivateEmail = Effect.fn("SmtpEmail.send")(function* (
   config: SmtpEmailConfig,
@@ -321,7 +319,7 @@ class SmtpResponseReader {
     if (!expectedCodes.includes(responseCode)) {
       return yield* new SmtpReplyError(stage, responseCode, lines.join(" "));
     }
-  });
+  }).bind(this);
 
   readonly #readLine = Effect.fn("SmtpResponseReader.readLine")(function* (
     this: SmtpResponseReader,

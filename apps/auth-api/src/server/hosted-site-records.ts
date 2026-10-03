@@ -7,13 +7,12 @@ import type {
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
 import { hmacSha256, sha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
 import {
   type HostedSiteFileManifest,
   HostedSiteInputError,
   type HostedSiteUploadRequest,
 } from "./hosted-site-contract";
-import { siteCall, siteDecode } from "./hosted-site-effects";
+import { siteCall, siteDecode, siteFailure } from "./hosted-site-effects";
 
 /**
  * The stored rows of hosted sites and deployments, and the pure helpers that read, map and name them.
@@ -65,26 +64,20 @@ export interface HostedSiteSummary extends Omit<HostedSiteClientSummary, "status
   status: SiteRow["status"];
 }
 
-export function uploadRequestHash(request: HostedSiteUploadRequest): Promise<string> {
-  return runApiEffect(uploadRequestHashEffect(request));
-}
-
-export const uploadRequestHashEffect = Effect.fn("HostedSites.uploadRequestHash")((request: HostedSiteUploadRequest) =>
-  siteCall(() =>
-    sha256(
-      JSON.stringify({
-        siteId: request.siteId,
-        title: request.title,
-        description: request.description,
-        framework: request.framework,
-        spaFallback: request.spaFallback,
-        files: [...request.files].sort((left, right) => {
-          if (left.path === right.path) return 0;
-          return left.path < right.path ? -1 : 1;
-        }),
+export const uploadRequestHash = Effect.fn("HostedSites.uploadRequestHash")((request: HostedSiteUploadRequest) =>
+  sha256(
+    JSON.stringify({
+      siteId: request.siteId,
+      title: request.title,
+      description: request.description,
+      framework: request.framework,
+      spaFallback: request.spaFallback,
+      files: [...request.files].sort((left, right) => {
+        if (left.path === right.path) return 0;
+        return left.path < right.path ? -1 : 1;
       }),
-    ),
-  ),
+    }),
+  ).pipe(Effect.mapError(siteFailure)),
 );
 
 export function parseManifest(value: string): HostedSiteFileManifest[] {
@@ -95,11 +88,7 @@ export function parseManifest(value: string): HostedSiteFileManifest[] {
   return parsed.map((file) => ({ path: file.path, size: file.size, mimeType: file.mimeType }));
 }
 
-export function readUploadBody(body: ReadableStream<Uint8Array>, expectedSize: number): Promise<Uint8Array> {
-  return runApiEffect(readUploadBodyEffect(body, expectedSize));
-}
-
-export const readUploadBodyEffect = Effect.fn("HostedSites.readUploadBody")(
+export const readUploadBody = Effect.fn("HostedSites.readUploadBody")(
   (body: ReadableStream<Uint8Array>, expectedSize: number) =>
     Effect.acquireUseRelease(
       siteDecode(() => body.getReader()),
@@ -297,11 +286,7 @@ export function randomBase32(length: number): string {
   return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
 }
 
-export function sourceIpHash(secret: string, value: string, deduplicationWindow: number): Promise<string> {
-  return runApiEffect(sourceIpHashEffect(secret, value, deduplicationWindow));
-}
-
-export const sourceIpHashEffect = Effect.fn("HostedSites.sourceIpHash")(
+export const sourceIpHash = Effect.fn("HostedSites.sourceIpHash")(
   (secret: string, value: string, deduplicationWindow: number) =>
-    siteCall(() => hmacSha256(secret, `${deduplicationWindow}\0${value}`)),
+    hmacSha256(secret, `${deduplicationWindow}\0${value}`).pipe(Effect.mapError(siteFailure)),
 );

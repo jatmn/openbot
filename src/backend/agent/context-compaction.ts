@@ -103,11 +103,7 @@ export class ContextCompaction {
     return true;
   }
 
-  request(agentId: string, threadId: string): Promise<void> {
-    return Effect.runPromise(this.requestEffect(agentId, threadId));
-  }
-
-  readonly requestEffect = Effect.fn("ContextCompaction.request")(function* (
+  readonly request = Effect.fn("ContextCompaction.request")(function* (
     this: ContextCompaction,
     agentId: string,
     threadId: string,
@@ -133,25 +129,25 @@ export class ContextCompaction {
     timer.unref?.();
     this.#timers.set(threadId, timer);
 
-    yield* Effect.tryPromise({
-      try: () => client.request("thread/compact/start", { threadId }, decodeRecordResponse),
-      catch: (cause) => new ContextCompactionFailed({ cause }),
-    }).pipe(
-      Effect.catch((failure) =>
-        Effect.sync(() => {
-          budget.lastCompactedTokens = budget.usedTokens;
-          this.#emitError("context_compaction_failed", failure.cause, agentId);
-          this.#release(agentId, threadId);
-          this.#scheduleDrain(agentId);
-        }),
-      ),
-      Effect.onInterrupt(() =>
-        Effect.sync(() => {
-          this.#release(agentId, threadId);
-          this.#scheduleDrain(agentId);
-        }),
-      ),
-    );
+    yield* client
+      .request("thread/compact/start", { threadId }, decodeRecordResponse)
+      .pipe(Effect.mapError((failure) => new ContextCompactionFailed({ cause: failure.cause })))
+      .pipe(
+        Effect.catch((failure) =>
+          Effect.sync(() => {
+            budget.lastCompactedTokens = budget.usedTokens;
+            this.#emitError("context_compaction_failed", failure.cause, agentId);
+            this.#release(agentId, threadId);
+            this.#scheduleDrain(agentId);
+          }),
+        ),
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            this.#release(agentId, threadId);
+            this.#scheduleDrain(agentId);
+          }),
+        ),
+      );
   });
 
   /**

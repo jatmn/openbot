@@ -10,7 +10,7 @@ import type { CustomProviderHeader, DetectedModel } from "@openbot/contracts/ipc
 import { PROVIDER_DETECTION_LIMITS } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, Result, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 
 /** A model list is a small JSON object. A larger body is not a model list. */
 export const MODEL_LIST_BODY_LIMIT = 1024 * 1024;
@@ -21,7 +21,7 @@ interface ModelServerTarget {
   headers: readonly CustomProviderHeader[];
 }
 
-export type ProbeModels = (target: ModelServerTarget, timeoutMs: number) => Promise<DetectedModel[]>;
+export type ProbeModels = (target: ModelServerTarget, timeoutMs: number) => Effect.Effect<DetectedModel[], ProbeError>;
 
 /** The part of an address that an error may name. */
 function hostOf(baseUrl: string): string {
@@ -58,7 +58,7 @@ export class ModelListTooLarge extends Schema.TaggedError<ModelListTooLarge>()("
   message: Schema.String,
 }) {}
 
-type ProbeError =
+export type ProbeError =
   | ModelServerUnavailable
   | ModelServerTimeout
   | ModelServerRejected
@@ -69,7 +69,7 @@ type ProbeError =
 const ModelListEnvelope = Schema.Struct({ data: Schema.Array(Schema.Unknown) });
 
 /** Secret-bearing request details and causes never enter errors or tracing attributes. */
-export const probeModelsEffect = Effect.fn("ModelServerProbe.probe")(function* (
+export const probeModels = Effect.fn("ModelServerProbe.probe")(function* (
   target: ModelServerTarget,
   timeoutMs: number,
 ): Effect.fn.Return<DetectedModel[], ProbeError> {
@@ -130,15 +130,8 @@ export class ModelServerProbe extends Context.Service<
     probe(target: ModelServerTarget, timeoutMs: number): Effect.Effect<DetectedModel[], ProbeError>;
   }
 >()("openbot/main/ModelServerProbe") {
-  static readonly layer = Layer.succeed(ModelServerProbe, { probe: probeModelsEffect });
+  static readonly layer = Layer.succeed(ModelServerProbe, { probe: probeModels });
 }
-
-/** Promise entry point for standalone callers. The desktop supplies its managed runtime. */
-export const probeModels: ProbeModels = async (target, timeoutMs) => {
-  const result = await Effect.runPromise(Effect.result(probeModelsEffect(target, timeoutMs)));
-  if (Result.isFailure(result)) throw result.failure;
-  return result.success;
-};
 
 const readLimited = Effect.fn("ModelServerProbe.readLimited")(function* (response: Response, host: string) {
   const tooLarge = () => new ModelListTooLarge({ message: sourceText("error.provider.discoveryTooLarge", { host }) });

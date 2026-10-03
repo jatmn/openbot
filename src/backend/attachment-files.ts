@@ -30,9 +30,8 @@ import {
   attachmentFailure,
   attachmentResult,
   attachmentSync,
-  runAttachmentEffect,
 } from "./attachment-effects";
-import { sha256FileEffect } from "./file-hash";
+import { sha256File } from "./file-hash";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
 const MAX_FILE_BYTES = ATTACHMENT_LIMITS.fileBytes;
@@ -115,11 +114,7 @@ export class AttachmentFiles {
     this.#transfersRoot = join(options.sharedRoot, "Transfers");
   }
 
-  initialize(): Promise<void> {
-    return runAttachmentEffect(this.initializeEffect());
-  }
-
-  readonly initializeEffect = Effect.fn("AttachmentFiles.initialize")(function* (
+  readonly initialize = Effect.fn("AttachmentFiles.initialize")(function* (
     this: AttachmentFiles,
   ): Effect.fn.Return<void, AttachmentOperationError> {
     yield* Effect.forEach(
@@ -127,13 +122,9 @@ export class AttachmentFiles {
       (root) => attachmentCall(() => mkdir(root, { recursive: true, mode: 0o700 })).pipe(Effect.uninterruptible),
       { concurrency: "unbounded" },
     );
-  });
+  }).bind(this);
 
-  resetDrafts(retainedIds: string[] = []): Promise<void> {
-    return runAttachmentEffect(this.resetDraftsEffect(retainedIds));
-  }
-
-  readonly resetDraftsEffect = Effect.fn("AttachmentFiles.resetDrafts")(function* (
+  readonly resetDrafts = Effect.fn("AttachmentFiles.resetDrafts")(function* (
     this: AttachmentFiles,
     retainedIds: string[] = [],
   ): Effect.fn.Return<void, AttachmentOperationError> {
@@ -141,10 +132,10 @@ export class AttachmentFiles {
     const entries = yield* attachmentCall(() => readdir(this.#draftsRoot));
     yield* Effect.forEach(
       entries.filter((name) => !retained.has(name)),
-      (name) => this.removeEffect(join(this.#draftsRoot, name)),
+      (name) => this.remove(join(this.#draftsRoot, name)),
       { concurrency: "unbounded" },
     );
-  });
+  }).bind(this);
 
   transferRoot(id: string): string {
     return join(this.#transfersRoot, id);
@@ -162,81 +153,55 @@ export class AttachmentFiles {
    * The real path of a managed transfer file, or null when the file is gone or resolves outside
    * the Transfers folder. A delete from Storage removes only a path this returns.
    */
-  managedTransferFile(path: string): Promise<string | null> {
-    return runAttachmentEffect(this.managedTransferFileEffect(path));
+
+  managedTransferFile(path: string): Effect.Effect<string | null, AttachmentOperationError> {
+    return Effect.gen({ self: this }, function* () {
+      try {
+        const [root, candidate] = attachmentResult(
+          yield* Effect.result(attachmentCall(() => Promise.all([realpath(this.#transfersRoot), realpath(path)]))),
+        );
+        if (!isWithin(root, candidate)) return null;
+        return attachmentResult(yield* Effect.result(attachmentCall(() => lstat(candidate)))).isFile()
+          ? candidate
+          : null;
+      } catch {
+        return null;
+      }
+    }).pipe(Effect.withSpan("AttachmentFiles.managedTransferFile"));
   }
 
-  readonly managedTransferFileEffect = Effect.fn("AttachmentFiles.managedTransferFile")(function* (
-    this: AttachmentFiles,
-    path: string,
-  ): Effect.fn.Return<string | null, AttachmentOperationError> {
-    try {
-      const [root, candidate] = attachmentResult(
-        yield* Effect.result(attachmentCall(() => Promise.all([realpath(this.#transfersRoot), realpath(path)]))),
-      );
-      if (!isWithin(root, candidate)) return null;
-      return attachmentResult(yield* Effect.result(attachmentCall(() => lstat(candidate)))).isFile() ? candidate : null;
-    } catch {
-      return null;
-    }
-  });
-
-  remove(path: string): Promise<void> {
-    return runAttachmentEffect(this.removeEffect(path));
-  }
-
-  readonly removeEffect = Effect.fn("AttachmentFiles.remove")(function* (
+  readonly remove = Effect.fn("AttachmentFiles.remove")(function* (
     this: AttachmentFiles,
     path: string,
   ): Effect.fn.Return<void, AttachmentOperationError> {
     yield* attachmentCall(() => rm(path, { recursive: true, force: true })).pipe(Effect.uninterruptible);
-  });
+  }).bind(this);
 
-  removeAttachmentDirectories(paths: string[]): Promise<void> {
-    return runAttachmentEffect(this.removeAttachmentDirectoriesEffect(paths));
-  }
-
-  readonly removeAttachmentDirectoriesEffect = Effect.fn("AttachmentFiles.removeAttachmentDirectories")(function* (
+  readonly removeAttachmentDirectories = Effect.fn("AttachmentFiles.removeAttachmentDirectories")(function* (
     this: AttachmentFiles,
     paths: string[],
   ): Effect.fn.Return<void, AttachmentOperationError> {
-    yield* Effect.forEach(paths, (path) => this.removeEffect(dirname(path)), { concurrency: "unbounded" });
-  });
+    yield* Effect.forEach(paths, (path) => this.remove(dirname(path)), { concurrency: "unbounded" });
+  }).bind(this);
 
-  discardGenerated(attachments: StoredGeneratedAttachment[]): Promise<void> {
-    return runAttachmentEffect(this.discardGeneratedEffect(attachments));
-  }
-
-  readonly discardGeneratedEffect = Effect.fn("AttachmentFiles.discardGenerated")(function* (
+  readonly discardGenerated = Effect.fn("AttachmentFiles.discardGenerated")(function* (
     this: AttachmentFiles,
     attachments: StoredGeneratedAttachment[],
   ): Effect.fn.Return<void, AttachmentOperationError> {
     const roots = attachments
       .map((attachment) => this.generatedRootForPath(attachment.path))
       .filter((path): path is string => path !== null);
-    yield* Effect.forEach(roots, (path) => Effect.result(this.removeEffect(path)), { concurrency: "unbounded" });
-  });
+    yield* Effect.forEach(roots, (path) => Effect.result(this.remove(path)), { concurrency: "unbounded" });
+  }).bind(this);
 
-  resolveDraft(attachment: StoredAttachment): Promise<{ path: string; mimeType: string; name: string } | null> {
-    return runAttachmentEffect(this.resolveDraftEffect(attachment));
-  }
-
-  resolveTransfer(attachment: StoredAttachment): Promise<{ path: string; mimeType: string; name: string } | null> {
-    return runAttachmentEffect(this.resolveTransferEffect(attachment));
-  }
-
-  resolveDraftEffect(attachment: StoredAttachment) {
+  resolveDraft(attachment: StoredAttachment) {
     return resolveManagedAttachmentEffect(this.#draftsRoot, attachment);
   }
-  resolveTransferEffect(attachment: StoredAttachment) {
+  resolveTransfer(attachment: StoredAttachment) {
     return resolveManagedAttachmentEffect(this.#transfersRoot, attachment);
   }
 
-  prepareDrafts(paths: string[], data: AttachmentDataInput[]): Promise<StoredDraft[]> {
-    return runAttachmentEffect(this.prepareDraftsEffect(paths, data));
-  }
-
-  readonly prepareDraftsEffect = Effect.fn("AttachmentFiles.prepareDrafts")(function* (
+  readonly prepareDrafts = Effect.fn("AttachmentFiles.prepareDrafts")(function* (
     this: AttachmentFiles,
     paths: string[],
     data: AttachmentDataInput[],
@@ -306,7 +271,7 @@ export class AttachmentFiles {
               targetPath,
               attachmentResult(
                 yield* Effect.result(
-                  sha256FileEffect(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
+                  sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
                 ),
               ),
             ),
@@ -365,23 +330,9 @@ export class AttachmentFiles {
         }).pipe(Effect.orDie),
       ),
     );
-  });
+  }).bind(this);
 
-  commitMessageTransfer(
-    transferId: string,
-    sender: QueueDelivery["sender"],
-    recipientAgentIds: string[],
-    messageId: string,
-    createdAt: string,
-    sourcePaths: string[],
-  ): Promise<StoredAttachment[]> {
-    if (sourcePaths.length === 0) return Promise.resolve([]);
-    return runAttachmentEffect(
-      this.commitMessageTransferEffect(transferId, sender, recipientAgentIds, messageId, createdAt, sourcePaths),
-    );
-  }
-
-  readonly commitMessageTransferEffect = Effect.fn("AttachmentFiles.commitMessageTransfer")(function* (
+  readonly commitMessageTransfer = Effect.fn("AttachmentFiles.commitMessageTransfer")(function* (
     this: AttachmentFiles,
     transferId: string,
     sender: QueueDelivery["sender"],
@@ -423,7 +374,7 @@ export class AttachmentFiles {
               join(finalRoot, name),
               attachmentResult(
                 yield* Effect.result(
-                  sha256FileEffect(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
+                  sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
                 ),
               ),
             ),
@@ -459,17 +410,9 @@ export class AttachmentFiles {
         }).pipe(Effect.orDie),
       ),
     );
-  });
+  }).bind(this);
 
-  stageGenerated(input: {
-    sources: GeneratedAttachmentSource[];
-    ownerAgentId?: string;
-    ownerThreadId?: string | null;
-  }): Promise<StoredGeneratedAttachment[]> {
-    return runAttachmentEffect(this.stageGeneratedEffect(input));
-  }
-
-  readonly stageGeneratedEffect = Effect.fn("AttachmentFiles.stageGenerated")(function* (
+  readonly stageGenerated = Effect.fn("AttachmentFiles.stageGenerated")(function* (
     this: AttachmentFiles,
     input: {
       sources: GeneratedAttachmentSource[];
@@ -538,7 +481,7 @@ export class AttachmentFiles {
               entry.targetPath,
               attachmentResult(
                 yield* Effect.result(
-                  sha256FileEffect(entry.targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
+                  sha256File(entry.targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
                 ),
               ),
             ),
@@ -563,20 +506,9 @@ export class AttachmentFiles {
         }).pipe(Effect.orDie),
       ),
     );
-  });
+  }).bind(this);
 
-  storeGenerated(input: {
-    sourcePath?: string;
-    bytes?: Uint8Array;
-    name?: string;
-    mimeType?: string;
-    ownerAgentId?: string;
-    ownerThreadId?: string | null;
-  }): Promise<StoredGeneratedAttachment> {
-    return runAttachmentEffect(this.storeGeneratedEffect(input));
-  }
-
-  readonly storeGeneratedEffect = Effect.fn("AttachmentFiles.storeGenerated")(function* (
+  readonly storeGenerated = Effect.fn("AttachmentFiles.storeGenerated")(function* (
     this: AttachmentFiles,
     input: {
       sourcePath?: string;
@@ -630,7 +562,7 @@ export class AttachmentFiles {
             targetPath,
             attachmentResult(
               yield* Effect.result(
-                sha256FileEffect(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
+                sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
               ),
             ),
             input.mimeType,
@@ -652,21 +584,14 @@ export class AttachmentFiles {
         }).pipe(Effect.orDie),
       ),
     );
-  });
+  }).bind(this);
 
-  exportAttachment(
-    attachment: StoredAttachment,
-    message?: { id: string; index: number },
-  ): Promise<ExportedAttachmentFile | null> {
-    return runAttachmentEffect(this.exportAttachmentEffect(attachment, message));
-  }
-
-  readonly exportAttachmentEffect = Effect.fn("AttachmentFiles.exportAttachment")(function* (
+  readonly exportAttachment = Effect.fn("AttachmentFiles.exportAttachment")(function* (
     this: AttachmentFiles,
     attachment: StoredAttachment,
     message?: { id: string; index: number },
   ): Effect.fn.Return<ExportedAttachmentFile | null, AttachmentOperationError> {
-    const resolved = yield* this.resolveTransferEffect(attachment);
+    const resolved = yield* this.resolveTransfer(attachment);
     if (!resolved) return null;
     return {
       sourcePath: resolved.path,
@@ -676,7 +601,7 @@ export class AttachmentFiles {
         `${safeArchiveSegment(attachment.id)}-${safeArchiveSegment(attachment.name)}`,
       ),
     };
-  });
+  }).bind(this);
 }
 
 const resolveManagedAttachmentEffect = Effect.fn("Attachments.resolveManagedAttachment")(function* (
@@ -693,7 +618,7 @@ const resolveManagedAttachmentEffect = Effect.fn("Attachments.resolveManagedAtta
     if (
       attachmentResult(
         yield* Effect.result(
-          sha256FileEffect(canonicalPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
+          sha256File(canonicalPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
         ),
       ) !== attachment.sha256
     )

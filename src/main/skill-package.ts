@@ -3,18 +3,13 @@ import { join, relative } from "node:path";
 import { SKILL_DESCRIPTION_MAX_LENGTH, type SkillPackagePreview } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { unzipSync, zipSync } from "fflate";
 import { parse as parseYaml } from "yaml";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const MAX_FILES = 200;
-export async function archiveDirectory(root: string): Promise<Uint8Array> {
-  const result = await Effect.runPromise(Effect.result(archiveDirectoryEffect(root)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-export const archiveDirectoryEffect = Effect.fn("SkillPackage.archiveDirectory")(function* (root: string) {
+export const archiveDirectory = Effect.fn("SkillPackage.archiveDirectory")(function* (root: string) {
   const files: Record<string, Uint8Array> = {};
   let expandedSize = 0;
   function visit(directory: string): Effect.Effect<void, SkillArchiveFailure> {

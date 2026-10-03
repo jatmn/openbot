@@ -5,14 +5,7 @@ import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-ser
 const CHUNK_BYTES = 64 * 1_024;
 
 /** Streams a file without keeping its whole contents in memory. Open failures still let the caller answer 404. */
-export function fileResponse(path: string, headers: Record<string, string>): Promise<Response> {
-  return runRemoteWorkflow(fileResponseEffect(path, headers));
-}
-
-export const fileResponseEffect = Effect.fn("FileResponse.open")(function* (
-  path: string,
-  headers: Record<string, string>,
-) {
+export const fileResponse = Effect.fn("FileResponse.open")(function* (path: string, headers: Record<string, string>) {
   // The response stream owns the handle after construction. Before that, the operation owns it.
   let transferred = false;
   return yield* Effect.acquireUseRelease(

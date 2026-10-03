@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { SLACK_BOT_SCOPES } from "@openbot/contracts/slack-app";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Deferred, Effect, Result } from "effect";
 import type { MessagingAnswerFile } from "../messaging-threads";
 import type {
   ConnectionIdentity,
@@ -16,10 +16,11 @@ import type {
   MessagingIngress,
   StatusReaction,
 } from "../messaging-types";
+import { MessagingAdapterError } from "../messaging-types";
 import { plainText, SLACK_ACTION_IDS } from "./slack-events";
 import { SlackEventsTransport } from "./slack-events-transport";
 import { slackChunks, slackMrkdwn } from "./slack-render";
-import { SlackApiError, SlackOperationFailed, SlackWebApi } from "./slack-web-api";
+import { SlackApiError, SlackWebApi } from "./slack-web-api";
 
 /** Slack's own limit for one uploaded file is 1 GB; the host holds its uploads to this. */
 const UPLOAD_BYTES = 100 * 1024 * 1024;
@@ -43,28 +44,24 @@ const BUTTON_ACTIONS = {
 class SlackAdapter implements MessagingAdapter {
   readonly platform = "slack" as const;
   readonly #api: SlackWebApi;
-  readonly #names = new Map<string, Promise<string>>();
-  readonly #places = new Map<string, Promise<string>>();
+  readonly #names = new Map<string, Deferred.Deferred<string>>();
+  readonly #places = new Map<string, Deferred.Deferred<string>>();
   #botUserId = "";
 
   constructor(botToken: string, options: MessagingDriverOptions & { origin?: string | undefined }) {
     this.#api = new SlackWebApi({ token: botToken, origin: options.origin, rateLimited: options.rateLimited });
   }
 
-  identify(): Promise<ConnectionIdentity> {
-    return runAdapter(this.identifyEffect());
-  }
-
-  readonly identifyEffect = Effect.fnUntraced(function* (
+  readonly identify = Effect.fnUntraced(function* (
     this: SlackAdapter,
-  ): Effect.fn.Return<ConnectionIdentity, SlackOperationFailed> {
-    const { payload, scopes } = yield* this.#api.authTestEffect();
+  ): Effect.fn.Return<ConnectionIdentity, MessagingAdapterError> {
+    const { payload, scopes } = yield* this.#api.authTest();
     const workspaceId = payload.team_id;
     const botUserId = payload.user_id;
     const botId = payload.bot_id;
     if (!isString(workspaceId) || !isString(botUserId) || !isString(botId))
-      return yield* new SlackOperationFailed({ cause: new SlackApiError("auth.test", "not_a_bot_token") });
-    const bot = yield* this.#api.callEffect("bots.info", { bot: botId });
+      return yield* new MessagingAdapterError({ cause: new SlackApiError("auth.test", "not_a_bot_token") });
+    const bot = yield* this.#api.call("bots.info", { bot: botId });
     const appId = isDynamicRecord(bot.bot) && isString(bot.bot.app_id) ? bot.bot.app_id : "";
     this.#botUserId = botUserId;
     return {
@@ -76,16 +73,12 @@ class SlackAdapter implements MessagingAdapter {
     };
   });
 
-  post(target: MessageTarget, body: MessageBody): Promise<string> {
-    return runAdapter(this.postEffect(target, body));
-  }
-
-  readonly postEffect = Effect.fnUntraced(function* (
+  readonly post = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     body: MessageBody,
-  ): Effect.fn.Return<string, SlackOperationFailed> {
-    const response = yield* this.#api.callEffect("chat.postMessage", {
+  ): Effect.fn.Return<string, MessagingAdapterError> {
+    const response = yield* this.#api.call("chat.postMessage", {
       channel: target.platformChannelId,
       thread_ts: target.replyThreadId ?? undefined,
       ...this.#content(body),
@@ -93,38 +86,30 @@ class SlackAdapter implements MessagingAdapter {
       unfurl_media: false,
     });
     if (!isString(response.ts))
-      return yield* new SlackOperationFailed({ cause: new SlackApiError("chat.postMessage", "no_ts") });
+      return yield* new MessagingAdapterError({ cause: new SlackApiError("chat.postMessage", "no_ts") });
     return response.ts;
   });
 
-  edit(target: MessageTarget, messageId: string, body: MessageBody): Promise<void> {
-    return runAdapter(this.editEffect(target, messageId, body));
-  }
-
-  readonly editEffect = Effect.fnUntraced(function* (
+  readonly edit = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     messageId: string,
     body: MessageBody,
-  ): Effect.fn.Return<void, SlackOperationFailed> {
-    yield* this.#api.callEffect("chat.update", {
+  ): Effect.fn.Return<void, MessagingAdapterError> {
+    yield* this.#api.call("chat.update", {
       channel: target.platformChannelId,
       ts: messageId,
       ...this.#content(body),
     });
   });
 
-  postPrivate(target: MessageTarget, userId: string, text: string): Promise<void> {
-    return runAdapter(this.postPrivateEffect(target, userId, text));
-  }
-
-  readonly postPrivateEffect = Effect.fnUntraced(function* (
+  readonly postPrivate = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     userId: string,
     text: string,
-  ): Effect.fn.Return<void, SlackOperationFailed> {
-    yield* this.#api.callEffect("chat.postEphemeral", {
+  ): Effect.fn.Return<void, MessagingAdapterError> {
+    yield* this.#api.call("chat.postEphemeral", {
       channel: target.platformChannelId,
       thread_ts: target.replyThreadId ?? undefined,
       user: userId,
@@ -132,11 +117,7 @@ class SlackAdapter implements MessagingAdapter {
     });
   });
 
-  react(target: MessageTarget, messageId: string, reaction: StatusReaction, on: boolean): Promise<void> {
-    return runAdapter(this.reactEffect(target, messageId, reaction, on));
-  }
-
-  readonly reactEffect = Effect.fnUntraced(function* (
+  readonly react = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     messageId: string,
@@ -144,7 +125,7 @@ class SlackAdapter implements MessagingAdapter {
     on: boolean,
   ) {
     yield* this.#api
-      .callEffect(on ? "reactions.add" : "reactions.remove", {
+      .call(on ? "reactions.add" : "reactions.remove", {
         channel: target.platformChannelId,
         timestamp: messageId,
         name: REACTIONS[reaction],
@@ -159,11 +140,7 @@ class SlackAdapter implements MessagingAdapter {
       );
   });
 
-  postAnswer(target: MessageTarget, markdown: string, replaceMessageId: string | null): Promise<void> {
-    return runAdapter(this.postAnswerEffect(target, markdown, replaceMessageId));
-  }
-
-  readonly postAnswerEffect = Effect.fnUntraced(function* (
+  readonly postAnswer = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     markdown: string,
@@ -172,7 +149,7 @@ class SlackAdapter implements MessagingAdapter {
     const [first = "", ...rest] = slackChunks(slackMrkdwn(markdown));
     if (replaceMessageId) {
       const updated = yield* Effect.result(
-        this.#api.callEffect("chat.update", {
+        this.#api.call("chat.update", {
           channel: target.platformChannelId,
           ts: replaceMessageId,
           text: first,
@@ -181,19 +158,15 @@ class SlackAdapter implements MessagingAdapter {
       );
       if (Result.isFailure(updated)) {
         yield* this.#api
-          .callEffect("chat.delete", { channel: target.platformChannelId, ts: replaceMessageId })
+          .call("chat.delete", { channel: target.platformChannelId, ts: replaceMessageId })
           .pipe(Effect.catch(() => Effect.void));
-        yield* this.#postTextEffect(target, first);
+        yield* this.#postText(target, first);
       }
-    } else yield* this.#postTextEffect(target, first);
-    for (const chunk of rest) yield* this.#postTextEffect(target, chunk);
+    } else yield* this.#postText(target, first);
+    for (const chunk of rest) yield* this.#postText(target, chunk);
   });
 
-  upload(target: MessageTarget, files: MessagingAnswerFile[]): Promise<string[]> {
-    return runAdapter(this.uploadEffect(target, files));
-  }
-
-  readonly uploadEffect = Effect.fnUntraced(function* (
+  readonly upload = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     files: MessagingAnswerFile[],
@@ -205,13 +178,13 @@ class SlackAdapter implements MessagingAdapter {
         Effect.gen({ self: this }, function* () {
           const bytes = yield* adapterIo(() => readFile(file.path));
           if (bytes.byteLength > UPLOAD_BYTES || bytes.byteLength === 0) return null;
-          const ticket = yield* this.#api.callEffect("files.getUploadURLExternal", {
+          const ticket = yield* this.#api.call("files.getUploadURLExternal", {
             filename: file.name,
             length: String(bytes.byteLength),
           });
           if (!isString(ticket.upload_url) || !isString(ticket.file_id))
-            return yield* new SlackOperationFailed({ cause: new SlackApiError("files", "no_upload_url") });
-          yield* this.#api.uploadBytesEffect(ticket.upload_url, bytes, file.mimeType);
+            return yield* new MessagingAdapterError({ cause: new SlackApiError("files", "no_upload_url") });
+          yield* this.#api.uploadBytes(ticket.upload_url, bytes, file.mimeType);
           return { id: ticket.file_id, title: file.name };
         }),
       );
@@ -219,7 +192,7 @@ class SlackAdapter implements MessagingAdapter {
       else uploaded.push(attempt.success);
     }
     if (uploaded.length)
-      yield* this.#api.callEffect("files.completeUploadExternal", {
+      yield* this.#api.call("files.completeUploadExternal", {
         files: uploaded,
         channel_id: target.platformChannelId,
         thread_ts: target.replyThreadId ?? undefined,
@@ -227,24 +200,15 @@ class SlackAdapter implements MessagingAdapter {
     return skipped;
   });
 
-  history(
-    platformChannelId: string,
-    threadKey: string,
-    afterId: string | null,
-    beforeId: string,
-  ): Promise<ContextEntry[]> {
-    return runAdapter(this.historyEffect(platformChannelId, threadKey, afterId, beforeId));
-  }
-
-  readonly historyEffect = Effect.fnUntraced(function* (
+  readonly history = Effect.fnUntraced(function* (
     this: SlackAdapter,
     platformChannelId: string,
     threadKey: string,
     afterId: string | null,
     beforeId: string,
-  ): Effect.fn.Return<ContextEntry[], SlackOperationFailed> {
+  ): Effect.fn.Return<ContextEntry[], MessagingAdapterError> {
     // Every conversation is a thread, in a direct message too.
-    const response = yield* this.#api.callEffect("conversations.replies", {
+    const response = yield* this.#api.call("conversations.replies", {
       channel: platformChannelId,
       ts: threadKey,
       latest: beforeId,
@@ -261,7 +225,7 @@ class SlackAdapter implements MessagingAdapter {
       if (Number(ts) >= Number(beforeId) || (afterId && Number(ts) <= Number(afterId))) continue;
       entries.push({
         id: ts,
-        authorName: yield* adapterIo(() => this.authorName(user)),
+        authorName: yield* this.authorName(user),
         text: plainText(isString(message.text) ? message.text : "", this.#botUserId),
         sentAt: new Date(Number(ts) * 1000).toISOString(),
       });
@@ -269,59 +233,52 @@ class SlackAdapter implements MessagingAdapter {
     return entries.sort((left, right) => Number(left.id) - Number(right.id));
   });
 
-  download(file: InboundFile, destination: string, maxBytes: number): Promise<void> {
+  download(file: InboundFile, destination: string, maxBytes: number): Effect.Effect<void, MessagingAdapterError> {
     return this.#api.download(file.url, destination, maxBytes);
   }
 
-  authorName(userId: string): Promise<string> {
-    let name = this.#names.get(userId);
-    if (!name) {
-      name = runAdapter(
-        this.#api.callEffect("users.info", { user: userId }).pipe(
-          Effect.map((response) => {
-            const user = isDynamicRecord(response.user) ? response.user : {};
-            const profile = isDynamicRecord(user.profile) ? user.profile : {};
-            for (const candidate of [profile.display_name, profile.real_name, user.real_name, user.name])
-              if (isString(candidate) && candidate.trim()) return candidate.trim();
-            return userId;
-          }),
-          Effect.catch(() => Effect.succeed(userId)),
-        ),
-      );
-      this.#names.set(userId, name);
-    }
-    return name;
-  }
+  readonly authorName = Effect.fnUntraced(function* (this: SlackAdapter, userId: string) {
+    const cached = this.#names.get(userId);
+    if (cached) return yield* Deferred.await(cached);
+    const name = Deferred.makeUnsafe<string>();
+    this.#names.set(userId, name);
+    const result = yield* this.#api.call("users.info", { user: userId }).pipe(
+      Effect.map((response) => {
+        const user = isDynamicRecord(response.user) ? response.user : {};
+        const profile = isDynamicRecord(user.profile) ? user.profile : {};
+        for (const candidate of [profile.display_name, profile.real_name, user.real_name, user.name])
+          if (isString(candidate) && candidate.trim()) return candidate.trim();
+        return userId;
+      }),
+      Effect.catch(() => Effect.succeed(userId)),
+    );
+    yield* Deferred.succeed(name, result);
+    return result;
+  }, Effect.uninterruptible);
 
-  placeName(platformChannelId: string): Promise<string> {
-    let name = this.#places.get(platformChannelId);
-    if (!name) {
-      name = runAdapter(
-        this.#api.callEffect("conversations.info", { channel: platformChannelId }).pipe(
-          Effect.map((response) =>
-            isDynamicRecord(response.channel) && isString(response.channel.name)
-              ? `#${response.channel.name}`
-              : platformChannelId,
-          ),
-          Effect.catch(() => Effect.succeed(platformChannelId)),
-        ),
-      );
-      this.#places.set(platformChannelId, name);
-    }
-    return name;
-  }
+  readonly placeName = Effect.fnUntraced(function* (this: SlackAdapter, platformChannelId: string) {
+    const cached = this.#places.get(platformChannelId);
+    if (cached) return yield* Deferred.await(cached);
+    const name = Deferred.makeUnsafe<string>();
+    this.#places.set(platformChannelId, name);
+    const result = yield* this.#api.call("conversations.info", { channel: platformChannelId }).pipe(
+      Effect.map((response) =>
+        isDynamicRecord(response.channel) && isString(response.channel.name)
+          ? `#${response.channel.name}`
+          : platformChannelId,
+      ),
+      Effect.catch(() => Effect.succeed(platformChannelId)),
+    );
+    yield* Deferred.succeed(name, result);
+    return result;
+  }, Effect.uninterruptible);
 
-  /** Every public channel of the workspace that OpenBot is not in yet. Archived ones are left out. */
-  joinPublicPlaces(): Promise<void> {
-    return runAdapter(this.joinPublicPlacesEffect());
-  }
-
-  readonly joinPublicPlacesEffect = Effect.fnUntraced(function* (
+  readonly joinPublicPlaces = Effect.fnUntraced(function* (
     this: SlackAdapter,
-  ): Effect.fn.Return<void, SlackOperationFailed> {
+  ): Effect.fn.Return<void, MessagingAdapterError> {
     let cursor: string | undefined;
     do {
-      const page = yield* this.#api.callEffect("conversations.list", {
+      const page = yield* this.#api.call("conversations.list", {
         types: "public_channel",
         exclude_archived: true,
         limit: CHANNEL_PAGE_LIMIT,
@@ -329,19 +286,15 @@ class SlackAdapter implements MessagingAdapter {
       });
       const channels = Array.isArray(page.channels) ? page.channels.filter(isDynamicRecord) : [];
       for (const channel of channels)
-        if (isString(channel.id) && channel.is_member !== true) yield* this.joinPlaceEffect(channel.id);
+        if (isString(channel.id) && channel.is_member !== true) yield* this.joinPlace(channel.id);
       const next = isDynamicRecord(page.response_metadata) ? page.response_metadata.next_cursor : undefined;
       cursor = isString(next) && next ? next : undefined;
     } while (cursor);
   });
 
-  joinPlace(platformChannelId: string): Promise<void> {
-    return runAdapter(this.joinPlaceEffect(platformChannelId));
-  }
-
-  readonly joinPlaceEffect = Effect.fnUntraced(function* (this: SlackAdapter, platformChannelId: string) {
+  readonly joinPlace = Effect.fnUntraced(function* (this: SlackAdapter, platformChannelId: string) {
     yield* this.#api
-      .callEffect("conversations.join", { channel: platformChannelId })
+      .call("conversations.join", { channel: platformChannelId })
       .pipe(Effect.catch((failure) => (failure.cause instanceof SlackApiError ? Effect.void : Effect.fail(failure))));
   });
 
@@ -358,12 +311,12 @@ class SlackAdapter implements MessagingAdapter {
     return slackMrkdwn(text).replace(/\uE000@([A-Z0-9]+)\uE000/g, "<@$1>");
   }
 
-  readonly #postTextEffect = Effect.fnUntraced(function* (
+  readonly #postText = Effect.fnUntraced(function* (
     this: SlackAdapter,
     target: MessageTarget,
     text: string,
-  ): Effect.fn.Return<void, SlackOperationFailed> {
-    yield* this.#api.callEffect("chat.postMessage", {
+  ): Effect.fn.Return<void, MessagingAdapterError> {
+    yield* this.#api.call("chat.postMessage", {
       channel: target.platformChannelId,
       thread_ts: target.replyThreadId ?? undefined,
       text,
@@ -416,12 +369,6 @@ export function slackDriver(options: SlackDriverOptions = {}): MessagingDriver {
   };
 }
 
-function adapterIo<A>(run: () => Promise<A>): Effect.Effect<A, SlackOperationFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new SlackOperationFailed({ cause }) });
-}
-
-async function runAdapter<A>(operation: Effect.Effect<A, SlackOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
+function adapterIo<A>(run: () => Promise<A>): Effect.Effect<A, MessagingAdapterError> {
+  return Effect.tryPromise({ try: run, catch: (cause) => new MessagingAdapterError({ cause }) });
 }

@@ -21,7 +21,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { isOneOf } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Effect, Exit, Fiber, Result, Scope, Semaphore } from "effect";
 import {
   type StoragePlacement,
   type StorageThread,
@@ -30,7 +30,7 @@ import {
   storageThreads,
 } from "./database/storage-usage-queries";
 import type { MailboxStore, MailboxStoredFile } from "./mailbox-store";
-import { runStored, StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
+import { StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
 
 export interface StorageRoots {
   /** The SQLite file. Its `-wal` and `-shm` companions are counted with it. */
@@ -53,7 +53,10 @@ export interface StorageAgent {
 export interface StorageUsageSources {
   roots: StorageRoots;
   database: () => DatabaseSync;
-  mailbox: Pick<MailboxStore, "listStoredFiles" | "deleteStoredFile">;
+  mailbox: {
+    listStoredFiles: MailboxStore["listStoredFiles"];
+    deleteStoredFile: OmitThisParameter<MailboxStore["deleteStoredFile"]>;
+  };
   agents: () => readonly StorageAgent[];
 }
 
@@ -174,10 +177,7 @@ export class StorageUsageScanner {
     this.#sources = sources;
   }
 
-  scan(input: GetStorageUsageInput): Promise<StorageUsage> {
-    return runStored(this.scanEffect(input));
-  }
-  scanEffect = Effect.fn("StorageUsage.scan")(function* (
+  scan = Effect.fn("StorageUsage.scan")(function* (
     this: StorageUsageScanner,
     input: GetStorageUsageInput,
   ): Effect.fn.Return<StorageUsage, StoredStateFailure> {
@@ -279,7 +279,7 @@ export class StorageUsageScanner {
       files: fileRows.rows.map((entry) => entry.row),
       truncated,
     };
-  });
+  }).bind(this);
 
   /** Placements in the scope's chats, by attachment id. Paged, with a yield between pages. */
   #placements = Effect.fn("StorageUsage.placements")(function* (
@@ -497,15 +497,17 @@ function scopeKey(input: GetStorageUsageInput): string {
  * drops every answer, and a scan that was running at that moment is not kept.
  */
 export class StorageUsageService {
-  readonly #scanner: Pick<StorageUsageScanner, "scan">;
+  readonly #scanner: { scan: OmitThisParameter<StorageUsageScanner["scan"]> };
   readonly #sources: Pick<StorageUsageSources, "roots" | "mailbox">;
   readonly #now: () => number;
   readonly #cache = new Map<string, { at: number; usage: StorageUsage }>();
-  readonly #running = new Map<string, Promise<StorageUsage>>();
+  readonly #running = new Map<string, { token: symbol; fiber: Fiber.Fiber<StorageUsage, StoredStateFailure> }>();
+  readonly #scope = Scope.makeUnsafe();
+  readonly #scanGate = Semaphore.makeUnsafe(1);
   #generation = 0;
 
   constructor(
-    scanner: Pick<StorageUsageScanner, "scan">,
+    scanner: { scan: OmitThisParameter<StorageUsageScanner["scan"]> },
     sources: Pick<StorageUsageSources, "roots" | "mailbox">,
     now: () => number = Date.now,
   ) {
@@ -514,44 +516,50 @@ export class StorageUsageService {
     this.#now = now;
   }
 
-  usage(input: GetStorageUsageInput): Promise<StorageUsage> {
-    const key = scopeKey(input);
-    const cached = this.#cache.get(key);
-    if (!input.force && cached && this.#now() - cached.at < CACHE_TTL_MS) return Promise.resolve(cached.usage);
-    const running = this.#running.get(key);
-    if (running) return running;
-    const generation = this.#generation;
-    const settled = this.#scanner
-      .scan(input)
-      .then((usage) => {
-        if (generation === this.#generation) this.#cache.set(key, { at: this.#now(), usage });
-        return usage;
-      })
-      .finally(() => {
-        if (this.#running.get(key) === settled) this.#running.delete(key);
-      });
-    this.#running.set(key, settled);
-    return settled;
-  }
-
-  deleteFile(fileId: string): Promise<void> {
-    return runStored(
+  readonly usage = Effect.fn("StorageUsage.usage")(function* (this: StorageUsageService, input: GetStorageUsageInput) {
+    const work = yield* this.#scanGate.withPermit(
       Effect.gen({ self: this }, function* () {
-        if (!this.#sources.mailbox.listStoredFiles().some((file) => file.attachment.id === fileId))
-          return yield* new StoredStateFailure({
-            cause: new StorageNotFoundError(sourceText("error.backend.fileGone")),
-          });
-        yield* storedIO(() => this.#sources.mailbox.deleteStoredFile(fileId)).pipe(
-          Effect.ensuring(Effect.sync(() => this.invalidate())),
+        const key = scopeKey(input);
+        const cached = this.#cache.get(key);
+        if (!input.force && cached && this.#now() - cached.at < CACHE_TTL_MS) return Effect.succeed(cached.usage);
+        const running = this.#running.get(key);
+        if (running) return Fiber.join(running.fiber);
+        const generation = this.#generation;
+        const token = Symbol();
+        const fiber = yield* this.#scanner.scan(input).pipe(
+          Effect.tap((usage) =>
+            Effect.sync(() => {
+              if (generation === this.#generation) this.#cache.set(key, { at: this.#now(), usage });
+            }),
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (this.#running.get(key)?.token === token) this.#running.delete(key);
+            }),
+          ),
+          Effect.forkIn(this.#scope),
         );
+        this.#running.set(key, { token, fiber });
+        return Fiber.join(fiber);
       }),
     );
+    return yield* work;
+  }).bind(this);
+
+  readonly deleteFile = Effect.fn("StorageUsage.deleteFile")(function* (this: StorageUsageService, fileId: string) {
+    if (!this.#sources.mailbox.listStoredFiles().some((file) => file.attachment.id === fileId))
+      return yield* new StoredStateFailure({ cause: new StorageNotFoundError(sourceText("error.backend.fileGone")) });
+    yield* this.#sources.mailbox.deleteStoredFile(fileId).pipe(Effect.ensuring(Effect.sync(() => this.invalidate())));
+  }).bind(this);
+
+  clear(category: ClearableStorageCategory) {
+    return clearStorageCategory(this.#sources.roots, category).pipe(
+      Effect.ensuring(Effect.sync(() => this.invalidate())),
+    );
   }
 
-  clear(category: ClearableStorageCategory): Promise<void> {
-    return runStored(
-      clearStorageCategory(this.#sources.roots, category).pipe(Effect.ensuring(Effect.sync(() => this.invalidate()))),
-    );
+  dispose() {
+    return Scope.close(this.#scope, Exit.void);
   }
 
   invalidate(): void {

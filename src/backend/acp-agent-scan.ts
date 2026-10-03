@@ -12,7 +12,7 @@ import {
   type DetectedAcpAgent,
   isNewCustomAgentId,
 } from "@openbot/contracts/ipc";
-import { Effect, Schema } from "effect";
+import { Effect } from "effect";
 import { resolveAgentCommand } from "./acp-agent-command";
 
 const AGENT_SCAN_TIMEOUT_MS = 10_000;
@@ -31,13 +31,7 @@ export interface ScanAcpAgentsOptions {
 }
 
 /** One row for each preset that is installed, in preset order. A scan past its time finds nothing. */
-export function scanAcpAgents(options: ScanAcpAgentsOptions): Promise<DetectedAcpAgent[]> {
-  return Effect.runPromise(scanAcpAgentsEffect(options));
-}
-
-class AcpCommandLookupFailed extends Schema.TaggedError<AcpCommandLookupFailed>()("AcpCommandLookupFailed", {}) {}
-
-export const scanAcpAgentsEffect = Effect.fn("AcpAgents.scan")(function* (options: ScanAcpAgentsOptions) {
+export const scanAcpAgents = Effect.fn("AcpAgents.scan")(function* (options: ScanAcpAgentsOptions) {
   const presets = options.presets ?? ACP_AGENT_PRESETS;
   const platform = options.platform ?? process.platform;
   const home = options.home ?? homedir();
@@ -51,10 +45,9 @@ export const scanAcpAgentsEffect = Effect.fn("AcpAgents.scan")(function* (option
   // the shim or an `.exe` can be started.
   const names = (command: string) => (platform === "win32" ? [`${command}.exe`, `${command}.cmd`] : [command]);
   const lookup = Effect.fn("AcpAgents.lookup")((name: string, searchPath?: readonly string[]) =>
-    Effect.tryPromise({
-      try: () => resolve(name, { platform, home, ...(searchPath ? { searchPath } : {}) }),
-      catch: () => new AcpCommandLookupFailed(),
-    }).pipe(Effect.catchTag("AcpCommandLookupFailed", () => Effect.succeed(null))),
+    resolve(name, { platform, home, ...(searchPath ? { searchPath } : {}) }).pipe(
+      Effect.catch(() => Effect.succeed(null)),
+    ),
   );
   const find = Effect.fn("AcpAgents.find")(function* (preset: AcpAgentPreset) {
     if (folders.length > 0) {

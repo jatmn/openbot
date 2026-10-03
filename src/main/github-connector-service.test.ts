@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Effect } from "effect";
 import { afterEach, expect, it, vi } from "vitest";
 import { GitHubConnectorService } from "./github-connector-service";
 import { GitHubConnectorStore } from "./github-connector-store";
@@ -13,7 +14,7 @@ for (const cancel of [false, true]) {
   it(
     cancel ? "does not persist a late token after cancellation" : "removes stored and tool credentials on disconnect",
     async () => {
-      vi.useFakeTimers();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       const directory = await mkdtemp(join(tmpdir(), "openbot-github-effect-"));
       const path = join(directory, "account.json");
       const tools = join(directory, "tools");
@@ -54,7 +55,7 @@ for (const cancel of [false, true]) {
         if (status.state === "connected") connected.resolve();
       });
       try {
-        await service.connect();
+        await Effect.runPromise(service.connect().pipe(Effect.mapError((error) => error.cause)));
         await vi.advanceTimersByTimeAsync(1_000);
         await arrived.promise;
         if (cancel) service.cancel();
@@ -65,15 +66,15 @@ for (const cancel of [false, true]) {
           await connected.promise;
           expect(await readFile(join(tools, "token"), "utf8")).toBe("test-access-token");
           expect(store.read()?.accessToken).toBe("test-access-token");
-          await service.disconnect();
+          await Effect.runPromise(service.disconnect().pipe(Effect.mapError((error) => error.cause)));
         }
-        await service.dispose();
+        await Effect.runPromise(service.dispose().pipe(Effect.mapError((error) => error.cause)));
         expect(store.read()).toBeNull();
         await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(readFile(join(tools, "token"))).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         token.resolve(new Response(null, { status: 500 }));
-        await service.dispose();
+        await Effect.runPromise(service.dispose().pipe(Effect.mapError((error) => error.cause)));
         await rm(directory, { recursive: true, force: true });
       }
     },

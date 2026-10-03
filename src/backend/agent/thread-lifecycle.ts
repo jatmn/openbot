@@ -27,6 +27,7 @@ import {
   type McpAuthorizationSource,
   type McpServerDrop,
   type McpServerSource,
+  McpShapeFailed,
   type McpToolRuntimeSource,
   type McpToolRuntimes,
   mcpFingerprintValues,
@@ -151,12 +152,15 @@ export class ThreadLifecycle {
     return this.#mcpToolRuntimes?.() ?? NO_MCP_TOOL_RUNTIMES;
   }
 
-  refreshAgentRuntime(agentId: string): void {
+  readonly refreshAgentRuntime = Effect.fn("ThreadLifecycle.refreshAgentRuntime")(function* (
+    this: ThreadLifecycle,
+    agentId: string,
+  ) {
     const agent = this.#store.list().find((candidate) => candidate.id === agentId);
     if (!agent) throw new Error(sourceText("error.agent.selectedGone"));
     this.#pendingRuntimeRefreshes.add(agentId);
-    this.applyPendingRuntimeRefresh(agent);
-  }
+    yield* this.applyPendingRuntimeRefresh(agent);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Marks every agent's provider session for refresh, after a change to the MCP set.
@@ -168,29 +172,27 @@ export class ThreadLifecycle {
    * thread or its history - the same mechanism an installed skill uses. An agent that is mid-turn
    * keeps its mark, and the drain scheduler spends it when that turn ends.
    */
-  refreshAllAgentRuntimes(): void {
+  readonly refreshAllAgentRuntimes = Effect.fn("ThreadLifecycle.refreshAllAgentRuntimes")(function* (
+    this: ThreadLifecycle,
+  ) {
     for (const agent of this.#store.list()) {
       this.#pendingRuntimeRefreshes.add(agent.id);
-      this.applyPendingRuntimeRefresh(agent);
+      yield* this.applyPendingRuntimeRefresh(agent);
     }
-  }
+  }, Effect.uninterruptible).bind(this);
 
   consumePendingHandoff(threadId: string): string | undefined {
     return this.#pendingHandoffs.get(threadId);
   }
 
-  deletePendingHandoff(threadId: string): Promise<void> {
-    return runThread(this.deletePendingHandoffEffect(threadId));
-  }
-
-  readonly deletePendingHandoffEffect = Effect.fn("ThreadLifecycle.deletePendingHandoff")(function* (
+  readonly deletePendingHandoff = Effect.fn("ThreadLifecycle.deletePendingHandoff")(function* (
     this: ThreadLifecycle,
     threadId: string,
   ) {
     if (!this.#pendingHandoffs.has(threadId)) return;
     yield* threadIo(() => rm(this.handoffPath(threadId), { force: true }));
     this.#pendingHandoffs.delete(threadId);
-  });
+  }).bind(this);
 
   /**
    * Closes every provider session of an agent that is about to be deleted, and waits for the close.
@@ -199,11 +201,8 @@ export class ThreadLifecycle {
    * that follows reports whether the files could go. Each session is also unloaded, so the next turn
    * of an agent whose deletion failed opens the session again.
    */
-  releaseAgentSessions(agentId: string): Promise<void> {
-    return runThread(this.releaseAgentSessionsEffect(agentId));
-  }
 
-  readonly releaseAgentSessionsEffect = Effect.fn("ThreadLifecycle.releaseAgentSessions")(function* (
+  readonly releaseAgentSessions = Effect.fn("ThreadLifecycle.releaseAgentSessions")(function* (
     this: ThreadLifecycle,
     agentId: string,
   ) {
@@ -213,35 +212,29 @@ export class ThreadLifecycle {
         Effect.gen({ self: this }, function* () {
           const releaseThread = client.releaseThread?.bind(client);
           if (releaseThread)
-            yield* threadIo(() => releaseThread(externalThreadId)).pipe(
-              Effect.catch((failure) =>
-                Effect.sync(() => this.#hooks.logReleaseFailure(client.provider, failure.cause)),
-              ),
-            );
+            yield* releaseThread(externalThreadId)
+              .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })))
+              .pipe(
+                Effect.catch((failure) =>
+                  Effect.sync(() => this.#hooks.logReleaseFailure(client.provider, failure.cause)),
+                ),
+              );
           this.#conversation.unloadThread(externalThreadId);
         }),
       { concurrency: "unbounded", discard: true },
     );
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  deleteProviderSessionFiles(sessionId: string): Promise<void> {
-    return runThread(this.deleteProviderSessionFilesEffect(sessionId));
-  }
-
-  readonly deleteProviderSessionFilesEffect = Effect.fn("ThreadLifecycle.deleteProviderSessionFiles")(function* (
+  readonly deleteProviderSessionFiles = Effect.fn("ThreadLifecycle.deleteProviderSessionFiles")(function* (
     this: ThreadLifecycle,
     sessionId: string,
   ) {
     yield* threadIo(() => rm(this.handoffPath(sessionId), { force: true }));
     yield* threadIo(() => rm(this.toolManifestPath(sessionId), { force: true }));
     this.#pendingHandoffs.delete(sessionId);
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  reconcileProviderSessionFiles(): Promise<void> {
-    return runThread(this.reconcileProviderSessionFilesEffect());
-  }
-
-  readonly reconcileProviderSessionFilesEffect = Effect.fn("ThreadLifecycle.reconcileProviderSessionFiles")(function* (
+  readonly reconcileProviderSessionFiles = Effect.fn("ThreadLifecycle.reconcileProviderSessionFiles")(function* (
     this: ThreadLifecycle,
   ) {
     const recorded = yield* threadStep(
@@ -264,7 +257,7 @@ export class ThreadLifecycle {
         if (file.isFile() && /^[a-f0-9]{64}$/.test(file.name) && !recorded.has(file.name))
           yield* threadIo(() => rm(join(directory, file.name), { force: true }));
     }
-  });
+  }).bind(this);
 
   dispose(): void {
     this.#pendingHandoffs.clear();
@@ -272,17 +265,17 @@ export class ThreadLifecycle {
     this.#pendingStarts.clear();
   }
 
-  ensureThread(agent: AgentSummary, client: AgentClient, executionThreadId?: string): Promise<string> {
-    return runThread(this.ensureThreadEffect(agent, client, executionThreadId));
-  }
-
-  readonly ensureThreadEffect = Effect.fn("ThreadLifecycle.ensureThread")(function* (
+  readonly ensureThread = Effect.fn("ThreadLifecycle.ensureThread")(function* (
     this: ThreadLifecycle,
     agent: AgentSummary,
     client: AgentClient,
     executionThreadId?: string,
   ) {
-    const publicThreadId = executionThreadId ?? (yield* threadIo(() => this.#store.ensureThreadId(agent.id)));
+    const publicThreadId =
+      executionThreadId ??
+      (yield* this.#store
+        .ensureThreadId(agent.id)
+        .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause }))));
     if (executionThreadId) this.#conversation.registerExecutionThread(agent.id, executionThreadId);
     const { currentAgent, session } = yield* threadStep(() => ({
       currentAgent: this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent,
@@ -300,20 +293,20 @@ export class ThreadLifecycle {
         client.provider === "codex" &&
         !(yield* this.hasCurrentToolsEffect(currentAgent, client, session.externalSessionId))
       ) {
-        const replacement = yield* this.startProviderThreadEffect(currentAgent, client, publicThreadId);
+        const replacement = yield* this.startProviderThread(currentAgent, client, publicThreadId);
+        yield* this.#releaseProviderSession(session.externalSessionId, client);
         yield* threadStep(() => {
-          this.#releaseProviderSession(session.externalSessionId, client);
           this.retireProviderSession(currentAgent, session.externalSessionId);
           this.#hooks.logRecovery(currentAgent.id, client.provider, "replaced");
         });
         return replacement;
       }
       if (this.#conversation.loadedClientFor(session.externalSessionId) !== client) {
-        const resumed = yield* Effect.result(this.resumeThreadEffect(currentAgent, client, session.externalSessionId));
+        const resumed = yield* Effect.result(this.resumeThread(currentAgent, client, session.externalSessionId));
         if (Result.isFailure(resumed)) {
           if (!isMissingProviderSessionError(resumed.failure.cause, client.provider)) return yield* resumed.failure;
           yield* threadStep(() => this.retireProviderSession(currentAgent, session.externalSessionId));
-          const replacement = yield* this.startProviderThreadEffect(currentAgent, client, publicThreadId);
+          const replacement = yield* this.startProviderThread(currentAgent, client, publicThreadId);
           this.#hooks.logRecovery(currentAgent.id, client.provider, "replaced");
           return replacement;
         }
@@ -321,8 +314,8 @@ export class ThreadLifecycle {
       this.#conversation.bindThread(session.externalSessionId, agent.id, publicThreadId);
       return session.externalSessionId;
     }
-    return yield* this.startProviderThreadEffect(currentAgent, client, publicThreadId);
-  }, Effect.uninterruptible);
+    return yield* this.startProviderThread(currentAgent, client, publicThreadId);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Holds this agent's runtime refresh until the returned function is called.
@@ -344,11 +337,7 @@ export class ThreadLifecycle {
     };
   }
 
-  startProviderThread(agent: AgentSummary, client: AgentClient, publicThreadId: string): Promise<string> {
-    return runThread(this.startProviderThreadEffect(agent, client, publicThreadId));
-  }
-
-  readonly startProviderThreadEffect = Effect.fn("ThreadLifecycle.startProviderThread")(function* (
+  readonly startProviderThread = Effect.fn("ThreadLifecycle.startProviderThread")(function* (
     this: ThreadLifecycle,
     agent: AgentSummary,
     client: AgentClient,
@@ -356,12 +345,12 @@ export class ThreadLifecycle {
   ) {
     return yield* Effect.acquireUseRelease(
       Effect.sync(() => this.holdRuntimeRefresh(agent.id)),
-      () => this.#startProviderThreadEffect(agent, client, publicThreadId),
+      () => this.#startProviderThread(agent, client, publicThreadId),
       (release) => Effect.sync(release),
     );
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  readonly #startProviderThreadEffect = Effect.fn("ThreadLifecycle.prepareProviderThread")(function* (
+  readonly #startProviderThread = Effect.fn("ThreadLifecycle.prepareProviderThread")(function* (
     this: ThreadLifecycle,
     agent: AgentSummary,
     client: AgentClient,
@@ -380,8 +369,8 @@ export class ThreadLifecycle {
     // The same single reading, so the manifest records the variables this session was started with.
     const environment = this.#agentEnvironment();
     const config = yield* this.codexConfigEffect(agent, client, mcpServers, disabled, toolRuntimes, environment);
-    const response = yield* threadIo(() =>
-      client.request(
+    const response = yield* client
+      .request(
         "thread/start",
         {
           ...config,
@@ -404,8 +393,8 @@ export class ThreadLifecycle {
           dynamicTools: [...BROWSER_DYNAMIC_TOOLS, OPENBOT_DYNAMIC_TOOLS],
         },
         decodeThreadResponse,
-      ),
-    );
+      )
+      .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })));
     const externalThreadId = response.thread.id;
     const prepared = yield* Effect.result(
       Effect.gen({ self: this }, function* () {
@@ -445,7 +434,7 @@ export class ThreadLifecycle {
       }),
     );
     if (Result.isFailure(prepared)) {
-      const cleanup = yield* Effect.result(this.deleteProviderSessionFilesEffect(externalThreadId));
+      const cleanup = yield* Effect.result(this.deleteProviderSessionFiles(externalThreadId));
       if (Result.isFailure(cleanup))
         return yield* new ThreadOperationFailed({
           cause: new AggregateError(
@@ -509,7 +498,9 @@ export class ThreadLifecycle {
     ThreadOperationFailed
   > {
     if (client.provider !== "codex") return {};
-    const usable = yield* threadIo(() => usableMcpServers(configs, toolRuntimes, this.#mcpAuthorization));
+    const usable = yield* usableMcpServers(configs, toolRuntimes, this.#mcpAuthorization).pipe(
+      Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })),
+    );
     const { servers, dropped } = yield* threadStep(() => codexMcpServers(usable));
     this.#hooks.reportMcpDrops(client.provider, dropped);
     const mcpServers = { ...disabled, ...servers };
@@ -537,9 +528,13 @@ export class ThreadLifecycle {
     client: AgentClient,
   ): Effect.fn.Return<Record<string, CodexDisabledMcpServer>> {
     if (client.provider !== "codex") return {};
-    return yield* threadIo(() =>
-      codexDisabledServers(() => client.request("config/read", { includeLayers: false }, decodeRecordResponse)),
-    ).pipe(Effect.catch(() => Effect.succeed({})));
+    return yield* codexDisabledServers(() =>
+      client
+        .request("config/read", { includeLayers: false }, decodeRecordResponse)
+        .pipe(Effect.mapError((failure) => new McpShapeFailed({ cause: failure.cause }))),
+    )
+      .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })))
+      .pipe(Effect.catch(() => Effect.succeed({})));
   });
 
   /**
@@ -651,11 +646,8 @@ export class ThreadLifecycle {
    * recovery, which reads a session before any turn resumes it: a client that has to load the
    * session to answer needs the same workspace and settings as the resume would have given it.
    */
-  threadParams(agent: AgentSummary, client: AgentClient, externalThreadId: string): Promise<DynamicRecord> {
-    return runThread(this.threadParamsEffect(agent, client, externalThreadId));
-  }
 
-  readonly threadParamsEffect = Effect.fn("ThreadLifecycle.threadParams")(function* (
+  readonly threadParams = Effect.fn("ThreadLifecycle.threadParams")(function* (
     this: ThreadLifecycle,
     agent: AgentSummary,
     client: AgentClient,
@@ -687,41 +679,49 @@ export class ThreadLifecycle {
         this.#agentEnvironment(),
       )),
     };
-  });
+  }).bind(this);
 
-  resumeThread(agent: AgentSummary, client: AgentClient, externalThreadId: string): Promise<void> {
-    return runThread(this.resumeThreadEffect(agent, client, externalThreadId));
-  }
-
-  readonly resumeThreadEffect = Effect.fn("ThreadLifecycle.resumeThread")(function* (
+  readonly resumeThread = Effect.fn("ThreadLifecycle.resumeThread")(function* (
     this: ThreadLifecycle,
     agent: AgentSummary,
     client: AgentClient,
     externalThreadId: string,
   ) {
     this.#conversation.bindThread(externalThreadId, agent.id);
-    const params = yield* this.threadParamsEffect(agent, client, externalThreadId);
-    const resumed = yield* Effect.result(threadIo(() => client.request("thread/resume", params, decodeRecordResponse)));
+    const params = yield* this.threadParams(agent, client, externalThreadId);
+    const resumed = yield* Effect.result(
+      client
+        .request("thread/resume", params, decodeRecordResponse)
+        .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause }))),
+    );
     if (Result.isFailure(resumed)) {
       if (client.provider !== "codex" || !isArchivedThreadError(resumed.failure.cause)) return yield* resumed.failure;
-      yield* threadIo(() => client.request("thread/unarchive", { threadId: externalThreadId }, decodeRecordResponse));
-      yield* threadIo(() => client.request("thread/resume", params, decodeRecordResponse));
+      yield* client
+        .request("thread/unarchive", { threadId: externalThreadId }, decodeRecordResponse)
+        .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })));
+      yield* client
+        .request("thread/resume", params, decodeRecordResponse)
+        .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })));
     }
     this.#conversation.markThreadLoaded(externalThreadId, client);
-  });
+  }).bind(this);
 
   /**
    * Closes one provider session that the provider refuses, and keeps the public thread. The next
    * turn opens a new session, and `startProviderThread` gives it the OpenBot transcript.
    */
-  dropRefusedProviderSession(agentId: string, externalThreadId: string): void {
+  readonly dropRefusedProviderSession = Effect.fn("ThreadLifecycle.dropRefusedProviderSession")(function* (
+    this: ThreadLifecycle,
+    agentId: string,
+    externalThreadId: string,
+  ) {
     const agent = this.#store.list().find((candidate) => candidate.id === agentId);
     if (!agent) return;
     // The client first, while the routing entry that `retireProviderSession` removes still names it.
-    this.#releaseProviderSession(externalThreadId);
+    yield* this.#releaseProviderSession(externalThreadId);
     this.retireProviderSession(agent, externalThreadId);
     this.#hooks.logRecovery(agentId, agent.provider, "replaced");
-  }
+  }, Effect.uninterruptible).bind(this);
 
   retireProviderSession(agent: AgentSummary, externalThreadId: string): void {
     const publicThreadId = this.#conversation.publicThreadId(agent.id, externalThreadId);
@@ -734,17 +734,7 @@ export class ThreadLifecycle {
     this.#pendingHandoffs.delete(externalThreadId);
   }
 
-  requestWithArchivedThreadRecovery<T>(
-    agent: AgentSummary,
-    client: AgentClient,
-    method: string,
-    params: unknown,
-    decoder: ResponseDecoder<T>,
-  ): Promise<T> {
-    return runThread(this.requestWithArchivedThreadRecoveryEffect(agent, client, method, params, decoder));
-  }
-
-  readonly requestWithArchivedThreadRecoveryEffect = Effect.fn("ThreadLifecycle.requestWithArchivedThreadRecovery")(
+  readonly requestWithArchivedThreadRecovery = Effect.fn("ThreadLifecycle.requestWithArchivedThreadRecovery")(
     function* <T>(
       this: ThreadLifecycle,
       agent: AgentSummary,
@@ -753,13 +743,19 @@ export class ThreadLifecycle {
       params: unknown,
       decoder: ResponseDecoder<T>,
     ) {
-      const response = yield* Effect.result(threadIo(() => client.request(method, params, decoder)));
+      const response = yield* Effect.result(
+        client
+          .request(method, params, decoder)
+          .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause }))),
+      );
       if (Result.isSuccess(response)) return response.success;
       if (client.provider !== "codex" || !isArchivedThreadError(response.failure.cause)) return yield* response.failure;
       const threadId = getString(params, "threadId");
       if (!threadId) return yield* response.failure;
-      yield* this.resumeThreadEffect(agent, client, threadId);
-      return yield* threadIo(() => client.request(method, params, decoder));
+      yield* this.resumeThread(agent, client, threadId);
+      return yield* client
+        .request(method, params, decoder)
+        .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })));
     },
   );
 
@@ -773,7 +769,11 @@ export class ThreadLifecycle {
    * `startingDeliveryIds` names the deliveries whose start is calling this, which are the ones
    * whose unconfirmed state must not hold the mark back: they are about to be given the new set.
    */
-  applyPendingRuntimeRefresh(agent: AgentSummary, startingDeliveryIds: ReadonlySet<string> = new Set()): void {
+  readonly applyPendingRuntimeRefresh = Effect.fn("ThreadLifecycle.applyPendingRuntimeRefresh")(function* (
+    this: ThreadLifecycle,
+    agent: AgentSummary,
+    startingDeliveryIds: ReadonlySet<string> = new Set(),
+  ) {
     if (!this.#pendingRuntimeRefreshes.has(agent.id)) return;
     // A compaction is a provider turn that deliberately keeps no conversation turn id, so the busy
     // check below reads its thread as idle. Its completion arrives on the routing this refresh
@@ -800,10 +800,10 @@ export class ThreadLifecycle {
       // A running turn owns its provider session, so the refresh waits for it. The mark stays, and
       // the next drain of this agent refreshes the thread that was busy this time.
       if (this.#activeTurnOf(agent.id, threadId)) deferred = true;
-      else this.#refreshThreadRuntime(threadId);
+      else yield* this.#refreshThreadRuntime(threadId);
     }
     if (!deferred) this.#pendingRuntimeRefreshes.delete(agent.id);
-  }
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Whether a provider turn may own a session of this agent's own thread, as the checks of
@@ -821,9 +821,12 @@ export class ThreadLifecycle {
    * The thread and its messages stay. The next turn starts a new session, and its handoff takes
    * only the messages after the marker. Channel execution threads are not changed.
    */
-  endThreadContext(threadId: string): void {
-    this.#refreshThreadRuntime(threadId);
-  }
+  readonly endThreadContext = Effect.fn("ThreadLifecycle.endThreadContext")(function* (
+    this: ThreadLifecycle,
+    threadId: string,
+  ) {
+    yield* this.#refreshThreadRuntime(threadId);
+  }, Effect.uninterruptible).bind(this);
 
   #activeTurnOf(agentId: string, threadId: string): string | null {
     const snapshot = [...this.#conversation.activeSnapshots()].find(
@@ -836,35 +839,41 @@ export class ThreadLifecycle {
    * Drops the provider-side state of one thread and keeps the thread itself. The public thread row
    * and its messages stay, so the next turn starts a new provider session with the same history.
    */
-  #refreshThreadRuntime(threadId: string): void {
+  readonly #refreshThreadRuntime = Effect.fn("ThreadLifecycle.refreshThreadRuntime")(function* (
+    this: ThreadLifecycle,
+    threadId: string,
+  ) {
     const sessions = this.#store.database.listProviderSessions(threadId).filter((one) => one.state === "active");
     this.#store.database.deactivateProviderSessions(threadId);
     for (const session of sessions) {
       // The client first, while the routing entry below still names it. Dropping the entry alone
       // would leave the old session open inside the client with the MCP servers it spawned, so each
       // further change would add a set of processes the user can no longer reach.
-      this.#releaseProviderSession(session.externalSessionId);
+      yield* this.#releaseProviderSession(session.externalSessionId);
       this.#conversation.unbindThread(session.externalSessionId);
       this.#conversation.unloadThread(session.externalSessionId);
       this.#compaction.forgetThread(session.externalSessionId);
       this.#pendingHandoffs.delete(session.externalSessionId);
     }
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Tells the client to close one provider session, and does not wait for it. The callers are the
    * synchronous settings paths, and the close talks to a child process; the routing entries are
    * dropped either way, so the next turn starts a new session whatever the old one answers.
    */
-  #releaseProviderSession(
+  readonly #releaseProviderSession = Effect.fn("ThreadLifecycle.releaseProviderSession")(function* (
+    this: ThreadLifecycle,
     externalThreadId: string,
-    client = this.#conversation.loadedClientFor(externalThreadId),
-  ): void {
+    client: AgentClient | undefined = this.#conversation.loadedClientFor(externalThreadId),
+  ) {
     if (!client?.releaseThread) return;
-    void client.releaseThread(externalThreadId).catch((error: unknown) => {
-      this.#hooks.logReleaseFailure(client.provider, error);
-    });
-  }
+    yield* client
+      .releaseThread(externalThreadId)
+      .pipe(
+        Effect.catch((failure) => Effect.sync(() => this.#hooks.logReleaseFailure(client.provider, failure.cause))),
+      );
+  }, Effect.uninterruptible);
 
   buildProviderHandoff(agentId: string, threadId: string): string | null {
     if (this.#conversation.isExecutionThread(threadId)) return null;
@@ -948,12 +957,6 @@ function threadIo<A>(run: () => Promise<A>): Effect.Effect<A, ThreadOperationFai
 
 function threadStep<A>(run: () => A): Effect.Effect<A, ThreadOperationFailed> {
   return Effect.try({ try: run, catch: (cause) => new ThreadOperationFailed({ cause }) });
-}
-
-async function runThread<A>(operation: Effect.Effect<A, ThreadOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }
 
 function missingSessionFile(error: unknown): boolean {

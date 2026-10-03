@@ -13,9 +13,10 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { isString } from "@openbot/contracts/runtime-values";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit } from "effect";
 import { type McpOperationError, mcpCall, mcpFailure, mcpResult, mcpSync, runMcpEffect } from "./mcp-effects";
 import type { DynamicToolResult } from "./protocol";
+import type { ProviderClientOperationError } from "./provider-client-effects";
 
 interface DynamicToolDefinition {
   type: "function";
@@ -67,7 +68,7 @@ interface BridgeRoute {
       arguments: unknown;
     },
     signal: AbortSignal,
-  ) => Promise<DynamicToolResult>;
+  ) => Effect.Effect<DynamicToolResult, ProviderClientOperationError>;
   activeTurnId: () => string | null;
   /**
    * The calls still running, by JSON-RPC id. Each POST gets a new MCP server, so the POST that
@@ -79,22 +80,13 @@ interface BridgeRoute {
 export class LocalMcpBridge {
   #server: HttpServer | null = null;
   #port: number | null = null;
-  #listening: Promise<void> | null = null;
+  #listening: Deferred.Deferred<void, McpOperationError> | null = null;
   /** Counts the closes, so a session asked for before a close does not register after it. */
   #closes = 0;
-  #closing: Promise<void> | null = null;
+  #closing: Deferred.Deferred<void, McpOperationError> | null = null;
   readonly #routes = new Map<string, BridgeRoute>();
 
-  createSession(
-    threadId: string,
-    namespaces: DynamicToolNamespace[],
-    activeTurnId: () => string | null,
-    call: BridgeRoute["call"],
-  ): Promise<LocalMcpSession> {
-    return runMcpEffect(this.#createSessionOperation(threadId, namespaces, activeTurnId, call));
-  }
-
-  readonly #createSessionOperation = Effect.fn("LocalMcpBridge.createSession")(function* (
+  readonly createSession = Effect.fn("LocalMcpBridge.createSession")(function* (
     this: LocalMcpBridge,
     threadId: string,
     namespaces: DynamicToolNamespace[],
@@ -103,7 +95,7 @@ export class LocalMcpBridge {
   ): Effect.fn.Return<LocalMcpSession, McpOperationError> {
     const closes = this.#closes;
     if (this.#closing) return yield* mcpFailure(new Error("The local OpenBot MCP bridge closed."));
-    yield* mcpCall(() => this.#listen());
+    yield* this.#listen();
     if (closes !== this.#closes) return yield* mcpFailure(new Error("The local OpenBot MCP bridge closed."));
     const tokens: string[] = [];
     const servers = namespaces.map((namespace) => {
@@ -131,38 +123,27 @@ export class LocalMcpBridge {
     };
   });
 
-  close(): Promise<void> {
-    return runMcpEffect(this.#closeOperation().pipe(Effect.uninterruptible));
-  }
-
-  readonly #closeOperation = Effect.fn("LocalMcpBridge.close")(function* (
-    this: LocalMcpBridge,
-  ): Effect.fn.Return<void, McpOperationError> {
+  readonly close = Effect.fn("LocalMcpBridge.close")(function* (this: LocalMcpBridge) {
+    if (this.#closing) return yield* Deferred.await(this.#closing);
     this.#closes += 1;
     this.#routes.clear();
-    const closing = this.#shutDown();
+    const closing = Deferred.makeUnsafe<void, McpOperationError>();
     this.#closing = closing;
-    yield* Effect.gen({ self: this }, function* () {
-      yield* mcpCall(() => closing);
-    }).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
+    yield* this.#shutDown().pipe(
+      Effect.onExit((exit) =>
+        Effect.gen({ self: this }, function* () {
+          yield* Deferred.done(closing, exit);
           if (this.#closing === closing) this.#closing = null;
         }),
       ),
     );
-  });
+  }, Effect.uninterruptible);
 
-  /** Until the server is closed, no session may start a second bind: that server would stay open. */
-  #shutDown(): Promise<void> {
-    return runMcpEffect(this.#shutDownEffect());
-  }
-
-  readonly #shutDownEffect = Effect.fn("LocalMcpBridge.shutDown")(function* (
+  readonly #shutDown = Effect.fn("LocalMcpBridge.shutDown")(function* (
     this: LocalMcpBridge,
   ): Effect.fn.Return<void, McpOperationError> {
     // A bind still in flight sets the server when it ends, so it is awaited before the close.
-    yield* mcpCall(() => this.#listening?.catch(() => undefined));
+    if (this.#listening) yield* Deferred.await(this.#listening).pipe(Effect.ignore);
     const server = this.#server;
     this.#server = null;
     this.#port = null;
@@ -171,27 +152,26 @@ export class LocalMcpBridge {
   });
 
   /** One bind, however many sessions ask for it at once: a second would leave a server listening. */
-  #listen(): Promise<void> {
-    if (!this.#listening) {
-      const listening = this.#bind();
-      this.#listening = listening;
-      listening.catch(() => {
-        if (this.#listening === listening) this.#listening = null;
-      });
-    }
-    return this.#listening;
-  }
+  readonly #listen = Effect.fn("LocalMcpBridge.listen")(function* (this: LocalMcpBridge) {
+    if (this.#listening) return yield* Deferred.await(this.#listening);
+    const listening = Deferred.makeUnsafe<void, McpOperationError>();
+    this.#listening = listening;
+    yield* this.#bind().pipe(
+      Effect.onExit((exit) =>
+        Effect.gen({ self: this }, function* () {
+          yield* Deferred.done(listening, exit);
+          if (Exit.isFailure(exit) && this.#listening === listening) this.#listening = null;
+        }),
+      ),
+    );
+  }, Effect.uninterruptible);
 
-  #bind(): Promise<void> {
-    return runMcpEffect(this.#bindEffect());
-  }
-
-  readonly #bindEffect = Effect.fn("LocalMcpBridge.bind")(function* (
+  readonly #bind = Effect.fn("LocalMcpBridge.bind")(function* (
     this: LocalMcpBridge,
   ): Effect.fn.Return<void, McpOperationError> {
     let retained = false;
     yield* Effect.acquireUseRelease(
-      mcpSync(() => createServer((request, response) => void this.#handle(request, response))),
+      mcpSync(() => createServer((request, response) => void runMcpEffect(this.#handle(request, response)))),
       (server) =>
         Effect.gen({ self: this }, function* () {
           yield* mcpCall(
@@ -218,11 +198,7 @@ export class LocalMcpBridge {
     );
   });
 
-  #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    return runMcpEffect(this.#handleEffect(request, response));
-  }
-
-  readonly #handleEffect = Effect.fn("LocalMcpBridge.handle")(function* (
+  readonly #handle = Effect.fn("LocalMcpBridge.handle")(function* (
     this: LocalMcpBridge,
     request: IncomingMessage,
     response: ServerResponse,
@@ -273,8 +249,8 @@ export class LocalMcpBridge {
                     .catch(() => undefined);
                 }, LOCAL_MCP_PROGRESS_INTERVAL_MS);
           const result = yield* Effect.gen({ self: this }, function* () {
-            return yield* mcpCall(() =>
-              route.call(
+            return yield* route
+              .call(
                 {
                   threadId: route.threadId,
                   turnId: route.activeTurnId() ?? randomUUID(),
@@ -284,8 +260,8 @@ export class LocalMcpBridge {
                   arguments: params.arguments ?? {},
                 },
                 abandoned.signal,
-              ),
-            );
+              )
+              .pipe(Effect.mapError(({ cause }) => mcpFailure(cause)));
           }).pipe(
             Effect.onInterrupt(() => Effect.sync(abandon)),
             Effect.ensuring(
@@ -317,7 +293,7 @@ export class LocalMcpBridge {
     yield* Effect.gen({ self: this }, function* () {
       try {
         mcpResult(yield* Effect.result(mcpCall(() => mcp.connect(transport))));
-        const body = mcpResult(yield* Effect.result(readJsonBodyEffect(request)));
+        const body = mcpResult(yield* Effect.result(readJsonBody(request)));
         for (const message of Array.isArray(body) ? body : body ? [body] : []) {
           const cancelled = CancelledNotificationSchema.safeParse(message);
           const requestId = cancelled.success ? cancelled.data.params.requestId : undefined;
@@ -358,15 +334,7 @@ export class LocalMcpBridge {
     return null;
   }
 }
-
-/** The JSON-RPC messages of one MCP POST. It rejects a body larger than `maxBytes`. */
-export function readJsonBody(
-  request: IncomingMessage,
-  maxBytes = 1_000_000,
-): Promise<JSONRPCMessage | JSONRPCMessage[] | undefined> {
-  return runMcpEffect(readJsonBodyEffect(request, maxBytes));
-}
-export const readJsonBodyEffect = Effect.fn("LocalMcpBridge.readJsonBody")(function* (
+export const readJsonBody = Effect.fn("LocalMcpBridge.readJsonBody")(function* (
   request: IncomingMessage,
   maxBytes = 1_000_000,
 ): Effect.fn.Return<JSONRPCMessage | JSONRPCMessage[] | undefined, McpOperationError> {

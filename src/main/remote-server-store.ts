@@ -18,7 +18,7 @@ import type { ServerNotificationLevel, TeamRole } from "@openbot/contracts/ipc";
 import { LOCAL_SERVER_ID } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Effect, Result, Semaphore } from "effect";
 import { writeJsonFileAtomically } from "../backend/atomic-json-file";
 import {
   emptyStoredRemoteServers,
@@ -28,7 +28,7 @@ import {
   type StoredServerNotifications,
   serializeStoredRemoteServers,
 } from "./remote-server-stored-shape";
-import { RemoteWorkflowError, remoteCall, remoteDecode, runRemoteWorkflow } from "./remote-service-effects";
+import { RemoteWorkflowError, remoteCall, remoteDecode } from "./remote-service-effects";
 
 export interface TokenCipher {
   encrypt: (value: string) => Buffer;
@@ -80,7 +80,7 @@ export class RemoteServerStore implements RemoteServerDirectory {
   readonly #path: string;
   readonly #cipher: TokenCipher;
   #state: StoredRemoteServers = emptyStoredRemoteServers();
-  #writeChain = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
   #activeServerRevision = 0;
 
   constructor(options: { path: string; cipher: TokenCipher }) {
@@ -91,10 +91,8 @@ export class RemoteServerStore implements RemoteServerDirectory {
   // A missing file is a first run. Anything else -- a permission error, a truncated read, a file that
   // is not JSON, a file this build cannot decode -- reaches the caller, because continuing would leave
   // an empty list that the next write replaces the user's servers with.
-  load(): Promise<void> {
-    return runRemoteWorkflow(this.loadEffect());
-  }
-  readonly loadEffect = Effect.fn("RemoteStore.load")(function* (
+
+  readonly load = Effect.fn("RemoteStore.load")(function* (
     this: RemoteServerStore,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     const attempt0 = yield* Effect.gen({ self: this }, function* () {
@@ -209,16 +207,14 @@ export class RemoteServerStore implements RemoteServerDirectory {
   // writes its own entry, this one gets it from `replaceServers` and only has to retire the old.
   // Reconciliation must not call it: an id recreated from a directory advertisement proves nothing
   // about the machine holding the pinned key.
-  retireUnreadable(serverId: string): Promise<void> {
-    return runRemoteWorkflow(this.retireUnreadableEffect(serverId));
-  }
-  readonly retireUnreadableEffect = Effect.fn("RemoteStore.retireUnreadable")(function* (
+
+  readonly retireUnreadable = Effect.fn("RemoteStore.retireUnreadable")(function* (
     this: RemoteServerStore,
     serverId: string,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (!this.#state.unreadableServers.some((preserved) => preserved.entry.id === serverId)) return;
     this.#forgetUnreadable(serverId);
-    yield* this.persistEffect();
+    yield* this.persist();
   });
 
   // Adds a server the user just joined or signed in to, replacing any earlier entry with the same
@@ -227,25 +223,21 @@ export class RemoteServerStore implements RemoteServerDirectory {
   // This is also the one path allowed to retire an entry the reader could not decode. Joining or
   // signing in verified the host's identity, so the new entry supersedes the old; a reconciliation
   // that happens to mint the same id did not, and `replaceServers` deliberately leaves it alone.
-  adopt(server: StoredRemoteServer): Promise<void> {
-    return runRemoteWorkflow(this.adoptEffect(server));
-  }
-  readonly adoptEffect = Effect.fn("RemoteStore.adopt")(function* (
+
+  readonly adopt = Effect.fn("RemoteStore.adopt")(function* (
     this: RemoteServerStore,
     server: StoredRemoteServer,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     this.#forgetUnreadable(server.id);
     this.#state.servers = [...this.#state.servers.filter((candidate) => candidate.id !== server.id), server];
     this.setActiveServerId(server.id);
-    yield* this.persistEffect();
+    yield* this.persist();
   });
 
   // Returns the updated server so a caller that needs the new credentials for its next request does
   // not have to look them up again -- and null when the server is gone, which a live event can race.
-  update(serverId: string, patch: RemoteServerPatch): Promise<StoredRemoteServerView | null> {
-    return runRemoteWorkflow(this.updateEffect(serverId, patch));
-  }
-  readonly updateEffect = Effect.fn("RemoteStore.update")(function* (
+
+  readonly update = Effect.fn("RemoteStore.update")(function* (
     this: RemoteServerStore,
     serverId: string,
     patch: RemoteServerPatch,
@@ -254,14 +246,11 @@ export class RemoteServerStore implements RemoteServerDirectory {
     if (!current) return null;
     const updated: StoredRemoteServer = { ...current, ...patch };
     this.#state.servers = this.#state.servers.map((candidate) => (candidate.id === serverId ? updated : candidate));
-    yield* this.persistEffect();
+    yield* this.persist();
     return updated;
   });
 
-  remove(serverId: string, options: { hideHost?: boolean } = {}): Promise<void> {
-    return runRemoteWorkflow(this.removeEffect(serverId, options));
-  }
-  readonly removeEffect = Effect.fn("RemoteStore.remove")(function* (
+  readonly remove = Effect.fn("RemoteStore.remove")(function* (
     this: RemoteServerStore,
     serverId: string,
     options: { hideHost?: boolean } = {},
@@ -272,7 +261,7 @@ export class RemoteServerStore implements RemoteServerDirectory {
     this.#forgetUnreadable(serverId);
     this.#state.servers = this.#state.servers.filter((server) => server.id !== serverId);
     if (this.#state.activeServerId === serverId) this.setActiveServerId(LOCAL_SERVER_ID);
-    yield* this.persistEffect();
+    yield* this.persist();
   });
 
   #forgetUnreadable(serverId: string): void {
@@ -282,25 +271,20 @@ export class RemoteServerStore implements RemoteServerDirectory {
     if (this.#state.unreadableActiveServerId === serverId) this.#state.unreadableActiveServerId = null;
   }
 
-  unhideHost(hostId: string): Promise<void> {
-    return runRemoteWorkflow(this.unhideHostEffect(hostId));
-  }
-  readonly unhideHostEffect = Effect.fn("RemoteStore.unhideHost")(function* (
+  readonly unhideHost = Effect.fn("RemoteStore.unhideHost")(function* (
     this: RemoteServerStore,
     hostId: string,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     if (!this.isHiddenHost(hostId)) return;
     this.#state.hiddenHostIds = this.#state.hiddenHostIds.filter((candidate) => candidate !== hostId);
-    yield* this.persistEffect();
+    yield* this.persist();
   });
 
   // Throws rather than repairing: an order that does not name every server exactly once came from a
   // renderer working off a stale list, and silently guessing at the rest would reorder the sidebar
   // under the user. Returns false when the order already matches, so the caller can skip its event.
-  reorder(serverIds: readonly string[]): Promise<boolean> {
-    return runRemoteWorkflow(this.reorderEffect(serverIds));
-  }
-  readonly reorderEffect = Effect.fn("RemoteStore.reorder")(function* (
+
+  readonly reorder = Effect.fn("RemoteStore.reorder")(function* (
     this: RemoteServerStore,
     serverIds: readonly string[],
   ): Effect.fn.Return<boolean, RemoteWorkflowError> {
@@ -318,17 +302,15 @@ export class RemoteServerStore implements RemoteServerDirectory {
     }
     if (serverIds.every((serverId, index) => this.#state.servers[index]?.id === serverId)) return false;
     this.#state.servers = reordered;
-    yield* this.persistEffect();
+    yield* this.persist();
     return true;
   });
 
   // The host directory owns the whole WebRTC half of the list, so it replaces it wholesale. If the
   // active server is not in the new list, selection falls back to the local server -- the same rule
   // `readStoredRemoteServers` applies to a file that lost an entry.
-  replaceServers(servers: readonly StoredRemoteServerView[]): Promise<void> {
-    return runRemoteWorkflow(this.replaceServersEffect(servers));
-  }
-  readonly replaceServersEffect = Effect.fn("RemoteStore.replaceServers")(function* (
+
+  readonly replaceServers = Effect.fn("RemoteStore.replaceServers")(function* (
     this: RemoteServerStore,
     servers: readonly StoredRemoteServerView[],
   ): Effect.fn.Return<void, RemoteWorkflowError> {
@@ -336,7 +318,7 @@ export class RemoteServerStore implements RemoteServerDirectory {
     if (this.#state.activeServerId !== LOCAL_SERVER_ID && !this.has(this.#state.activeServerId)) {
       this.setActiveServerId(LOCAL_SERVER_ID);
     }
-    yield* this.persistEffect();
+    yield* this.persist();
   });
 
   // A timed mute that has ended reads as unmuted. Its entry stays until the next write for the server
@@ -367,10 +349,8 @@ export class RemoteServerStore implements RemoteServerDirectory {
 
   // `until` null mutes until the user unmutes; a time mutes until then. Both kinds are cleared first,
   // so a server never carries a permanent and a timed mute at once.
-  setMuted(serverId: string, muted: boolean, until: number | null = null): Promise<void> {
-    return runRemoteWorkflow(this.setMutedEffect(serverId, muted, until));
-  }
-  readonly setMutedEffect = Effect.fn("RemoteStore.setMuted")(function* (
+
+  readonly setMuted = Effect.fn("RemoteStore.setMuted")(function* (
     this: RemoteServerStore,
     serverId: string,
     muted: boolean,
@@ -391,10 +371,7 @@ export class RemoteServerStore implements RemoteServerDirectory {
     });
   });
 
-  setNotificationLevel(serverId: string, level: ServerNotificationLevel): Promise<void> {
-    return runRemoteWorkflow(this.setNotificationLevelEffect(serverId, level));
-  }
-  readonly setNotificationLevelEffect = Effect.fn("RemoteStore.setNotificationLevel")(function* (
+  readonly setNotificationLevel = Effect.fn("RemoteStore.setNotificationLevel")(function* (
     this: RemoteServerStore,
     serverId: string,
     level: ServerNotificationLevel,
@@ -417,49 +394,46 @@ export class RemoteServerStore implements RemoteServerDirectory {
     serverId: string,
     change: (state: StoredRemoteServers) => Pick<StoredRemoteServers, "mutedServerIds" | "serverNotifications">,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
-    const operation = this.#writeChain.then(() =>
-      runRemoteWorkflow(
+    yield* this.#writes.withPermit(
+      Effect.uninterruptible(
         Effect.gen({ self: this }, function* () {
           if (serverId !== LOCAL_SERVER_ID && !this.has(serverId))
             return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.serverNotFound")) });
           const next = change(this.#state);
-          yield* this.#writeSnapshotEffect({ ...structuredClone(this.#state), ...next });
+          yield* this.#writeSnapshot({ ...structuredClone(this.#state), ...next });
           this.#state.mutedServerIds = next.mutedServerIds;
           this.#state.serverNotifications = next.serverNotifications;
         }),
       ),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    yield* remoteCall(() => operation);
   });
 
   // Capture server state now, but use the notification preferences committed by preceding writes.
-  persist(): Promise<void> {
-    return runRemoteWorkflow(this.persistEffect());
-  }
-  readonly persistEffect = Effect.fn("RemoteStore.persist")(function* (
+
+  readonly persist = Effect.fn("RemoteStore.persist")(function* (
     this: RemoteServerStore,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     const snapshot = structuredClone(this.#state);
-    const operation = this.#writeChain.then(() =>
-      this.#writeSnapshot({
-        ...snapshot,
-        mutedServerIds: [...this.#state.mutedServerIds],
-        serverNotifications: structuredClone(this.#state.serverNotifications),
-      }),
+    yield* this.#writes.withPermit(
+      Effect.uninterruptible(
+        Effect.suspend(() =>
+          this.#writeSnapshot({
+            ...snapshot,
+            mutedServerIds: [...this.#state.mutedServerIds],
+            serverNotifications: structuredClone(this.#state.serverNotifications),
+          }),
+        ),
+      ),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    yield* remoteCall(() => operation);
   });
 
-  #writeSnapshot(snapshot: StoredRemoteServers): Promise<void> {
-    return runRemoteWorkflow(this.#writeSnapshotEffect(snapshot));
-  }
-  readonly #writeSnapshotEffect = Effect.fn("RemoteStore.writeSnapshot")(function* (
+  readonly #writeSnapshot = Effect.fn("RemoteStore.writeSnapshot")(function* (
     this: RemoteServerStore,
     snapshot: StoredRemoteServers,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
-    yield* remoteCall(() => writeJsonFileAtomically(this.#path, serializeStoredRemoteServers(snapshot)));
+    yield* writeJsonFileAtomically(this.#path, serializeStoredRemoteServers(snapshot)).pipe(
+      Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })),
+    );
   });
 }
 

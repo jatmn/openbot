@@ -11,7 +11,7 @@ import { app, type BrowserWindow, dialog } from "electron";
 import type { AgentService } from "../backend/agent-service";
 import type { BrowserHost } from "../backend/browser-host";
 import type { MailboxStore } from "../backend/mailbox-store";
-import { type ArchiveOperationError, archiveCall, archiveSync, runArchiveEffect } from "./archive-effects";
+import { type ArchiveOperationError, archiveCall, archiveFailure, archiveSync } from "./archive-effects";
 import type { TraceFile } from "./trace-file";
 import type { UpdateService } from "./update-service";
 
@@ -26,13 +26,7 @@ interface MaintenanceContext {
   parentWindow: BrowserWindow | null;
   translate: AppTranslate;
 }
-
-export function exportOpenBotData(
-  context: Pick<MaintenanceContext, "service" | "mailbox" | "parentWindow" | "translate">,
-): Promise<ExportResult> {
-  return runArchiveEffect(exportOpenBotDataEffect(context));
-}
-export const exportOpenBotDataEffect = Effect.fn("Archive.exportOpenBotData")(function* (
+export const exportOpenBotData = Effect.fn("Archive.exportOpenBotData")(function* (
   context: Pick<MaintenanceContext, "service" | "mailbox" | "parentWindow" | "translate">,
 ): Effect.fn.Return<ExportResult, ArchiveOperationError> {
   const destination = yield* chooseExportDestinationEffect(
@@ -52,11 +46,18 @@ export const exportOpenBotDataEffect = Effect.fn("Archive.exportOpenBotData")(fu
         const agents = context.service.listAgents();
         const [conversations, queues, attachments] = yield* Effect.all(
           [
-            Effect.forEach(agents, (agent) => archiveCall(() => context.service.readConversation(agent.id)), {
-              concurrency: "unbounded",
-            }),
+            Effect.forEach(
+              agents,
+              (agent) =>
+                context.service
+                  .readConversation(agent.id)
+                  .pipe(Effect.mapError((error) => archiveFailure(error.cause))),
+              {
+                concurrency: "unbounded",
+              },
+            ),
             archiveSync(() => agents.map((agent) => context.service.listQueue(agent.id))),
-            archiveCall(() => context.mailbox.listExportAttachments()),
+            context.mailbox.listExportAttachments().pipe(Effect.mapError((error) => archiveFailure(error.cause))),
           ],
           { concurrency: "unbounded" },
         );
@@ -125,13 +126,7 @@ export const exportOpenBotDataEffect = Effect.fn("Archive.exportOpenBotData")(fu
 function powerShellLiteral(value: string): string {
   return value.replaceAll("'", "''");
 }
-
-export function exportDiagnostics(
-  context: Pick<MaintenanceContext, "service" | "browser" | "updater" | "trace" | "parentWindow" | "translate">,
-): Promise<ExportResult> {
-  return runArchiveEffect(exportDiagnosticsEffect(context));
-}
-export const exportDiagnosticsEffect = Effect.fn("Archive.exportDiagnostics")(function* (
+export const exportDiagnostics = Effect.fn("Archive.exportDiagnostics")(function* (
   context: Pick<MaintenanceContext, "service" | "browser" | "updater" | "trace" | "parentWindow" | "translate">,
 ): Effect.fn.Return<ExportResult, ArchiveOperationError> {
   const destination = yield* chooseExportDestinationEffect(
@@ -206,7 +201,7 @@ export const exportDiagnosticsEffect = Effect.fn("Archive.exportDiagnostics")(fu
       history: context.updater.getDiagnostics(),
     },
     // IPC channels and turn origins with counts, outcomes and durations, from the local trace file.
-    trace: yield* archiveCall(() => context.trace.summarize()),
+    trace: yield* context.trace.summarize(),
     privacy:
       "Contains no conversations, URLs, email addresses, tokens, file contents, file paths, or raw error messages.",
   };

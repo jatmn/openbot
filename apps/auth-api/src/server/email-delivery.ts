@@ -1,5 +1,4 @@
 import { Effect, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 import {
   RATE_LIMITED_DELIVERY_ERROR,
   type SmtpEmailConfig,
@@ -8,7 +7,7 @@ import {
 } from "./smtp-email-delivery";
 import type { EmailCodeDelivery, TeamInviteEmailDelivery, WorkerBindings } from "./types";
 
-class EmailDeliveryError extends Schema.TaggedError<EmailDeliveryError>()("EmailDeliveryError", {
+export class EmailDeliveryError extends Schema.TaggedError<EmailDeliveryError>()("EmailDeliveryError", {
   message: Schema.String,
 }) {}
 
@@ -52,7 +51,7 @@ export function createEmailCodeDelivery(bindings: EmailDeliveryBindings): EmailC
     if (response.status === 429) return yield* new EmailDeliveryError({ message: RATE_LIMITED_DELIVERY_ERROR });
     if (!response.ok) return yield* new EmailDeliveryError({ message: "email_delivery_webhook_failed" });
   });
-  return { send: (message) => runApiEffect(send(message)) };
+  return { send };
 }
 
 export function createTeamInviteEmailDelivery(bindings: EmailDeliveryBindings): TeamInviteEmailDelivery | null {

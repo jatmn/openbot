@@ -35,7 +35,10 @@ export interface AgentRemovalOptions {
   hostedSites: HostedSiteCoordinator;
   compaction: ContextCompaction;
   /** Runs `remove` with the agent's approvals revoked. The main process gives it. */
-  deleteWithRevokedApproval: (agentId: string, remove: () => Promise<void>) => Promise<void>;
+  deleteWithRevokedApproval: (
+    agentId: string,
+    remove: () => Effect.Effect<void, AgentRemovalFailed>,
+  ) => Effect.Effect<void, AgentRemovalFailed>;
   /** The agent service logger, so a deletion keeps the `agent-service` prefix it always had. */
   logger: Logger;
   hooks: AgentRemovalHooks;
@@ -91,12 +94,7 @@ export class AgentRemoval {
     return this.#deleting;
   }
 
-  async delete(agentId: string): Promise<void> {
-    const result = await Effect.runPromise(Effect.result(this.deleteEffect(agentId)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-  }
-
-  readonly deleteEffect = Effect.fn("AgentRemoval.delete")(function* (this: AgentRemoval, agentId: string) {
+  readonly delete = Effect.fn("AgentRemoval.delete")(function* (this: AgentRemoval, agentId: string) {
     const agent = yield* removalStep(() => {
       if (this.#deleting.has(agentId)) throw new Error(sourceText("error.agent.deletionBusy"));
       const candidate = this.#store.list().find((entry) => entry.id === agentId);
@@ -115,7 +113,7 @@ export class AgentRemoval {
       ({ wasPending }) =>
         Effect.gen({ self: this }, function* () {
           yield* removalStep(() => this.#routines.arm());
-          yield* this.deleteDataEffect(agent ?? { id: agentId, threadId: null });
+          yield* this.deleteData(agent ?? { id: agentId, threadId: null });
           yield* removalStep(() => {
             this.#channels.removeDeletedMembers(new Set(this.#store.list().map((candidate) => candidate.id)));
             this.#duplication.forget(agentId);
@@ -133,23 +131,13 @@ export class AgentRemoval {
     );
   }, Effect.uninterruptible);
 
-  async deleteData(agent: Pick<AgentSummary, "id" | "threadId">): Promise<void> {
-    const result = await Effect.runPromise(Effect.result(this.deleteDataEffect(agent)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-  }
-
-  readonly deleteDataEffect = Effect.fn("AgentRemoval.deleteData")(function* (
+  readonly deleteData = Effect.fn("AgentRemoval.deleteData")(function* (
     this: AgentRemoval,
     agent: Pick<AgentSummary, "id" | "threadId">,
   ) {
     // Approval revocation remains owned by the main-process gate. Its callback runs the
     // complete ordered removal before the gate can restore an approval on failure.
-    yield* removalIo(() =>
-      this.#deleteWithRevokedApproval(agent.id, async () => {
-        const result = await Effect.runPromise(Effect.result(this.#removeAgentDataEffect(agent)));
-        if (Result.isFailure(result)) throw result.failure.cause;
-      }),
-    ).pipe(
+    yield* this.#deleteWithRevokedApproval(agent.id, () => this.#removeAgentDataEffect(agent)).pipe(
       Effect.mapError(() => new AgentRemovalFailed({ cause: new Error(sourceText("error.agent.deleteIncomplete")) })),
     );
   }, Effect.uninterruptible);
@@ -162,21 +150,25 @@ export class AgentRemoval {
       agent.threadId ? this.#store.database.listProviderSessions(agent.threadId) : [],
     );
     // Keep provider session records until their private files have been removed.
-    yield* this.#threads.releaseAgentSessionsEffect(agent.id);
+    yield* this.#threads.releaseAgentSessions(agent.id);
     let stage = "provider-files";
     yield* Effect.gen({ self: this }, function* () {
       for (const session of providerSessions)
         yield* this.#threads
-          .deleteProviderSessionFilesEffect(session.externalSessionId)
+          .deleteProviderSessionFiles(session.externalSessionId)
           .pipe(Effect.mapError((failure) => new AgentRemovalFailed({ cause: failure.cause })));
       stage = "messaging";
       yield* this.#messaging
-        .deleteForAgentEffect(agent.id)
+        .deleteForAgent(agent.id)
         .pipe(Effect.mapError((failure) => new AgentRemovalFailed({ cause: failure.cause })));
       stage = "mailbox";
-      yield* removalIo(() => this.#mailbox.deleteAgentData(agent.id, this.#channels.store.allContextThreads()));
+      yield* this.#mailbox
+        .deleteAgentData(agent.id, this.#channels.store.allContextThreads())
+        .pipe(Effect.mapError((failure) => new AgentRemovalFailed({ cause: failure.cause })));
       stage = "agent-files-and-record";
-      yield* removalIo(() => this.#store.deleteAgent(agent.id));
+      yield* this.#store
+        .deleteAgent(agent.id)
+        .pipe(Effect.mapError((failure) => new AgentRemovalFailed({ cause: failure.cause })));
     }).pipe(
       Effect.mapError(() => {
         // File-system errors can contain private paths. Log only the failed stage.
@@ -223,7 +215,11 @@ export class AgentRemoval {
       );
     let closed = 0;
     for (const tab of owned) {
-      const result = yield* Effect.result(removalIo(() => this.#browser.close(tab.id)));
+      const result = yield* Effect.result(
+        this.#browser
+          .close(tab.id)
+          .pipe(Effect.mapError((failure) => new AgentRemovalFailed({ cause: failure.cause }))),
+      );
       if (Result.isSuccess(result)) closed += 1;
       else this.#logger.warn("Could not close a deleted agent's browser tab.", { error: result.failure.cause });
     }
@@ -234,10 +230,6 @@ export class AgentRemoval {
 export class AgentRemovalFailed extends Schema.TaggedError<AgentRemovalFailed>()("AgentRemovalFailed", {
   cause: Schema.Defect(),
 }) {}
-
-function removalIo<A>(run: () => Promise<A>): Effect.Effect<A, AgentRemovalFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new AgentRemovalFailed({ cause }) });
-}
 
 function removalStep<A>(run: () => A): Effect.Effect<A, AgentRemovalFailed> {
   return Effect.try({ try: run, catch: (cause) => new AgentRemovalFailed({ cause }) });

@@ -5,7 +5,7 @@ import {
   SLACK_DELIVERY_RESPONSE_BYTES_LIMIT,
 } from "@openbot/contracts/signal-protocol/messages";
 import { createOpenBotLogger } from "@openbot/logging";
-import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
+import { Context, Effect, Exit, Layer, ManagedRuntime, Result, Scope } from "effect";
 import WebSocket from "ws";
 import type {
   IngressAnswer,
@@ -13,7 +13,7 @@ import type {
   IngressState,
   MessagingIngress,
 } from "../backend/messaging/messaging-types";
-import { type RemoteWorkflowError, remoteCall, remoteDecode } from "./remote-service-effects";
+import { type RemoteWorkflowError, remoteDecode } from "./remote-service-effects";
 
 const logger = createOpenBotLogger("slack-ingress");
 
@@ -26,9 +26,9 @@ export interface SlackIngressOptions {
   /** The remote host id of this computer, or null before it has a name. */
   hostId(): string | null;
   signedIn(): boolean;
-  issueTicket(hostId: string): Promise<{ ticket: string; signalUrl: string }>;
+  issueTicket(hostId: string): Effect.Effect<{ ticket: string; signalUrl: string }, RemoteWorkflowError>;
   /** The Slack route ticket: the workspaces that the account service links to this host. */
-  issueSlackRoute(hostId: string): Promise<string>;
+  issueSlackRoute(hostId: string): Effect.Effect<string, RemoteWorkflowError>;
 }
 
 class SlackIngressAccount extends Context.Service<
@@ -42,8 +42,8 @@ class SlackIngressAccount extends Context.Service<
     return Layer.succeed(
       SlackIngressAccount,
       SlackIngressAccount.of({
-        ticket: (hostId) => remoteCall(() => options.issueTicket(hostId)),
-        route: (hostId) => remoteCall(() => options.issueSlackRoute(hostId)),
+        ticket: (hostId) => options.issueTicket(hostId),
+        route: (hostId) => options.issueSlackRoute(hostId),
       }),
     );
   }
@@ -58,8 +58,8 @@ class SlackIngressAccount extends Context.Service<
 export class SlackIngress implements MessagingIngress {
   readonly #options: SlackIngressOptions;
   readonly #runtime: ManagedRuntime.ManagedRuntime<SlackIngressAccount, never>;
-  readonly #operations = new Set<Promise<unknown>>();
-  #disposing: Promise<void> | null = null;
+  readonly #scope = Scope.makeUnsafe();
+  #disposing = false;
   readonly #listeners = new Set<(state: IngressState) => void>();
   #holders = 0;
   #state: IngressState = "unavailable";
@@ -77,7 +77,7 @@ export class SlackIngress implements MessagingIngress {
 
   acquire(): () => void {
     this.#holders += 1;
-    if (this.#holders === 1) void this.#open();
+    if (this.#holders === 1) this.#run(this.#open());
     let released = false;
     return () => {
       if (released) return;
@@ -107,25 +107,20 @@ export class SlackIngress implements MessagingIngress {
   reconnect(): void {
     if (this.#holders === 0) return;
     this.#close();
-    void this.#open();
+    this.#run(this.#open());
   }
 
-  dispose(): Promise<void> {
+  readonly dispose = Effect.fn("SlackIngress.dispose")(function* (this: SlackIngress) {
+    this.#disposing = true;
     this.#holders = 0;
     this.#close();
     this.#listeners.clear();
-    this.#disposing ??= (async () => {
-      await Promise.allSettled([...this.#operations]);
-      await this.#runtime.dispose();
-    })();
-    return this.#disposing;
-  }
+    yield* Scope.close(this.#scope, Exit.void);
+    yield* this.#runtime.disposeEffect;
+  }, Effect.uninterruptible);
 
-  #open(): Promise<void> {
-    if (this.#disposing) return Promise.resolve();
-    return this.#run(this.#openEffect());
-  }
-  readonly #openEffect = Effect.fn("SlackIngress.open")(function* (this: SlackIngress) {
+  readonly #open = Effect.fn("SlackIngress.open")(function* (this: SlackIngress) {
+    if (this.#disposing) return;
     const generation = ++this.#generation;
     this.#clearRetry();
     const hostId = this.#options.hostId();
@@ -154,7 +149,7 @@ export class SlackIngress implements MessagingIngress {
       };
       socket.send(JSON.stringify(hello));
     });
-    socket.on("message", (data) => void this.#receive(socket, data.toString()));
+    socket.on("message", (data) => this.#run(this.#receive(socket, data.toString())));
     socket.on("pong", () => pongs.set(socket, true));
     socket.on("close", () => {
       if (socket !== this.#socket) return;
@@ -167,15 +162,12 @@ export class SlackIngress implements MessagingIngress {
     });
   });
 
-  #receive(socket: WebSocket, text: string): Promise<void> {
-    if (this.#disposing || socket !== this.#socket) return Promise.resolve();
-    return this.#run(this.#receiveEffect(socket, text));
-  }
-  readonly #receiveEffect = Effect.fn("SlackIngress.receive")(function* (
+  readonly #receive = Effect.fn("SlackIngress.receive")(function* (
     this: SlackIngress,
     socket: WebSocket,
     text: string,
   ) {
+    if (this.#disposing || socket !== this.#socket) return;
     const decoded = yield* remoteDecode(() => decodeSignalServerMessage(JSON.parse(text))).pipe(Effect.result);
     if (Result.isFailure(decoded)) {
       socket.close(1002);
@@ -197,13 +189,11 @@ export class SlackIngress implements MessagingIngress {
     if (message.type !== "slack-delivery") return;
     const handler = this.#handler;
     const answer: IngressAnswer = handler
-      ? yield* remoteCall(() =>
-          handler(message.teamId, {
-            kind: message.kind,
-            retryNum: message.retryNum,
-            body: Buffer.from(message.bodyBase64, "base64"),
-          }),
-        ).pipe(Effect.catch(() => Effect.succeed<IngressAnswer>({ status: 503 })))
+      ? yield* handler(message.teamId, {
+          kind: message.kind,
+          retryNum: message.retryNum,
+          body: Buffer.from(message.bodyBase64, "base64"),
+        }).pipe(Effect.catch(() => Effect.succeed<IngressAnswer>({ status: 503 })))
       : { status: 503 };
     if (socket.readyState !== WebSocket.OPEN) return;
     const body =
@@ -220,17 +210,11 @@ export class SlackIngress implements MessagingIngress {
     socket.send(JSON.stringify(result));
   });
 
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, SlackIngressAccount>): Promise<A> {
-    const pending = this.#runtime.runPromise(Effect.result(operation)).then((result) => {
-      if (Result.isFailure(result)) throw result.failure.cause;
-      return result.success;
-    });
-    this.#operations.add(pending);
-    const clear = () => {
-      this.#operations.delete(pending);
-    };
-    void pending.then(clear, clear);
-    return pending;
+  #run(operation: Effect.Effect<void, never, SlackIngressAccount>): void {
+    if (this.#disposing) return;
+    this.#runtime.runFork(
+      operation.pipe(Effect.uninterruptible, Effect.forkIn(this.#scope, { startImmediately: true })),
+    );
   }
 
   #wait(state: Exclude<IngressState, "online" | "connecting">): void {
@@ -240,7 +224,7 @@ export class SlackIngress implements MessagingIngress {
     this.#backoffMs = Math.min(this.#backoffMs * 2, BACKOFF_LIMIT_MS);
     this.#retry = setTimeout(() => {
       this.#retry = null;
-      void this.#open();
+      this.#run(this.#open());
     }, delay);
   }
 

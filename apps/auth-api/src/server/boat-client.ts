@@ -1,6 +1,5 @@
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { Context, Effect, Layer, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 
 const BOAT_API_URL = "https://boat.dev/api/v1";
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -120,102 +119,102 @@ export class BoatClient {
     env: Record<string, string>;
     ttlSeconds: number;
     idempotencyKey: string;
-  }): Promise<BoatSandbox> {
-    return this.#run(
-      boatRequest("POST", "/sandboxes", {
-        body: {
-          type: input.type,
-          from: input.from,
-          env: input.env,
-          noEnv: true,
-          ttlSeconds: input.ttlSeconds,
-          setupScript: HOSTED_SERVER_SETUP_SCRIPT,
-        },
-        headers: { "Idempotency-Key": input.idempotencyKey },
-      }).pipe(Effect.flatMap(parseSandbox)),
-    );
+  }) {
+    return boatRequest("POST", "/sandboxes", {
+      body: {
+        type: input.type,
+        from: input.from,
+        env: input.env,
+        noEnv: true,
+        ttlSeconds: input.ttlSeconds,
+        setupScript: HOSTED_SERVER_SETUP_SCRIPT,
+      },
+      headers: { "Idempotency-Key": input.idempotencyKey },
+    })
+      .pipe(Effect.flatMap(parseSandbox))
+      .pipe(Effect.provide(this.#transport));
   }
 
-  getSandbox(sandboxId: string): Promise<BoatSandbox> {
-    return this.#run(
-      boatRequest("GET", `/sandboxes/${encodeURIComponent(sandboxId)}`).pipe(Effect.flatMap(parseSandbox)),
-    );
+  getSandbox(sandboxId: string) {
+    return boatRequest("GET", `/sandboxes/${encodeURIComponent(sandboxId)}`)
+      .pipe(Effect.flatMap(parseSandbox))
+      .pipe(Effect.provide(this.#transport));
   }
 
   /** Restore the saved disk; boat refuses a smaller machine that cannot hold it. */
-  resumeSandbox(sandboxId: string, ttlSeconds: number, type?: BoatSandboxType): Promise<void> {
-    return this.#run(
-      boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/resume`, {
-        body: type === undefined ? { ttlSeconds } : { ttlSeconds, type },
-      }).pipe(Effect.asVoid),
-    );
+  resumeSandbox(sandboxId: string, ttlSeconds: number, type?: BoatSandboxType) {
+    return boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/resume`, {
+      body: type === undefined ? { ttlSeconds } : { ttlSeconds, type },
+    })
+      .pipe(Effect.asVoid)
+      .pipe(Effect.provide(this.#transport));
   }
 
-  extendSandbox(sandboxId: string, ttlSeconds: number): Promise<void> {
-    return this.#run(
-      boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { ttlSeconds } }).pipe(Effect.asVoid),
-    );
+  extendSandbox(sandboxId: string, ttlSeconds: number) {
+    return boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { ttlSeconds } })
+      .pipe(Effect.asVoid)
+      .pipe(Effect.provide(this.#transport));
   }
 
-  renameSandbox(sandboxId: string, name: string): Promise<void> {
-    return this.#run(
-      boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { name } }).pipe(Effect.asVoid),
-    );
+  renameSandbox(sandboxId: string, name: string) {
+    return boatRequest("PATCH", `/sandboxes/${encodeURIComponent(sandboxId)}`, { body: { name } })
+      .pipe(Effect.asVoid)
+      .pipe(Effect.provide(this.#transport));
   }
 
   /** Boat saves the disk before stopping. A failed save must not force a stop. */
-  stopSandbox(sandboxId: string): Promise<void> {
-    return this.#run(
-      boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/stop`, { body: {} }).pipe(Effect.asVoid),
-    );
+  stopSandbox(sandboxId: string) {
+    return boatRequest("POST", `/sandboxes/${encodeURIComponent(sandboxId)}/stop`, { body: {} })
+      .pipe(Effect.asVoid)
+      .pipe(Effect.provide(this.#transport));
   }
 
   /** A sandbox that is already gone counts as deleted. */
-  deleteSandbox(sandboxId: string): Promise<void> {
-    return this.#run(
-      boatRequest("DELETE", `/sandboxes/${encodeURIComponent(sandboxId)}`, {
-        headers: { "X-Ascii-Confirm-Delete": sandboxId },
-      }).pipe(
+  deleteSandbox(sandboxId: string) {
+    return boatRequest("DELETE", `/sandboxes/${encodeURIComponent(sandboxId)}`, {
+      headers: { "X-Ascii-Confirm-Delete": sandboxId },
+    })
+      .pipe(
         Effect.asVoid,
         Effect.catch((error) => (error.status === 404 ? Effect.void : Effect.fail(error))),
-      ),
-    );
-  }
-
-  #run<A>(operation: Effect.Effect<A, BoatApiError, BoatTransport>): Promise<A> {
-    return runApiEffect(operation.pipe(Effect.provide(this.#transport)));
+      )
+      .pipe(Effect.provide(this.#transport));
   }
 }
 
 export const isBoatState = Schema.is(BoatSandboxState);
 
 /** Checks a boat webhook signature: hex HMAC-SHA256 of `delivery.timestamp.body`. */
-export async function verifyBoatWebhookSignature(input: {
+export const verifyBoatWebhookSignature = Effect.fn("verifyBoatWebhookSignature")(function* (input: {
   secret: string;
   deliveryId: string;
   timestamp: string;
   signature: string;
   body: string;
   now: number;
-}): Promise<boolean> {
+}) {
   const seconds = Number(input.timestamp);
   if (!Number.isInteger(seconds) || Math.abs(input.now - seconds * 1_000) > 5 * 60_000) return false;
   const provided = input.signature.startsWith("v1=") ? input.signature.slice(3) : "";
   if (!/^[0-9a-f]{64}$/iu.test(provided)) return false;
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(input.secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
+  const key = yield* Effect.tryPromise({
+    try: () =>
+      crypto.subtle.importKey("raw", new TextEncoder().encode(input.secret), { name: "HMAC", hash: "SHA-256" }, false, [
+        "verify",
+      ]),
+    catch: () => new BoatApiError(502, "signature_verification_failed"),
+  });
   const bytes = new Uint8Array(32);
   for (let index = 0; index < 32; index += 1)
     bytes[index] = Number.parseInt(provided.slice(index * 2, index * 2 + 2), 16);
-  return crypto.subtle.verify(
-    "HMAC",
-    key,
-    bytes,
-    new TextEncoder().encode(`${input.deliveryId}.${input.timestamp}.${input.body}`),
-  );
-}
+  return yield* Effect.tryPromise({
+    try: () =>
+      crypto.subtle.verify(
+        "HMAC",
+        key,
+        bytes,
+        new TextEncoder().encode(`${input.deliveryId}.${input.timestamp}.${input.body}`),
+      ),
+    catch: () => new BoatApiError(502, "signature_verification_failed"),
+  });
+});

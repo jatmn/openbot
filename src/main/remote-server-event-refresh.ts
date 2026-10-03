@@ -17,12 +17,12 @@
 
 import type { AgentEvent } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
-import { Effect, Result } from "effect";
+import { Deferred, Effect, Result } from "effect";
 import { decodeAgentSummaries, decodeQueueSnapshot } from "./remote-agent-decoding";
 import { decodeConversationPageFromHost } from "./remote-conversation-decoding";
 import type { RemoteRequestFn } from "./remote-server-client";
 import { addRemotePreviewUrls, pageQuery } from "./remote-server-urls";
-import { RemoteRequest, type RemoteWorkflowError, runRemoteWorkflow } from "./remote-service-effects";
+import type { RemoteWorkflowError } from "./remote-service-effects";
 
 // One in-flight conversation refetch, and the newest revision asked for while it was running.
 // `sequence` counts announcements that did not move the revision: a read on another device changes
@@ -55,7 +55,7 @@ export class RemoteEventRefresh {
   readonly #conversations = new Map<string, ConversationRefresh>();
   readonly #queues = new Map<string, QueueRefresh>();
   readonly #generations = new Map<string, number>();
-  readonly #rosterLoads = new Map<string, Promise<void>>();
+  readonly #rosterLoads = new Map<string, Deferred.Deferred<void, RemoteWorkflowError>>();
 
   constructor(options: RemoteEventRefreshOptions) {
     this.#request = options.request;
@@ -68,37 +68,36 @@ export class RemoteEventRefresh {
    * goes straight out. `bufferedLive` marks an event that arrived while the fallback was loading,
    * so the renderer can tell it apart from the snapshot it is patching.
    */
-  forward(serverId: string, event: AgentEvent, bufferedLive = false): void {
+  readonly forward = Effect.fn("RemoteEvents.forward")(function* (
+    this: RemoteEventRefresh,
+    serverId: string,
+    event: AgentEvent,
+    bufferedLive = false,
+  ) {
     this.#advance(serverId);
     if (event.type === "agents-changed") this.#rosterLoads.delete(serverId);
     if (event.type === "conversation-invalidated") {
-      void this.#refreshConversationPage(serverId, event.agentId, event.revision);
+      yield* this.#refreshConversationPage(serverId, event.agentId, event.revision);
     } else if (event.type === "queue-invalidated") {
-      void this.#refreshQueue(serverId, event.agentId);
+      yield* this.#refreshQueue(serverId, event.agentId);
     } else {
       const remoteEvent = addRemotePreviewUrls(event, serverId);
       if (bufferedLive) this.#emit(serverId, remoteEvent, true);
       else this.#emit(serverId, remoteEvent);
     }
-  }
+  }).bind(this);
 
   /**
    * Builds the current state from scratch, for a host that cannot replay what was missed. One agent
    * failing is not the server failing, so each is caught on its own.
    */
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, RemoteRequest>): Promise<A> {
-    return runRemoteWorkflow(operation.pipe(Effect.provide(RemoteRequest.layer(this.#request))));
-  }
 
-  refreshAgentState(serverId: string): Promise<void> {
-    return this.#run(this.refreshAgentStateEffect(serverId));
-  }
-  readonly refreshAgentStateEffect = Effect.fn("RemoteEvents.refreshAgentState")(function* (
+  readonly refreshAgentState = Effect.fn("RemoteEvents.refreshAgentState")(function* (
     this: RemoteEventRefresh,
     serverId: string,
   ) {
     const generation = this.#advance(serverId);
-    const request = yield* RemoteRequest;
+    const request = { request: this.#request };
     const agents = yield* request.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries);
     if (this.#generations.get(serverId) !== generation) return;
     this.#emit(serverId, { type: "agents-changed", agents });
@@ -120,30 +119,30 @@ export class RemoteEventRefresh {
         }).pipe(Effect.catch(() => Effect.void)),
       { concurrency: "unbounded", discard: true },
     );
-  });
+  }).bind(this);
 
-  /** A shared Promise retains coalescing and generation identity for native event callers. */
-  refreshAgentRoster(serverId: string): Promise<void> {
+  /** Shared admission keeps a roster response bound to its generation. */
+  readonly refreshAgentRoster = Effect.fn("RemoteEvents.refreshAgentRoster")(function* (
+    this: RemoteEventRefresh,
+    serverId: string,
+  ) {
     const pending = this.#rosterLoads.get(serverId);
-    if (pending) return pending;
-    const operation = this.#run(
-      Effect.gen({ self: this }, function* () {
-        const agents = yield* RemoteRequest.use((service) =>
-          service.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries),
-        );
-        if (this.#rosterLoads.get(serverId) !== operation || !this.#hasServer(serverId)) return;
-        this.#emit(serverId, { type: "agents-changed", agents });
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (this.#rosterLoads.get(serverId) === operation) this.#rosterLoads.delete(serverId);
-          }),
-        ),
+    if (pending) return yield* Deferred.await(pending);
+    const operation = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    this.#rosterLoads.set(serverId, operation);
+    yield* Effect.gen({ self: this }, function* () {
+      const agents = yield* this.#request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries);
+      if (this.#rosterLoads.get(serverId) !== operation || !this.#hasServer(serverId)) return;
+      this.#emit(serverId, { type: "agents-changed", agents });
+    }).pipe(
+      Effect.onExit((exit) => Deferred.done(operation, exit)),
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (this.#rosterLoads.get(serverId) === operation) this.#rosterLoads.delete(serverId);
+        }),
       ),
     );
-    this.#rosterLoads.set(serverId, operation);
-    return operation;
-  }
+  }).bind(this);
 
   forget(serverId: string): void {
     this.#rosterLoads.delete(serverId);
@@ -163,10 +162,7 @@ export class RemoteEventRefresh {
     this.#queues.clear();
   }
 
-  #refreshConversationPage(serverId: string, agentId: string, revision: number): Promise<void> {
-    return this.#run(this.#refreshConversationPageEffect(serverId, agentId, revision));
-  }
-  readonly #refreshConversationPageEffect = Effect.fn("RemoteEvents.refreshConversationPage")(function* (
+  readonly #refreshConversationPage = Effect.fn("RemoteEvents.refreshConversationPage")(function* (
     this: RemoteEventRefresh,
     serverId: string,
     agentId: string,
@@ -209,10 +205,7 @@ export class RemoteEventRefresh {
     );
   });
 
-  #refreshQueue(serverId: string, agentId: string): Promise<void> {
-    return this.#run(this.#refreshQueueEffect(serverId, agentId));
-  }
-  readonly #refreshQueueEffect = Effect.fn("RemoteEvents.refreshQueue")(function* (
+  readonly #refreshQueue = Effect.fn("RemoteEvents.refreshQueue")(function* (
     this: RemoteEventRefresh,
     serverId: string,
     agentId: string,
@@ -228,9 +221,9 @@ export class RemoteEventRefresh {
     yield* Effect.gen({ self: this }, function* () {
       do {
         request.dirty = false;
-        const result = yield* RemoteRequest.use((service) =>
-          service.request(serverId, TEAM_API_ROUTES.agent.queue(agentId), decodeQueueSnapshot),
-        ).pipe(Effect.result);
+        const result = yield* this.#request(serverId, TEAM_API_ROUTES.agent.queue(agentId), decodeQueueSnapshot).pipe(
+          Effect.result,
+        );
         if (Result.isFailure(result)) {
           if (request.dirty) continue;
           return;
@@ -249,12 +242,10 @@ export class RemoteEventRefresh {
 
   readonly #conversationPageEffect = Effect.fn("RemoteEvents.conversationPage")(
     (serverId: string, agentId: string, limit: number) =>
-      RemoteRequest.use((service) =>
-        service.request(
-          serverId,
-          `${TEAM_API_ROUTES.agent.conversationPage(agentId)}${pageQuery({ type: "latest" }, limit)}`,
-          decodeConversationPageFromHost,
-        ),
+      this.#request(
+        serverId,
+        `${TEAM_API_ROUTES.agent.conversationPage(agentId)}${pageQuery({ type: "latest" }, limit)}`,
+        decodeConversationPageFromHost,
       ),
   );
 

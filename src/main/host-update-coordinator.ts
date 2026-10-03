@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import type { HostUpdateState } from "../../packages/contracts/src/host-manager";
 import { restartActivityGeneration } from "../backend/restart-activity";
 import {
@@ -8,10 +8,10 @@ import {
   HOST_MANAGER_DIRECTORY,
   HOST_POLL_MS,
   hostStateSchema,
-  readHostConfigEffect,
-  readOwnedJsonEffect,
-  verifyTenantDirectoryEffect,
-  writeProtocolJsonEffect,
+  readHostConfig,
+  readOwnedJson,
+  verifyTenantDirectory,
+  writeProtocolJson,
 } from "./host-update-files";
 import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
 import type { RestartReadiness } from "./update-readiness";
@@ -25,7 +25,7 @@ interface HostUpdateCoordinatorOptions {
   currentVersion: string;
   now?: () => number;
   describeReadiness: () => RestartReadiness;
-  checkHealth: () => Promise<{ ok: boolean; checks: string[] }>;
+  checkHealth: () => Effect.Effect<{ ok: boolean; checks: string[] }, RemoteWorkflowError>;
   setManagedByHost: (managed: boolean) => void;
   setHostState?: (state: HostUpdateState) => void;
   onDiagnostic?: (message: string) => void;
@@ -35,7 +35,7 @@ interface HostUpdateCoordinatorOptions {
 export class HostUpdateCoordinator {
   readonly #options: HostUpdateCoordinatorOptions;
   #timer: ReturnType<typeof setInterval> | null = null;
-  #pending: Promise<void> | null = null;
+  #pending: Deferred.Deferred<void, RemoteWorkflowError> | null = null;
   #stopHandler: (() => Promise<void>) | null = null;
   #stopRequested = false;
   #idleSince: number | null = null;
@@ -49,35 +49,40 @@ export class HostUpdateCoordinator {
     if ((this.#options.platform ?? process.platform) !== "darwin") return;
     if (this.#timer) return;
     this.#timer = setInterval(() => {
-      void this.tick().catch(() =>
+      void runRemoteWorkflow(this.tick()).catch(() =>
         this.#options.onDiagnostic?.("Host status exchange failed. Contact the host administrator."),
       );
     }, HOST_POLL_MS);
     this.#timer.unref();
   }
 
-  async stop(): Promise<void> {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = null;
-    // Do not wait on #pending: the stop handler itself enters application teardown.
+  stop(): Effect.Effect<void> {
+    return Effect.sync(() => {
+      if (this.#timer) clearInterval(this.#timer);
+      this.#timer = null;
+      // The stop handler enters teardown, so waiting on its own tick would deadlock.
+    });
   }
 
   setStopHandler(handler: () => Promise<void>): void {
     this.#stopHandler = handler;
   }
 
-  tick(): Promise<void> {
-    if (this.#pending) return this.#pending;
-    this.#pending = this.#tick().finally(() => {
-      this.#pending = null;
-    });
-    return this.#pending;
-  }
+  readonly tick = Effect.fn("HostCoordinator.tick")(function* (this: HostUpdateCoordinator) {
+    if (this.#pending) return yield* Deferred.await(this.#pending);
+    const pending = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    this.#pending = pending;
+    yield* this.#exchange().pipe(
+      Effect.onExit((exit) =>
+        Effect.gen({ self: this }, function* () {
+          yield* Deferred.done(pending, exit);
+          this.#pending = null;
+        }),
+      ),
+    );
+  });
 
-  #tick(): Promise<void> {
-    return runRemoteWorkflow(this.#tickEffect());
-  }
-  readonly #tickEffect = Effect.fn("HostCoordinator.tick")(function* (
+  readonly #exchange = Effect.fn("HostCoordinator.exchange")(function* (
     this: HostUpdateCoordinator,
   ): Effect.fn.Return<void, RemoteWorkflowError> {
     if ((this.#options.platform ?? process.platform) !== "darwin") {
@@ -86,7 +91,7 @@ export class HostUpdateCoordinator {
     }
     const directory = this.#options.directory ?? HOST_MANAGER_DIRECTORY;
     const hostUid = this.#options.hostUid ?? 0;
-    const config = yield* readHostConfigEffect(directory, hostUid).pipe(
+    const config = yield* readHostConfig(directory, hostUid).pipe(
       Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })),
     );
     const managed = config?.managed === true;
@@ -96,10 +101,10 @@ export class HostUpdateCoordinator {
       return;
     }
     if (!config.tenants.includes(this.#options.uid)) return;
-    const tenantDirectory = yield* verifyTenantDirectoryEffect(directory, this.#options.uid, hostUid).pipe(
+    const tenantDirectory = yield* verifyTenantDirectory(directory, this.#options.uid, hostUid).pipe(
       Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })),
     );
-    const state = yield* readOwnedJsonEffect(join(directory, "state.json"), hostUid, hostStateSchema).pipe(
+    const state = yield* readOwnedJson(join(directory, "state.json"), hostUid, hostStateSchema).pipe(
       Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })),
     );
     this.#options.setHostState?.(state);
@@ -110,8 +115,8 @@ export class HostUpdateCoordinator {
     const readiness = this.#options.describeReadiness();
     if (!readiness.safeToRestart) this.#idleSince = null;
     else this.#idleSince ??= now;
-    const health = yield* remoteCall(() => this.#options.checkHealth());
-    yield* writeProtocolJsonEffect(join(tenantDirectory, "status.json"), {
+    const health = yield* this.#options.checkHealth();
+    yield* writeProtocolJson(join(tenantDirectory, "status.json"), {
       uid: this.#options.uid,
       pid: this.#options.pid,
       currentVersion: this.#options.currentVersion,
@@ -151,14 +156,11 @@ export class HostUpdateCoordinator {
 }
 
 /** Called before tenant services start, so login items cannot start work during replacement. */
-export function hostAllowsTenantLaunch(): Promise<boolean> {
-  return runRemoteWorkflow(hostAllowsTenantLaunchEffect());
-}
-export const hostAllowsTenantLaunchEffect = Effect.fn("HostCoordinator.allowsLaunch")(function* () {
+export const hostAllowsTenantLaunch = Effect.fn("HostCoordinator.allowsLaunch")(function* () {
   if (process.platform !== "darwin") return true;
-  const config = yield* readHostConfigEffect().pipe(Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })));
+  const config = yield* readHostConfig().pipe(Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })));
   if (!config?.managed) return true;
-  const state = yield* readOwnedJsonEffect(join(HOST_MANAGER_DIRECTORY, "state.json"), 0, hostStateSchema).pipe(
+  const state = yield* readOwnedJson(join(HOST_MANAGER_DIRECTORY, "state.json"), 0, hostStateSchema).pipe(
     Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })),
   );
   return !["stopping", "installing", "failed"].includes(state.phase);

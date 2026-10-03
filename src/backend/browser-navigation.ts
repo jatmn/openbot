@@ -1,7 +1,7 @@
 import type { BrowserTarget } from "@openbot/contracts/ipc";
 import { Effect } from "effect";
 import type { WebContents } from "electron";
-import { type BrowserOperationError, browserFailure, runBrowserEffect } from "./browser-effects";
+import { type BrowserOperationError, browserFailure, browserSync } from "./browser-effects";
 
 const NAVIGATION_TIMED_OUT = "Navigation timed out.";
 const TAB_CLOSED = "Browser tab was closed during navigation.";
@@ -15,22 +15,16 @@ export function navigateAndWait(
   contents: WebContents,
   initiate: () => boolean | Promise<unknown>,
   timeoutMs = 10_000,
-): Promise<void> {
-  return runBrowserEffect(watchNavigation(contents, initiate, timeoutMs));
+): Effect.Effect<void, BrowserOperationError> {
+  return watchNavigation(contents, initiate, timeoutMs);
 }
 
 /** Waits for a load that already started, such as one from CDP `Page.navigate`. */
-export function waitForLoading(contents: WebContents, timeoutMs: number): Promise<void> {
-  if (!contents.isLoading()) return Promise.resolve();
-  return runBrowserEffect(watchNavigation(contents, undefined, timeoutMs));
+export function waitForLoading(contents: WebContents, timeoutMs: number): Effect.Effect<void, BrowserOperationError> {
+  return Effect.suspend(() => (contents.isLoading() ? watchNavigation(contents, undefined, timeoutMs) : Effect.void));
 }
 
-export function stopLoadingAndWait(contents: WebContents): Promise<void> {
-  if (!contents.isLoading()) return Promise.resolve();
-  return runBrowserEffect(stopLoadingAndWaitEffect(contents));
-}
-
-export const stopLoadingAndWaitEffect = Effect.fn("Browser.stopLoadingAndWait")((contents: WebContents) => {
+export const stopLoadingAndWait = Effect.fn("Browser.stopLoadingAndWait")((contents: WebContents) => {
   if (!contents.isLoading()) return Effect.void;
   return Effect.callback<void, BrowserOperationError>((resume) => {
     let settled = false;
@@ -149,7 +143,13 @@ const watchNavigation = Effect.fn("Browser.watchNavigation")(
         finish(error);
       }
       return Effect.sync(cleanup);
-    });
+    }).pipe(
+      Effect.onInterrupt(() =>
+        browserSync(() => {
+          if (!contents.isDestroyed() && contents.isLoading()) contents.stop();
+        }).pipe(Effect.ignore),
+      ),
+    );
   },
 );
 

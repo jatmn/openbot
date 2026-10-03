@@ -5,7 +5,7 @@ import { createOpenBotLogger, registerSecretValue, toLogValue } from "@openbot/l
 import { Effect } from "effect";
 import { z } from "zod";
 import type { GitHubFetch } from "./github-device-flow";
-import { GitHubOperationError, githubCall, githubDecode, runGitHubEffect } from "./github-effects";
+import { GitHubOperationError, githubCall, githubDecode } from "./github-effects";
 
 const logger = createOpenBotLogger("github-bot-tokens");
 
@@ -99,11 +99,8 @@ export class GitHubBotTokens {
    * Replaces the set with the API's answer. A failure keeps the tokens that are still valid and
    * does not reject. An answer that arrives after `clear` is discarded.
    */
-  renew(userToken: string, signal?: AbortSignal): Promise<void> {
-    return runGitHubEffect(this.renewEffect(userToken, signal));
-  }
 
-  readonly renewEffect = Effect.fn("GitHubBotTokens.renew")(function* (
+  readonly renew = Effect.fn("GitHubBotTokens.renew")(function* (
     this: GitHubBotTokens,
     userToken: string,
     signal?: AbortSignal,

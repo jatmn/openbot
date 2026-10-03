@@ -1,10 +1,10 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import type { BrowserElement, BrowserFocus, BrowserSnapshot, BrowserTarget } from "@openbot/contracts/ipc";
+import type { BrowserElement, BrowserSnapshot, BrowserTarget } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
 import {
   assertBeforeDeadline,
-  automationContextIdEffect,
+  automationContextId,
   axValue,
   type CdpResult,
   exceptionDescription,
@@ -16,7 +16,7 @@ import {
   stringValue,
   textMatches,
 } from "./browser-cdp-values";
-import { browserCall, browserFailure, browserSync, runBrowserEffect } from "./browser-effects";
+import { browserFailure, browserSync } from "./browser-effects";
 
 const MAX_SNAPSHOT_ELEMENTS = 200;
 const MAX_SNAPSHOT_CANDIDATES = MAX_SNAPSHOT_ELEMENTS * 2;
@@ -72,17 +72,7 @@ export interface SemanticMatch {
   name: string;
 }
 
-export function collectBoundedSnapshot(
-  send: SendCommand,
-  captures: SnapshotTarget[],
-  revision: number,
-  includeText: boolean,
-  deadline?: number,
-) {
-  return runBrowserEffect(collectBoundedSnapshotEffect(send, captures, revision, includeText, deadline));
-}
-
-export const collectBoundedSnapshotEffect = Effect.fn("Browser.collectBoundedSnapshot")(function* (
+export const collectBoundedSnapshot = Effect.fn("Browser.collectBoundedSnapshot")(function* (
   send: SendCommand,
   captures: SnapshotTarget[],
   revision: number,
@@ -170,12 +160,11 @@ const collectPageSummaryEffect = Effect.fn("Browser.collectPageSummary")(functio
   sessionId: string | undefined,
   maxText: number,
 ) {
-  const contextId = yield* automationContextIdEffect(send, sessionId);
-  const result = yield* browserCall(() =>
-    send(
-      "Runtime.evaluate",
-      {
-        expression: `(() => {
+  const contextId = yield* automationContextId(send, sessionId);
+  const result = yield* send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
         const maxNodes = ${MAX_SNAPSHOT_SCANNED_NODES};
         const maxText = ${maxText};
         const roots = [document];
@@ -254,11 +243,10 @@ const collectPageSummaryEffect = Effect.fn("Browser.collectPageSummary")(functio
         if (text.length > maxText) truncated = true;
         return { text: text.slice(0, maxText), truncated, hasVisualSurface, hasFrame };
       })()`,
-        contextId,
-        returnByValue: true,
-      },
-      sessionId,
-    ),
+      contextId,
+      returnByValue: true,
+    },
+    sessionId,
   );
   const value = recordValue(recordValue(result.result)?.value);
   return {
@@ -269,21 +257,12 @@ const collectPageSummaryEffect = Effect.fn("Browser.collectPageSummary")(functio
   };
 });
 
-// Focus is what `type` writes to when it has no target, and an application that draws its own
-// surface keeps it on a node no semantic target names -- Google Sheets parks it on a hidden editor
-// beside the grid, and on its Name box the moment that box was used. Without this a caller cannot
-// tell the two apart until the data lands in the wrong place.
-export function collectFocus(send: SendCommand, sessionId?: string): Promise<BrowserFocus | null> {
-  return runBrowserEffect(collectFocusEffect(send, sessionId));
-}
-
-export const collectFocusEffect = Effect.fn("Browser.collectFocus")(function* (send: SendCommand, sessionId?: string) {
-  const contextId = yield* automationContextIdEffect(send, sessionId);
-  const result = yield* browserCall(() =>
-    send(
-      "Runtime.evaluate",
-      {
-        expression: `(() => {
+export const collectFocus = Effect.fn("Browser.collectFocus")(function* (send: SendCommand, sessionId?: string) {
+  const contextId = yield* automationContextId(send, sessionId);
+  const result = yield* send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
         let node = document.activeElement;
         let inFrame = false;
         for (let depth = 0; depth < 10 && node; depth += 1) {
@@ -306,11 +285,10 @@ export const collectFocusEffect = Effect.fn("Browser.collectFocus")(function* (s
           inFrame,
         };
       })()`,
-        contextId,
-        returnByValue: true,
-      },
-      sessionId,
-    ),
+      contextId,
+      returnByValue: true,
+    },
+    sessionId,
   );
   const value = recordValue(recordValue(result.result)?.value);
   if (!value) return null;
@@ -323,16 +301,7 @@ export const collectFocusEffect = Effect.fn("Browser.collectFocus")(function* (s
   };
 });
 
-export function pageContainsText(
-  send: SendCommand,
-  captures: SnapshotTarget[],
-  text: string,
-  deadline: number,
-): Promise<boolean> {
-  return runBrowserEffect(pageContainsTextEffect(send, captures, text, deadline));
-}
-
-export const pageContainsTextEffect = Effect.fn("Browser.pageContainsText")(function* (
+export const pageContainsText = Effect.fn("Browser.pageContainsText")(function* (
   send: SendCommand,
   captures: SnapshotTarget[],
   text: string,
@@ -341,12 +310,11 @@ export const pageContainsTextEffect = Effect.fn("Browser.pageContainsText")(func
   for (const capture of captures) {
     yield* browserSync(() => assertBeforeDeadline(deadline));
     const scanBudgetMs = Math.max(1, deadline - Date.now());
-    const contextId = yield* automationContextIdEffect(send, capture.sessionId);
-    const result = yield* browserCall(() =>
-      send(
-        "Runtime.evaluate",
-        {
-          expression: `(() => {
+    const contextId = yield* automationContextId(send, capture.sessionId);
+    const result = yield* send(
+      "Runtime.evaluate",
+      {
+        expression: `(() => {
           const needle = ${JSON.stringify(text)};
           const scanDeadline = performance.now() + ${scanBudgetMs};
           const roots = [document];
@@ -403,12 +371,11 @@ export const pageContainsTextEffect = Effect.fn("Browser.pageContainsText")(func
           }
           return { matched: combined.includes(needle), expired: false };
         })()`,
-          contextId,
-          returnByValue: true,
-        },
-        capture.sessionId,
-      ).catch(() => null),
-    );
+        contextId,
+        returnByValue: true,
+      },
+      capture.sessionId,
+    ).pipe(Effect.catch(() => Effect.succeed(null)));
     yield* browserSync(() => assertBeforeDeadline(deadline));
     const value = recordValue(recordValue(result?.result)?.value);
     if (value?.expired === true) return yield* browserFailure(new Error("Browser wait condition timed out."));
@@ -417,25 +384,16 @@ export const pageContainsTextEffect = Effect.fn("Browser.pageContainsText")(func
   return false;
 });
 
-export function cssObjectMatch(
-  send: SendCommand,
-  selector: string,
-  sessionId?: string,
-): Promise<{ objectId?: string; ambiguous: boolean }> {
-  return runBrowserEffect(cssObjectMatchEffect(send, selector, sessionId));
-}
-
-export const cssObjectMatchEffect = Effect.fn("Browser.cssObjectMatch")(function* (
+export const cssObjectMatch = Effect.fn("Browser.cssObjectMatch")(function* (
   send: SendCommand,
   selector: string,
   sessionId?: string,
 ) {
-  const contextId = yield* automationContextIdEffect(send, sessionId);
-  const collection = yield* browserCall(() =>
-    send(
-      "Runtime.evaluate",
-      {
-        expression: `(() => {
+  const contextId = yield* automationContextId(send, sessionId);
+  const collection = yield* send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
         const selector = ${JSON.stringify(selector)};
         const roots = [document];
         const seen = new Set();
@@ -470,41 +428,36 @@ export const cssObjectMatchEffect = Effect.fn("Browser.cssObjectMatch")(function
         if (truncated && matches.length < 2) throw new Error('CSS selector uniqueness scan exceeded the safe node limit.');
         return matches;
       })()`,
-        contextId,
-        returnByValue: false,
-      },
-      sessionId,
-    ),
+      contextId,
+      returnByValue: false,
+    },
+    sessionId,
   );
   const exception = recordValue(collection.exceptionDetails);
   if (exception) return yield* browserFailure(new Error(exceptionDescription(exception)));
   const collectionId = stringValue(recordValue(collection.result)?.objectId);
   if (!collectionId) return { ambiguous: false };
   return yield* Effect.gen(function* () {
-    const lengthResult = yield* browserCall(() =>
-      send(
-        "Runtime.callFunctionOn",
-        {
-          objectId: collectionId,
-          functionDeclaration: "function() { return this.length; }",
-          returnByValue: true,
-        },
-        sessionId,
-      ),
+    const lengthResult = yield* send(
+      "Runtime.callFunctionOn",
+      {
+        objectId: collectionId,
+        functionDeclaration: "function() { return this.length; }",
+        returnByValue: true,
+      },
+      sessionId,
     );
     const length = numberValue(recordValue(lengthResult.result)?.value);
     if (length === 0) return { ambiguous: false };
     if (length > 1) return { ambiguous: true };
-    const element = yield* browserCall(() =>
-      send(
-        "Runtime.callFunctionOn",
-        {
-          objectId: collectionId,
-          functionDeclaration: "function() { return this[0]; }",
-          returnByValue: false,
-        },
-        sessionId,
-      ),
+    const element = yield* send(
+      "Runtime.callFunctionOn",
+      {
+        objectId: collectionId,
+        functionDeclaration: "function() { return this[0]; }",
+        returnByValue: false,
+      },
+      sessionId,
     );
     const objectId = stringValue(recordValue(element.result)?.objectId);
     if (!objectId) return yield* browserFailure(new Error(`Unable to resolve CSS selector: ${selector}`));
@@ -512,25 +465,13 @@ export const cssObjectMatchEffect = Effect.fn("Browser.cssObjectMatch")(function
   }).pipe(
     Effect.ensuring(
       Effect.gen(function* () {
-        yield* browserCall(() =>
-          send("Runtime.releaseObject", { objectId: collectionId }, sessionId).catch(() => undefined),
-        );
+        yield* send("Runtime.releaseObject", { objectId: collectionId }, sessionId).pipe(Effect.ignore);
       }).pipe(Effect.orDie),
     ),
   );
 });
 
-export function semanticAxMatches(
-  send: SendCommand,
-  capture: SnapshotTarget,
-  target: Extract<BrowserTarget, { kind: "role" | "text" }>,
-  allowNonActionableRole: boolean,
-  deadline?: number,
-): Promise<SemanticMatch[]> {
-  return runBrowserEffect(semanticAxMatchesEffect(send, capture, target, allowNonActionableRole, deadline));
-}
-
-export const semanticAxMatchesEffect = Effect.fn("Browser.semanticAxMatches")(function* (
+export const semanticAxMatches = Effect.fn("Browser.semanticAxMatches")(function* (
   send: SendCommand,
   capture: SnapshotTarget,
   target: Extract<BrowserTarget, { kind: "role" | "text" }>,
@@ -538,12 +479,12 @@ export const semanticAxMatchesEffect = Effect.fn("Browser.semanticAxMatches")(fu
   deadline?: number,
 ) {
   yield* browserSync(() => assertBeforeDeadline(deadline));
-  yield* browserCall(() => send("Accessibility.enable", {}, capture.sessionId));
+  yield* send("Accessibility.enable", {}, capture.sessionId);
   const matches: SemanticMatch[] = [];
   const seen = new Set<number>();
-  const frameTree = yield* browserCall(() => send("Page.getFrameTree", {}, capture.sessionId));
+  const frameTree = yield* send("Page.getFrameTree", {}, capture.sessionId);
   for (const frameId of frameIds(frameTree)) {
-    const tree = yield* browserCall(() => send("Accessibility.getFullAXTree", { frameId }, capture.sessionId));
+    const tree = yield* send("Accessibility.getFullAXTree", { frameId }, capture.sessionId);
     yield* browserSync(() => assertBeforeDeadline(deadline));
     for (const node of Array.isArray(tree.nodes) ? tree.nodes.filter(isRecord) : []) {
       if (node.ignored === true) continue;
@@ -574,28 +515,18 @@ export const semanticAxMatchesEffect = Effect.fn("Browser.semanticAxMatches")(fu
   return matches;
 });
 
-export function visibleTextObjectMatches(
-  send: SendCommand,
-  capture: SnapshotTarget,
-  target: Extract<BrowserTarget, { kind: "text" }>,
-  deadline?: number,
-): Promise<string[]> {
-  return runBrowserEffect(visibleTextObjectMatchesEffect(send, capture, target, deadline));
-}
-
-export const visibleTextObjectMatchesEffect = Effect.fn("Browser.visibleTextObjectMatches")(function* (
+export const visibleTextObjectMatches = Effect.fn("Browser.visibleTextObjectMatches")(function* (
   send: SendCommand,
   capture: SnapshotTarget,
   target: Extract<BrowserTarget, { kind: "text" }>,
   deadline?: number,
 ) {
   yield* browserSync(() => assertBeforeDeadline(deadline));
-  const contextId = yield* automationContextIdEffect(send, capture.sessionId);
-  const collection = yield* browserCall(() =>
-    send(
-      "Runtime.evaluate",
-      {
-        expression: `(() => {
+  const contextId = yield* automationContextId(send, capture.sessionId);
+  const collection = yield* send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
         const roles = new Set(${JSON.stringify([...ACTIONABLE_ROLES])});
         const needle = ${JSON.stringify(target.text.trim().toLocaleLowerCase())};
         const exact = ${target.exact === true};
@@ -655,19 +586,20 @@ export const visibleTextObjectMatchesEffect = Effect.fn("Browser.visibleTextObje
         if (truncated && matches.length < 2) throw new Error('Semantic target uniqueness scan exceeded the safe node limit.');
         return matches;
       })()`,
-        contextId,
-        returnByValue: false,
-      },
-      capture.sessionId,
-    ),
+      contextId,
+      returnByValue: false,
+    },
+    capture.sessionId,
   );
   const exception = recordValue(collection.exceptionDetails);
   if (exception) return yield* browserFailure(new Error(exceptionDescription(exception)));
   const collectionId = stringValue(recordValue(collection.result)?.objectId);
   if (!collectionId) return [];
   return yield* Effect.gen(function* () {
-    const properties = yield* browserCall(() =>
-      send("Runtime.getProperties", { objectId: collectionId, ownProperties: true }, capture.sessionId),
+    const properties = yield* send(
+      "Runtime.getProperties",
+      { objectId: collectionId, ownProperties: true },
+      capture.sessionId,
     );
     return (Array.isArray(properties.result) ? properties.result.filter(isRecord) : [])
       .filter((descriptor) => /^\d+$/.test(stringValue(descriptor.name)))
@@ -678,9 +610,7 @@ export const visibleTextObjectMatchesEffect = Effect.fn("Browser.visibleTextObje
   }).pipe(
     Effect.ensuring(
       Effect.gen(function* () {
-        yield* browserCall(() =>
-          send("Runtime.releaseObject", { objectId: collectionId }, capture.sessionId).catch(() => undefined),
-        );
+        yield* send("Runtime.releaseObject", { objectId: collectionId }, capture.sessionId).pipe(Effect.ignore);
       }).pipe(Effect.orDie),
     ),
   );
@@ -693,15 +623,11 @@ const collectActionableNodesEffect = Effect.fn("Browser.collectActionableNodes")
   deadline?: number,
 ) {
   yield* browserSync(() => assertBeforeDeadline(deadline));
-  yield* Effect.all(
-    [
-      browserCall(() => send("DOM.enable", {}, capture.sessionId)),
-      browserCall(() => send("Accessibility.enable", {}, capture.sessionId)),
-    ],
-    { concurrency: "unbounded" },
-  );
+  yield* Effect.all([send("DOM.enable", {}, capture.sessionId), send("Accessibility.enable", {}, capture.sessionId)], {
+    concurrency: "unbounded",
+  });
   yield* browserSync(() => assertBeforeDeadline(deadline));
-  const contextId = yield* automationContextIdEffect(send, capture.sessionId);
+  const contextId = yield* automationContextId(send, capture.sessionId);
   const results: Array<{
     backendNodeId: number;
     node: CdpResult;
@@ -710,16 +636,14 @@ const collectActionableNodesEffect = Effect.fn("Browser.collectActionableNodes")
     visibleText: string;
   }> = [];
   const batchSize = MAX_SNAPSHOT_ELEMENTS;
-  const collection = yield* browserCall(() =>
-    send(
-      "Runtime.evaluate",
-      {
-        expression: actionableNodesExpression(MAX_SNAPSHOT_CANDIDATES),
-        contextId,
-        returnByValue: false,
-      },
-      capture.sessionId,
-    ),
+  const collection = yield* send(
+    "Runtime.evaluate",
+    {
+      expression: actionableNodesExpression(MAX_SNAPSHOT_CANDIDATES),
+      contextId,
+      returnByValue: false,
+    },
+    capture.sessionId,
   );
   const exception = recordValue(collection.exceptionDetails);
   if (exception) return yield* browserFailure(new Error(exceptionDescription(exception)));
@@ -727,8 +651,10 @@ const collectActionableNodesEffect = Effect.fn("Browser.collectActionableNodes")
   if (!collectionId) return results;
   const objectIds: string[] = [];
   yield* Effect.gen(function* () {
-    const properties = yield* browserCall(() =>
-      send("Runtime.getProperties", { objectId: collectionId, ownProperties: true }, capture.sessionId),
+    const properties = yield* send(
+      "Runtime.getProperties",
+      { objectId: collectionId, ownProperties: true },
+      capture.sessionId,
     );
     const descriptors = Array.isArray(properties.result) ? properties.result.filter(isRecord) : [];
     objectIds.push(
@@ -746,21 +672,17 @@ const collectActionableNodesEffect = Effect.fn("Browser.collectActionableNodes")
           Effect.gen(function* () {
             const [description, partialAxTree, visibleTextResult] = yield* Effect.all(
               [
-                browserCall(() => send("DOM.describeNode", { objectId, depth: 0 }, capture.sessionId)),
-                browserCall(() =>
-                  send("Accessibility.getPartialAXTree", { objectId, fetchRelatives: false }, capture.sessionId),
-                ),
-                browserCall(() =>
-                  send(
-                    "Runtime.callFunctionOn",
-                    {
-                      objectId,
-                      functionDeclaration:
-                        "function() { return String(this.innerText ?? this.textContent ?? '').replace(/\\s+/g, ' ').trim().slice(0, 500); }",
-                      returnByValue: true,
-                    },
-                    capture.sessionId,
-                  ),
+                send("DOM.describeNode", { objectId, depth: 0 }, capture.sessionId),
+                send("Accessibility.getPartialAXTree", { objectId, fetchRelatives: false }, capture.sessionId),
+                send(
+                  "Runtime.callFunctionOn",
+                  {
+                    objectId,
+                    functionDeclaration:
+                      "function() { return String(this.innerText ?? this.textContent ?? '').replace(/\\s+/g, ' ').trim().slice(0, 500); }",
+                    returnByValue: true,
+                  },
+                  capture.sessionId,
                 ),
               ],
               { concurrency: "unbounded" },
@@ -791,11 +713,12 @@ const collectActionableNodesEffect = Effect.fn("Browser.collectActionableNodes")
   }).pipe(
     Effect.ensuring(
       Effect.gen(function* () {
-        yield* browserCall(() =>
-          Promise.allSettled([
+        yield* Effect.all(
+          [
             ...objectIds.map((objectId) => send("Runtime.releaseObject", { objectId }, capture.sessionId)),
             send("Runtime.releaseObject", { objectId: collectionId }, capture.sessionId),
-          ]),
+          ].map((operation) => Effect.exit(operation)),
+          { concurrency: "unbounded" },
         );
       }).pipe(Effect.orDie),
     ),

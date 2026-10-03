@@ -1,5 +1,4 @@
 import { Effect, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 import type { WorkerBindings } from "./types";
 
 const RETRY_AFTER_SECONDS = 60;
@@ -21,7 +20,7 @@ export class MarketplaceRateLimitError extends Schema.TaggedError<MarketplaceRat
 
 class MarketplaceLimiterError extends Schema.TaggedError<MarketplaceLimiterError>()("MarketplaceLimiterError", {}) {}
 
-const enforceIngress = Effect.fn("MarketplacePolicy.enforceIngress")(function* (
+export const enforceMarketplaceIngress = Effect.fn("MarketplacePolicy.enforceMarketplaceIngress")(function* (
   request: Request,
   bindings: Pick<WorkerBindings, "MARKETPLACE_INGRESS_RATE_LIMITER">,
 ) {
@@ -37,14 +36,7 @@ const enforceIngress = Effect.fn("MarketplacePolicy.enforceIngress")(function* (
   if (!result.success) return yield* new MarketplaceRateLimitError();
 });
 
-export function enforceMarketplaceIngress(
-  request: Request,
-  bindings: Pick<WorkerBindings, "MARKETPLACE_INGRESS_RATE_LIMITER">,
-): Promise<void> {
-  return runApiEffect(enforceIngress(request, bindings));
-}
-
-const enforceMutation = Effect.fn("MarketplacePolicy.enforceMutation")(function* (
+export const enforceMarketplaceMutation = Effect.fn("MarketplacePolicy.enforceMarketplaceMutation")(function* (
   bindings: Pick<WorkerBindings, "MARKETPLACE_MUTATION_RATE_LIMITER" | "MARKETPLACE_UPLOAD_RATE_LIMITER">,
   kind: MarketplaceMutationKind,
   principal: string,
@@ -57,14 +49,6 @@ const enforceMutation = Effect.fn("MarketplacePolicy.enforceMutation")(function*
   });
   if (!result.success) return yield* new MarketplaceRateLimitError();
 });
-
-export function enforceMarketplaceMutation(
-  bindings: Pick<WorkerBindings, "MARKETPLACE_MUTATION_RATE_LIMITER" | "MARKETPLACE_UPLOAD_RATE_LIMITER">,
-  kind: MarketplaceMutationKind,
-  principal: string,
-): Promise<void> {
-  return runApiEffect(enforceMutation(bindings, kind, principal));
-}
 
 function isMarketplacePath(pathname: string): boolean {
   return (

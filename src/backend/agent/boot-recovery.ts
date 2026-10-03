@@ -1,4 +1,4 @@
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import type { AgentProvider } from "../agent-client";
 import type { AgentStore } from "../agent-store";
 import { mergeProviderHistory, snapshotFromThread } from "../conversation-snapshots";
@@ -107,11 +107,7 @@ export class BootRecovery {
     }
   }
 
-  reconcileUnresolvedDeliveries(): Promise<void> {
-    return runRecovery(this.reconcileUnresolvedDeliveriesEffect());
-  }
-
-  readonly reconcileUnresolvedDeliveriesEffect = Effect.fn("BootRecovery.reconcileUnresolvedDeliveries")(function* (
+  readonly reconcileUnresolvedDeliveries = Effect.fn("BootRecovery.reconcileUnresolvedDeliveries")(function* (
     this: BootRecovery,
   ) {
     const unresolved = yield* recoveryStep(() => this.#mailbox.unresolvedDeliveries());
@@ -131,9 +127,11 @@ export class BootRecovery {
     for (const context of unresolved) {
       const { delivery } = context;
       if (!this.#orphanedDeliveryIds.delete(delivery.id)) continue;
-      let terminal: "completed" | "failed" | "interrupted" = "interrupted";
-      let reason = "OpenBot restarted before this delivery reached a confirmed terminal state.";
-      yield* Effect.gen({ self: this }, function* () {
+      const interrupted = {
+        terminal: "interrupted" as const,
+        reason: "OpenBot restarted before this delivery reached a confirmed terminal state.",
+      };
+      const { terminal, reason } = yield* Effect.gen({ self: this }, function* () {
         const { agent, client, session } = yield* recoveryStep(() => {
           const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
           const client = agent ? this.#providers.clientForAgent(agent) : null;
@@ -144,11 +142,11 @@ export class BootRecovery {
         });
         if (agent && session && client) {
           const params = yield* this.#threads
-            .threadParamsEffect(agent, client, session.externalSessionId)
+            .threadParams(agent, client, session.externalSessionId)
             .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
-          const response = yield* recoveryIo(() =>
-            client.request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse),
-          );
+          const response = yield* client
+            .request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse)
+            .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
           const batchIds = delivery.turnId ? null : unconfirmedStarts.get(delivery.recipientAgentId);
           const turn = response.thread.turns?.find(
             (candidate) =>
@@ -161,21 +159,22 @@ export class BootRecovery {
               ),
           );
           if (turn && !delivery.turnId) {
-            yield* recoveryIo(() => this.#mailbox.markRunning(delivery.id, turn.id));
+            yield* this.#mailbox
+              .markRunning(delivery.id, turn.id)
+              .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
           }
           if (turn?.status === "completed") {
-            terminal = "completed";
-            reason = "Recovered completed delivery after restart.";
+            return { terminal: "completed" as const, reason: null };
           } else if (turn?.status === "failed") {
-            terminal = "failed";
-            reason = "The recovered Codex turn failed.";
+            return { terminal: "failed" as const, reason: "The recovered Codex turn failed." };
           }
         }
-      }).pipe(Effect.catch(() => Effect.void));
+        return interrupted;
+      }).pipe(Effect.catch(() => Effect.succeed(interrupted)));
       // A failed provider read keeps the conservative interrupted result; never replay side effects.
-      yield* recoveryIo(() =>
-        this.#mailbox.markTerminal(delivery.id, terminal, terminal === "completed" ? null : reason),
-      );
+      yield* this.#mailbox
+        .markTerminal(delivery.id, terminal, reason)
+        .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
       yield* recoveryStep(() => {
         const agent = this.#store.list().find((candidate) => candidate.id === delivery.recipientAgentId);
         const threadId = this.#hooks.deliveryThreadId?.(delivery.id) ?? agent?.threadId;
@@ -226,13 +225,7 @@ export class BootRecovery {
     }
   }
 
-  backfillProviderHistory(): Promise<void> {
-    return runRecovery(this.backfillProviderHistoryEffect());
-  }
-
-  readonly backfillProviderHistoryEffect = Effect.fn("BootRecovery.backfillProviderHistory")(function* (
-    this: BootRecovery,
-  ) {
+  readonly backfillProviderHistory = Effect.fn("BootRecovery.backfillProviderHistory")(function* (this: BootRecovery) {
     for (const agent of yield* recoveryStep(() => this.threads())) {
       const publicThreadId = agent.threadId;
       if (!publicThreadId) continue;
@@ -248,12 +241,12 @@ export class BootRecovery {
           const params =
             session.externalSessionId === active?.externalSessionId
               ? yield* this.#threads
-                  .threadParamsEffect(agent, client, session.externalSessionId)
+                  .threadParams(agent, client, session.externalSessionId)
                   .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })))
               : { threadId: session.externalSessionId };
-          const response = yield* recoveryIo(() =>
-            client.request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse),
-          );
+          const response = yield* client
+            .request("thread/read", { ...params, includeTurns: true }, decodeThreadResponse)
+            .pipe(Effect.mapError((failure) => new BootRecoveryFailed({ cause: failure.cause })));
           yield* recoveryStep(() => {
             const imported = snapshotFromThread(agent.id, response.thread, (deliveryId) =>
               this.#mailbox.getDelivery(deliveryId),
@@ -292,16 +285,6 @@ export class BootRecoveryFailed extends Schema.TaggedError<BootRecoveryFailed>()
   cause: Schema.Defect(),
 }) {}
 
-function recoveryIo<A>(run: () => Promise<A>): Effect.Effect<A, BootRecoveryFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new BootRecoveryFailed({ cause }) });
-}
-
 function recoveryStep<A>(run: () => A): Effect.Effect<A, BootRecoveryFailed> {
   return Effect.try({ try: run, catch: (cause) => new BootRecoveryFailed({ cause }) });
-}
-
-async function runRecovery<A>(operation: Effect.Effect<A, BootRecoveryFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

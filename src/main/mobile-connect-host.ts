@@ -1,35 +1,34 @@
-import type { MobileConnectHostBinding, MobileConnectTicket } from "@openbot/contracts/mobile-connect";
+import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
 import type { CentralAuthManager } from "./central-auth-manager";
-import { RemoteWorkflowError, remoteCall, runRemoteWorkflow } from "./remote-service-effects";
+import { RemoteWorkflowError } from "./remote-service-effects";
 
 interface MobileConnectHostDependencies {
   centralAuth: Pick<CentralAuthManager, "createMobileConnect">;
   host: {
-    configure(input: { serverName: string }): Promise<unknown>;
+    configure(input: { serverName: string }): Effect.Effect<unknown, RemoteWorkflowError>;
     getStatus(): { configured: boolean };
     getMobileConnectHost(): MobileConnectHostBinding | null;
-    start(): Promise<{
-      serverId: string | null;
-      phase: string;
-      apiOnline: boolean;
-      apiUrl: string | null;
-      message: string | null;
-    }>;
+    start(): Effect.Effect<
+      {
+        serverId: string | null;
+        phase: string;
+        apiOnline: boolean;
+        apiUrl: string | null;
+        message: string | null;
+      },
+      RemoteWorkflowError
+    >;
   };
 }
 
-export function createHostedMobileConnect(input: MobileConnectHostDependencies): Promise<MobileConnectTicket> {
-  return runRemoteWorkflow(createHostedMobileConnectEffect(input));
-}
-
-export const createHostedMobileConnectEffect = Effect.fn("MobileConnectHost.create")(function* ({
+export const createHostedMobileConnect = Effect.fn("MobileConnectHost.create")(function* ({
   centralAuth,
   host,
 }: MobileConnectHostDependencies) {
-  if (!host.getStatus().configured) yield* remoteCall(() => host.configure({ serverName: "OpenBot" }));
-  const status = yield* remoteCall(() => host.start());
+  if (!host.getStatus().configured) yield* host.configure({ serverName: "OpenBot" });
+  const status = yield* host.start();
   if (!isPublishedHost(status)) {
     return yield* new RemoteWorkflowError({
       cause: new Error(status.message ?? sourceText("error.host.mobileConnectPublishFailed")),
@@ -38,7 +37,7 @@ export const createHostedMobileConnectEffect = Effect.fn("MobileConnectHost.crea
   const binding = host.getMobileConnectHost();
   if (!binding || binding.hostId !== status.serverId)
     return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.host.mobileConnectHostChanged")) });
-  return yield* remoteCall(() => centralAuth.createMobileConnect(binding));
+  return yield* centralAuth.createMobileConnect(binding);
 });
 
 function isPublishedHost(status: { phase: string; apiOnline: boolean; apiUrl: string | null }): boolean {

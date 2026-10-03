@@ -24,7 +24,7 @@ import { agentProviderName } from "@openbot/contracts/agent-providers";
 import { type DynamicRecord, isBoolean, isString } from "@openbot/contracts/runtime-values";
 import { type SourceMessages, sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import { acpPlanSteps, PLAN_UPDATED_METHOD } from "./agent/plan-updates";
 import { elicitationOptions, elicitationValue, secretElicitationField } from "./agent/prompts";
 import { isUsageLimitDiagnostic } from "./agent/provider-diagnostics";
@@ -60,7 +60,7 @@ import {
   type ThreadItem,
 } from "./protocol";
 import {
-  type ProviderClientOperationError,
+  ProviderClientOperationError,
   providerCall,
   providerFailure,
   providerResult,
@@ -69,7 +69,7 @@ import {
 } from "./provider-client-effects";
 import { createDiagnosticStream } from "./stderr-diagnostics";
 import { stopWindowsProcessTree } from "./windows-process-tree";
-import { withTimeout } from "./with-timeout";
+import { TimeoutError } from "./with-timeout";
 
 /**
  * How long model discovery may spend on asking an agent for each model's reasoning efforts. One
@@ -138,7 +138,7 @@ interface AcpTurn {
   toolNames: Map<string, string>;
   /** The ACP `kind` of each tool call; a later update can omit it. */
   toolKinds: Map<string, string>;
-  task: Promise<void>;
+  task: Fiber.Fiber<void, ProviderClientOperationError> | null;
 }
 
 interface AcpThread {
@@ -256,14 +256,21 @@ export interface AcpProviderOptions {
   reportMcpDrops?: McpDropReporter | undefined;
   mcpToolRuntimes?: McpToolRuntimeSource | undefined;
   mcpAuthorization?: McpAuthorizationSource | undefined;
-  authenticate?(connection: ClientSideConnection, initialization: InitializeResponse): Promise<void>;
+  authenticate?(
+    connection: ClientSideConnection,
+    initialization: InitializeResponse,
+  ): Effect.Effect<void, ProviderClientOperationError>;
   /**
    * Reads optional identity fields that ACP does not define. A provider extension failing must not
    * turn a working authenticated process into a signed-out one, so account/read falls back to null
    * fields when this hook cannot answer.
    */
-  readAccount?(connection: ClientSideConnection): Promise<Partial<AcpProviderAccount>>;
-  readRateLimits?(connection: ClientSideConnection): Promise<AccountRateLimitsReadResult>;
+  readAccount?(
+    connection: ClientSideConnection,
+  ): Effect.Effect<Partial<AcpProviderAccount>, ProviderClientOperationError>;
+  readRateLimits?(
+    connection: ClientSideConnection,
+  ): Effect.Effect<AccountRateLimitsReadResult, ProviderClientOperationError>;
 }
 
 export class AcpAgentClient extends EventEmitter<ClientEvents> {
@@ -274,6 +281,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   readonly #requestTimeoutMs: number;
   readonly #bridge = new LocalMcpBridge();
   readonly #threads = new IdleThreadPool<AcpThread, ReleasedAcpThread>({
+    scope: () => this.#scope,
     releaseAfterMs: ACP_SESSION_IDLE_RELEASE_MS,
     idleLimit: ACP_IDLE_SESSION_LIMIT,
     // An agent that cannot close a session and load it again would keep its MCP servers or lose it.
@@ -301,13 +309,17 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         true,
       ),
   });
-  readonly #startingThreads = new Map<string, Promise<{ thread: { id: string } }>>();
+  readonly #startingThreads = new Map<
+    string,
+    Deferred.Deferred<{ thread: { id: string } }, ProviderClientOperationError>
+  >();
   readonly #serverRequests = new PendingServerRequests((request) => this.emit("request", request));
   #process: ChildProcessWithoutNullStreams | null = null;
   #connection: ClientSideConnection | null = null;
   /** How the current process ended, and its last stderr line, once its output is read to the end. */
-  #ended: Promise<ProcessEnd> | null = null;
-  #initialized: Promise<void> | null = null;
+  #ended: Deferred.Deferred<ProcessEnd> | null = null;
+  #initialized: Deferred.Deferred<void, ProviderClientOperationError> | null = null;
+  #scope = Scope.makeUnsafe();
   #initialization: InitializeResponse | null = null;
   #models: AcpModel[] = [];
   #signedIn = false;
@@ -350,6 +362,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   start(): void {
     if (this.running) return;
     this.#stopping = false;
+    this.#scope = Scope.makeUnsafe();
     const direct = cliSpawnTarget(this.#cli.executable, this.options.argv);
     const target = this.options.confine ? this.options.confine(direct) : direct;
     const child = spawn(target.command, target.args, {
@@ -365,7 +378,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       limitLineLength(() => {
         const error = new LineTooLongError(this.#label);
         this.#fail(error, child);
-        void endProcess(child);
+        Effect.runFork(endProcess(child));
         return error;
       }),
     );
@@ -377,10 +390,10 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     );
     this.#connection = new ClientSideConnection(
       () => ({
-        requestPermission: (params) => this.#requestPermission(params),
+        requestPermission: (params) => runProviderClientEffect(this.#requestPermission(params)),
         sessionUpdate: (params) => this.#sessionUpdate(params),
-        createElicitation: (params) => this.#createElicitation(params),
-        extMethod: (method, params) => this.#requestUserInput(method, params),
+        createElicitation: (params) => runProviderClientEffect(this.#createElicitation(params)),
+        extMethod: (method, params) => runProviderClientEffect(this.#requestUserInput(method, params)),
       }),
       stream,
     );
@@ -397,13 +410,21 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     child.stderr.on("data", (chunk: Buffer) => diagnostics.push(chunk.toString("utf8")));
     // Read at `close`, not `exit`: only then is stderr read to its end, and a CLI that fails at start
     // writes the reason as its last line.
-    this.#ended = new Promise((resolve) => {
-      child.once("error", (error) => resolve({ ending: "it could not start", detail: this.#redact(error.message) }));
-      child.once("close", (code, signal) => {
-        diagnostics.flush();
-        resolve({ ending: signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`, detail: lastDiagnostic });
-      });
+    const ended = Deferred.makeUnsafe<ProcessEnd>();
+    this.#ended = ended;
+    child.once("close", (code, signal) => {
+      diagnostics.flush();
+      Deferred.doneUnsafe(
+        ended,
+        Effect.succeed({
+          ending: signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`,
+          detail: lastDiagnostic,
+        }),
+      );
     });
+    child.once("error", (error) =>
+      Deferred.doneUnsafe(ended, Effect.succeed({ ending: "it could not start", detail: this.#redact(error.message) })),
+    );
     child.once("error", (error) => this.#fail(error, child));
     child.once("exit", (code, signal) => {
       const suffix = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
@@ -411,11 +432,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     });
   }
 
-  stop(): Promise<void> {
-    return runProviderClientEffect(this.#stopOperation());
-  }
-
-  readonly #stopOperation = Effect.fn("AcpAgentClient.stop")(function* (
+  readonly stop = Effect.fn("AcpAgentClient.stop")(function* (
     this: AcpAgentClient,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#stopping = true;
@@ -428,17 +445,21 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     for (const thread of this.#threads.clear()) thread.mcp.close();
     this.#startingThreads.clear();
     this.#serverRequests.rejectAll("ACP session stopped.");
-    yield* providerCall(() => this.#bridge.close()).pipe(
-      Effect.ensuring(
-        Effect.suspend(() => (!child || child.exitCode !== null ? Effect.void : endProcessEffect(child))).pipe(
-          Effect.orDie,
+    yield* this.#bridge
+      .close()
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })))
+      .pipe(
+        Effect.ensuring(
+          Effect.suspend(() => (!child || child.exitCode !== null ? Effect.void : endProcess(child))).pipe(
+            Effect.orDie,
+            Effect.ensuring(Scope.close(this.#scope, Exit.void)),
+          ),
         ),
-      ),
-    );
-  });
+      );
+  }, Effect.uninterruptible);
 
-  releaseIdleThreads(): void {
-    this.#threads.releaseIdle();
+  releaseIdleThreads(): Effect.Effect<void, ProviderClientOperationError> {
+    return this.#threads.releaseIdle();
   }
 
   /**
@@ -447,25 +468,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * what ends the MCP servers it started for it. An agent that does not answer `session/close` is
    * ignored: the session is already replaced on this side.
    */
-  releaseThread(sessionId: string): Promise<void> {
-    return runProviderClientEffect(this.#releaseThreadOperation(sessionId));
-  }
 
-  readonly #releaseThreadOperation = Effect.fn("AcpAgentClient.releaseThread")(function* (
+  readonly releaseThread = Effect.fn("AcpAgentClient.releaseThread")(function* (
     this: AcpAgentClient,
     sessionId: string,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     this.#threads.forget(sessionId);
     const thread = this.#threads.get(sessionId);
     if (!thread) return;
-    yield* providerCall(() => this.#threads.close(thread));
+    yield* this.#threads
+      .close(thread)
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
   });
 
-  #closeSession(thread: AcpThread): Promise<void> {
-    return runProviderClientEffect(this.#closeSessionEffect(thread));
-  }
-
-  readonly #closeSessionEffect = Effect.fn("AcpAgentClient.closeSession")(function* (
+  readonly #closeSession = Effect.fn("AcpAgentClient.closeSession")(function* (
     this: AcpAgentClient,
     thread: AcpThread,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
@@ -473,11 +489,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     yield* providerCall(() => this.#connection?.closeSession({ sessionId: thread.id }).catch(() => undefined));
   });
 
-  request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
-    return runProviderClientEffect(this.#requestOperation(method, params, decoder, timeoutMs));
-  }
-
-  readonly #requestOperation = Effect.fn("AcpAgentClient.request")(function* <T>(
+  readonly request = Effect.fn("AcpAgentClient.request")(function* <T>(
     this: AcpAgentClient,
     method: string,
     params: unknown,
@@ -502,22 +514,16 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   readonly #explainEndEffect = Effect.fn("AcpAgentClient.explainEnd")(function* (
     this: AcpAgentClient,
     error: unknown,
-    ended: Promise<ProcessEnd> | null,
+    ended: Deferred.Deferred<ProcessEnd> | null,
   ): Effect.fn.Return<unknown, ProviderClientOperationError> {
-    if (!ended || this.#stopping) return yield* providerCall(() => error);
+    if (!ended || this.#stopping) return yield* providerSync(() => error);
     const message = error instanceof Error ? error.message : "";
     if (message !== "ACP connection closed" && message !== "ACP client is not running.")
-      return yield* providerCall(() => error);
-    let timer: NodeJS.Timeout | undefined;
-    const ending = yield* providerCall(() =>
-      Promise.race([
-        ended,
-        new Promise<null>((resolve) => {
-          timer = setTimeout(() => resolve(null), EXIT_REPORT_WAIT_MS);
-        }),
-      ]).finally(() => clearTimeout(timer)),
+      return yield* providerSync(() => error);
+    const ending = yield* Deferred.await(ended).pipe(
+      Effect.timeoutOrElse({ duration: EXIT_REPORT_WAIT_MS, orElse: () => Effect.succeed(null) }),
     );
-    if (ending === null) return yield* providerCall(() => error);
+    if (ending === null) return yield* providerSync(() => error);
     return yield* providerCall(
       () =>
         new AgentProcessExitError(`${this.#label} stopped before it answered (${ending.ending}).`, ending.detail, {
@@ -537,11 +543,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     switch (method) {
       case "initialize":
         yield* this.#ensureInitializedEffect(timeoutMs);
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       case "account/read": {
-        if (!this.#signedIn) return yield* providerCall(() => decoder({ account: null, requiresOpenaiAuth: false }));
+        if (!this.#signedIn) return yield* providerSync(() => decoder({ account: null, requiresOpenaiAuth: false }));
         const account = yield* this.#readProviderAccountEffect(timeoutMs);
-        return yield* providerCall(() =>
+        return yield* providerSync(() =>
           decoder({
             account: { type: this.provider, email: account.email, planType: account.planType },
             requiresOpenaiAuth: false,
@@ -550,16 +556,18 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       }
       case "account/rateLimits/read":
         yield* this.#ensureInitializedEffect();
-        if (!this.#signedIn) return yield* providerCall(() => decoder({ rateLimits: null, rateLimitsByLimitId: null }));
+        if (!this.#signedIn) return yield* providerSync(() => decoder({ rateLimits: null, rateLimitsByLimitId: null }));
         {
           const readRateLimits = this.options.readRateLimits;
           const response = readRateLimits
-            ? yield* providerCall(() =>
-                withTimeout(
-                  readRateLimits(this.#requireConnection()),
-                  timeoutMs ?? this.#requestTimeoutMs,
-                  `${this.#label} request timed out: account/rateLimits/read`,
-                ),
+            ? yield* readRateLimits(this.#requireConnection()).pipe(
+                Effect.timeoutOrElse({
+                  duration: timeoutMs ?? this.#requestTimeoutMs,
+                  orElse: () =>
+                    Effect.fail(
+                      providerFailure(new TimeoutError(`${this.#label} request timed out: account/rateLimits/read`)),
+                    ),
+                }),
               )
             : { rateLimits: null, rateLimitsByLimitId: null };
           return yield* providerSync(() => decoder(response));
@@ -576,7 +584,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
             if (this.provider !== "opencode" || this.#models.length === 0) return yield* providerFailure(error);
           }
         }
-        return yield* providerCall(() =>
+        return yield* providerSync(() =>
           decoder({
             data: this.#models.map((model) => ({
               model: model.id,
@@ -590,13 +598,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           }),
         );
       case "plugin/list":
-        return yield* providerCall(() => decoder({ marketplaces: [] }));
+        return yield* providerSync(() => decoder({ marketplaces: [] }));
       case "thread/start": {
-        const response = yield* this.#startThreadEffect(params, false);
+        const response = yield* this.#startThread(params, false);
         return yield* providerSync(() => decoder(response));
       }
       case "thread/resume": {
-        const response = yield* this.#startThreadEffect(params, true);
+        const response = yield* this.#startThread(params, true);
         return yield* providerSync(() => decoder(response));
       }
       case "thread/read": {
@@ -605,7 +613,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         // servers again.
         const released = this.#threads.has(threadId) ? undefined : this.#threads.released(threadId);
         const thread = released ?? (yield* this.#readableThreadEffect(threadId, params));
-        return yield* providerCall(() => decoder({ thread: { id: threadId, turns: thread?.turns ?? [] } }));
+        return yield* providerSync(() => decoder({ thread: { id: threadId, turns: thread?.turns ?? [] } }));
       }
       case "turn/start": {
         const response = yield* this.#startTurnEffect(params, false);
@@ -618,13 +626,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       case "turn/interrupt": {
         const threadId = yield* providerSync(() => requiredString(params, "threadId"));
         // A closed idle session has no turn to stop.
-        if (this.#threads.isReleased(threadId)) return yield* providerCall(() => decoder({}));
+        if (this.#threads.isReleased(threadId)) return yield* providerSync(() => decoder({}));
         const thread = yield* providerSync(() => this.#requireThread(threadId));
         (yield* providerSync(() => this.#requireConnection())).cancel({ sessionId: thread.id });
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       }
       case "thread/compact/start":
-        return yield* providerCall(() => decoder({}));
+        return yield* providerSync(() => decoder({}));
       default:
         return yield* providerFailure(new Error(`ACP adapter does not implement ${method}.`));
     }
@@ -642,14 +650,18 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#serverRequests.reject(id, error);
   }
 
-  readonly #ensureInitializedEffect = Effect.fn("AcpAgentClient.ensureInitialized")(function* (
-    this: AcpAgentClient,
-    timeoutMs = this.#requestTimeoutMs,
-  ): Effect.fn.Return<void, ProviderClientOperationError> {
-    const initialized = this.#initialized ?? this.#initialize(timeoutMs);
-    this.#initialized = initialized;
-    return yield* providerCall(() => initialized);
-  });
+  readonly #ensureInitializedEffect: (timeoutMs?: number) => Effect.Effect<void, ProviderClientOperationError> =
+    Effect.fn("AcpAgentClient.ensureInitialized")(function* (
+      this: AcpAgentClient,
+      timeoutMs?: number,
+    ): Effect.fn.Return<void, ProviderClientOperationError> {
+      if (this.#initialized) return yield* Deferred.await(this.#initialized);
+      const initialized = Deferred.makeUnsafe<void, ProviderClientOperationError>();
+      this.#initialized = initialized;
+      const exit = yield* Effect.exit(this.#initialize(timeoutMs ?? this.#requestTimeoutMs));
+      yield* Deferred.done(initialized, exit);
+      return yield* exit;
+    }, Effect.uninterruptible);
 
   readonly #readProviderAccountEffect = Effect.fn("AcpAgentClient.readProviderAccount")(function* (
     this: AcpAgentClient,
@@ -660,12 +672,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     try {
       const account = providerResult(
         yield* Effect.result(
-          providerCall(() =>
-            withTimeout(
-              readAccount(this.#requireConnection()),
-              timeoutMs ?? this.#requestTimeoutMs,
-              `${this.#label} request timed out: account/read`,
-            ),
+          readAccount(this.#requireConnection()).pipe(
+            Effect.timeoutOrElse({
+              duration: timeoutMs ?? this.#requestTimeoutMs,
+              orElse: () =>
+                Effect.fail(providerFailure(new TimeoutError(`${this.#label} request timed out: account/read`))),
+            }),
           ),
         ),
       );
@@ -675,29 +687,26 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
   });
 
-  #initialize(timeoutMs: number): Promise<void> {
-    return runProviderClientEffect(this.#initializeEffect(timeoutMs));
-  }
-
-  readonly #initializeEffect = Effect.fn("AcpAgentClient.initialize")(function* (
+  readonly #initialize = Effect.fn("AcpAgentClient.initialize")(function* (
     this: AcpAgentClient,
     timeoutMs: number,
   ): Effect.fn.Return<void, ProviderClientOperationError> {
     const connection = yield* providerSync(() => this.#requireConnection());
     this.#initialization = yield* providerCall(() =>
-      withTimeout(
-        connection.initialize({
-          protocolVersion: 1,
-          clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
-          clientInfo: OPENBOT_ACP_CLIENT_INFO,
-        }),
-        timeoutMs,
-        "ACP initialization timed out.",
-      ),
+      connection.initialize({
+        protocolVersion: 1,
+        clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
+        clientInfo: OPENBOT_ACP_CLIENT_INFO,
+      }),
+    ).pipe(
+      Effect.timeoutOrElse({
+        duration: timeoutMs,
+        orElse: () => Effect.fail(providerFailure(new TimeoutError("ACP initialization timed out."))),
+      }),
     );
     const initialization = this.#initialization;
     try {
-      providerResult(yield* Effect.result(providerCall(() => this.options.authenticate?.(connection, initialization))));
+      providerResult(yield* Effect.result(this.options.authenticate?.(connection, initialization) ?? Effect.void));
       this.#models = providerResult(yield* Effect.result(this.#discoverModelsEffect(timeoutMs)));
       if (this.#models.length === 0 && !this.options.allowNoModels) {
         throw new Error(sourceText("error.provider.acpNoModels"));
@@ -721,36 +730,26 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // caller's own timeout: what the sweep may spend is what a slow `session/new` left of the time
     // the caller gave `model/list`. A sweep that timed the caller out would return no catalog at all.
     const deadline = Date.now() + timeoutMs - MODEL_DISCOVERY_RETURN_MS;
-    return yield* providerCall(() =>
-      withTimeout(
-        (() =>
-          runProviderClientEffect(
-            Effect.gen({ self: this }, function* () {
-              const cwd = this.options.discoveryCwd?.() ?? process.cwd();
-              const probe = yield* providerCall(() => connection.newSession({ cwd, mcpServers: [] }));
-              return yield* Effect.gen({ self: this }, function* () {
-                return yield* this.#modelReasoningEffortsEffect(
-                  connection,
-                  probe,
-                  modelsFromSessionSetup(probe),
-                  deadline,
-                );
-              }).pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    // Sent always, and not awaited. An agent can run one process per session, so a probe left
-                    // open after a slow `session/new` used the deadline, or after `model/list` timed out, is one
-                    // idle process until the app quits. Not awaited, because the catalog is complete by now, and
-                    // an agent that is slow to close a session must not take it away.
-                    void connection.closeSession({ sessionId: probe.sessionId }).catch(() => undefined);
-                  }),
-                ),
-              );
-            }),
-          ))(),
-        timeoutMs,
-        `${this.#label} request timed out: model/list`,
+    const discovery = yield* Effect.forkIn(
+      Effect.acquireUseRelease(
+        providerCall(() =>
+          connection.newSession({ cwd: this.options.discoveryCwd?.() ?? process.cwd(), mcpServers: [] }),
+        ),
+        (probe) => this.#modelReasoningEffortsEffect(connection, probe, modelsFromSessionSetup(probe), deadline),
+        (probe) =>
+          Effect.forkIn(
+            providerCall(() => connection.closeSession({ sessionId: probe.sessionId })).pipe(Effect.ignore),
+            this.#scope,
+            { startImmediately: true },
+          ).pipe(Effect.asVoid),
       ),
+      this.#scope,
+    );
+    return yield* Fiber.join(discovery).pipe(
+      Effect.timeoutOrElse({
+        duration: timeoutMs,
+        orElse: () => Effect.fail(providerFailure(new Error(`${this.#label} request timed out: model/list`))),
+      }),
     );
   });
 
@@ -770,8 +769,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   ): Effect.fn.Return<T | null, ProviderClientOperationError> {
     const remaining = until - Date.now();
     if (remaining <= 0) return null;
-    return yield* providerCall(() =>
-      withTimeout(request(), remaining, `${this.#label} request timed out: ${method}`).catch(() => null),
+    return yield* providerCall(request).pipe(
+      Effect.timeoutOrElse({
+        duration: remaining,
+        orElse: () => Effect.fail(providerFailure(new TimeoutError(`${this.#label} request timed out: ${method}`))),
+      }),
+      Effect.catch(() => Effect.succeed(null)),
     );
   });
 
@@ -805,7 +808,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       (candidate): candidate is Extract<SessionConfigOption, { type: "select" }> =>
         candidate.category === "model" && candidate.type === "select",
     );
-    if (!option || availableModels(probe).length > 0) return yield* providerCall(() => models);
+    if (!option || availableModels(probe).length > 0) return yield* providerSync(() => models);
     // The sweep, and each request in it, ends at whichever comes first: its own budget, or the point
     // where the caller's deadline still holds the cleanup. One agent that never answers then costs
     // its own model's efforts, and not the whole catalog.
@@ -836,7 +839,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         "session/set_config_option",
       );
     }
-    return yield* providerCall(() => probed);
+    return yield* providerSync(() => probed);
   });
 
   /**
@@ -856,14 +859,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     params: unknown,
   ): Effect.fn.Return<AcpThread | null, ProviderClientOperationError> {
     const held = this.#threads.get(id);
-    if (held) return yield* providerCall(() => held);
+    if (held) return yield* providerSync(() => held);
     if (!getString(params, "cwd")) return null;
     // A resume that is already loading this session opens it for a turn, not for this read.
     const resuming = this.#startingThreads.has(id);
     try {
       providerResult(yield* Effect.result(this.#ensureInitializedEffect()));
       if (!this.#loadsSessions) return null;
-      providerResult(yield* Effect.result(this.#startThreadEffect(params, true)));
+      providerResult(yield* Effect.result(this.#startThread(params, true)));
     } catch (error) {
       // The next turn replaces the missing session, so the user has nothing to act on.
       if (!(error instanceof MissingAcpSessionError)) {
@@ -875,8 +878,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // Boot recovery reads every stored session, and each loaded session holds its own set of the
     // user's MCP servers. A session loaded only for a read is idle from the start, so the idle limit
     // counts it and keeps only the most recent ones warm for a first turn.
-    if (thread && !resuming && thread.idleSince === 0 && !thread.activeTurn) this.#threads.markIdle(thread);
-    return yield* providerCall(() => thread);
+    if (thread && !resuming && thread.idleSince === 0 && !thread.activeTurn) yield* this.#threads.markIdle(thread);
+    return yield* providerSync(() => thread);
   });
 
   /** Whether the agent answers `session/load`, which it advertises in its initialization. */
@@ -884,11 +887,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return this.#initialization?.agentCapabilities?.loadSession === true;
   }
 
-  #startThread(params: unknown, resume: boolean): Promise<{ thread: { id: string } }> {
-    return runProviderClientEffect(this.#startThreadEffect(params, resume));
-  }
-
-  readonly #startThreadEffect = Effect.fn("AcpAgentClient.startThread")(function* (
+  readonly #startThread = Effect.fn("AcpAgentClient.startThread")(function* (
     this: AcpAgentClient,
     params: unknown,
     resume: boolean,
@@ -896,14 +895,16 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     yield* this.#ensureInitializedEffect();
     if (!this.#signedIn) return yield* providerFailure(new Error(this.options.signInMessage));
     const requestedThreadId = getString(params, "threadId");
-    if (!resume || !requestedThreadId) return yield* this.#openThreadEffect(params, false);
+    if (!resume || !requestedThreadId) return yield* this.#openThread(params, false);
     const held = this.#threads.get(requestedThreadId);
     let turns: AcpThread["turns"] | undefined;
     // The MCP servers are fixed when a session opens, so a changed Computer Use switch loads the
     // session again. A session with a turn keeps its servers until a later resume.
     if (held && !held.activeTurn && held.computerUse !== computerUseParam(params)) {
       turns = held.turns;
-      yield* providerCall(() => this.#threads.close(held));
+      yield* this.#threads
+        .close(held)
+        .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     }
     // A thread this client already holds takes the caller's settings even though no session is
     // opened for them: the loader may have been a `thread/read`, which carries none of its own, and
@@ -917,19 +918,16 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // the first drain resumes it, and two `session/load` calls would leave two threads and two MCP
     // bridge sessions under one id, of which only the last is reachable.
     const starting = this.#startingThreads.get(requestedThreadId);
-    if (starting) return yield* providerCall(() => starting);
-    const start = this.#openThread(params, true, turns).finally(() => {
-      this.#startingThreads.delete(requestedThreadId);
-    });
-    this.#startingThreads.set(requestedThreadId, start);
-    return yield* providerCall(() => start);
-  });
+    if (starting) return yield* Deferred.await(starting);
+    const completion = Deferred.makeUnsafe<{ thread: { id: string } }, ProviderClientOperationError>();
+    this.#startingThreads.set(requestedThreadId, completion);
+    const exit = yield* Effect.exit(this.#openThread(params, true, turns));
+    yield* Deferred.done(completion, exit);
+    if (this.#startingThreads.get(requestedThreadId) === completion) this.#startingThreads.delete(requestedThreadId);
+    return yield* exit;
+  }, Effect.uninterruptible);
 
-  #openThread(params: unknown, resume: boolean, heldTurns?: AcpThread["turns"]): Promise<{ thread: { id: string } }> {
-    return runProviderClientEffect(this.#openThreadEffect(params, resume, heldTurns));
-  }
-
-  readonly #openThreadEffect = Effect.fn("AcpAgentClient.openThread")(function* (
+  readonly #openThread = Effect.fn("AcpAgentClient.openThread")(function* (
     this: AcpAgentClient,
     params: unknown,
     resume: boolean,
@@ -948,14 +946,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     let threadRef: AcpThread | null = null;
     let retained = false;
     return yield* Effect.acquireUseRelease(
-      providerCall(() =>
-        this.#bridge.createSession(
+      this.#bridge
+        .createSession(
           requestedThreadId ?? randomUUID(),
           dynamicTools,
           () => threadRef?.activeTurn?.id ?? null,
           (call, signal) => this.#callDynamicTool(call, signal),
-        ),
-      ),
+        )
+        .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause }))),
       (mcp) =>
         Effect.gen({ self: this }, function* () {
           try {
@@ -969,13 +967,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
             const handoff = acpMcpServers(
               providerResult(
                 yield* Effect.result(
-                  providerCall(() =>
-                    usableMcpServers(
-                      agentMcpServers(this.options.mcpServers?.() ?? [], computerUse),
-                      this.options.mcpToolRuntimes?.(),
-                      this.options.mcpAuthorization,
-                    ),
-                  ),
+                  usableMcpServers(
+                    agentMcpServers(this.options.mcpServers?.() ?? [], computerUse),
+                    this.options.mcpToolRuntimes?.(),
+                    this.options.mcpAuthorization,
+                  ).pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause }))),
                 ),
               ),
             );
@@ -1075,7 +1071,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           failure,
         ),
       );
-    yield* providerCall(() => new Promise((resolve) => setTimeout(resolve, OPENCODE_LOAD_RETRY_MS)));
+    yield* Effect.sleep(OPENCODE_LOAD_RETRY_MS);
     try {
       // The process can have stopped during the wait; this reports that instead of a closed stream.
       return providerResult(yield* Effect.result(providerCall(() => this.#requireConnection().loadSession(request))));
@@ -1178,24 +1174,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     steer: boolean,
   ): Effect.fn.Return<{ turn: { id: string; status: string }; turnId?: string }, ProviderClientOperationError> {
     const threadId = yield* providerSync(() => requiredString(params, "threadId"));
-    return yield* providerCall(() => this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params, steer)));
+    return yield* this.#threads
+      .startTurn(threadId, () => this.#openTurn(threadId, params, steer))
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
   });
 
-  #openTurn(
-    threadId: string,
-    params: unknown,
-    steer: boolean,
-  ): Promise<{ turn: { id: string; status: string }; turnId?: string }> {
-    return runProviderClientEffect(this.#openTurnEffect(threadId, params, steer));
-  }
-
-  readonly #openTurnEffect = Effect.fn("AcpAgentClient.openTurn")(function* (
+  readonly #openTurn = Effect.fn("AcpAgentClient.openTurn")(function* (
     this: AcpAgentClient,
     threadId: string,
     params: unknown,
     steer: boolean,
   ): Effect.fn.Return<{ turn: { id: string; status: string }; turnId?: string }, ProviderClientOperationError> {
-    yield* providerCall(() => this.#threads.wake(threadId));
+    yield* this.#threads
+      .wake(threadId)
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     const thread = yield* providerSync(() => this.#requireThread(threadId));
     if (!steer && thread.activeTurn)
       return yield* providerFailure(new Error("The ACP thread already has an active turn."));
@@ -1215,11 +1207,16 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     if (steer) {
       // A steered message can want an answer, so an empty turn is again a failure to report.
       if (activeTurn) activeTurn.answerOptional = false;
-      void (yield* providerSync(() => this.#requireConnection()))
-        .prompt({ sessionId: thread.id, prompt: blocks })
-        .catch((error) => {
-          this.emit("diagnostic", this.#redact(`ACP steer failed: ${String(error)}`));
-        });
+      const connection = yield* providerSync(() => this.#requireConnection());
+      yield* Effect.forkIn(
+        providerCall(() => connection.prompt({ sessionId: thread.id, prompt: blocks })).pipe(
+          Effect.catch((failure) =>
+            Effect.sync(() => this.emit("diagnostic", this.#redact(`ACP steer failed: ${String(failure.cause)}`))),
+          ),
+        ),
+        this.#scope,
+        { startImmediately: true },
+      );
       return { turn: { id: turnId, status: "inProgress" }, turnId };
     }
     const turn: AcpTurn = {
@@ -1234,7 +1231,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       messages: [],
       toolNames: new Map(),
       toolKinds: new Map(),
-      task: Promise.resolve(),
+      task: null,
     };
     thread.activeTurn = turn;
     this.#threads.holdForTurn(thread);
@@ -1242,7 +1239,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       method: "turn/started",
       params: { threadId: thread.id, turn: { id: turn.id, status: "inProgress" } },
     });
-    turn.task = this.#consumePrompt(thread, turn, blocks);
+    turn.task = yield* Effect.forkIn(this.#consumePrompt(thread, turn, blocks), this.#scope, {
+      startImmediately: true,
+    });
     return { turn: { id: turn.id, status: "inProgress" } };
   });
 
@@ -1255,11 +1254,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
   }
 
-  #consumePrompt(thread: AcpThread, turn: AcpTurn, prompt: ContentBlock[]): Promise<void> {
-    return runProviderClientEffect(this.#consumePromptEffect(thread, turn, prompt));
-  }
-
-  readonly #consumePromptEffect = Effect.fn("AcpAgentClient.consumePrompt")(function* (
+  readonly #consumePrompt = Effect.fn("AcpAgentClient.consumePrompt")(function* (
     this: AcpAgentClient,
     thread: AcpThread,
     turn: AcpTurn,
@@ -1283,7 +1278,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         !turn.receivedOutput &&
         !turn.answerOptional
       ) {
-        this.#completeTurn(
+        yield* this.#completeTurn(
           thread,
           turn,
           "failed",
@@ -1297,9 +1292,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           : response.stopReason === "end_turn"
             ? "completed"
             : "failed";
-      this.#completeTurn(thread, turn, status, status === "failed" ? response.stopReason : null);
+      yield* this.#completeTurn(thread, turn, status, status === "failed" ? response.stopReason : null);
     } catch (error) {
-      this.#completeTurn(thread, turn, "failed", error);
+      yield* this.#completeTurn(thread, turn, "failed", error);
     }
   });
 
@@ -1397,7 +1392,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     turn.thoughtItemId = `${turn.id}:thought:${turn.messages.length}`;
   }
 
-  #completeTurn(thread: AcpThread, turn: AcpTurn, status: string, error: unknown): void {
+  readonly #completeTurn = Effect.fn("AcpAgentClient.completeTurn")(function* (
+    this: AcpAgentClient,
+    thread: AcpThread,
+    turn: AcpTurn,
+    status: string,
+    error: unknown,
+  ) {
     if (thread.activeTurn !== turn) return;
     this.#completeThought(thread, turn);
     this.#completeMessage(thread, turn, "final_answer");
@@ -1421,8 +1422,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     });
     thread.turns.push({ id: turn.id, status, items: turn.messages });
     thread.activeTurn = null;
-    this.#threads.markIdle(thread);
-  }
+    yield* this.#threads.markIdle(thread);
+  });
 
   /**
    * OpenCode retries a rate limit or a provider failure by itself. When it stops, it fails the prompt
@@ -1446,11 +1447,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return sourceText(key, { detail: shown });
   }
 
-  #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    return runProviderClientEffect(this.#requestPermissionEffect(params));
-  }
-
-  readonly #requestPermissionEffect = Effect.fn("AcpAgentClient.requestPermission")(function* (
+  readonly #requestPermission = Effect.fn("AcpAgentClient.requestPermission")(function* (
     this: AcpAgentClient,
     params: RequestPermissionRequest,
   ): Effect.fn.Return<RequestPermissionResponse, ProviderClientOperationError> {
@@ -1464,8 +1461,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           ? "file-change"
           : "permissions";
     const requestedPermissions = kind === "permissions" ? { [params.toolCall.kind ?? "file-system"]: true } : null;
-    const result = yield* providerCall(() =>
-      this.#serverRequests.call(
+    const result = yield* this.#serverRequests
+      .call(
         `item/${kind === "command" ? "commandExecution" : kind === "file-change" ? "fileChange" : "permissions"}/requestApproval`,
         {
           threadId: params.sessionId,
@@ -1475,8 +1472,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           permissions: requestedPermissions,
           acpOptions: params.options,
         },
-      ),
-    );
+      )
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     const accepted =
       isRecord(result) &&
       (result.decision === "accept" ||
@@ -1488,33 +1485,25 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       : { outcome: { outcome: "cancelled" } };
   });
 
-  #requestUserInput(method: string, params: DynamicRecord): Promise<DynamicRecord> {
-    return runProviderClientEffect(this.#requestUserInputEffect(method, params));
-  }
-
-  readonly #requestUserInputEffect = Effect.fn("AcpAgentClient.requestUserInput")(function* (
+  readonly #requestUserInput = Effect.fn("AcpAgentClient.requestUserInput")(function* (
     this: AcpAgentClient,
     method: string,
     params: DynamicRecord,
   ): Effect.fn.Return<DynamicRecord, ProviderClientOperationError> {
     const sessionId = getString(params, "sessionId") ?? [...this.#threads.ids()][0];
     const thread = sessionId ? this.#threads.get(sessionId) : undefined;
-    const result = yield* providerCall(() =>
-      this.#serverRequests.call("item/tool/requestUserInput", {
+    const result = yield* this.#serverRequests
+      .call("item/tool/requestUserInput", {
         ...params,
         threadId: sessionId,
         turnId: thread?.activeTurn?.id ?? randomUUID(),
         sourceMethod: method,
-      }),
-    );
-    return yield* providerCall(() => (isRecord(result) ? result : {}));
+      })
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+    return yield* providerSync(() => (isRecord(result) ? result : {}));
   });
 
-  #createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
-    return runProviderClientEffect(this.#createElicitationEffect(params));
-  }
-
-  readonly #createElicitationEffect = Effect.fn("AcpAgentClient.createElicitation")(function* (
+  readonly #createElicitation = Effect.fn("AcpAgentClient.createElicitation")(function* (
     this: AcpAgentClient,
     params: CreateElicitationRequest,
   ): Effect.fn.Return<CreateElicitationResponse, ProviderClientOperationError> {
@@ -1542,7 +1531,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         options: null,
       });
     }
-    const result = yield* this.#requestUserInputEffect("session/elicitation", { ...params, questions });
+    const result = yield* this.#requestUserInput("session/elicitation", { ...params, questions });
     const answers = isRecord(result.answers) ? result.answers : null;
     if (!answers) return { action: "decline" };
     const content: Record<string, ElicitationContentValue> = {};
@@ -1556,21 +1545,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     );
   });
 
-  #callDynamicTool(
-    params: {
-      threadId: string;
-      turnId: string;
-      callId: string;
-      namespace: string;
-      tool: string;
-      arguments: unknown;
-    },
-    signal: AbortSignal,
-  ): Promise<DynamicToolResult> {
-    return runProviderClientEffect(this.#callDynamicToolEffect(params, signal));
-  }
-
-  readonly #callDynamicToolEffect = Effect.fn("AcpAgentClient.callDynamicTool")(function* (
+  readonly #callDynamicTool = Effect.fn("AcpAgentClient.callDynamicTool")(function* (
     this: AcpAgentClient,
     params: {
       threadId: string;
@@ -1582,10 +1557,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     },
     signal: AbortSignal,
   ): Effect.fn.Return<DynamicToolResult, ProviderClientOperationError> {
-    const result = yield* providerCall(() => this.#serverRequests.call("item/tool/call", params, signal));
+    const result = yield* this.#serverRequests
+      .call("item/tool/call", params, signal)
+      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
     if (!isDynamicToolResult(result))
       return yield* providerFailure(new Error("OpenBot returned an invalid dynamic tool result."));
-    return yield* providerCall(() => result);
+    return yield* providerSync(() => result);
   });
 
   #requireThread(id: string): AcpThread {
@@ -1607,13 +1584,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
 }
 
 /** Ends the agent process with SIGTERM, and with SIGKILL when it is still running after 2 seconds. */
-function endProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-  return runProviderClientEffect(endProcessEffect(child));
-}
-const endProcessEffect = Effect.fn("AcpAgentClient.endProcess")(function* (child: ChildProcessWithoutNullStreams) {
+const endProcess = Effect.fn("AcpAgentClient.endProcess")(function* (child: ChildProcessWithoutNullStreams) {
   child.stdin.end();
   // A `.cmd` agent runs under `cmd.exe`; a kill of the wrapper alone leaves the agent running.
-  if (process.platform === "win32") return yield* providerCall(() => stopWindowsProcessTree(child));
+  if (process.platform === "win32")
+    return yield* stopWindowsProcessTree(child).pipe(Effect.mapError((failure) => providerFailure(failure.cause)));
   yield* Effect.callback<void>((resume) => {
     const forceKill = setTimeout(() => {
       if (child.exitCode === null) child.kill("SIGKILL");

@@ -52,11 +52,9 @@ interface DesktopEntryOptions {
   homeDirectory?: string;
 }
 
-export function installLinuxDesktopEntry(options: DesktopEntryOptions): Promise<string | null> {
-  return Effect.runPromise(installLinuxDesktopEntryEffect(options));
-}
-
-const installLinuxDesktopEntryEffect = Effect.fn("LinuxDesktopEntry.install")(function* (options: DesktopEntryOptions) {
+export const installLinuxDesktopEntry = Effect.fn("LinuxDesktopEntry.install")(function* (
+  options: DesktopEntryOptions,
+) {
   if (options.platform !== "linux") return null;
   const appImagePath = options.environment.APPIMAGE?.trim();
   if (!appImagePath) return null;

@@ -6,7 +6,6 @@ import {
 } from "@openbot/contracts/hosted-sites";
 import { Effect, Result } from "effect";
 import { sha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
 import {
   expectedFile,
   HOSTED_SITE_LIMITS,
@@ -27,14 +26,14 @@ import {
   parseManifest,
   parseStoredSiteSummary,
   randomBase32,
-  readUploadBodyEffect,
+  readUploadBody,
   type SiteRow,
   siteRouteIdentity,
   slugWords,
-  sourceIpHashEffect,
-  uploadRequestHashEffect,
+  sourceIpHash,
+  uploadRequestHash,
 } from "./hosted-site-records";
-import { type HostedSiteScope, hostedSiteLimitEffect, scopeServerId } from "./hosted-site-server";
+import { type HostedSiteScope, hostedSiteLimit, scopeServerId } from "./hosted-site-server";
 
 export interface HostedSiteList {
   sites: HostedSiteSummary[];
@@ -63,13 +62,8 @@ export class HostedSiteService {
   ) {}
 
   /** The sites of the scope, with the limit and slot count of the server that new sites go to. */
-  list(scope: HostedSiteScope): Promise<HostedSiteList> {
-    return runApiEffect(
-      this.listEffect(scope).pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket))),
-    );
-  }
 
-  listEffect(scope: HostedSiteScope): Effect.Effect<HostedSiteList, HostedSiteFailure, HostedSiteStorage> {
+  list(scope: HostedSiteScope) {
     return Effect.fn("HostedSites.list")(() =>
       Effect.gen({ self: this }, function* () {
         const { database } = yield* HostedSiteStorage;
@@ -90,41 +84,22 @@ export class HostedSiteService {
             .all<SiteRow & { file_count: number; total_bytes: number }>(),
         );
         const [limit, used] = yield* Effect.all(
-          [
-            hostedSiteLimitEffect(database, serverId, now),
-            this.activeSiteSlotCountEffect(scope.userId, serverId, null, now),
-          ],
+          [hostedSiteLimit(database, serverId, now), this.activeSiteSlotCountEffect(scope.userId, serverId, null, now)],
           { concurrency: "unbounded" },
         );
         return { sites: rows.results.map((row) => mapSite(row, this.localSiteOrigin)), limit, used };
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  createUpload(
-    scope: HostedSiteScope,
-    request: HostedSiteUploadRequest,
-    idempotencyKey: string,
-  ): Promise<HostedSiteUploadSession> {
-    return runApiEffect(
-      this.createUploadEffect(scope, request, idempotencyKey).pipe(
-        Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)),
-      ),
-    );
-  }
-
-  createUploadEffect(
-    scope: HostedSiteScope,
-    request: HostedSiteUploadRequest,
-    idempotencyKey: string,
-  ): Effect.Effect<HostedSiteUploadSession, HostedSiteFailure, HostedSiteStorage> {
+  createUpload(scope: HostedSiteScope, request: HostedSiteUploadRequest, idempotencyKey: string) {
     return Effect.fn("HostedSites.createUpload")(() =>
       Effect.gen({ self: this }, function* () {
         const { database } = yield* HostedSiteStorage;
 
         const userId = scope.userId;
         const serverId = scopeServerId(scope);
-        const requestHash = yield* uploadRequestHashEffect(request);
+        const requestHash = yield* uploadRequestHash(request);
         const prior = yield* this.deploymentByIdempotencyEffect(userId, idempotencyKey);
         if (prior) return yield* this.uploadSessionForRequestEffect(prior, requestHash);
         const now = this.now();
@@ -226,7 +201,7 @@ export class HostedSiteService {
         }
 
         yield* this.enforceCreationRateEffect(userId, now);
-        const siteLimit = yield* hostedSiteLimitEffect(database, serverId, now);
+        const siteLimit = yield* hostedSiteLimit(database, serverId, now);
         const siteId = crypto.randomUUID();
         const hostname = yield* this.uniqueHostnameEffect(`${request.title} ${request.description}`);
         const statements = [
@@ -350,23 +325,10 @@ export class HostedSiteService {
         }
         return yield* this.uploadSessionEffect(yield* this.requireDeploymentEffect(userId, deploymentId));
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  uploadFile(userId: string, uploadId: string, path: string, request: Request): Promise<void> {
-    return runApiEffect(
-      this.uploadFileEffect(userId, uploadId, path, request).pipe(
-        Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)),
-      ),
-    );
-  }
-
-  uploadFileEffect(
-    userId: string,
-    uploadId: string,
-    path: string,
-    request: Request,
-  ): Effect.Effect<void, HostedSiteFailure, HostedSiteStorage> {
+  uploadFile(userId: string, uploadId: string, path: string, request: Request) {
     return Effect.fn("HostedSites.uploadFile")(() =>
       Effect.gen({ self: this }, function* () {
         const { database, bucket } = yield* HostedSiteStorage;
@@ -491,7 +453,7 @@ export class HostedSiteService {
           );
         }
         yield* Effect.gen({ self: this }, function* () {
-          const body = yield* readUploadBodyEffect(uploadBody, file.size);
+          const body = yield* readUploadBody(uploadBody, file.size);
           yield* siteCall(() => bucket.put(key, body, { httpMetadata: { contentType: file.mimeType } }));
           const stored = yield* siteCall(() => bucket.head(key));
           if (!stored || stored.size !== file.size) {
@@ -534,22 +496,10 @@ export class HostedSiteService {
           ),
         );
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  activate(userId: string, uploadId: string, idempotencyKey: string): Promise<HostedSiteSummary> {
-    return runApiEffect(
-      this.activateEffect(userId, uploadId, idempotencyKey).pipe(
-        Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)),
-      ),
-    );
-  }
-
-  activateEffect(
-    userId: string,
-    uploadId: string,
-    idempotencyKey: string,
-  ): Effect.Effect<HostedSiteSummary, HostedSiteFailure, HostedSiteStorage> {
+  activate(userId: string, uploadId: string, idempotencyKey: string) {
     return Effect.fn("HostedSites.activate")(() =>
       Effect.gen({ self: this }, function* () {
         const { database } = yield* HostedSiteStorage;
@@ -654,22 +604,10 @@ export class HostedSiteService {
             }),
         );
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  delete(scope: HostedSiteScope, siteId: string, idempotencyKey: string): Promise<void> {
-    return runApiEffect(
-      this.deleteEffect(scope, siteId, idempotencyKey).pipe(
-        Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)),
-      ),
-    );
-  }
-
-  deleteEffect(
-    scope: HostedSiteScope,
-    siteId: string,
-    idempotencyKey: string,
-  ): Effect.Effect<void, HostedSiteFailure, HostedSiteStorage> {
+  delete(scope: HostedSiteScope, siteId: string, idempotencyKey: string) {
     return Effect.fn("HostedSites.delete")(() =>
       Effect.gen({ self: this }, function* () {
         const { database } = yield* HostedSiteStorage;
@@ -729,23 +667,10 @@ export class HostedSiteService {
             }),
         );
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  report(hostname: string, reason: string, details: string | null, sourceIp: string): Promise<void> {
-    return runApiEffect(
-      this.reportEffect(hostname, reason, details, sourceIp).pipe(
-        Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)),
-      ),
-    );
-  }
-
-  reportEffect(
-    hostname: string,
-    reason: string,
-    details: string | null,
-    sourceIp: string,
-  ): Effect.Effect<void, HostedSiteFailure, HostedSiteStorage> {
+  report(hostname: string, reason: string, details: string | null, sourceIp: string) {
     return Effect.fn("HostedSites.report")(() =>
       Effect.gen({ self: this }, function* () {
         const { database } = yield* HostedSiteStorage;
@@ -777,8 +702,10 @@ export class HostedSiteService {
         const secret = this.reportHashSecret?.trim();
         if (!secret || secret.length < 32)
           return yield* Effect.fail(siteFailure(new Error("The hosted site report hash secret is unavailable.")));
-        const ipHash = yield* sourceIpHashEffect(secret, sourceIp, deduplicationWindow);
-        const reportId = yield* siteCall(() => sha256(`${hostname}\0${reason}\0${ipHash}\0${deduplicationWindow}`));
+        const ipHash = yield* sourceIpHash(secret, sourceIp, deduplicationWindow);
+        const reportId = yield* sha256(`${hostname}\0${reason}\0${ipHash}\0${deduplicationWindow}`).pipe(
+          Effect.mapError(siteFailure),
+        );
         yield* siteCall(() =>
           database
             .prepare(
@@ -790,16 +717,10 @@ export class HostedSiteService {
             .run(),
         );
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  setBlocked(siteId: string, blocked: boolean): Promise<void> {
-    return runApiEffect(
-      this.setBlockedEffect(siteId, blocked).pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket))),
-    );
-  }
-
-  setBlockedEffect(siteId: string, blocked: boolean): Effect.Effect<void, HostedSiteFailure, HostedSiteStorage> {
+  setBlocked(siteId: string, blocked: boolean) {
     return Effect.fn("HostedSites.setBlocked")(() =>
       Effect.gen({ self: this }, function* () {
         const { database, bucket } = yield* HostedSiteStorage;
@@ -884,18 +805,10 @@ export class HostedSiteService {
           yield* this.deleteDeploymentEffect(site.id, deploymentId);
         }
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
-  cleanup(now = this.now()): Promise<{ uploads: number; expired: number; tombstones: number }> {
-    return runApiEffect(
-      this.cleanupEffect(now).pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket))),
-    );
-  }
-
-  cleanupEffect(
-    now = this.now(),
-  ): Effect.Effect<{ uploads: number; expired: number; tombstones: number }, HostedSiteFailure, HostedSiteStorage> {
+  cleanup(now = this.now()) {
     return Effect.fn("HostedSites.cleanup")(() =>
       Effect.gen({ self: this }, function* () {
         const { database, bucket } = yield* HostedSiteStorage;
@@ -1079,7 +992,7 @@ export class HostedSiteService {
           tombstones: deletedTombstones,
         };
       }),
-    )();
+    )().pipe(Effect.provide(HostedSiteStorage.layer(this.database, this.bucket)));
   }
 
   private finalizeActivationEffect(
@@ -1095,7 +1008,7 @@ export class HostedSiteService {
 
         const previousDeployment = deployment.base_deployment_id;
         // The site keeps the server it was created for, so the activation counts against that server's plan.
-        const siteLimit = yield* hostedSiteLimitEffect(database, site.server_id, now);
+        const siteLimit = yield* hostedSiteLimit(database, site.server_id, now);
         const results = yield* siteCall(() =>
           database.batch([
             database

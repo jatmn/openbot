@@ -3,23 +3,22 @@ import type {
   AgentSummary,
   ConversationMessageSender,
   SaveAgentProfileInput,
-  SaveAgentProfileResult,
   SidebarLayoutSnapshot,
 } from "@openbot/contracts/ipc";
 import { decodeSaveAgentProfileResult } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Exit, Schema, Semaphore } from "effect";
 import type { AgentStore } from "../agent-store";
 import type { SidebarLayoutStore } from "../sidebar-layout-store";
 
 interface ProfileSaveHooks {
   create(
     input: SaveAgentProfileInput,
-    configure: (agent: AgentSummary) => Promise<AgentSummary>,
+    configure: (agent: AgentSummary) => Effect.Effect<AgentSummary, ProfileSaveFailed>,
     sender: ConversationMessageSender | undefined,
-  ): Promise<AgentSummary>;
+  ): Effect.Effect<AgentSummary, ProfileSaveFailed>;
   changed(agent: AgentSummary): void;
-  delete(agent: AgentSummary): Promise<void>;
+  delete(agent: AgentSummary): Effect.Effect<void, ProfileSaveFailed>;
 }
 
 /** Coordinates reviewed profiles with the separately persisted sidebar, and receipts for network retries. */
@@ -30,7 +29,7 @@ export class ProfileSave {
     return !this.#pendingAgents.has(agentId);
   }
 
-  #queue: Promise<void> = Promise.resolve();
+  readonly #queue = Semaphore.makeUnsafe(1);
   constructor(
     private readonly store: AgentStore,
     private readonly hooks: ProfileSaveHooks,
@@ -41,24 +40,11 @@ export class ProfileSave {
     input: SaveAgentProfileInput,
     sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "withProfileAssignment">,
     sender?: ConversationMessageSender,
-  ): Promise<SaveAgentProfileResult> {
-    const operation = this.#queue.then(() => this.#save(input, sidebar, sender));
-    this.#queue = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
+  ) {
+    return this.#queue.withPermit(this.#save(input, sidebar, sender));
   }
 
-  #save(
-    input: SaveAgentProfileInput,
-    sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "withProfileAssignment">,
-    sender: ConversationMessageSender | undefined,
-  ): Promise<SaveAgentProfileResult> {
-    return runProfileSave(this.#saveEffect(input, sidebar, sender));
-  }
-
-  readonly #saveEffect = Effect.fn("ProfileSave.save")(function* (
+  readonly #save = Effect.fn("ProfileSave.save")(function* (
     this: ProfileSave,
     input: SaveAgentProfileInput,
     sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "withProfileAssignment">,
@@ -83,23 +69,31 @@ export class ProfileSave {
     });
     const oldAvatar = previous ? this.store.resolveAvatar(previous.id) : null;
     // The sidebar owns its serialization; the callback runs the profile workflow under that lock.
-    const result = yield* profileIo(() =>
-      sidebar.withProfileAssignment(input.draft.sectionId, (assign) =>
-        runProfileSave(this.#assignEffect(input, previous, commandId, sidebar.getSnapshot(), assign, sender)),
-      ),
-    );
+    const result = yield* sidebar
+      .withProfileAssignment(input.draft.sectionId, (assign) =>
+        this.#assign(
+          input,
+          previous,
+          commandId,
+          sidebar.getSnapshot(),
+          (agentId) =>
+            assign(agentId).pipe(Effect.mapError((failure) => new ProfileSaveFailed({ cause: failure.cause }))),
+          sender,
+        ),
+      )
+      .pipe(Effect.mapError((failure) => new ProfileSaveFailed({ cause: failure.cause })));
     if (oldAvatar) yield* profileIo(() => rm(oldAvatar.path, { force: true })).pipe(Effect.ignore);
     this.hooks.changed(result.agent);
     return result;
   }, Effect.uninterruptible);
 
-  readonly #assignEffect = Effect.fn("ProfileSave.assign")(function* (
+  readonly #assign = Effect.fn("ProfileSave.assign")(function* (
     this: ProfileSave,
     input: SaveAgentProfileInput,
     previous: AgentSummary | null | undefined,
     commandId: string,
     initialLayout: SidebarLayoutSnapshot,
-    assign: (agentId: string) => Promise<SidebarLayoutSnapshot>,
+    assign: (agentId: string) => Effect.Effect<SidebarLayoutSnapshot, ProfileSaveFailed>,
     sender: ConversationMessageSender | undefined,
   ) {
     let layout = initialLayout;
@@ -107,43 +101,36 @@ export class ProfileSave {
     const operation = Effect.gen({ self: this }, function* () {
       let agent: AgentSummary;
       if (previous) {
-        layout = yield* profileIo(() => assign(previous.id));
+        layout = yield* assign(previous.id);
         agent = yield* profileStep(
           () => this.store.commitReviewedProfile(previous.id, input.draft, commandId, layout).agent,
         );
       } else {
-        agent = yield* profileIo(() =>
-          this.hooks.create(
-            input,
-            (candidate) => {
+        agent = yield* this.hooks.create(
+          input,
+          (candidate) =>
+            Effect.gen({ self: this }, function* () {
               pending.created = candidate;
               this.#pendingAgents.add(candidate.id);
-              return runProfileSave(
-                Effect.gen({ self: this }, function* () {
-                  layout = yield* profileIo(() => assign(candidate.id));
-                  return yield* profileStep(() => this.store.saveReviewedProfile(candidate.id, input.draft));
-                }),
-              );
-            },
-            sender,
-          ),
+              layout = yield* assign(candidate.id);
+              return yield* profileStep(() => this.store.saveReviewedProfile(candidate.id, input.draft));
+            }),
+          sender,
         );
         agent = yield* profileStep(
           () => this.store.commitReviewedProfile(agent.id, input.draft, commandId, layout).agent,
         );
       }
       return { agent, layout };
-    }).pipe(
-      Effect.catch((failure) =>
-        Effect.gen({ self: this }, function* () {
-          const created = pending.created;
-          if (created && this.store.list().some((agent) => agent.id === created.id))
-            yield* profileIo(() => this.hooks.delete(created));
-          return yield* failure;
-        }),
-      ),
-    );
-    return yield* operation.pipe(
+    });
+    const compensated = Effect.gen({ self: this }, function* () {
+      const exit = yield* Effect.exit(operation);
+      if (Exit.isSuccess(exit)) return exit.value;
+      const created = pending.created;
+      if (created && this.store.list().some((agent) => agent.id === created.id)) yield* this.hooks.delete(created);
+      return yield* Effect.failCause(exit.cause);
+    });
+    return yield* compensated.pipe(
       Effect.ensuring(
         Effect.sync(() => {
           if (pending.created) this.#pendingAgents.delete(pending.created.id);
@@ -163,10 +150,4 @@ function profileIo<A>(run: () => Promise<A>): Effect.Effect<A, ProfileSaveFailed
 
 function profileStep<A>(run: () => A): Effect.Effect<A, ProfileSaveFailed> {
   return Effect.try({ try: run, catch: (cause) => new ProfileSaveFailed({ cause }) });
-}
-
-async function runProfileSave<A>(effect: Effect.Effect<A, ProfileSaveFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(effect));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

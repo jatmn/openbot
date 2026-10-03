@@ -144,11 +144,8 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
   }
 
   /** A manual fire: no trigger, so it never collides with the scheduled occurrence. */
-  test(input: TestChannelRoutineInput): Promise<ChannelRoutineRun> {
-    return runChannelRoutine(this.testEffect(input));
-  }
 
-  readonly testEffect = Effect.fn("ChannelRoutineScheduler.test")(function* (
+  readonly test = Effect.fn("ChannelRoutineScheduler.test")(function* (
     this: ChannelRoutineScheduler,
     input: TestChannelRoutineInput,
   ) {
@@ -172,11 +169,7 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
     return this.#routines.nextDueAt(this.#excluded());
   }
 
-  processDue(now = new Date(), active: () => boolean = () => true): Promise<void> {
-    return runChannelRoutine(this.processDueEffect(now, active));
-  }
-
-  readonly processDueEffect = Effect.fn("ChannelRoutineScheduler.processDue")(function* (
+  readonly processDue = Effect.fn("ChannelRoutineScheduler.processDue")(function* (
     this: ChannelRoutineScheduler,
     now = new Date(),
     active: () => boolean = () => true,
@@ -215,11 +208,8 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
    * id never reached the channel, so it is fired now; a run that has one re-issues the identical
    * command, which the receipt turns into a no-op that only re-wakes the channel.
    */
-  resumePendingRuns(): Promise<void> {
-    return runChannelRoutine(this.resumePendingRunsEffect());
-  }
 
-  readonly resumePendingRunsEffect = Effect.fn("ChannelRoutineScheduler.resumePendingRuns")(function* (
+  readonly resumePendingRuns = Effect.fn("ChannelRoutineScheduler.resumePendingRuns")(function* (
     this: ChannelRoutineScheduler,
   ) {
     const pending = yield* channelRoutineStep(() => this.#routines.pendingRuns());
@@ -312,8 +302,8 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
     if (!requestMessageId)
       return yield* new ChannelRoutineFailed({ cause: new Error("The routine run has no request message.") });
     const issued = yield* Effect.result(
-      channelRoutineIo(() =>
-        this.#channels.command(
+      this.#channels
+        .command(
           {
             type: "request",
             operationId: this.#operationId(run),
@@ -324,8 +314,8 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
             origin: { kind: "routine", routineId: run.routineId, routineName: run.routineName, runId: run.id },
           },
           this.#actor(run),
-        ),
-      ),
+        )
+        .pipe(Effect.mapError((failure) => new ChannelRoutineFailed({ cause: failure.cause }))),
     );
     if (Result.isFailure(issued)) {
       const error = issued.failure.cause;
@@ -371,16 +361,6 @@ export class ChannelRoutineFailed extends Schema.TaggedError<ChannelRoutineFaile
   cause: Schema.Defect(),
 }) {}
 
-function channelRoutineIo<A>(run: () => Promise<A>): Effect.Effect<A, ChannelRoutineFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new ChannelRoutineFailed({ cause }) });
-}
-
 function channelRoutineStep<A>(run: () => A): Effect.Effect<A, ChannelRoutineFailed> {
   return Effect.try({ try: run, catch: (cause) => new ChannelRoutineFailed({ cause }) });
-}
-
-async function runChannelRoutine<A>(operation: Effect.Effect<A, ChannelRoutineFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

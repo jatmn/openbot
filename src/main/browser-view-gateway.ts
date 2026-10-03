@@ -1,7 +1,7 @@
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, ManagedRuntime, Result } from "effect";
+import { Context, Deferred, Effect, Layer, Result } from "effect";
 import { recordRestartActivity } from "../backend/restart-activity";
-import { type RemoteWorkflowError, remoteCall, remoteDecode } from "./remote-service-effects";
+import { RemoteWorkflowError, remoteDecode } from "./remote-service-effects";
 // The host's side of the live browser view: a session a member asks for, a socket that carries the
 // frames, and the pointer and key input that comes back on it.
 //
@@ -66,7 +66,7 @@ class BrowserViewPort extends Context.Service<
   {
     start(
       ...args: Parameters<BrowserHost["startView"]>
-    ): Effect.Effect<Awaited<ReturnType<BrowserHost["startView"]>>, RemoteWorkflowError>;
+    ): Effect.Effect<Effect.Success<ReturnType<BrowserHost["startView"]>>, RemoteWorkflowError>;
     input(...args: Parameters<BrowserHost["dispatchViewInput"]>): Effect.Effect<void, RemoteWorkflowError>;
   }
 >()("openbot/main/BrowserViewPort") {
@@ -74,8 +74,10 @@ class BrowserViewPort extends Context.Service<
     return Layer.succeed(
       BrowserViewPort,
       BrowserViewPort.of({
-        start: (...args) => remoteCall(() => browser.startView(...args)),
-        input: (...args) => remoteCall(() => browser.dispatchViewInput(...args)),
+        start: (...args) =>
+          browser.startView(...args).pipe(Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause }))),
+        input: (...args) =>
+          browser.dispatchViewInput(...args).pipe(Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause }))),
       }),
     );
   }
@@ -87,7 +89,7 @@ interface ManagedViewSession {
   memberId: string;
   teamSessionId: string;
   socket: Ws.WebSocket | null;
-  stopView: (() => Promise<void>) | null;
+  stopView: (() => Effect.Effect<void>) | null;
   /** The size of the last frame sent, which is what a fractional input coordinate refers to. */
   frameWidth: number;
   frameHeight: number;
@@ -102,14 +104,15 @@ interface ManagedViewSession {
 
 export class BrowserViewGateway {
   readonly #options: BrowserViewGatewayOptions;
-  #runtime: ManagedRuntime.ManagedRuntime<BrowserViewPort, never> | null = null;
-  readonly #operations = new Set<Promise<unknown>>();
-  #stopping: Promise<void> | null = null;
+  readonly #layer: Layer.Layer<BrowserViewPort>;
+  readonly #operations = new Set<Deferred.Deferred<void>>();
+  #stopping: Deferred.Deferred<void, RemoteWorkflowError> | null = null;
   readonly #webSockets = new webSockets.WebSocketServer({ noServer: true });
   readonly #sessions = new Map<string, ManagedViewSession>();
 
   constructor(options: BrowserViewGatewayOptions) {
     this.#options = options;
+    this.#layer = BrowserViewPort.layer(options.browser);
   }
 
   createSession(input: { memberId: string; teamSessionId: string; tabId: string }): BrowserViewSessionResponse {
@@ -132,19 +135,19 @@ export class BrowserViewGateway {
     return { id, tabId: input.tabId, streamPath: browserViewStreamPath(id) };
   }
 
-  closeMemberSession(id: string, memberId: string): Promise<boolean> {
-    return this.#run(this.closeMemberSessionEffect(id, memberId));
-  }
-  readonly closeMemberSessionEffect = Effect.fn("BrowserViewGateway.closeMemberSession")(function* (
-    this: BrowserViewGateway,
-    id: string,
-    memberId: string,
-  ): Effect.fn.Return<boolean, RemoteWorkflowError, BrowserViewPort> {
-    const session = this.#sessions.get(id);
-    if (!session || session.memberId !== memberId) return false;
-    yield* this.#closeSessionEffect(session, "The browser view was closed.");
-    return true;
-  });
+  readonly closeMemberSession = Effect.fn("BrowserViewGateway.closeMemberSession")(
+    function* (
+      this: BrowserViewGateway,
+      id: string,
+      memberId: string,
+    ): Effect.fn.Return<boolean, RemoteWorkflowError, BrowserViewPort> {
+      const session = this.#sessions.get(id);
+      if (!session || session.memberId !== memberId) return false;
+      yield* this.#closeSession(session, "The browser view was closed.");
+      return true;
+    },
+    (operation) => this.#provide(operation),
+  ).bind(this);
 
   /** Views with a live socket. Created but never opened views do not hold anything. */
   activeViewCount(): number {
@@ -155,37 +158,40 @@ export class BrowserViewGateway {
     return count;
   }
 
-  revokeTeamSession(teamSessionId: string): Promise<void> {
-    return this.#run(this.revokeTeamSessionEffect(teamSessionId));
-  }
-  readonly revokeTeamSessionEffect = Effect.fn("BrowserViewGateway.revokeTeamSession")(function* (
-    this: BrowserViewGateway,
-    teamSessionId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, BrowserViewPort> {
-    for (const session of [...this.#sessions.values()]) {
-      if (session.teamSessionId === teamSessionId) yield* this.#closeSessionEffect(session, "Team access ended.");
-    }
-  });
-
-  stop(): Promise<void> {
-    this.#stopping ??= (async () => {
-      try {
-        await this.#run(this.stopEffect());
-        await Promise.allSettled([...this.#operations]);
-      } finally {
-        await this.#runtime?.dispose();
-        this.#runtime = null;
-        this.#stopping = null;
+  readonly revokeTeamSession = Effect.fn("BrowserViewGateway.revokeTeamSession")(
+    function* (
+      this: BrowserViewGateway,
+      teamSessionId: string,
+    ): Effect.fn.Return<void, RemoteWorkflowError, BrowserViewPort> {
+      for (const session of [...this.#sessions.values()]) {
+        if (session.teamSessionId === teamSessionId) yield* this.#closeSession(session, "Team access ended.");
       }
-    })();
-    return this.#stopping;
-  }
-  readonly stopEffect = Effect.fn("BrowserViewGateway.stop")(function* (
-    this: BrowserViewGateway,
-  ): Effect.fn.Return<void, RemoteWorkflowError, BrowserViewPort> {
-    for (const session of [...this.#sessions.values()]) yield* this.#closeSessionEffect(session, "The host stopped.");
-    this.#webSockets.close();
-  });
+    },
+    (operation) => this.#provide(operation),
+  ).bind(this);
+
+  readonly stop = Effect.fn("BrowserViewGateway.stop")(function* (this: BrowserViewGateway) {
+    if (this.#stopping) return yield* Deferred.await(this.#stopping);
+    const stopped = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    this.#stopping = stopped;
+    return yield* Effect.gen({ self: this }, function* () {
+      for (const session of [...this.#sessions.values()]) {
+        yield* this.#closeSession(session, "The host stopped.");
+      }
+      this.#webSockets.close();
+      while (this.#operations.size > 0) {
+        yield* Effect.all([...this.#operations].map(Deferred.await), { concurrency: "unbounded" });
+      }
+    }).pipe(
+      Effect.provide(this.#layer),
+      Effect.onExit((exit) =>
+        Effect.sync(() => {
+          Deferred.doneUnsafe(stopped, exit);
+          this.#stopping = null;
+        }),
+      ),
+    );
+  }, Effect.uninterruptible).bind(this);
 
   handlesUpgrade(url: URL): boolean {
     return browserViewStreamSessionId(url.pathname) !== null;
@@ -204,7 +210,7 @@ export class BrowserViewGateway {
     session.frameHeight = 0;
     session.frameSizes.clear();
     session.rememberFrames = browserViewClientAcksFrames(url);
-    this.#webSockets.handleUpgrade(request, socket, head, (client) => void this.#connect(session, client));
+    this.#webSockets.handleUpgrade(request, socket, head, (client) => this.#dispatch(this.#connect(session, client)));
   }
 
   /**
@@ -222,10 +228,7 @@ export class BrowserViewGateway {
     return this.#options.authenticate(token)?.id === session.memberId;
   }
 
-  #connect(session: ManagedViewSession, client: Ws.WebSocket): Promise<void> {
-    return this.#run(this.#connectEffect(session, client));
-  }
-  readonly #connectEffect = Effect.fn("BrowserViewGateway.connect")(function* (
+  readonly #connect = Effect.fn("BrowserViewGateway.connect")(function* (
     this: BrowserViewGateway,
     session: ManagedViewSession,
     client: Ws.WebSocket,
@@ -235,10 +238,10 @@ export class BrowserViewGateway {
     recordRestartActivity();
     client.on("message", (data, binary) => {
       if (binary || session.socket !== client) return;
-      void this.#handleInput(session, data);
+      this.#dispatch(this.#handleInput(session, data));
     });
-    client.once("close", () => void this.#detach(session, client));
-    client.once("error", () => void this.#detach(session, client));
+    client.once("close", () => this.#dispatch(this.#detach(session, client)));
+    client.once("error", () => this.#dispatch(this.#detach(session, client)));
     return yield* Effect.gen({ self: this }, function* () {
       const browser = yield* BrowserViewPort;
       const stopView = yield* browser.start(
@@ -255,35 +258,32 @@ export class BrowserViewGateway {
           if (session.rememberFrames) {
             session.frameSizes.set(frame.sequence, { width: frame.width, height: frame.height });
             if (session.frameSizes.size > MAX_UNACKNOWLEDGED_FRAMES) {
-              void this.#closeSession(session, "The live view fell too far behind.");
+              this.#dispatch(this.#closeSession(session, "The live view fell too far behind."));
             }
           }
         },
         (reason) => {
-          void this.#closeSession(session, reason);
+          this.#dispatch(this.#closeSession(session, reason));
         },
       );
       if (session.socket === client) session.stopView = stopView;
-      else yield* remoteCall(() => stopView());
+      else yield* stopView();
     }).pipe(
       Effect.catch(({ cause: error }) =>
         Effect.gen({ self: this }, function* () {
           client.close(1011, String(error instanceof Error ? error.message : error).slice(0, 120));
-          yield* this.#detachEffect(session, client);
+          yield* this.#detach(session, client);
         }),
       ),
     );
   });
 
-  #handleInput(session: ManagedViewSession, data: Ws.RawData): Promise<void> {
-    if (!session.socket) return Promise.resolve();
-    return this.#run(this.#handleInputEffect(session, data));
-  }
-  readonly #handleInputEffect = Effect.fn("BrowserViewGateway.handleInput")(function* (
+  readonly #handleInput = Effect.fn("BrowserViewGateway.handleInput")(function* (
     this: BrowserViewGateway,
     session: ManagedViewSession,
     data: Ws.RawData,
   ): Effect.fn.Return<void, RemoteWorkflowError, BrowserViewPort> {
+    if (!session.socket) return;
     if (rawDataSize(data) > MAX_INPUT_MESSAGE_BYTES) return;
 
     const attempt1 = yield* remoteDecode(() => decodeBrowserViewInput(rawDataText(data))).pipe(Effect.result);
@@ -325,11 +325,7 @@ export class BrowserViewGateway {
     yield* browser.input(session.tabId, dispatched).pipe(Effect.catch(() => Effect.void));
   });
 
-  #detach(session: ManagedViewSession, client: Ws.WebSocket): Promise<void> {
-    if (session.socket !== client) return Promise.resolve();
-    return this.#run(this.#detachEffect(session, client));
-  }
-  readonly #detachEffect = Effect.fn("BrowserViewGateway.detach")(function* (
+  readonly #detach = Effect.fn("BrowserViewGateway.detach")(function* (
     this: BrowserViewGateway,
     session: ManagedViewSession,
     client: Ws.WebSocket,
@@ -339,14 +335,10 @@ export class BrowserViewGateway {
     session.socket = null;
     const stopView = session.stopView;
     session.stopView = null;
-    if (stopView) yield* remoteCall(stopView).pipe(Effect.catch(() => Effect.void));
+    if (stopView) yield* stopView().pipe(Effect.catch(() => Effect.void));
   });
 
-  #closeSession(session: ManagedViewSession, reason: string): Promise<void> {
-    if (!this.#sessions.has(session.id) && !session.socket) return Promise.resolve();
-    return this.#run(this.#closeSessionEffect(session, reason));
-  }
-  readonly #closeSessionEffect = Effect.fn("BrowserViewGateway.closeSession")(function* (
+  readonly #closeSession = Effect.fn("BrowserViewGateway.closeSession")(function* (
     this: BrowserViewGateway,
     session: ManagedViewSession,
     reason: string,
@@ -357,19 +349,28 @@ export class BrowserViewGateway {
     const stopView = session.stopView;
     session.stopView = null;
     client?.close(1000, reason.slice(0, 120));
-    if (stopView) yield* remoteCall(stopView).pipe(Effect.catch(() => Effect.void));
+    if (stopView) yield* stopView().pipe(Effect.catch(() => Effect.void));
   });
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, BrowserViewPort>): Promise<A> {
-    this.#runtime ??= ManagedRuntime.make(BrowserViewPort.layer(this.#options.browser));
-    const pending = this.#runtime.runPromise(Effect.result(operation)).then((result) => {
-      if (Result.isFailure(result)) throw result.failure.cause;
-      return result.success;
+  #provide<A>(
+    operation: Effect.Effect<A, RemoteWorkflowError, BrowserViewPort>,
+  ): Effect.Effect<A, RemoteWorkflowError> {
+    return Effect.suspend(() => {
+      const completed = Deferred.makeUnsafe<void>();
+      this.#operations.add(completed);
+      return operation.pipe(
+        Effect.provide(this.#layer),
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#operations.delete(completed);
+            Deferred.doneUnsafe(completed, Effect.void);
+          }),
+        ),
+      );
     });
-    this.#operations.add(pending);
-    const clear = () => {
-      this.#operations.delete(pending);
-    };
-    void pending.then(clear, clear);
-    return pending;
+  }
+
+  // Native WebSocket and browser callbacks own these executions. stop waits for each one.
+  #dispatch(operation: Effect.Effect<void, RemoteWorkflowError, BrowserViewPort>): void {
+    Effect.runFork(this.#provide(operation));
   }
 }

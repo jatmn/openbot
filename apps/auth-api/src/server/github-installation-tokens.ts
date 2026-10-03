@@ -1,6 +1,5 @@
 import { Effect, Result, Schema } from "effect";
 import { importPKCS8, SignJWT } from "jose";
-import { runApiEffect } from "./effect-runtime";
 
 /**
  * Installation tokens of the OpenBot GitHub App for one signed-in GitHub user.
@@ -98,11 +97,8 @@ export class GitHubInstallationTokens {
   }
 
   /** The tokens for installations where this user can push to a repository. */
-  issue(userToken: string): Promise<GitHubInstallationToken[]> {
-    return runApiEffect(this.#issue(userToken));
-  }
 
-  readonly #issue = Effect.fn("GitHubInstallationTokens.issue")(function* (
+  readonly issue = Effect.fn("GitHubInstallationTokens.issue")(function* (
     this: GitHubInstallationTokens,
     userToken: string,
   ): Effect.fn.Return<GitHubInstallationToken[], GitHubInstallationTokensError> {
@@ -120,7 +116,7 @@ export class GitHubInstallationTokens {
       } else tokens.push(...result.success);
     }
     return tokens;
-  });
+  }).bind(this);
 
   readonly #issueForInstallation = Effect.fn("GitHubInstallationTokens.issueForInstallation")(function* (
     this: GitHubInstallationTokens,

@@ -12,7 +12,7 @@ import type {
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
 import { z } from "zod";
-import { runTool, ToolOperationFailed, toolIo, toolStep } from "./tool-operation";
+import { ToolOperationFailed, toolStep } from "./tool-operation";
 
 const sourcePath = z.string().min(1).max(INPUT_LIMITS.path);
 const skillId = z.string().regex(/^local-skill-[\da-f-]{36}$/u);
@@ -36,14 +36,18 @@ const setSkillEnabledSchema = z
 const uninstallSkillSchema = z.object({ agentId: targetAgentId, skillId: installedSkillId }).strict();
 
 export interface LocalSkillTools {
-  create(input: CreateLocalSkillInput): Promise<MarketplaceSkillDetail>;
-  revise(input: ReviseLocalSkillInput): Promise<MarketplaceSkillDetail>;
-  list(): Promise<MarketplaceSkillDetail[]>;
-  get(input: LocalSkillRevisionInput): Promise<MarketplaceSkillDetail & { archivePath: string }>;
-  install(input: LocalSkillRevisionInput & { agentId: string; revision: number }): Promise<InstalledSkill>;
-  listInstalled(agentId: string): Promise<InstalledSkill[]>;
-  setEnabled(input: SetEnabledSkillInput): Promise<InstalledSkill>;
-  uninstall(input: UninstallSkillInput): Promise<void>;
+  create(input: CreateLocalSkillInput): Effect.Effect<MarketplaceSkillDetail, ToolOperationFailed>;
+  revise(input: ReviseLocalSkillInput): Effect.Effect<MarketplaceSkillDetail, ToolOperationFailed>;
+  list(): Effect.Effect<MarketplaceSkillDetail[], ToolOperationFailed>;
+  get(
+    input: LocalSkillRevisionInput,
+  ): Effect.Effect<MarketplaceSkillDetail & { archivePath: string }, ToolOperationFailed>;
+  install(
+    input: LocalSkillRevisionInput & { agentId: string; revision: number },
+  ): Effect.Effect<InstalledSkill, ToolOperationFailed>;
+  listInstalled(agentId: string): Effect.Effect<InstalledSkill[], ToolOperationFailed>;
+  setEnabled(input: SetEnabledSkillInput): Effect.Effect<InstalledSkill, ToolOperationFailed>;
+  uninstall(input: UninstallSkillInput): Effect.Effect<void, ToolOperationFailed>;
 }
 
 export const LOCAL_SKILL_TOOL_DEFINITIONS = [
@@ -113,18 +117,7 @@ function skillToolDetail(skill: MarketplaceSkillDetail) {
  * `agentId` is the calling agent: it owns the skills it creates and revises. `targetAgent` resolves
  * the agent that an install, enable, or uninstall changes, which is the caller when `agentId` is omitted.
  */
-export function runLocalSkillTool(
-  api: LocalSkillTools,
-  agentId: string,
-  tool: string,
-  args: unknown,
-  targetAgent: (agentId: string | undefined) => string,
-  onChanged?: (event: SkillConversationEvent) => void,
-) {
-  return runTool(runLocalSkillToolEffect(api, agentId, tool, args, targetAgent, onChanged));
-}
-
-export const runLocalSkillToolEffect = Effect.fn("SkillTools.run")(function* (
+export const runLocalSkillTool = Effect.fn("SkillTools.run")(function* (
   api: LocalSkillTools,
   agentId: string,
   tool: string,
@@ -135,25 +128,25 @@ export const runLocalSkillToolEffect = Effect.fn("SkillTools.run")(function* (
   switch (tool) {
     case "create_skill": {
       const input = yield* toolStep(() => createSkillSchema.parse(args));
-      const skill = yield* toolIo(() => api.create({ agentId, ...input }));
+      const skill = yield* api.create({ agentId, ...input });
       onChanged?.({ action: "created", skillId: skill.id, revision: skill.version, skillName: skill.name });
       return skillToolDetail(skill);
     }
     case "revise_skill": {
       const input = yield* toolStep(() => reviseSkillSchema.parse(args));
-      const skill = yield* toolIo(() => api.revise({ agentId, ...input }));
+      const skill = yield* api.revise({ agentId, ...input });
       onChanged?.({ action: "revised", skillId: skill.id, revision: skill.version, skillName: skill.name });
       return skillToolDetail(skill);
     }
     case "read_local_skill": {
       const input = yield* toolStep(() => readSkillSchema.parse(args));
-      const skill = yield* toolIo(() => api.get(input));
+      const skill = yield* api.get(input);
       return { ...skillToolDetail(skill), archivePath: skill.archivePath };
     }
     case "install_local_skill": {
       const input = yield* toolStep(() => installLocalSkillSchema.parse(args));
       const target = yield* toolStep(() => targetAgent(input.agentId));
-      const skill = yield* toolIo(() => api.install({ ...input, agentId: target }));
+      const skill = yield* api.install({ ...input, agentId: target });
       onChanged?.({
         action: "installed",
         skillId: skill.skillId,
@@ -163,22 +156,22 @@ export const runLocalSkillToolEffect = Effect.fn("SkillTools.run")(function* (
       return skill;
     }
     case "list_local_skills":
-      return (yield* toolIo(() => api.list())).map(skillToolSummary);
+      return (yield* api.list()).map(skillToolSummary);
     case "set_skill_enabled": {
       const input = yield* toolStep(() => setSkillEnabledSchema.parse(args));
       const target = yield* toolStep(() => targetAgent(input.agentId));
-      return yield* toolIo(() => api.setEnabled({ ...input, agentId: target }));
+      return yield* api.setEnabled({ ...input, agentId: target });
     }
     case "uninstall_skill": {
       const input = yield* toolStep(() => uninstallSkillSchema.parse(args));
       const target = yield* toolStep(() => targetAgent(input.agentId));
       // The service ignores an id that is not in the lock file, and workspace folder skills are never in it.
-      const installed = yield* toolIo(() => api.listInstalled(target));
+      const installed = yield* api.listInstalled(target);
       if (!installed.some((skill) => skill.skillId === input.skillId && skill.origin !== "workspace")) {
         return yield* new ToolOperationFailed({ cause: new Error(sourceText("error.skill.notFound")) });
       }
       // Never `removeModified`: files the user changed are theirs to remove.
-      yield* toolIo(() => api.uninstall({ agentId: target, skillId: input.skillId }));
+      yield* api.uninstall({ agentId: target, skillId: input.skillId });
       return { agentId: target, skillId: input.skillId, removed: true };
     }
     default:

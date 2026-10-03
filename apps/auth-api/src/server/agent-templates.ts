@@ -2,7 +2,6 @@ import { isAgentTemplateId } from "@openbot/contracts/agent-template-links";
 import { isValidAvatarImage } from "@openbot/contracts/avatar-images";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
-  type AgentTemplateDetail,
   type AgentTemplateSnapshot,
   isAgentTemplateCardPng,
   isAgentTemplateSnapshot,
@@ -11,7 +10,6 @@ import {
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { Effect, Result, Schema } from "effect";
 import { AgentMarketplaceError } from "./agent-marketplace";
-import { runApiEffect } from "./effect-runtime";
 import { MarketplaceStorage } from "./marketplace-storage";
 import type { AuthUser, WorkerBindings } from "./types";
 
@@ -54,18 +52,7 @@ export class AgentTemplates {
     avatar: { bytes: Uint8Array; mimeType: string } | null;
     /** The share card for link previews: a PNG of `AGENT_TEMPLATE_CARD` size. */
     card?: Uint8Array | null;
-  }): Promise<OwnedAgentTemplate> {
-    return runApiEffect(this.publishEffect(input).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  publishEffect(input: {
-    user: AuthUser;
-    sourceAgentId: unknown;
-    snapshot: unknown;
-    avatar: { bytes: Uint8Array; mimeType: string } | null;
-    /** The share card for link previews: a PNG of `AGENT_TEMPLATE_CARD` size. */
-    card?: Uint8Array | null;
-  }): Effect.Effect<OwnedAgentTemplate, AgentMarketplaceError | AgentTemplatesStorageError, MarketplaceStorage> {
+  }) {
     return Effect.fn("AgentTemplates.publish")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -196,16 +183,10 @@ export class AgentTemplates {
         yield* this.deleteImagesEffect([previous.avatarKey, previous.cardKey]);
         return { id: returned.id, sourceAgentId, updatedAt: new Date(now).toISOString() };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  listMine(userId: string): Promise<OwnedAgentTemplate[]> {
-    return runApiEffect(this.listMineEffect(userId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  listMineEffect(
-    userId: string,
-  ): Effect.Effect<OwnedAgentTemplate[], AgentMarketplaceError | AgentTemplatesStorageError, MarketplaceStorage> {
+  listMine(userId: string) {
     return Effect.fn("AgentTemplates.listMine")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -226,16 +207,10 @@ export class AgentTemplates {
           })),
         );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  get(id: string): Promise<AgentTemplateDetail> {
-    return runApiEffect(this.getEffect(id).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  getEffect(
-    id: string,
-  ): Effect.Effect<AgentTemplateDetail, AgentMarketplaceError | AgentTemplatesStorageError, MarketplaceStorage> {
+  get(id: string) {
     return Effect.fn("AgentTemplates.get")(() =>
       Effect.gen({ self: this }, function* () {
         const row = yield* this.rowEffect(id);
@@ -256,17 +231,12 @@ export class AgentTemplates {
           updatedAt: new Date(row.updated_at).toISOString(),
         };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   /** With the request headers, an unchanged image comes back without a body, for a 304. */
-  avatar(id: string, conditions?: Headers) {
-    return runApiEffect(
-      this.avatarEffect(id, conditions).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
 
-  avatarEffect(id: string, conditions?: Headers) {
+  avatar(id: string, conditions?: Headers) {
     return Effect.fn("AgentTemplates.avatar")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -286,14 +256,10 @@ export class AgentTemplates {
           );
         return object;
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   card(id: string, conditions?: Headers) {
-    return runApiEffect(this.cardEffect(id, conditions).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  cardEffect(id: string, conditions?: Headers) {
     return Effect.fn("AgentTemplates.card")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -313,21 +279,15 @@ export class AgentTemplates {
           );
         return object;
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   /**
    * Removes everything the link shows: the snapshot, the avatar and the card. The row keeps only its
    * id, the owner and the local agent, so publishing the same agent again gives back the same link.
    */
-  unpublish(userId: string, id: string): Promise<void> {
-    return runApiEffect(this.unpublishEffect(userId, id).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
 
-  unpublishEffect(
-    userId: string,
-    id: string,
-  ): Effect.Effect<void, AgentMarketplaceError | AgentTemplatesStorageError, MarketplaceStorage> {
+  unpublish(userId: string, id: string) {
     return Effect.fn("AgentTemplates.unpublish")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -353,7 +313,7 @@ export class AgentTemplates {
         // can no longer fix, because the row no longer names these images.
         yield* this.deleteImagesEffect([images.avatarKey, images.cardKey]);
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   private deleteImagesEffect(

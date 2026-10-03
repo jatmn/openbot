@@ -7,7 +7,7 @@
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Result, Schema } from "effect";
 import { z } from "zod";
-import { GitHubOperationError, githubCall, githubDecode, runGitHubEffect } from "./github-effects";
+import { GitHubOperationError, githubCall, githubDecode } from "./github-effects";
 
 const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
 export const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -102,12 +102,8 @@ export interface PollGitHubDeviceTokenOptions extends GitHubDeviceFlowOptions {
 }
 
 /** Asks GitHub for a user code. The user types it at `verificationUri`. An abort rejects with the signal's reason. */
-export function requestGitHubDeviceCode(
-  options: GitHubDeviceFlowOptions & { signal: AbortSignal },
-): Promise<GitHubDeviceCode> {
-  return runGitHubEffect(requestGitHubDeviceCodeEffect(options));
-}
-export const requestGitHubDeviceCodeEffect = Effect.fn("GitHub.requestDeviceCode")(function* (
+
+export const requestGitHubDeviceCode = Effect.fn("GitHub.requestDeviceCode")(function* (
   options: GitHubDeviceFlowOptions & { signal: AbortSignal },
 ): Effect.fn.Return<GitHubDeviceCode, GitHubOperationError> {
   const now = options.now ?? Date.now;
@@ -137,10 +133,8 @@ export const requestGitHubDeviceCodeEffect = Effect.fn("GitHub.requestDeviceCode
 });
 
 /** Keep GitHub's polling interval and retry only unreachable requests. */
-export function pollGitHubDeviceToken(options: PollGitHubDeviceTokenOptions): Promise<GitHubTokenSet> {
-  return runGitHubEffect(pollGitHubDeviceTokenEffect(options));
-}
-export const pollGitHubDeviceTokenEffect = Effect.fn("GitHub.pollDeviceToken")(function* (
+
+export const pollGitHubDeviceToken = Effect.fn("GitHub.pollDeviceToken")(function* (
   options: PollGitHubDeviceTokenOptions,
 ): Effect.fn.Return<GitHubTokenSet, GitHubOperationError> {
   const now = options.now ?? Date.now;
@@ -172,12 +166,7 @@ export const pollGitHubDeviceTokenEffect = Effect.fn("GitHub.pollDeviceToken")(f
   }
 });
 
-export function refreshGitHubToken(
-  options: GitHubDeviceFlowOptions & { refreshToken: string },
-): Promise<GitHubTokenSet> {
-  return runGitHubEffect(refreshGitHubTokenEffect(options));
-}
-export const refreshGitHubTokenEffect = Effect.fn("GitHub.refreshToken")(function* (
+export const refreshGitHubToken = Effect.fn("GitHub.refreshToken")(function* (
   options: GitHubDeviceFlowOptions & { refreshToken: string },
 ): Effect.fn.Return<GitHubTokenSet, GitHubOperationError> {
   const now = options.now ?? Date.now;

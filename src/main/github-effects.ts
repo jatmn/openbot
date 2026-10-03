@@ -1,6 +1,6 @@
-import { Context, Effect, Layer, Result, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 
-/** Adapter failure retains the original error for the released Promise interface. */
+/** Adapter failure retains the original error for the native boundary. */
 export class GitHubOperationError extends Schema.TaggedError<GitHubOperationError>()("GitHubOperationError", {
   cause: Schema.Defect(),
 }) {}
@@ -9,12 +9,6 @@ export const githubCall = <A>(operation: (signal: AbortSignal) => Promise<A>) =>
   Effect.tryPromise({ try: operation, catch: (cause) => new GitHubOperationError({ cause }) });
 export const githubDecode = <A>(operation: () => A) =>
   Effect.try({ try: operation, catch: (cause) => new GitHubOperationError({ cause }) });
-
-export async function runGitHubEffect<A>(operation: Effect.Effect<A, GitHubOperationError>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
 
 /** Actual injected network and desktop navigation capabilities. */
 export class GitHubPlatform extends Context.Service<

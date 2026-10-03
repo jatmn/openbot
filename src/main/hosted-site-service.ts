@@ -21,8 +21,9 @@ import type {
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { type SourceMessages, sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, Result, Schema } from "effect";
 import { isMissingFileError } from "../backend/file-errors";
+import type { CentralAuthOperationError } from "./central-auth-effects";
 
 const PATH_PROBLEM_KEYS = {
   invalid: "error.site.unsafePath",
@@ -55,11 +56,16 @@ interface PendingUpload {
   session: UploadSession | null;
   uploadedPaths: Set<string>;
   createdAt: number;
-  inFlight: Promise<HostedSiteSummary> | null;
+  inFlight: Deferred.Deferred<HostedSiteSummary, HostedSiteFailure> | null;
 }
 
 export interface HostedSiteAuthClient {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
+  requestAuthorized<T>(
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs?: number,
+  ): Effect.Effect<T, CentralAuthOperationError>;
 }
 
 /** The registered server of this computer and its machine token. The token is a secret: never log it. */
@@ -83,94 +89,83 @@ export class HostedSiteDesktopService {
     private readonly serverCredential: () => HostedSiteServerCredential | null = () => null,
   ) {}
 
-  list(): Promise<HostedSiteList> {
-    return runSite(
-      Effect.gen({ self: this }, function* () {
-        const credential = this.serverCredential();
-        const unlinked = siteIO(() =>
-          this.auth.requestAuthorized(`/v1/sites/${UNLINKED_SCOPE}`, { method: "GET" }, decodeSiteList),
-        );
-        if (!credential) return yield* unlinked;
-        const [server, account] = yield* Effect.all(
-          [
-            siteIO(() =>
-              this.auth.requestAuthorized(
-                "/v1/sites/",
-                { method: "GET", headers: serverHeaders(credential) },
-                decodeSiteList,
-              ),
-            ),
-            unlinked,
-          ],
-          { concurrency: "unbounded" },
-        );
-        const shown = new Set(server.sites.map((site) => site.id));
-        const unlinkedSites = account.sites.filter((site) => !shown.has(site.id));
-        return { sites: [...server.sites, ...unlinkedSites], limit: server.limit, used: server.used };
-      }),
-    );
+  list(): Effect.Effect<HostedSiteList, HostedSiteFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const credential = this.serverCredential();
+      const unlinked = this.auth
+        .requestAuthorized(`/v1/sites/${UNLINKED_SCOPE}`, { method: "GET" }, decodeSiteList)
+        .pipe(Effect.mapError((error) => new HostedSiteFailure({ cause: error.cause })));
+      if (!credential) return yield* unlinked;
+      const [server, account] = yield* Effect.all(
+        [
+          this.auth
+            .requestAuthorized("/v1/sites/", { method: "GET", headers: serverHeaders(credential) }, decodeSiteList)
+            .pipe(Effect.mapError((error) => new HostedSiteFailure({ cause: error.cause }))),
+          unlinked,
+        ],
+        { concurrency: "unbounded" },
+      );
+      const shown = new Set(server.sites.map((site) => site.id));
+      const unlinkedSites = account.sites.filter((site) => !shown.has(site.id));
+      return { sites: [...server.sites, ...unlinkedSites], limit: server.limit, used: server.used };
+    });
   }
 
-  publish(input: PublishHostedSiteInput, allowedRoots?: readonly string[]): Promise<HostedSiteSummary> {
+  publish(
+    input: PublishHostedSiteInput,
+    allowedRoots?: readonly string[],
+  ): Effect.Effect<HostedSiteSummary, HostedSiteFailure> {
     return this.upload(input, null, allowedRoots);
   }
 
-  replace(input: ReplaceHostedSiteInput, allowedRoots?: readonly string[]): Promise<HostedSiteSummary> {
+  replace(
+    input: ReplaceHostedSiteInput,
+    allowedRoots?: readonly string[],
+  ): Effect.Effect<HostedSiteSummary, HostedSiteFailure> {
     return this.upload(input, input.siteId, allowedRoots);
   }
 
   /** Deletes a site of this server, or an unlinked site of this account. Only for this computer's own user. */
-  delete(siteId: string): Promise<void> {
-    return runSite(
-      Effect.gen({ self: this }, function* () {
-        const key = operationKey("delete");
-        const credential = this.serverCredential();
-        if (credential) {
-          const result = yield* Effect.result(this.deleteSite(siteId, key, serverHeaders(credential)));
-          if (Result.isSuccess(result)) return;
-          const error = result.failure.cause;
-          if (!(error instanceof Error && "code" in error && error.code === "site_other_server"))
-            return yield* result.failure;
-        }
-        yield* this.deleteSite(siteId, key, {}, UNLINKED_SCOPE);
-      }),
-    );
+  delete(siteId: string): Effect.Effect<void, HostedSiteFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const key = operationKey("delete");
+      const credential = this.serverCredential();
+      if (credential) {
+        const result = yield* Effect.result(this.deleteSite(siteId, key, serverHeaders(credential)));
+        if (Result.isSuccess(result)) return;
+        const error = result.failure.cause;
+        if (!(error instanceof Error && "code" in error && error.code === "site_other_server"))
+          return yield* result.failure;
+      }
+      yield* this.deleteSite(siteId, key, {}, UNLINKED_SCOPE);
+    });
   }
 
   /**
    * The sites of this server only, for a member on a joined server. The unlinked sites belong to the owner's
    * account, not to the server, so a member never sees or deletes them.
    */
-  listServerSites(): Promise<HostedSiteList> {
-    return runSite(this.listServerSitesEffect());
-  }
 
-  private listServerSitesEffect(): Effect.Effect<HostedSiteList, HostedSiteFailure> {
+  listServerSites(): Effect.Effect<HostedSiteList, HostedSiteFailure> {
     return Effect.gen({ self: this }, function* () {
       const credential = yield* siteSync(() => this.requireServerCredential());
-      const list = yield* siteIO(() =>
-        this.auth.requestAuthorized(
-          "/v1/sites/",
-          { method: "GET", headers: serverHeaders(credential) },
-          decodeSiteList,
-        ),
-      );
+      const list = yield* this.auth
+        .requestAuthorized("/v1/sites/", { method: "GET", headers: serverHeaders(credential) }, decodeSiteList)
+        .pipe(Effect.mapError((error) => new HostedSiteFailure({ cause: error.cause })));
       if (list.sites.some((site) => site.serverId !== credential.hostId))
         return yield* new HostedSiteFailure({ cause: new Error(sourceText("error.team.hostedSitesUnsupported")) });
       return list;
     });
   }
 
-  deleteServerSite(siteId: string): Promise<void> {
-    return runSite(
-      Effect.gen({ self: this }, function* () {
-        const { sites } = yield* this.listServerSitesEffect();
-        if (!sites.some((site) => site.id === siteId))
-          return yield* new HostedSiteFailure({ cause: new Error(sourceText("error.team.hostedSiteNotFound")) });
-        const credential = yield* siteSync(() => this.requireServerCredential());
-        return yield* this.deleteSite(siteId, operationKey("delete"), serverHeaders(credential));
-      }),
-    );
+  deleteServerSite(siteId: string): Effect.Effect<void, HostedSiteFailure> {
+    return Effect.gen({ self: this }, function* () {
+      const { sites } = yield* this.listServerSites();
+      if (!sites.some((site) => site.id === siteId))
+        return yield* new HostedSiteFailure({ cause: new Error(sourceText("error.team.hostedSiteNotFound")) });
+      const credential = yield* siteSync(() => this.requireServerCredential());
+      return yield* this.deleteSite(siteId, operationKey("delete"), serverHeaders(credential));
+    });
   }
 
   /**
@@ -205,21 +200,22 @@ export class HostedSiteDesktopService {
     headers: Record<string, string>,
     query = "",
   ): Effect.Effect<void, HostedSiteFailure> {
-    return siteIO(() =>
-      this.auth.requestAuthorized(
+    return this.auth
+      .requestAuthorized(
         `/v1/sites/${encodeURIComponent(siteId)}${query}`,
         { method: "DELETE", headers: { "Idempotency-Key": key, ...headers } },
         decodeDeleteResult,
-      ),
-    );
+      )
+      .pipe(Effect.mapError((error) => new HostedSiteFailure({ cause: error.cause })));
   }
 
-  private async upload(
+  private readonly upload = Effect.fn("HostedSite.upload")(function* (
+    this: HostedSiteDesktopService,
     input: PublishHostedSiteInput,
     siteId: string | null,
     allowedRoots?: readonly string[],
-  ): Promise<HostedSiteSummary> {
-    const prepared = await runSite(prepareSiteEffect(input.sourcePath, allowedRoots));
+  ) {
+    const prepared = yield* prepareSite(input.sourcePath, allowedRoots);
     this.prunePendingUploads();
     const signature = uploadSignature(input, siteId, prepared);
     let pending = this.#pendingUploads.get(signature);
@@ -234,16 +230,20 @@ export class HostedSiteDesktopService {
       };
       this.#pendingUploads.set(signature, pending);
     }
-    if (!pending.inFlight) pending.inFlight = runSite(this.performUpload(input, siteId, prepared, pending));
-    try {
-      const site = await pending.inFlight;
-      this.#pendingUploads.delete(signature);
-      return site;
-    } catch (error) {
-      pending.inFlight = null;
-      throw error;
-    }
-  }
+    if (pending.inFlight) return yield* Deferred.await(pending.inFlight);
+    const done = Deferred.makeUnsafe<HostedSiteSummary, HostedSiteFailure>();
+    pending.inFlight = done;
+    const entry = pending;
+    return yield* this.performUpload(input, siteId, prepared, entry).pipe(
+      Effect.tap(() => Effect.sync(() => this.#pendingUploads.delete(signature))),
+      Effect.onExit((exit) => Deferred.done(done, exit)),
+      Effect.ensuring(
+        Effect.sync(() => {
+          entry.inFlight = null;
+        }),
+      ),
+    );
+  }).bind(this);
 
   private performUpload(
     input: PublishHostedSiteInput,
@@ -321,10 +321,7 @@ export class HostedSiteDesktopService {
   }
 }
 
-export function prepareSite(sourcePath: string, allowedRoots?: readonly string[]): Promise<PreparedSite> {
-  return runSite(prepareSiteEffect(sourcePath, allowedRoots));
-}
-const prepareSiteEffect = Effect.fn("HostedSite.prepare")(function* (
+export const prepareSite = Effect.fn("HostedSite.prepare")(function* (
   sourcePath: string,
   allowedRoots?: readonly string[],
 ): Effect.fn.Return<PreparedSite, HostedSiteFailure> {
@@ -543,10 +540,13 @@ function uploadSignature(input: PublishHostedSiteInput, siteId: string | null, p
   return hash.digest("hex");
 }
 
-function retryTransport<A>(request: () => Promise<A>): Effect.Effect<A, HostedSiteFailure> {
-  return siteIO(request).pipe(
-    Effect.catch((error) => (isTransportFailure(error.cause) ? siteIO(request) : Effect.fail(error))),
+function retryTransport<A>(
+  request: () => Effect.Effect<A, CentralAuthOperationError>,
+): Effect.Effect<A, HostedSiteFailure> {
+  const operation = Effect.suspend(request).pipe(
+    Effect.mapError((error) => new HostedSiteFailure({ cause: error.cause })),
   );
+  return operation.pipe(Effect.catch((error) => (isTransportFailure(error.cause) ? operation : Effect.fail(error))));
 }
 
 function isTransportFailure(error: unknown): boolean {
@@ -581,7 +581,7 @@ const exists = Effect.fn("HostedSite.exists")((path: string) =>
   ),
 );
 
-class HostedSiteFailure extends Schema.TaggedError<HostedSiteFailure>()("HostedSiteFailure", {
+export class HostedSiteFailure extends Schema.TaggedError<HostedSiteFailure>()("HostedSiteFailure", {
   cause: Schema.Defect(),
 }) {}
 function siteIO<A>(operation: () => Promise<A>): Effect.Effect<A, HostedSiteFailure> {
@@ -589,9 +589,4 @@ function siteIO<A>(operation: () => Promise<A>): Effect.Effect<A, HostedSiteFail
 }
 function siteSync<A>(operation: () => A): Effect.Effect<A, HostedSiteFailure> {
   return Effect.try({ try: operation, catch: (cause) => new HostedSiteFailure({ cause }) });
-}
-async function runSite<A>(operation: Effect.Effect<A, HostedSiteFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

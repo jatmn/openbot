@@ -7,26 +7,23 @@ import {
 } from "@openbot/contracts/ipc";
 import { Effect, Result } from "effect";
 import { RemoteRequestError } from "./remote-server-errors";
-import type { RemoteServerManager } from "./remote-server-manager";
-import { remoteCall, runRemoteWorkflow } from "./remote-service-effects";
+import type { RemoteWorkflowError } from "./remote-service-effects";
 
 interface RemoteDesktopEvents {
   changed: [sessions: RemoteDesktopSession[]];
 }
 
+interface RemoteDesktopServers {
+  createRemoteDesktopSession(serverId: string): Effect.Effect<RemoteDesktopSession, RemoteWorkflowError>;
+  closeRemoteDesktopSession(serverId: string, sessionId: string): Effect.Effect<void, RemoteWorkflowError>;
+  selectRemoteDesktopDisplay(serverId: string, displayId: string): Effect.Effect<void, RemoteWorkflowError>;
+}
+
 export class RemoteDesktopManager extends EventEmitter<RemoteDesktopEvents> {
-  readonly #servers: Pick<
-    RemoteServerManager,
-    "createRemoteDesktopSession" | "closeRemoteDesktopSession" | "selectRemoteDesktopDisplay"
-  >;
+  readonly #servers: RemoteDesktopServers;
   readonly #sessions = new Map<string, RemoteDesktopSession>();
 
-  constructor(
-    servers: Pick<
-      RemoteServerManager,
-      "createRemoteDesktopSession" | "closeRemoteDesktopSession" | "selectRemoteDesktopDisplay"
-    >,
-  ) {
+  constructor(servers: RemoteDesktopServers) {
     super();
     this.#servers = servers;
   }
@@ -35,18 +32,13 @@ export class RemoteDesktopManager extends EventEmitter<RemoteDesktopEvents> {
     return [...this.#sessions.values()].map((session) => structuredClone(session));
   }
 
-  connect(input: RemoteDesktopConnectInput): Promise<RemoteDesktopConnectResult> {
-    return runRemoteWorkflow(this.connectEffect(input));
-  }
-  readonly connectEffect = Effect.fn("RemoteDesktop.connect")(function* (
+  readonly connect = Effect.fn("RemoteDesktop.connect")(function* (
     this: RemoteDesktopManager,
     input: RemoteDesktopConnectInput,
   ) {
     const existing = [...this.#sessions.values()].find((session) => session.serverId === input.serverId);
     if (existing) return { status: "connected" as const, session: structuredClone(existing) };
-    const attempt = yield* remoteCall(() => this.#servers.createRemoteDesktopSession(input.serverId)).pipe(
-      Effect.result,
-    );
+    const attempt = yield* this.#servers.createRemoteDesktopSession(input.serverId).pipe(Effect.result);
     if (Result.isFailure(attempt)) {
       const refusal = hostRefusal(attempt.failure.cause);
       if (!refusal) return yield* attempt.failure;
@@ -58,10 +50,7 @@ export class RemoteDesktopManager extends EventEmitter<RemoteDesktopEvents> {
     return { status: "connected" as const, session: structuredClone(session) };
   });
 
-  disconnect(sessionId: string): Promise<void> {
-    return runRemoteWorkflow(this.disconnectEffect(sessionId));
-  }
-  readonly disconnectEffect = Effect.fn("RemoteDesktop.disconnect")(function* (
+  readonly disconnect = Effect.fn("RemoteDesktop.disconnect")(function* (
     this: RemoteDesktopManager,
     sessionId: string,
   ) {
@@ -69,20 +58,15 @@ export class RemoteDesktopManager extends EventEmitter<RemoteDesktopEvents> {
     if (!session) return;
     this.#sessions.delete(sessionId);
     this.#emitChanged();
-    yield* remoteCall(() => this.#servers.closeRemoteDesktopSession(session.serverId, session.id)).pipe(
-      Effect.catch(() => Effect.void),
-    );
+    yield* this.#servers.closeRemoteDesktopSession(session.serverId, session.id).pipe(Effect.catch(() => Effect.void));
   });
 
-  selectDisplay(serverId: string, displayId: string): Promise<void> {
-    return runRemoteWorkflow(this.selectDisplayEffect(serverId, displayId));
-  }
-  readonly selectDisplayEffect = Effect.fn("RemoteDesktop.selectDisplay")(function* (
+  readonly selectDisplay = Effect.fn("RemoteDesktop.selectDisplay")(function* (
     this: RemoteDesktopManager,
     serverId: string,
     displayId: string,
   ) {
-    yield* remoteCall(() => this.#servers.selectRemoteDesktopDisplay(serverId, displayId));
+    yield* this.#servers.selectRemoteDesktopDisplay(serverId, displayId);
     for (const [id, session] of this.#sessions) {
       if (session.serverId !== serverId) continue;
       this.#sessions.set(id, { ...session, selectedDisplayId: displayId, phase: "connecting" });
@@ -90,11 +74,8 @@ export class RemoteDesktopManager extends EventEmitter<RemoteDesktopEvents> {
     this.#emitChanged();
   });
 
-  stop(): Promise<void> {
-    return runRemoteWorkflow(this.stopEffect());
-  }
-  readonly stopEffect = Effect.fn("RemoteDesktop.stop")(function* (this: RemoteDesktopManager) {
-    yield* Effect.forEach([...this.#sessions.keys()], (sessionId) => this.disconnectEffect(sessionId), {
+  readonly stop = Effect.fn("RemoteDesktop.stop")(function* (this: RemoteDesktopManager) {
+    yield* Effect.forEach([...this.#sessions.keys()], (sessionId) => this.disconnect(sessionId), {
       concurrency: "unbounded",
       discard: true,
     });

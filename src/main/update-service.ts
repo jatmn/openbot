@@ -10,7 +10,7 @@ import type {
 } from "@openbot/contracts/ipc";
 import { isUpdateBusyPhase } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, Exit, Result, Schema, Scope, Semaphore } from "effect";
 import type { ProgressInfo, UpdateInfo } from "electron-updater";
 import type { HostUpdateState } from "../../packages/contracts/src/host-manager";
 import type { OpenBotSiblingInstance } from "./update-sibling-instances";
@@ -81,6 +81,7 @@ type UpdateOperation = "check" | "download" | "install";
 
 interface UpdateServiceEvents {
   status: [status: UpdateStatus];
+  diagnostic: [event: UpdateDiagnosticEvent];
 }
 
 interface UpdateServiceOptions {
@@ -172,7 +173,8 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   #installHandedOver = false;
   #operation: UpdateOperation = "check";
   #history: UpdateDiagnosticEvent[] = [];
-  #logWrite = Promise.resolve();
+  readonly #logLock = Semaphore.makeUnsafe(1);
+  readonly #workScope = Scope.makeUnsafe();
   #autoDownload: boolean;
   #downloadedVersion: string | null = null;
   #managedByHost = false;
@@ -184,7 +186,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   #installGeneration = 0;
   #activeDownload: number | null = null;
   #activeInstall: number | null = null;
-  #checkRequest: Promise<UpdateCheckOutcome | null> | null = null;
+  #checkRequest: Deferred.Deferred<UpdateCheckOutcome | null, UpdateOperationFailure> | null = null;
   #downloadInFlight = false;
   #teardownCommitted = false;
 
@@ -212,6 +214,10 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       message: options.enabled ? null : sourceText("error.update.unsupported"),
       errorCode: null,
     };
+    this.on("diagnostic", (event) => {
+      const directory = this.#options.logDirectory;
+      if (directory) void runUpdate(this.#logLock.withPermit(appendUpdateLog(directory, event)));
+    });
     this.#recordStatus();
   }
 
@@ -261,7 +267,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       }
     });
     if (this.#options.platform === "darwin" && this.#options.shipItDirectory) {
-      void pruneShipItLogs(this.#options.shipItDirectory);
+      void runUpdate(pruneShipItLogs(this.#options.shipItDirectory));
     }
 
     if (scheduleChecks && this.#options.enabled) {
@@ -301,10 +307,15 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
     return this.#autoDownload;
   }
 
-  setAutoDownload(enabled: boolean): void {
+  readonly setAutoDownload = Effect.fn("UpdateService.setAutoDownload")(function* (
+    this: UpdateService,
+    enabled: boolean,
+  ) {
     this.#autoDownload = enabled;
-    if (enabled && this.#options.enabled && this.#status.phase === "available") void this.downloadUpdate();
-  }
+    if (enabled && this.#options.enabled && this.#status.phase === "available") {
+      yield* Effect.forkIn(this.downloadUpdate(), this.#workScope, { startImmediately: true });
+    }
+  });
 
   /** Host-managed sessions display host state and never invoke the tenant updater. */
   setManagedByHost(managed: boolean): void {
@@ -356,14 +367,11 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
    * "checking" and settles on a real outcome even when an earlier call is still unsettled, because
    * an action that answers a press by leaving the same error on screen reads as a dead button.
    */
-  checkForUpdates(): Promise<UpdateStatus> {
+  checkForUpdates(): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
     return this.#check(true);
   }
 
-  #check(joinOutstandingRequest: boolean): Promise<UpdateStatus> {
-    return runUpdate(this.#checkEffect(joinOutstandingRequest));
-  }
-  #checkEffect(joinOutstandingRequest: boolean): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
+  #check(joinOutstandingRequest: boolean): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
     return Effect.gen({ self: this }, function* () {
       if (this.#managedByHost || !this.#options.enabled || this.#teardownCommitted) return this.getStatus();
       if (this.#status.phase === "ready") return yield* this.#checkSupersedingRelease();
@@ -387,7 +395,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       const generation = ++this.#checkGeneration;
       this.#operation = "check";
       this.#setStatus({ phase: "checking", progress: null, message: null, errorCode: null });
-      const checked = yield* Effect.result(updateIO(() => this.#checkRequest ?? this.#issueCheck())).pipe(
+      const checked = yield* Effect.result(this.#issueCheck()).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             if (this.#checkGeneration === generation) this.#scheduleCheck(this.#options.checkIntervalMs);
@@ -416,7 +424,8 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       }
       // downloadUpdate() moves into "downloading" before its first await, so the caller and the
       // renderer see the download start rather than a stale "available".
-      if (this.#autoDownload && this.#status.phase === "available") void this.downloadUpdate();
+      if (this.#autoDownload && this.#status.phase === "available")
+        yield* Effect.forkIn(this.downloadUpdate(), this.#workScope, { startImmediately: true });
       return this.getStatus();
     });
   }
@@ -435,7 +444,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       this.#scheduleCheck(this.#options.checkIntervalMs);
       if (!this.#autoDownload || this.#checkRequest) return this.getStatus();
       const downloaded = this.#downloadedVersion;
-      const checked = yield* Effect.result(updateIO(() => this.#issueCheck()));
+      const checked = yield* Effect.result(this.#issueCheck());
       if (Result.isFailure(checked)) return this.getStatus();
       const result = checked.success;
       // An install can start, a host can take over, or the preference can change while the request
@@ -457,15 +466,12 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       this.#cancellationToken = result.cancellationToken ?? null;
       this.#downloadedVersion = null;
       this.#markAvailable(result.updateInfo.version);
-      void this.downloadUpdate();
+      yield* Effect.forkIn(this.downloadUpdate(), this.#workScope, { startImmediately: true });
       return this.getStatus();
     });
   }
 
-  downloadUpdate(): Promise<UpdateStatus> {
-    return runUpdate(this.#downloadEffect());
-  }
-  #downloadEffect(): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
+  downloadUpdate(): Effect.Effect<UpdateStatus, UpdateOperationFailure> {
     return Effect.gen({ self: this }, function* () {
       if (this.#managedByHost) return this.getStatus();
       if (!this.#options.enabled || this.#teardownCommitted || !this.#canDownload()) return this.getStatus();
@@ -485,7 +491,11 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
           this.#setError("download_failed");
           return;
         }
-        const result = yield* Effect.result(updateIO(() => this.#updater.downloadUpdate(token)));
+        const result = yield* Effect.result(
+          updateIO(() => this.#updater.downloadUpdate(token)).pipe(
+            Effect.onInterrupt(() => Effect.sync(() => token.cancel())),
+          ),
+        );
         if (Result.isFailure(result) && this.#downloadGeneration === generation) {
           this.#activeDownload = null;
           this.#setError("download_failed");
@@ -501,15 +511,13 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
     });
   }
 
-  installUpdate(): Promise<void> {
-    return runUpdate(
-      Effect.gen({ self: this }, function* () {
-        if (!this.#canInstall() || this.#installStarted)
-          return yield* new UpdateOperationFailure({ cause: new Error(sourceText("error.update.notReady")) });
-        if (this.#managedByHost) return yield* new UpdateOperationFailure({ cause: new Error(MANAGED_HOST_MESSAGE) });
-        yield* this.#install();
-      }),
-    );
+  installUpdate(): Effect.Effect<void, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (!this.#canInstall() || this.#installStarted)
+        return yield* new UpdateOperationFailure({ cause: new Error(sourceText("error.update.notReady")) });
+      if (this.#managedByHost) return yield* new UpdateOperationFailure({ cause: new Error(MANAGED_HOST_MESSAGE) });
+      yield* this.#install();
+    });
   }
 
   #install(): Effect.Effect<void, UpdateOperationFailure> {
@@ -537,9 +545,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
           this.#teardownCommitted = true;
           yield* updateIO(() => this.#options.beforeInstall());
           if (this.#installGeneration !== generation) return;
-          yield* updateIO(async () => {
-            await this.#checkRequest?.catch(() => null);
-          });
+          if (this.#checkRequest) yield* Deferred.await(this.#checkRequest).pipe(Effect.catch(() => Effect.void));
           if (this.#installGeneration !== generation) return;
           this.#installHandedOver = true;
           yield* updateSync(() => this.#updater.quitAndInstall(false, true));
@@ -553,26 +559,36 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
     }).pipe(Effect.uninterruptible);
   }
 
-  stop(): void {
+  readonly stop = Effect.fn("UpdateService.stop")(function* (this: UpdateService) {
     if (this.#checkTimer) clearTimeout(this.#checkTimer);
     this.#checkTimer = null;
     // An install runs shutdown preparation, which stops background work through this method. The
     // install deadline has to survive that: it is the only thing that can release a restart which
     // never happens, and clearing it here would leave the app latched in "installing" forever.
     if (this.#status.phase !== "installing") this.#clearPhaseTimer();
-  }
+    yield* Scope.close(this.#workScope, Exit.void);
+  });
 
   /**
    * Issues the one outstanding request every caller shares. The handle is cleared when the call
    * settles, so `#checkRequest` answers exactly the question the join above asks: is electron-updater
    * still holding a promise that a fresh call would be answered by?
    */
-  #issueCheck(): Promise<UpdateCheckOutcome | null> {
-    const request = this.#updater.checkForUpdates().finally(() => {
-      if (this.#checkRequest === request) this.#checkRequest = null;
+  #issueCheck(): Effect.Effect<UpdateCheckOutcome | null, UpdateOperationFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (this.#checkRequest) return yield* Deferred.await(this.#checkRequest);
+      const request = Deferred.makeUnsafe<UpdateCheckOutcome | null, UpdateOperationFailure>();
+      this.#checkRequest = request;
+      return yield* updateIO(() => this.#updater.checkForUpdates()).pipe(
+        Effect.onExit((exit) =>
+          Effect.gen({ self: this }, function* () {
+            yield* Deferred.done(request, exit);
+            if (this.#checkRequest === request) this.#checkRequest = null;
+          }),
+        ),
+        Effect.uninterruptible,
+      );
     });
-    this.#checkRequest = request;
-    return request;
   }
 
   /** True while the download the service still believes in is the one events are reporting on. */
@@ -642,7 +658,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
 
   #scheduleCheck(delayMs: number): void {
     if (this.#checkTimer) clearTimeout(this.#checkTimer);
-    this.#checkTimer = setTimeout(() => void this.#check(false), delayMs);
+    this.#checkTimer = setTimeout(() => void runUpdate(this.#check(false)), delayMs);
     this.#checkTimer.unref?.();
   }
 
@@ -718,10 +734,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   #recordStatus(): void {
     const event = { at: new Date().toISOString(), phase: this.#status.phase, errorCode: this.#status.errorCode };
     this.#history = [...this.#history.slice(-(MAX_DIAGNOSTIC_EVENTS - 1)), event];
-    const logDirectory = this.#options.logDirectory;
-    if (logDirectory) {
-      this.#logWrite = this.#logWrite.then(() => appendUpdateLog(logDirectory, event));
-    }
+    this.emit("diagnostic", event);
   }
 }
 
@@ -786,38 +799,34 @@ function errorMessage(code: UpdateFailureCode) {
   return sourceText("error.update.checkFailed");
 }
 
-function appendUpdateLog(directory: string, event: UpdateDiagnosticEvent): Promise<void> {
-  return runUpdate(
-    Effect.gen(function* () {
-      yield* updateIO(() => mkdir(directory, { recursive: true, mode: 0o700 }));
-      const path = join(directory, "update.log");
-      const rotatedPath = `${path}.1`;
-      const size = yield* updateIO(() => stat(path)).pipe(
-        Effect.map((value) => value.size),
-        Effect.catch(() => Effect.succeed(0)),
-      );
-      if (size >= MAX_LOG_BYTES) {
-        yield* updateIO(() => rm(rotatedPath, { force: true }));
-        yield* updateIO(() => rename(path, rotatedPath));
-      }
-      yield* updateIO(() => appendFile(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }));
-    }).pipe(Effect.catch(() => Effect.void)),
-  );
+function appendUpdateLog(directory: string, event: UpdateDiagnosticEvent): Effect.Effect<void, UpdateOperationFailure> {
+  return Effect.gen(function* () {
+    yield* updateIO(() => mkdir(directory, { recursive: true, mode: 0o700 }));
+    const path = join(directory, "update.log");
+    const rotatedPath = `${path}.1`;
+    const size = yield* updateIO(() => stat(path)).pipe(
+      Effect.map((value) => value.size),
+      Effect.catch(() => Effect.succeed(0)),
+    );
+    if (size >= MAX_LOG_BYTES) {
+      yield* updateIO(() => rm(rotatedPath, { force: true }));
+      yield* updateIO(() => rename(path, rotatedPath));
+    }
+    yield* updateIO(() => appendFile(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }));
+  }).pipe(Effect.catch(() => Effect.void));
 }
 
-export function pruneShipItLogs(directory: string): Promise<void> {
-  return runUpdate(
-    Effect.gen(function* () {
-      const entries = (yield* updateIO(() => readdir(directory, { withFileTypes: true })))
-        .filter((entry) => entry.isFile() && /^ShipIt_(?:stdout|stderr)\.log\.\d+$/u.test(entry.name))
-        .map((entry) => entry.name)
-        .sort((left, right) => Number(right.split(".").at(-1)) - Number(left.split(".").at(-1)));
-      yield* Effect.forEach(entries.slice(10), (entry) => updateIO(() => rm(join(directory, entry), { force: true })), {
-        concurrency: "unbounded",
-        discard: true,
-      });
-    }).pipe(Effect.catch(() => Effect.void)),
-  );
+export function pruneShipItLogs(directory: string): Effect.Effect<void, UpdateOperationFailure> {
+  return Effect.gen(function* () {
+    const entries = (yield* updateIO(() => readdir(directory, { withFileTypes: true })))
+      .filter((entry) => entry.isFile() && /^ShipIt_(?:stdout|stderr)\.log\.\d+$/u.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => Number(right.split(".").at(-1)) - Number(left.split(".").at(-1)));
+    yield* Effect.forEach(entries.slice(10), (entry) => updateIO(() => rm(join(directory, entry), { force: true })), {
+      concurrency: "unbounded",
+      discard: true,
+    });
+  }).pipe(Effect.catch(() => Effect.void));
 }
 
 /**
@@ -839,7 +848,7 @@ function clampProgress(value: number): number {
   return Math.max(0, Math.min(100, Number.isFinite(value) ? Math.round(value) : 0));
 }
 
-class UpdateOperationFailure extends Schema.TaggedError<UpdateOperationFailure>()("UpdateOperationFailure", {
+export class UpdateOperationFailure extends Schema.TaggedError<UpdateOperationFailure>()("UpdateOperationFailure", {
   cause: Schema.Defect(),
 }) {}
 function updateIO<A>(operation: () => Promise<A>): Effect.Effect<A, UpdateOperationFailure> {

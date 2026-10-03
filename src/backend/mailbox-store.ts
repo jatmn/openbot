@@ -40,7 +40,7 @@ import {
   type StoredGeneratedAttachment,
   toAttachmentSummary,
 } from "./attachment-files";
-import { runStored, StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
+import { StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
 
 export type { ExportedAttachmentFile, GeneratedAttachmentSource } from "./attachment-files";
 
@@ -189,21 +189,18 @@ export class MailboxStore {
     this.#database = database;
   }
 
-  initialize(): Promise<void> {
-    return runStored(this.initializeEffect());
-  }
-  initializeEffect = Effect.fn("MailboxStore.initialize")(function* (
+  initialize = Effect.fn("MailboxStore.initialize")(function* (
     this: MailboxStore,
   ): Effect.fn.Return<void, StoredStateFailure> {
     try {
       yield* Effect.all(
         [
           storedIO(() => mkdir(dirname(this.#statePath), { recursive: true, mode: 0o700 })),
-          this.#files.initializeEffect().pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause }))),
+          this.#files.initialize().pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause }))),
         ],
         { concurrency: "unbounded" },
       );
-      yield* this.#database.initializeEffect();
+      yield* this.#database.initialize();
       const stored = this.#database.readMailboxState();
       if (stored !== null && stored !== undefined) {
         const persisted = toCurrentMailboxState(stored);
@@ -211,7 +208,7 @@ export class MailboxStore {
         this.#state = normalizeStoredState(persisted);
       } else {
         this.#state = normalizeStoredState(yield* this.#readStateEffect());
-        yield* this.#database.backupLegacyFileEffect(this.#statePath);
+        yield* this.#database.backupLegacyFile(this.#statePath);
         this.#persist("mailbox.legacy-imported", "legacy-import:mailbox:v1");
       }
       const activeEdits = new Set(
@@ -227,32 +224,26 @@ export class MailboxStore {
         this.#persist("mailbox.drafts-cleared");
       }
       yield* this.#files
-        .resetDraftsEffect(retainedDrafts.map((draft) => draft.id))
+        .resetDrafts(retainedDrafts.map((draft) => draft.id))
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       yield* this.#drainFileDeletionOutboxEffect();
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  prepareAttachments(paths: string[]): Promise<DraftAttachment[]> {
-    return runStored(this.prepareAttachmentsEffect(paths));
-  }
-  prepareAttachmentsEffect = Effect.fn("MailboxStore.prepareAttachments")(function* (
+  prepareAttachments = Effect.fn("MailboxStore.prepareAttachments")(function* (
     this: MailboxStore,
     paths: string[],
   ): Effect.fn.Return<DraftAttachment[], StoredStateFailure> {
     try {
-      return yield* this.prepareImportedAttachmentsEffect(paths, []);
+      return yield* this.prepareImportedAttachments(paths, []);
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  prepareImportedAttachments(paths: string[], data: AttachmentDataInput[]): Promise<DraftAttachment[]> {
-    return runStored(this.prepareImportedAttachmentsEffect(paths, data));
-  }
-  prepareImportedAttachmentsEffect = Effect.fn("MailboxStore.prepareImportedAttachments")(function* (
+  prepareImportedAttachments = Effect.fn("MailboxStore.prepareImportedAttachments")(function* (
     this: MailboxStore,
     paths: string[],
     data: AttachmentDataInput[],
@@ -266,7 +257,7 @@ export class MailboxStore {
         throw new Error(sourceText("error.backend.draftAttachmentLimit", { limit: INPUT_LIMITS.draftAttachments }));
       }
       const prepared = yield* this.#files
-        .prepareDraftsEffect(paths, data)
+        .prepareDrafts(paths, data)
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       this.#state.drafts.push(...prepared);
       try {
@@ -276,19 +267,16 @@ export class MailboxStore {
         const preparedIds = new Set(prepared.map((draft) => draft.id));
         this.#state.drafts = this.#state.drafts.filter((draft) => !preparedIds.has(draft.id));
         yield* this.#files
-          .removeAttachmentDirectoriesEffect(prepared.map((draft) => draft.path))
+          .removeAttachmentDirectories(prepared.map((draft) => draft.path))
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         throw error;
       }
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  discardDraft(id: string): Promise<void> {
-    return runStored(this.discardDraftEffect(id));
-  }
-  discardDraftEffect = Effect.fn("MailboxStore.discardDraft")(function* (
+  discardDraft = Effect.fn("MailboxStore.discardDraft")(function* (
     this: MailboxStore,
     id: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -304,12 +292,12 @@ export class MailboxStore {
         throw error;
       }
       yield* this.#files
-        .removeAttachmentDirectoriesEffect([draft.path])
+        .removeAttachmentDirectories([draft.path])
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   blockAgentDeliveries(agentId: string): () => void {
     return this.#deliveryGate.block(agentId);
@@ -376,10 +364,7 @@ export class MailboxStore {
       .map((delivery) => this.#context(delivery));
   }
 
-  enqueue(input: EnqueueInput): Promise<QueuedMessageReceipt> {
-    return runStored(this.enqueueEffect(input));
-  }
-  enqueueEffect = Effect.fn("MailboxStore.enqueue")(function* (
+  enqueue = Effect.fn("MailboxStore.enqueue")(function* (
     this: MailboxStore,
     input: EnqueueInput,
   ): Effect.fn.Return<QueuedMessageReceipt, StoredStateFailure> {
@@ -423,13 +408,13 @@ export class MailboxStore {
       const createdAt = new Date().toISOString();
       const messageId = randomUUID();
       const attachments = yield* this.#files
-        .commitMessageTransferEffect(messageId, input.sender, recipients, messageId, createdAt, sourcePaths)
+        .commitMessageTransfer(messageId, input.sender, recipients, messageId, createdAt, sourcePaths)
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       try {
         validateRecipients();
       } catch (error) {
         yield* this.#files
-          .removeEffect(this.#files.transferRoot(messageId))
+          .remove(this.#files.transferRoot(messageId))
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         throw error;
       }
@@ -482,18 +467,18 @@ export class MailboxStore {
           }
         }
         yield* this.#files
-          .removeEffect(this.#files.transferRoot(messageId))
+          .remove(this.#files.transferRoot(messageId))
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         throw error;
       }
       yield* this.#files
-        .removeAttachmentDirectoriesEffect(drafts.map((draft) => draft.path))
+        .removeAttachmentDirectories(drafts.map((draft) => draft.path))
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       return this.#receipt(messageId);
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Commits the uploads of one channel request before any member holds it. A channel dispatches
@@ -502,15 +487,8 @@ export class MailboxStore {
    * keeps durable references, every later dispatch re-sends the stored copies, and the files leave
    * with the channel through `deleteChannelData`.
    */
-  commitChannelAttachments(input: {
-    channelId: string;
-    messageId: string;
-    text: string;
-    draftIds: string[];
-  }): Promise<{ text: string; attachments: AttachmentSummary[] }> {
-    return runStored(this.commitChannelAttachmentsEffect(input));
-  }
-  commitChannelAttachmentsEffect = Effect.fn("MailboxStore.commitChannelAttachments")(function* (
+
+  commitChannelAttachments = Effect.fn("MailboxStore.commitChannelAttachments")(function* (
     this: MailboxStore,
     input: {
       channelId: string;
@@ -533,7 +511,7 @@ export class MailboxStore {
       const sender: StoredMessage["sender"] = { kind: "user" };
       const createdAt = new Date().toISOString();
       const attachments = yield* this.#files
-        .commitMessageTransferEffect(
+        .commitMessageTransfer(
           input.messageId,
           sender,
           [],
@@ -564,18 +542,18 @@ export class MailboxStore {
         for (const draft of drafts)
           if (!this.#state.drafts.some((candidate) => candidate.id === draft.id)) this.#state.drafts.push(draft);
         yield* this.#files
-          .removeEffect(this.#files.transferRoot(input.messageId))
+          .remove(this.#files.transferRoot(input.messageId))
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         throw error;
       }
       yield* this.#files
-        .removeAttachmentDirectoriesEffect(drafts.map((draft) => draft.path))
+        .removeAttachmentDirectories(drafts.map((draft) => draft.path))
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       return { text: message.text, attachments: attachments.map(toAttachmentSummary) };
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * A delivery held for editing stays listed, marked `editing`, and keeps its position. Hiding it
@@ -800,15 +778,7 @@ export class MailboxStore {
     return result;
   }
 
-  setReaction(
-    agentId: string,
-    messageId: string,
-    actor: ConversationReactionActor,
-    emoji: MessageReaction | null,
-  ): Promise<void> {
-    return runStored(this.setReactionEffect(agentId, messageId, actor, emoji));
-  }
-  setReactionEffect = Effect.fn("MailboxStore.setReaction")(function* (
+  setReaction = Effect.fn("MailboxStore.setReaction")(function* (
     this: MailboxStore,
     agentId: string,
     messageId: string,
@@ -846,7 +816,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   #sourceTurnId(messageId: string): string | undefined {
     const key = Object.entries(this.#state.idempotency).find(([, value]) => value === messageId)?.[0];
@@ -1004,10 +974,8 @@ export class MailboxStore {
    * channel and leave with it, through `deleteChannelData`. `channelThreadIds` names the threads
    * the channels hold, because a generated file records the thread it was made in.
    */
-  deleteAgentData(agentId: string, channelThreadIds: readonly string[] = []): Promise<void> {
-    return runStored(this.deleteAgentDataEffect(agentId, channelThreadIds));
-  }
-  deleteAgentDataEffect = Effect.fn("MailboxStore.deleteAgentData")(function* (
+
+  deleteAgentData = Effect.fn("MailboxStore.deleteAgentData")(function* (
     this: MailboxStore,
     agentId: string,
     channelThreadIds: readonly string[] = [],
@@ -1066,13 +1034,11 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /** Removes messages, deliveries, reactions and attachments that belong to a channel. */
-  deleteChannelData(channelId: string, threadIds: readonly string[] = []): Promise<void> {
-    return runStored(this.deleteChannelDataEffect(channelId, threadIds));
-  }
-  deleteChannelDataEffect = Effect.fn("MailboxStore.deleteChannelData")(function* (
+
+  deleteChannelData = Effect.fn("MailboxStore.deleteChannelData")(function* (
     this: MailboxStore,
     channelId: string,
     threadIds: readonly string[] = [],
@@ -1126,7 +1092,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   chainOriginAgentId(messageId: string): string | null {
     const visited = new Set<string>();
@@ -1164,10 +1130,7 @@ export class MailboxStore {
     });
   }
 
-  markStarting(deliveryId: string): Promise<void> {
-    return runStored(this.markStartingEffect(deliveryId));
-  }
-  markStartingEffect = Effect.fn("MailboxStore.markStarting")(function* (
+  markStarting = Effect.fn("MailboxStore.markStarting")(function* (
     this: MailboxStore,
     deliveryId: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1177,12 +1140,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  markRunning(deliveryId: string, turnId: string): Promise<void> {
-    return runStored(this.markRunningEffect(deliveryId, turnId));
-  }
-  markRunningEffect = Effect.fn("MailboxStore.markRunning")(function* (
+  markRunning = Effect.fn("MailboxStore.markRunning")(function* (
     this: MailboxStore,
     deliveryId: string,
     turnId: string,
@@ -1196,16 +1156,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  markTerminal(
-    deliveryId: string,
-    status: Extract<QueueDeliveryStatus, "completed" | "failed" | "interrupted">,
-    error: string | null = null,
-  ): Promise<void> {
-    return runStored(this.markTerminalEffect(deliveryId, status, error));
-  }
-  markTerminalEffect = Effect.fn("MailboxStore.markTerminal")(function* (
+  markTerminal = Effect.fn("MailboxStore.markTerminal")(function* (
     this: MailboxStore,
     deliveryId: string,
     status: Extract<QueueDeliveryStatus, "completed" | "failed" | "interrupted">,
@@ -1222,12 +1175,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  cancel(agentId: string, deliveryId: string): Promise<void> {
-    return runStored(this.cancelEffect(agentId, deliveryId));
-  }
-  cancelEffect = Effect.fn("MailboxStore.cancel")(function* (
+  cancel = Effect.fn("MailboxStore.cancel")(function* (
     this: MailboxStore,
     agentId: string,
     deliveryId: string,
@@ -1237,7 +1187,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   cancelNow(agentId: string, deliveryId: string): void {
     this.#assertQueueNotUpdating(deliveryId);
@@ -1380,28 +1330,26 @@ export class MailboxStore {
     attachmentDraftIds: string[],
     editId?: string,
     sender?: ConversationMessageSender,
-  ): Promise<void> {
-    return runStored(
-      Effect.gen({ self: this }, function* () {
-        yield* storedSync(() => this.#assertQueueNotUpdating(deliveryId));
-        this.#queueUpdates.add(deliveryId);
-        yield* this.#updateQueuedMessageEffect(
-          agentId,
-          deliveryId,
-          text,
-          keepAttachmentIds,
-          attachmentDraftIds,
-          editId,
-          sender,
-        ).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              this.#queueUpdates.delete(deliveryId);
-            }),
-          ),
-        );
-      }).pipe(Effect.uninterruptible),
-    );
+  ) {
+    return Effect.gen({ self: this }, function* () {
+      yield* storedSync(() => this.#assertQueueNotUpdating(deliveryId));
+      this.#queueUpdates.add(deliveryId);
+      yield* this.#updateQueuedMessageEffect(
+        agentId,
+        deliveryId,
+        text,
+        keepAttachmentIds,
+        attachmentDraftIds,
+        editId,
+        sender,
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#queueUpdates.delete(deliveryId);
+          }),
+        ),
+      );
+    }).pipe(Effect.uninterruptible);
   }
 
   #updateQueuedMessageEffect = Effect.fn("MailboxStore.updateQueuedMessage")(function* (
@@ -1464,7 +1412,7 @@ export class MailboxStore {
               );
               const committedDrafts = draftAttachmentPaths.length
                 ? yield* this.#files
-                    .commitMessageTransferEffect(
+                    .commitMessageTransfer(
                       `${message.id}-edit-${randomUUID()}`,
                       message.sender,
                       this.#state.deliveries
@@ -1534,13 +1482,13 @@ export class MailboxStore {
             }
           }
           yield* this.#files
-            .removeAttachmentDirectoriesEffect(newAttachmentPaths)
+            .removeAttachmentDirectories(newAttachmentPaths)
             .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
           throw error;
         }
       }
       yield* this.#files
-        .removeAttachmentDirectoriesEffect(drafts.map((draft) => draft.path))
+        .removeAttachmentDirectories(drafts.map((draft) => draft.path))
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       yield* this.#drainFileDeletionOutboxEffect();
     } catch (cause) {
@@ -1552,10 +1500,8 @@ export class MailboxStore {
    * A held delivery keeps its place. `listQueue` reports it now, so a caller may send its id with
    * the rest; both that list and one without it are accepted, and neither moves the held message.
    */
-  reorderQueue(agentId: string, deliveryIds: string[]): Promise<void> {
-    return runStored(this.reorderQueueEffect(agentId, deliveryIds));
-  }
-  reorderQueueEffect = Effect.fn("MailboxStore.reorderQueue")(function* (
+
+  reorderQueue = Effect.fn("MailboxStore.reorderQueue")(function* (
     this: MailboxStore,
     agentId: string,
     deliveryIds: string[],
@@ -1587,12 +1533,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  markSteering(deliveryId: string, turnId: string): Promise<void> {
-    return runStored(this.markSteeringEffect(deliveryId, turnId));
-  }
-  markSteeringEffect = Effect.fn("MailboxStore.markSteering")(function* (
+  markSteering = Effect.fn("MailboxStore.markSteering")(function* (
     this: MailboxStore,
     deliveryId: string,
     turnId: string,
@@ -1607,12 +1550,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  restoreQueued(deliveryId: string): Promise<void> {
-    return runStored(this.restoreQueuedEffect(deliveryId));
-  }
-  restoreQueuedEffect = Effect.fn("MailboxStore.restoreQueued")(function* (
+  restoreQueued = Effect.fn("MailboxStore.restoreQueued")(function* (
     this: MailboxStore,
     deliveryId: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1625,13 +1565,11 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /** A delivery whose turn the provider refused before any work, back at its place in the queue. */
-  requeueRefused(deliveryId: string): Promise<void> {
-    return runStored(this.requeueRefusedEffect(deliveryId));
-  }
-  requeueRefusedEffect = Effect.fn("MailboxStore.requeueRefused")(function* (
+
+  requeueRefused = Effect.fn("MailboxStore.requeueRefused")(function* (
     this: MailboxStore,
     deliveryId: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1644,7 +1582,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Both guards that ask this - agent deletion and the provider switch - have to see a channel
@@ -1667,10 +1605,7 @@ export class MailboxStore {
       .map((delivery) => this.#context(delivery));
   }
 
-  recoverAsInterrupted(deliveryId: string, reason: string): Promise<void> {
-    return runStored(this.recoverAsInterruptedEffect(deliveryId, reason));
-  }
-  recoverAsInterruptedEffect = Effect.fn("MailboxStore.recoverAsInterrupted")(function* (
+  recoverAsInterrupted = Effect.fn("MailboxStore.recoverAsInterrupted")(function* (
     this: MailboxStore,
     deliveryId: string,
     reason: string,
@@ -1683,12 +1618,9 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  resolveAttachment(id: string): Promise<{ path: string; mimeType: string; name: string } | null> {
-    return runStored(this.resolveAttachmentEffect(id));
-  }
-  resolveAttachmentEffect = Effect.fn("MailboxStore.resolveAttachment")(function* (
+  resolveAttachment = Effect.fn("MailboxStore.resolveAttachment")(function* (
     this: MailboxStore,
     id: string,
   ): Effect.fn.Return<{ path: string; mimeType: string; name: string } | null, StoredStateFailure> {
@@ -1696,7 +1628,7 @@ export class MailboxStore {
       const draft = this.#state.drafts.find((candidate) => candidate.id === id);
       if (draft)
         return yield* this.#files
-          .resolveDraftEffect(draft)
+          .resolveDraft(draft)
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       for (const message of this.#state.messages) {
         const attachment = message.attachments.find((candidate) => candidate.id === id);
@@ -1704,7 +1636,7 @@ export class MailboxStore {
           return attachment.deletedAt
             ? null
             : yield* this.#files
-                .resolveTransferEffect(attachment)
+                .resolveTransfer(attachment)
                 .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       }
       const generated = this.#state.generatedAttachments.find((candidate) => candidate.id === id);
@@ -1712,13 +1644,13 @@ export class MailboxStore {
         return generated.deletedAt
           ? null
           : yield* this.#files
-              .resolveTransferEffect(generated)
+              .resolveTransfer(generated)
               .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       return null;
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /** Every sent and generated file that the user has not deleted, from the in-memory state. */
   listStoredFiles(): MailboxStoredFile[] {
@@ -1761,10 +1693,8 @@ export class MailboxStore {
    * marker. The file is removed through the deletion outbox, and only when it resolves inside the
    * Transfers folder and no other record that is not deleted uses the same path.
    */
-  deleteStoredFile(fileId: string): Promise<void> {
-    return runStored(this.deleteStoredFileEffect(fileId));
-  }
-  deleteStoredFileEffect = Effect.fn("MailboxStore.deleteStoredFile")(function* (
+
+  deleteStoredFile = Effect.fn("MailboxStore.deleteStoredFile")(function* (
     this: MailboxStore,
     fileId: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1773,7 +1703,12 @@ export class MailboxStore {
       // markers without their outbox entry, and a failed save restores a copy that has all other changes.
       const managedPaths = new Map<string, string | null>();
       for (const path of new Set(this.#undeletedFileRecords(fileId).map((target) => target.path))) {
-        managedPaths.set(path, yield* storedIO(() => this.#files.managedTransferFile(path)));
+        managedPaths.set(
+          path,
+          yield* this.#files
+            .managedTransferFile(path)
+            .pipe(Effect.mapError((failure) => new StoredStateFailure({ cause: failure.cause }))),
+        );
       }
       const records = this.#fileRecords();
       const targets = this.#undeletedFileRecords(fileId);
@@ -1796,7 +1731,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   #fileRecords(): StoredAttachment[] {
     return [...this.#state.messages.flatMap((message) => message.attachments), ...this.#state.generatedAttachments];
@@ -1808,10 +1743,7 @@ export class MailboxStore {
     return targets;
   }
 
-  verifyDeliveryAttachments(deliveryId: string): Promise<void> {
-    return runStored(this.verifyDeliveryAttachmentsEffect(deliveryId));
-  }
-  verifyDeliveryAttachmentsEffect = Effect.fn("MailboxStore.verifyDeliveryAttachments")(function* (
+  verifyDeliveryAttachments = Effect.fn("MailboxStore.verifyDeliveryAttachments")(function* (
     this: MailboxStore,
     deliveryId: string,
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1821,23 +1753,16 @@ export class MailboxStore {
       const message = this.#requireMessage(delivery.messageId);
       for (const attachment of message.attachments) {
         const resolved = yield* this.#files
-          .resolveTransferEffect(attachment)
+          .resolveTransfer(attachment)
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         if (!resolved) throw new Error(sourceText("error.backend.managedAttachmentChanged", { name: attachment.name }));
       }
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  stageGeneratedAttachments(input: {
-    sources: GeneratedAttachmentSource[];
-    ownerAgentId?: string;
-    ownerThreadId?: string | null;
-  }): Promise<AttachmentSummary[]> {
-    return runStored(this.stageGeneratedAttachmentsEffect(input));
-  }
-  stageGeneratedAttachmentsEffect = Effect.fn("MailboxStore.stageGeneratedAttachments")(function* (
+  stageGeneratedAttachments = Effect.fn("MailboxStore.stageGeneratedAttachments")(function* (
     this: MailboxStore,
     input: {
       sources: GeneratedAttachmentSource[];
@@ -1847,14 +1772,14 @@ export class MailboxStore {
   ): Effect.fn.Return<AttachmentSummary[], StoredStateFailure> {
     try {
       const attachments = yield* this.#files
-        .stageGeneratedEffect(input)
+        .stageGenerated(input)
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       for (const attachment of attachments) this.#stagedGeneratedAttachments.set(attachment.id, attachment);
       return attachments.map(toAttachmentSummary);
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   persistGeneratedAttachmentsWithConversation(
     snapshot: ConversationSnapshot,
@@ -1883,10 +1808,7 @@ export class MailboxStore {
     return persisted;
   }
 
-  discardStagedGeneratedAttachments(attachmentIds: string[]): Promise<void> {
-    return runStored(this.discardStagedGeneratedAttachmentsEffect(attachmentIds));
-  }
-  discardStagedGeneratedAttachmentsEffect = Effect.fn("MailboxStore.discardStagedGeneratedAttachments")(function* (
+  discardStagedGeneratedAttachments = Effect.fn("MailboxStore.discardStagedGeneratedAttachments")(function* (
     this: MailboxStore,
     attachmentIds: string[],
   ): Effect.fn.Return<void, StoredStateFailure> {
@@ -1900,24 +1822,14 @@ export class MailboxStore {
 
       for (const id of ids) this.#stagedGeneratedAttachments.delete(id);
       yield* this.#files
-        .discardGeneratedEffect(removed)
+        .discardGenerated(removed)
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  storeGeneratedAttachment(input: {
-    sourcePath?: string;
-    bytes?: Uint8Array;
-    name?: string;
-    mimeType?: string;
-    ownerAgentId?: string;
-    ownerThreadId?: string | null;
-  }): Promise<AttachmentSummary> {
-    return runStored(this.storeGeneratedAttachmentEffect(input));
-  }
-  storeGeneratedAttachmentEffect = Effect.fn("MailboxStore.storeGeneratedAttachment")(function* (
+  storeGeneratedAttachment = Effect.fn("MailboxStore.storeGeneratedAttachment")(function* (
     this: MailboxStore,
     input: {
       sourcePath?: string;
@@ -1930,7 +1842,7 @@ export class MailboxStore {
   ): Effect.fn.Return<AttachmentSummary, StoredStateFailure> {
     try {
       const attachment = yield* this.#files
-        .storeGeneratedEffect(input)
+        .storeGenerated(input)
         .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
       this.#state.generatedAttachments.push(attachment);
       try {
@@ -1941,19 +1853,16 @@ export class MailboxStore {
           (candidate) => candidate.id !== attachment.id,
         );
         yield* this.#files
-          .removeAttachmentDirectoriesEffect([attachment.path])
+          .removeAttachmentDirectories([attachment.path])
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         throw error;
       }
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  listExportAttachments(): Promise<ExportedAttachmentFile[]> {
-    return runStored(this.listExportAttachmentsEffect());
-  }
-  listExportAttachmentsEffect = Effect.fn("MailboxStore.listExportAttachments")(function* (
+  listExportAttachments = Effect.fn("MailboxStore.listExportAttachments")(function* (
     this: MailboxStore,
   ): Effect.fn.Return<ExportedAttachmentFile[], StoredStateFailure> {
     try {
@@ -1962,7 +1871,7 @@ export class MailboxStore {
         for (const attachment of message.attachments) {
           if (attachment.deletedAt) continue;
           const file = yield* this.#files
-            .exportAttachmentEffect(attachment, { id: message.id, index })
+            .exportAttachment(attachment, { id: message.id, index })
             .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
           if (file) files.push(file);
         }
@@ -1970,7 +1879,7 @@ export class MailboxStore {
       for (const attachment of this.#state.generatedAttachments) {
         if (attachment.deletedAt) continue;
         const file = yield* this.#files
-          .exportAttachmentEffect(attachment)
+          .exportAttachment(attachment)
           .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
         if (file) files.push(file);
       }
@@ -1978,7 +1887,7 @@ export class MailboxStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   #context(delivery: StoredDelivery): DeliveryContext {
     const message = this.#requireMessage(delivery.messageId);
@@ -2102,9 +2011,7 @@ export class MailboxStore {
     for (const item of pending) {
       const removed = yield* Effect.result(
         Effect.gen({ self: this }, function* () {
-          yield* this.#files
-            .removeEffect(item.path)
-            .pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
+          yield* this.#files.remove(item.path).pipe(Effect.mapError(({ cause }) => new StoredStateFailure({ cause })));
           yield* storedSync(() => this.#database.completeFileDeletion(item.id));
         }),
       );

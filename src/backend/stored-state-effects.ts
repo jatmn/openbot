@@ -1,6 +1,6 @@
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
-/** Internal storage failure. Public facades retain the released native error contract. */
+/** Expected storage failures retain their cause for mapping at application boundaries. */
 export class StoredStateFailure extends Schema.TaggedError<StoredStateFailure>()("StoredStateFailure", {
   cause: Schema.Defect(),
 }) {}
@@ -11,10 +11,4 @@ export function storedIO<A>(operation: (signal: AbortSignal) => Promise<A>): Eff
 
 export function storedSync<A>(operation: () => A): Effect.Effect<A, StoredStateFailure> {
   return Effect.try({ try: operation, catch: (cause) => new StoredStateFailure({ cause }) });
-}
-
-export async function runStored<A>(operation: Effect.Effect<A, StoredStateFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

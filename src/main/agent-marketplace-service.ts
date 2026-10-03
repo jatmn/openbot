@@ -24,10 +24,18 @@ import {
 import { isBoolean, isDynamicRecord, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Result, Schema } from "effect";
+import type { AgentLifecycleFailed } from "../backend/agent-service";
+import type { CentralAuthOperationError } from "./central-auth-effects";
+import type { SkillMarketplaceFailure } from "./skill-marketplace-service";
 
 interface AgentMarketplaceAuth {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
-  downloadAuthorized(path: string): Promise<Uint8Array>;
+  requestAuthorized<T>(
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs?: number,
+  ): Effect.Effect<T, CentralAuthOperationError>;
+  downloadAuthorized(path: string): Effect.Effect<Uint8Array, CentralAuthOperationError>;
   resolveApiUrl(path: string): string;
 }
 
@@ -47,7 +55,7 @@ interface AgentMarketplaceAgents {
     description: string;
     avatarSeed: string;
     avatarHue: MarketplaceAgentDetail["avatarHue"];
-  }): Promise<AgentSummary>;
+  }): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
   updateAgent(input: {
     agentId: string;
     name: string;
@@ -55,8 +63,8 @@ interface AgentMarketplaceAgents {
     description: string;
     avatarSeed: string;
     avatarHue: MarketplaceAgentDetail["avatarHue"];
-  }): Promise<AgentSummary>;
-  setAvatar(agentId: string, image: AvatarImageInput | null): Promise<AgentSummary>;
+  }): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
+  setAvatar(agentId: string, image: AvatarImageInput | null): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
   createRoutine(
     input: {
       agentId: string;
@@ -71,15 +79,19 @@ interface AgentMarketplaceAgents {
   deleteRoutine(
     input: { agentId: string; routineId: string },
     options?: { recordConversationEvent?: boolean },
-  ): Promise<void>;
+  ): Effect.Effect<void, AgentLifecycleFailed>;
   setMarketplaceSource(agentId: string, source: NonNullable<AgentSummary["marketplaceSource"]>): AgentSummary;
-  deleteAgent(agentId: string): Promise<void>;
+  deleteAgent(agentId: string): Effect.Effect<void, AgentLifecycleFailed>;
 }
 
 interface AgentMarketplaceSkills {
-  listPublishable(agentId: string): Promise<MarketplaceAgentSkill[]>;
-  installVersion(input: { agentId: string; skillId: string; versionId: string }): Promise<unknown>;
-  uninstall(input: { agentId: string; skillId: string }): Promise<void>;
+  listPublishable(agentId: string): Effect.Effect<MarketplaceAgentSkill[], SkillMarketplaceFailure>;
+  installVersion(input: {
+    agentId: string;
+    skillId: string;
+    versionId: string;
+  }): Effect.Effect<unknown, SkillMarketplaceFailure>;
+  uninstall(input: { agentId: string; skillId: string }): Effect.Effect<void, SkillMarketplaceFailure>;
 }
 
 export class AgentMarketplaceService {
@@ -89,60 +101,46 @@ export class AgentMarketplaceService {
     private readonly skills: AgentMarketplaceSkills,
   ) {}
 
-  list(query: MarketplaceAgentQuery = {}): Promise<MarketplaceAgentPage> {
-    return runMarketplace(this.listEffect(query));
-  }
-
-  listEffect(query: MarketplaceAgentQuery = {}): Effect.Effect<MarketplaceAgentPage, AgentMarketplaceFailure> {
+  list(query: MarketplaceAgentQuery = {}): Effect.Effect<MarketplaceAgentPage, AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<MarketplaceAgentPage, AgentMarketplaceFailure> {
       const params = marketplaceQueryParams(query);
-      const page = yield* marketplaceIO(() =>
-        this.auth.requestAuthorized(`/v1/marketplace/agents/?${params}`, { method: "GET" }, decodeMarketplaceAgentPage),
-      );
+      const page = yield* this.auth
+        .requestAuthorized(`/v1/marketplace/agents/?${params}`, { method: "GET" }, decodeMarketplaceAgentPage)
+        .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       return { ...page, agents: page.agents.map((agent) => this.withAbsoluteAvatar(agent)) };
     });
   }
 
-  get(listingId: string): Promise<MarketplaceAgentDetail> {
-    return runMarketplace(this.getEffect(listingId));
-  }
-
-  getEffect(listingId: string): Effect.Effect<MarketplaceAgentDetail, AgentMarketplaceFailure> {
+  get(listingId: string): Effect.Effect<MarketplaceAgentDetail, AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<MarketplaceAgentDetail, AgentMarketplaceFailure> {
-      const detail = yield* marketplaceIO(() =>
-        this.auth.requestAuthorized(
+      const detail = yield* this.auth
+        .requestAuthorized(
           `/v1/marketplace/agents/${encodeURIComponent(listingId)}`,
           { method: "GET" },
           decodeMarketplaceAgentDetail,
-        ),
-      );
+        )
+        .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       return this.withAbsoluteAvatar(detail);
     });
   }
 
-  listMine(): Promise<AgentSubmission[]> {
-    return runMarketplace(this.listMineEffect());
-  }
-
-  listMineEffect(): Effect.Effect<AgentSubmission[], AgentMarketplaceFailure> {
+  listMine(): Effect.Effect<AgentSubmission[], AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentSubmission[], AgentMarketplaceFailure> {
-      const values = yield* marketplaceIO(() =>
-        this.auth.requestAuthorized("/v1/marketplace/agents/mine", { method: "GET" }, decodeAgentSubmissions),
-      );
+      const values = yield* this.auth
+        .requestAuthorized("/v1/marketplace/agents/mine", { method: "GET" }, decodeAgentSubmissions)
+        .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       return values.map((value) => this.withAbsoluteAvatar(value));
     });
   }
 
-  preview(agentId: string): Promise<AgentPublicationPreview> {
-    return runMarketplace(this.previewEffect(agentId));
-  }
-
-  previewEffect(agentId: string): Effect.Effect<AgentPublicationPreview, AgentMarketplaceFailure> {
+  preview(agentId: string): Effect.Effect<AgentPublicationPreview, AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentPublicationPreview, AgentMarketplaceFailure> {
       const agent = this.agents.listAgents().find((candidate) => candidate.id === agentId);
       if (!agent)
         return yield* new AgentMarketplaceFailure({ cause: new Error(sourceText("error.skill.chooseLocalAgent")) });
-      const skills = yield* marketplaceIO(() => this.skills.listPublishable(agentId));
+      const skills = yield* this.skills
+        .listPublishable(agentId)
+        .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       const routines = this.agents.listRoutines(agentId).map(({ name, instruction, active, trigger }) => ({
         name,
         instruction,
@@ -163,13 +161,9 @@ export class AgentMarketplaceService {
     });
   }
 
-  submit(input: SubmitMarketplaceAgentInput): Promise<AgentSubmission> {
-    return runMarketplace(this.submitEffect(input));
-  }
-
-  submitEffect(input: SubmitMarketplaceAgentInput): Effect.Effect<AgentSubmission, AgentMarketplaceFailure> {
+  submit(input: SubmitMarketplaceAgentInput): Effect.Effect<AgentSubmission, AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentSubmission, AgentMarketplaceFailure> {
-      const snapshot = yield* this.previewEffect(input.agentId);
+      const snapshot = yield* this.preview(input.agentId);
       const form = new FormData();
       if (input.category) form.set("category", input.category);
       if (input.showCreatorAvatar !== undefined) form.set("showCreatorAvatar", String(input.showCreatorAvatar));
@@ -181,25 +175,14 @@ export class AgentMarketplaceService {
         const bytes = new Uint8Array(yield* marketplaceIO(() => readFile(avatar.path)));
         form.set("avatar", new Blob([toArrayBuffer(bytes)], { type: avatar.mimeType }), "avatar");
       }
-      const submission = yield* marketplaceIO(() =>
-        this.auth.requestAuthorized(
-          "/v1/marketplace/agents/",
-          { method: "POST", body: form },
-          decodeAgentSubmission,
-          30_000,
-        ),
-      );
+      const submission = yield* this.auth
+        .requestAuthorized("/v1/marketplace/agents/", { method: "POST", body: form }, decodeAgentSubmission, 30_000)
+        .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       return this.withAbsoluteAvatar(submission);
     });
   }
 
-  install(input: InstallMarketplaceAgentInput): Promise<InstallMarketplaceAgentResult> {
-    return runMarketplace(this.installEffect(input));
-  }
-
-  installEffect(
-    input: InstallMarketplaceAgentInput,
-  ): Effect.Effect<InstallMarketplaceAgentResult, AgentMarketplaceFailure> {
+  install(input: InstallMarketplaceAgentInput): Effect.Effect<InstallMarketplaceAgentResult, AgentMarketplaceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       InstallMarketplaceAgentResult,
       AgentMarketplaceFailure
@@ -208,7 +191,7 @@ export class AgentMarketplaceService {
         return yield* new AgentMarketplaceFailure({
           cause: new Error(sourceText("error.marketplace.timezoneInvalid")),
         });
-      const detail = yield* this.getEffect(input.listingId);
+      const detail = yield* this.get(input.listingId);
       const existing = input.agentId
         ? this.agents.listAgents().find((candidate) => candidate.id === input.agentId)
         : undefined;
@@ -227,7 +210,9 @@ export class AgentMarketplaceService {
       let avatar: AvatarImageInput | null = null;
       if (detail.avatarUrl) {
         const avatarUrl = detail.avatarUrl;
-        const bytes = yield* marketplaceIO(() => this.auth.downloadAuthorized(avatarUrl));
+        const bytes = yield* this.auth
+          .downloadAuthorized(avatarUrl)
+          .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
         const mimeType = imageMimeType(bytes);
         if (!mimeType)
           return yield* new AgentMarketplaceFailure({
@@ -237,23 +222,23 @@ export class AgentMarketplaceService {
       }
       let agent =
         existing ??
-        (yield* marketplaceIO(() =>
-          this.agents.createAgentProfile({
+        (yield* this.agents
+          .createAgentProfile({
             name: detail.name,
             title: detail.title,
             description: detail.description,
             avatarSeed: detail.avatarSeed,
             avatarHue: detail.avatarHue,
-          }),
-        ));
+          })
+          .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause }))));
       const createdRoutineIds: string[] = [];
       {
         const outcome = yield* Effect.result(
           Effect.gen({ self: this }, function* () {
             for (const skill of detail.skills) {
-              yield* marketplaceIO(() =>
-                this.skills.installVersion({ agentId: agent.id, skillId: skill.skillId, versionId: skill.versionId }),
-              );
+              yield* this.skills
+                .installVersion({ agentId: agent.id, skillId: skill.skillId, versionId: skill.versionId })
+                .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
             }
             for (const routine of detail.routines) {
               const created = yield* marketplaceSync(() =>
@@ -272,22 +257,26 @@ export class AgentMarketplaceService {
               createdRoutineIds.push(created.id);
             }
             if (existing) {
-              agent = yield* marketplaceIO(() =>
-                this.agents.updateAgent({
+              agent = yield* this.agents
+                .updateAgent({
                   agentId: agent.id,
                   name: detail.name,
                   title: detail.title,
                   description: detail.description,
                   avatarSeed: detail.avatarSeed,
                   avatarHue: detail.avatarHue,
-                }),
-              );
+                })
+                .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
             }
-            agent = yield* marketplaceIO(() => this.agents.setAvatar(agent.id, avatar));
+            agent = yield* this.agents
+              .setAvatar(agent.id, avatar)
+              .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
             const nextSkillIds = new Set(detail.skills.map((skill) => skill.skillId));
             for (const skillId of existing?.marketplaceSource?.skillIds ?? []) {
               if (!nextSkillIds.has(skillId))
-                yield* marketplaceIO(() => this.skills.uninstall({ agentId: agent.id, skillId }));
+                yield* this.skills
+                  .uninstall({ agentId: agent.id, skillId })
+                  .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
             }
             agent = yield* marketplaceSync(() =>
               this.agents.setMarketplaceSource(agent.id, {
@@ -299,35 +288,32 @@ export class AgentMarketplaceService {
               }),
             );
             for (const routineId of existing?.marketplaceSource?.routineIds ?? []) {
-              yield* marketplaceIO(() =>
-                this.agents
-                  .deleteRoutine({ agentId: agent.id, routineId }, { recordConversationEvent: false })
-                  .catch(() => undefined),
-              );
+              yield* this.agents
+                .deleteRoutine({ agentId: agent.id, routineId }, { recordConversationEvent: false })
+                .pipe(Effect.catch(() => Effect.void));
             }
           }),
         );
         if (Result.isFailure(outcome)) {
           const error = outcome.failure.cause;
           if (existing) {
-            yield* marketplaceIO(() =>
-              Promise.all(
-                createdRoutineIds.map((routineId) =>
-                  this.agents
-                    .deleteRoutine({ agentId: agent.id, routineId }, { recordConversationEvent: false })
-                    .catch(() => undefined),
-                ),
-              ),
+            yield* Effect.forEach(
+              createdRoutineIds,
+              (routineId) =>
+                this.agents
+                  .deleteRoutine({ agentId: agent.id, routineId }, { recordConversationEvent: false })
+                  .pipe(Effect.catch(() => Effect.void)),
+              { concurrency: "unbounded" },
             );
           } else {
-            yield* marketplaceIO(() => this.agents.deleteAgent(agent.id).catch(() => undefined));
+            yield* this.agents.deleteAgent(agent.id).pipe(Effect.catch(() => Effect.void));
           }
           return yield* new AgentMarketplaceFailure({ cause: error });
         }
       }
       if (!existing) {
-        yield* marketplaceIO(() =>
-          this.auth.requestAuthorized(
+        yield* this.auth
+          .requestAuthorized(
             `/v1/marketplace/agents/${encodeURIComponent(detail.id)}/install`,
             {
               method: "POST",
@@ -335,8 +321,8 @@ export class AgentMarketplaceService {
               body: JSON.stringify({ receiptId: input.receiptId }),
             },
             decodeInstallReceipt,
-          ),
-        );
+          )
+          .pipe(Effect.mapError((error) => new AgentMarketplaceFailure({ cause: error.cause })));
       }
       return { agent: agent };
     });
@@ -432,16 +418,11 @@ export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return Uint8Array.from(bytes).buffer;
 }
 
-class AgentMarketplaceFailure extends Schema.TaggedError<AgentMarketplaceFailure>()("AgentMarketplaceFailure", {
+export class AgentMarketplaceFailure extends Schema.TaggedError<AgentMarketplaceFailure>()("AgentMarketplaceFailure", {
   cause: Schema.Defect(),
 }) {}
 function marketplaceIO<A>(operation: () => Promise<A>): Effect.Effect<A, AgentMarketplaceFailure> {
   return Effect.tryPromise({ try: operation, catch: (cause) => new AgentMarketplaceFailure({ cause }) });
-}
-async function runMarketplace<A>(operation: Effect.Effect<A, AgentMarketplaceFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }
 
 function marketplaceSync<A>(operation: () => A): Effect.Effect<A, AgentMarketplaceFailure> {

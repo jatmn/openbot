@@ -4,7 +4,6 @@ import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { Effect, Result, Schema } from "effect";
 import { unzipSync } from "fflate";
 import { parse as parseYaml } from "yaml";
-import { runApiEffect } from "./effect-runtime";
 import {
   decodeMarketplaceCursor,
   encodeMarketplaceCursor,
@@ -73,17 +72,6 @@ export class SkillMarketplace {
   constructor(private readonly bindings: Pick<WorkerBindings, "DB" | "SKILLS">) {}
 
   list(input: {
-    query?: string;
-    category?: string;
-    featured?: boolean;
-    sort?: "installs";
-    cursor?: string;
-    limit?: number;
-  }) {
-    return runApiEffect(this.listEffect(input).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  listEffect(input: {
     query?: string;
     category?: string;
     featured?: boolean;
@@ -162,14 +150,10 @@ export class SkillMarketplace {
               : null,
         };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   get(skillId: string) {
-    return runApiEffect(this.getEffect(skillId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  getEffect(skillId: string) {
     return Effect.fn("SkillMarketplace.get")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -195,16 +179,10 @@ export class SkillMarketplace {
           ...(preview.examplePrompt ? { examplePrompt: preview.examplePrompt } : {}),
         };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   getVersion(skillId: string, versionId: string) {
-    return runApiEffect(
-      this.getVersionEffect(skillId, versionId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  getVersionEffect(skillId: string, versionId: string) {
     return Effect.fn("SkillMarketplace.getVersion")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -232,22 +210,10 @@ export class SkillMarketplace {
           ...(preview.examplePrompt ? { examplePrompt: preview.examplePrompt } : {}),
         };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  setCreatorAvatar(userId: string, listingId: string, show: boolean): Promise<void> {
-    return runApiEffect(
-      this.setCreatorAvatarEffect(userId, listingId, show).pipe(
-        Effect.provide(MarketplaceStorage.layer(this.bindings)),
-      ),
-    );
-  }
-
-  setCreatorAvatarEffect(
-    userId: string,
-    listingId: string,
-    show: boolean,
-  ): Effect.Effect<void, SkillMarketplaceError | SkillMarketplaceStorageError, MarketplaceStorage> {
+  setCreatorAvatar(userId: string, listingId: string, show: boolean) {
     return Effect.fn("SkillMarketplace.setCreatorAvatar")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -264,14 +230,10 @@ export class SkillMarketplace {
             marketplaceError(new SkillMarketplaceError(404, "skill_not_found", "The owned skill was not found.")),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   mine(userId: string) {
-    return runApiEffect(this.mineEffect(userId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  mineEffect(userId: string) {
     return Effect.fn("SkillMarketplace.mine")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -291,21 +253,10 @@ export class SkillMarketplace {
         );
         return yield* marketplaceDecode(() => result.results.map(submission));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   submit(input: {
-    user: AuthUser;
-    archive: Uint8Array;
-    category: SkillCategory;
-    icon: { bytes: Uint8Array; mimeType: string } | null;
-    skillId?: string;
-    showCreatorAvatar?: boolean;
-  }) {
-    return runApiEffect(this.submitEffect(input).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  submitEffect(input: {
     user: AuthUser;
     archive: Uint8Array;
     category: SkillCategory;
@@ -431,7 +382,7 @@ export class SkillMarketplace {
               .run(),
           );
           if (input.showCreatorAvatar !== undefined)
-            yield* this.setCreatorAvatarEffect(input.user.id, skillId, input.showCreatorAvatar);
+            yield* this.setCreatorAvatar(input.user.id, skillId, input.showCreatorAvatar);
           yield* marketplaceCall(() =>
             bindings.DB.prepare("UPDATE marketplace_skills SET updated_at = ? WHERE id = ?").bind(now, skillId).run(),
           );
@@ -476,14 +427,10 @@ export class SkillMarketplace {
         };
         return yield* marketplaceDecode(() => submission(submitted));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   content(skillId: string) {
-    return runApiEffect(this.contentEffect(skillId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  contentEffect(skillId: string) {
     return Effect.fn("SkillMarketplace.content")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -505,16 +452,10 @@ export class SkillMarketplace {
           );
         return object;
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   versionContent(skillId: string, versionId: string) {
-    return runApiEffect(
-      this.versionContentEffect(skillId, versionId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  versionContentEffect(skillId: string, versionId: string) {
     return Effect.fn("SkillMarketplace.versionContent")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -533,14 +474,10 @@ export class SkillMarketplace {
           );
         return object;
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   icon(skillId: string) {
-    return runApiEffect(this.iconEffect(skillId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  iconEffect(skillId: string) {
     return Effect.fn("SkillMarketplace.icon")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -549,18 +486,10 @@ export class SkillMarketplace {
         if (!row?.icon_key) return null;
         return bindings.SKILLS.get(row.icon_key);
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   recordInstall(skillId: string, userId: string, receiptId: string) {
-    return runApiEffect(
-      this.recordInstallEffect(skillId, userId, receiptId).pipe(
-        Effect.provide(MarketplaceStorage.layer(this.bindings)),
-      ),
-    );
-  }
-
-  recordInstallEffect(skillId: string, userId: string, receiptId: string) {
     return Effect.fn("SkillMarketplace.recordInstall")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -585,16 +514,10 @@ export class SkillMarketplace {
           );
         }
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   review(versionId: string, action: "approve" | "reject", rejectionNote?: string) {
-    return runApiEffect(
-      this.reviewEffect(versionId, action, rejectionNote).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  reviewEffect(versionId: string, action: "approve" | "reject", rejectionNote?: string) {
     return Effect.fn("SkillMarketplace.review")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -649,14 +572,10 @@ export class SkillMarketplace {
           );
         }
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   pending() {
-    return runApiEffect(this.pendingEffect().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  pendingEffect() {
     return Effect.fn("SkillMarketplace.pending")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -672,16 +591,10 @@ export class SkillMarketplace {
         );
         return yield* marketplaceDecode(() => result.results.map(submission));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   setFeatured(skillId: string, featured: boolean) {
-    return runApiEffect(
-      this.setFeaturedEffect(skillId, featured).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  setFeaturedEffect(skillId: string, featured: boolean) {
     return Effect.fn("SkillMarketplace.setFeatured")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -698,7 +611,7 @@ export class SkillMarketplace {
             marketplaceError(new SkillMarketplaceError(404, "skill_not_found", "The skill was not found.")),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   private approvedRowEffect(

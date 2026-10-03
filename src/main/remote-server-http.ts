@@ -25,14 +25,6 @@ import { RemoteProtocolError, RemoteRequestError } from "./remote-server-errors"
 
 export const REMOTE_REQUEST_TIMEOUT_MS = 15_000;
 
-export function remoteFetch(
-  input: string | URL,
-  init: RequestInit = {},
-  timeoutMs = REMOTE_REQUEST_TIMEOUT_MS,
-): Promise<Response> {
-  return runRemoteEffect(remoteFetchEffect(input, init, timeoutMs));
-}
-
 export interface RemoteJsonRequestOptions {
   method?: string;
   body?: unknown;
@@ -45,16 +37,7 @@ export interface RemoteJsonRequestOptions {
   timeoutMs?: number;
 }
 
-export function requestJson<T>(
-  apiUrl: string,
-  path: string,
-  decoder: ResponseDecoder<T>,
-  options: RemoteJsonRequestOptions = {},
-): Promise<T> {
-  return runRemoteEffect(requestJsonEffect(apiUrl, path, decoder, options));
-}
-
-export const requestJsonEffect = Effect.fn("RemoteHttp.requestJson")(function* <T>(
+export const requestJson = Effect.fn("RemoteHttp.requestJson")(function* <T>(
   apiUrl: string,
   path: string,
   decoder: ResponseDecoder<T>,
@@ -67,7 +50,7 @@ export const requestJsonEffect = Effect.fn("RemoteHttp.requestJson")(function* <
   const method = options.method ?? (options.body === undefined ? "GET" : "POST");
   const sideRoute = teamSideRouteCodec(path);
   const codec = teamHttpCodec(options.protocol);
-  const response = yield* remoteFetchEffect(
+  const response = yield* remoteFetch(
     new URL(path, apiUrl),
     {
       method,
@@ -153,11 +136,7 @@ export function webRtcRequestBody(
 // `requestJson` above agree on what a failing host response means. A host that answers with a JSON
 // error envelope produces a `RemoteRequestError` carrying its own message and code; a host that
 // claims JSON and does not send it is a protocol failure, not a request failure.
-export function throwRemoteResponseError(response: Response, method: string, path: string): Promise<never> {
-  return runRemoteEffect(remoteResponseErrorEffect(response, method, path));
-}
-
-export const remoteResponseErrorEffect = Effect.fn("RemoteHttp.responseError")(function* (
+export const throwRemoteResponseError = Effect.fn("RemoteHttp.responseError")(function* (
   response: Response,
   method: string,
   path: string,
@@ -192,7 +171,7 @@ class RemoteTransportError extends Schema.TaggedError<RemoteTransportError>()("R
   cause: Schema.Defect(),
 }) {}
 
-export const remoteFetchEffect = Effect.fn("RemoteHttp.fetch")(
+export const remoteFetch = Effect.fn("RemoteHttp.fetch")(
   (input: string | URL, init: RequestInit = {}, timeoutMs = REMOTE_REQUEST_TIMEOUT_MS) =>
     Effect.tryPromise({
       try: (signal) =>
@@ -203,10 +182,3 @@ export const remoteFetchEffect = Effect.fn("RemoteHttp.fetch")(
       catch: (cause) => new RemoteTransportError({ cause }),
     }),
 );
-
-async function runRemoteEffect<A, E>(operation: Effect.Effect<A, E>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result))
-    throw result.failure instanceof RemoteTransportError ? result.failure.cause : result.failure;
-  return result.success;
-}

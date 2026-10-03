@@ -20,7 +20,6 @@ import {
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Schema } from "effect";
-import { runTeamEffect } from "./effect-boundary";
 
 class MarketplaceCatalogError extends Schema.TaggedError<MarketplaceCatalogError>()("MarketplaceCatalogError", {
   message: Schema.String,
@@ -28,29 +27,22 @@ class MarketplaceCatalogError extends Schema.TaggedError<MarketplaceCatalogError
 
 export interface MarketplaceCatalog {
   skills: {
-    list: (query?: MarketplaceSkillQuery) => Promise<MarketplaceSkillPage>;
-    get: (skillId: string) => Promise<MarketplaceSkillDetail>;
+    list: (query?: MarketplaceSkillQuery) => Effect.Effect<MarketplaceSkillPage, MarketplaceCatalogError>;
+    get: (skillId: string) => Effect.Effect<MarketplaceSkillDetail, MarketplaceCatalogError>;
   };
   agents: {
-    list: (query?: MarketplaceAgentQuery) => Promise<MarketplaceAgentPage>;
-    get: (listingId: string) => Promise<MarketplaceAgentDetail>;
+    list: (query?: MarketplaceAgentQuery) => Effect.Effect<MarketplaceAgentPage, MarketplaceCatalogError>;
+    get: (listingId: string) => Effect.Effect<MarketplaceAgentDetail, MarketplaceCatalogError>;
   };
   /** A shared agent template, by the id its link names. */
-  templates: { get: (templateId: string) => Promise<AgentTemplateDetail> };
+  templates: { get: (templateId: string) => Effect.Effect<AgentTemplateDetail, MarketplaceCatalogError> };
 }
 
 export function createMarketplaceCatalog(request: typeof fetch): MarketplaceCatalog {
-  function read<T>(
+  const read = Effect.fn("MarketplaceCatalog.read")(function* <T>(
     path: string,
     decode: (value: unknown) => T,
     failure = sourceText("error.marketplace.catalogLoadFailed"),
-  ): Promise<T> {
-    return runTeamEffect(readCatalog(path, decode, failure));
-  }
-  const readCatalog = Effect.fn("MarketplaceCatalog.read")(function* <T>(
-    path: string,
-    decode: (value: unknown) => T,
-    failure: string,
   ) {
     const response = yield* Effect.tryPromise({
       try: (signal) => request(path, { headers: { accept: "application/json" }, signal }),

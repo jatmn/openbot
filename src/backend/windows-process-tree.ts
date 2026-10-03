@@ -1,21 +1,16 @@
 import { type ChildProcess, execFile } from "node:child_process";
-import { Effect, Fiber, Result, Schema } from "effect";
+import { Effect, Fiber, Schema } from "effect";
 
 /**
  * Stops a process and every process it started, and waits for it to exit. Windows has no process
  * group: a `.cmd` command runs under `cmd.exe`, and a kill of the wrapper leaves the real program
  * running. `taskkill /T` stops the whole tree while the wrapper still holds it.
  */
-export async function stopWindowsProcessTree(child: ChildProcess): Promise<void> {
-  const result = await Effect.runPromise(Effect.result(stopWindowsProcessTreeEffect(child)));
-  if (Result.isFailure(result)) throw result.failure.cause;
-}
-
 export class ProcessTreeFailed extends Schema.TaggedError<ProcessTreeFailed>()("ProcessTreeFailed", {
   cause: Schema.Defect(),
 }) {}
 
-export const stopWindowsProcessTreeEffect = Effect.fn("WindowsProcessTree.stop")(function* (child: ChildProcess) {
+export const stopWindowsProcessTree = Effect.fn("WindowsProcessTree.stop")(function* (child: ChildProcess) {
   const pid = child.pid;
   if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
   const exited = yield* Effect.forkChild(
@@ -49,8 +44,8 @@ export const stopWindowsProcessTreeEffect = Effect.fn("WindowsProcessTree.stop")
  * Stops a process that may run under `cmd.exe`, such as a sign-in through a `.cmd` launcher, and
  * does not wait for it. Elsewhere SIGTERM goes to the process itself.
  */
-export function stopProcessTree(child: ChildProcess): void {
+export const stopProcessTree = Effect.fn("ProcessTree.stop")(function* (child: ChildProcess) {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "win32") void stopWindowsProcessTree(child);
-  else child.kill("SIGTERM");
-}
+  if (process.platform === "win32") yield* stopWindowsProcessTree(child);
+  else yield* Effect.try({ try: () => child.kill("SIGTERM"), catch: (cause) => new ProcessTreeFailed({ cause }) });
+});

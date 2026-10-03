@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Effect, Result } from "effect";
 import { migrateOpenBotDatabase } from "../openbot-database-schema";
-import { runStored, storedIO, storedSync } from "../stored-state-effects";
+import { storedIO, storedSync } from "../stored-state-effects";
 import { databaseRow, errorCode, requiredNumberColumn, requiredStringColumn } from "./database-rows";
 
 export interface OrchestrationEventInput {
@@ -57,11 +57,7 @@ export class DatabaseCore {
     this.#legacyBackupRoot = join(options.userDataPath, "legacy-backup-v1");
   }
 
-  initialize(): Promise<void> {
-    return runStored(this.initializeEffect());
-  }
-
-  initializeEffect = Effect.fn("DatabaseCore.initialize")(function* (this: DatabaseCore) {
+  initialize = Effect.fn("DatabaseCore.initialize")(function* (this: DatabaseCore) {
     if (this.#db) return;
     yield* storedIO(() => mkdir(dirname(this.path), { recursive: true, mode: 0o700 }));
     const db = yield* storedSync(() => new DatabaseSync(this.path));
@@ -180,11 +176,7 @@ export class DatabaseCore {
     }
   }
 
-  backupLegacyFile(path: string): Promise<void> {
-    return runStored(this.backupLegacyFileEffect(path));
-  }
-
-  backupLegacyFileEffect = Effect.fn("DatabaseCore.backupLegacyFile")(function* (this: DatabaseCore, path: string) {
+  backupLegacyFile = Effect.fn("DatabaseCore.backupLegacyFile")(function* (this: DatabaseCore, path: string) {
     const found = yield* Effect.result(storedIO(() => readFile(path)));
     if (Result.isFailure(found)) {
       if (errorCode(found.failure.cause) === "ENOENT") return;

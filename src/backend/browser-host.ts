@@ -21,7 +21,7 @@ import type {
 import { isNumber, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText, toLogValue } from "@openbot/logging";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit, Fiber, Scope, Semaphore } from "effect";
 import {
   type BrowserWindow,
   type BrowserWindowConstructorOptions,
@@ -97,7 +97,6 @@ import {
   remainingTime,
   runTabAction,
   runTabEvaluation,
-  unwindStalledOperation,
 } from "./browser-tab-operations";
 import {
   type BrowserDynamicToolHooks,
@@ -113,7 +112,6 @@ import {
 } from "./browser-tools";
 import type { DynamicToolCallParams, DynamicToolResult } from "./protocol";
 import { isRecord } from "./protocol";
-import { withTimeout } from "./with-timeout";
 
 interface BrowserHostEvents {
   changed: [tabs: BrowserTab[], activeTabId: string | null];
@@ -185,7 +183,7 @@ const BROWSER_WEB_PREFERENCES = {
 
 export interface PreparedBrowserSecret {
   request: BrowserSecretRequest;
-  submit(secret: string): Promise<"submitted" | "takeover">;
+  submit(secret: string): Effect.Effect<"submitted" | "takeover", BrowserOperationError>;
   cancel(): void;
 }
 
@@ -198,7 +196,7 @@ type BrowserToolHandlers = {
     call: BrowserToolCallOf<Name>,
     params: DynamicToolCallParams,
     hooks: BrowserDynamicToolHooks,
-  ) => Promise<DynamicToolResult>;
+  ) => Effect.Effect<DynamicToolResult, BrowserOperationError>;
 };
 
 // The generic name keeps each handler paired with its own call type.
@@ -208,12 +206,14 @@ function runBrowserTool<Name extends BrowserToolName>(
   call: BrowserToolCallOf<Name>,
   params: DynamicToolCallParams,
   hooks: BrowserDynamicToolHooks,
-): Promise<DynamicToolResult> {
+): Effect.Effect<DynamicToolResult, BrowserOperationError> {
   return handlers[tool](call, params, hooks);
 }
 
-async function rejectTakeoverTool(): Promise<DynamicToolResult> {
-  throw new Error("Browser takeover is handled by the agent service, not the browser host.");
+function rejectTakeoverTool(): Effect.Effect<DynamicToolResult, BrowserOperationError> {
+  return Effect.fail(
+    browserFailure(new Error("Browser takeover is handled by the agent service, not the browser host.")),
+  );
 }
 
 export class BrowserHost {
@@ -223,7 +223,7 @@ export class BrowserHost {
   readonly #downloadsRoot: string;
   readonly #statePath: string;
   readonly #tabs = new Map<string, BrowserHostTab>();
-  readonly #closingTabDrains = new Map<string, Promise<void>>();
+  readonly #closingTabDrains = new Map<string, Fiber.Fiber<void, BrowserOperationError>>();
   readonly #listeners = new Set<(...args: BrowserHostEvents["changed"]) => void>();
   readonly #documentListeners = new Set<(...args: BrowserHostEvents["documentChanged"]) => void>();
   readonly #siteVisitListeners = new Set<(...args: BrowserHostEvents["siteVisited"]) => void>();
@@ -239,8 +239,9 @@ export class BrowserHost {
   #target: BrowserViewTarget = "main";
   readonly #mountedViews = new Map<WebContentsView, BrowserWindow>();
   readonly #takeoverTabIds = new Set<string>();
-  #persistQueue: Promise<void> = Promise.resolve();
-  #destroyPromise: Promise<void> | null = null;
+  #persistLock = Semaphore.makeUnsafe(1);
+  readonly #scope = Scope.makeUnsafe();
+  #destroying: Deferred.Deferred<void, BrowserOperationError> | null = null;
   /** Whether the machine is too low on memory for one more tab. Only a hosted server has a reading. */
   readonly #memoryLow: () => boolean;
   readonly #idleTabSweep: NodeJS.Timeout;
@@ -276,24 +277,19 @@ export class BrowserHost {
       },
     );
     this.#configureSession();
-    this.#idleTabSweep = setInterval(() => this.#sleepIdleTabs(), IDLE_TAB_SWEEP_MS);
+    this.#idleTabSweep = setInterval(() => {
+      void runBrowserEffect(this.#sleepIdleTabs()).catch((error) =>
+        logger.warn("Unable to sleep browser tabs", { error: toLogValue(error) }),
+      );
+    }, IDLE_TAB_SWEEP_MS);
     this.#idleTabSweep.unref();
   }
 
-  /**
-   * `agents` is the roster as it stands after the migrations have run, and is what points a tab a
-   * pre-rename build wrote at the agent that owns it now. Without it the owner and thread ids in the file
-   * name an agent that no longer answers to them, and every tool call against the tab is refused.
-   */
-  restore(agents: readonly BrowserTabOwner[] = []): Promise<void> {
-    return runBrowserEffect(this.#restoreEffect(agents));
-  }
-
-  readonly #restoreEffect = Effect.fn("BrowserHost.restore")(function* (
+  readonly restore = Effect.fn("BrowserHost.restore")(function* (
     this: BrowserHost,
     agents: readonly BrowserTabOwner[] = [],
   ): Effect.fn.Return<void, BrowserOperationError> {
-    const state = yield* browserCall(() => readBrowserState(this.#statePath));
+    const state = yield* readBrowserState(this.#statePath);
     if (state.tabs.length === 0) return;
 
     const tabs: BrowserHostTab[] = [];
@@ -315,35 +311,40 @@ export class BrowserHost {
 
     for (const tab of tabs) tab.pendingRestore = () => loadSavedPage(tab);
     const activeTab = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : undefined;
-    if (activeTab) this.#wake(activeTab);
+    if (activeTab) yield* this.#wake(activeTab);
     // A view that never navigated is a debugger target that never answers, which stops a CDP client
     // from attaching to the app. A blank page answers, and costs far less than the saved page.
     for (const tab of tabs) {
-      if (tab.pendingRestore) void tab.contents.loadURL("about:blank").catch(() => undefined);
+      if (tab.pendingRestore)
+        yield* Effect.forkIn(browserCall(() => tab.contents.loadURL("about:blank")).pipe(Effect.ignore), tab.scope, {
+          startImmediately: true,
+        });
     }
-  });
+  }).bind(this);
 
   /**
    * Starts the held-back load of a restored or sleeping tab, once, ahead of anything else queued on
    * it.
    */
-  #wake(tab: BrowserHostTab): void {
+  readonly #wake = Effect.fn("BrowserHost.wake")(function* (this: BrowserHost, tab: BrowserHostTab) {
     const pending = tab.pendingRestore;
     if (!pending) return;
     tab.pendingRestore = undefined;
     tab.sleeping = undefined;
-    tab.queue = tab.queue.then(pending).catch(() => undefined);
-  }
+    yield* Effect.forkIn(enqueueTabOperation(tab, pending, true).pipe(Effect.ignore), tab.scope, {
+      startImmediately: true,
+    });
+  });
 
-  #sleepIdleTabs(): void {
+  readonly #sleepIdleTabs = Effect.fn("BrowserHost.sleepIdleTabs")(function* (this: BrowserHost) {
     const now = Date.now();
     const idleMs = this.#memoryLow() ? LOW_MEMORY_TAB_SLEEP_MS : IDLE_TAB_SLEEP_MS;
     for (const tab of this.#tabs.values()) {
       if (tab.pendingRestore || !this.#maySleep(tab)) continue;
       if (this.#tabInUse(tab)) tab.lastUsedAt = now;
-      else if (now - tab.lastUsedAt >= idleMs) this.#sleep(tab);
+      else if (now - tab.lastUsedAt >= idleMs) yield* this.#sleep(tab);
     }
-  }
+  });
 
   /**
    * Only an agent's own tab sleeps. A popup and its opener keep a live link between their pages, and
@@ -381,34 +382,32 @@ export class BrowserHost {
    * the page again through `#wake`. The page's own state, such as its history and unsent form
    * input, is lost, as when a browser discards a background tab.
    */
-  #sleep(tab: BrowserHostTab): void {
+  readonly #sleep = Effect.fn("BrowserHost.sleep")(function* (this: BrowserHost, tab: BrowserHostTab) {
     const saved = savedPreview(tab);
-    // Take the frame now, as the card shows it while the tab sleeps.
-    const preview = saved ? Promise.resolve(saved) : this.#previewCapture(tab).frame.catch(() => null);
+    const capture = saved ? undefined : yield* this.#previewCapture(tab);
     const sleeping: NonNullable<BrowserHostTab["sleeping"]> = { title: tab.contents.getTitle(), preview: null };
     let unloaded = false;
     tab.sleeping = sleeping;
-    // A use while the frame is taken wakes the tab first, and its page is still there.
-    tab.pendingRestore = () =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          if (unloaded) yield* browserCall(() => loadSavedPage(tab));
-        }),
-      );
-    tab.queue = tab.queue
-      .then(() =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            sleeping.preview = yield* browserCall(() => preview);
+    tab.pendingRestore = () => (unloaded ? loadSavedPage(tab) : Effect.void);
+    yield* Effect.forkIn(
+      enqueueTabOperation(
+        tab,
+        () =>
+          Effect.gen(function* () {
+            sleeping.preview =
+              saved ??
+              (capture ? yield* Deferred.await(capture.frame).pipe(Effect.catch(() => Effect.succeed(null))) : null);
             if (tab.sleeping !== sleeping || tab.closing || tab.contents.isDestroyed()) return;
             unloaded = true;
             yield* browserCall(() => tab.contents.loadURL("about:blank"));
           }),
-        ),
-      )
-      .catch(() => undefined);
+        true,
+      ).pipe(Effect.ignore),
+      tab.scope,
+      { startImmediately: true },
+    );
     this.#emitChanged();
-  }
+  });
 
   onChanged(listener: (...args: BrowserHostEvents["changed"]) => void): () => void {
     this.#listeners.add(listener);
@@ -477,16 +476,7 @@ export class BrowserHost {
     if (view && window && !window.isDestroyed()) window.contentView.addChildView(view);
   }
 
-  open(
-    url: string,
-    ownerThreadId: string | null = null,
-    ownerAgentId: string | null = null,
-    focus = false,
-  ): Promise<BrowserTab> {
-    return runBrowserEffect(this.#openEffect(url, ownerThreadId, ownerAgentId, focus));
-  }
-
-  readonly #openEffect = Effect.fn("BrowserHost.open")(function* (
+  readonly open = Effect.fn("BrowserHost.open")(function* (
     this: BrowserHost,
     url: string,
     ownerThreadId: string | null = null,
@@ -511,7 +501,7 @@ export class BrowserHost {
     this.#syncAttachedView();
     if (!focus) restoreWebContentsFocus(previouslyFocused, tab.contents);
     this.#emitChanged();
-    yield* browserCall(() => this.#persistState());
+    yield* this.#persistState();
 
     yield* Effect.gen({ self: this }, function* () {
       yield* browserCall(() => tab.contents.loadURL(normalizedUrl, browserLoadOptions()));
@@ -526,7 +516,7 @@ export class BrowserHost {
           if (this.#tabs.get(tab.id) === tab) {
             this.#unmountView(tab.view);
             this.#tabs.delete(tab.id);
-            tab.engine.destroy();
+            yield* tab.engine.destroy();
             tab.contents.close();
             if (this.#activeTabId === tab.id) {
               this.#activeTabId = this.#tabs.keys().next().value ?? null;
@@ -534,7 +524,7 @@ export class BrowserHost {
             this.#syncAttachedView();
           }
           this.#emitChanged();
-          yield* browserCall(() => this.#persistState());
+          yield* this.#persistState();
           return yield* browserFailure(
             new Error(sourceText("error.backend.browserOpenFailed", { url: normalizedUrl, reason: String(error) })),
           );
@@ -543,7 +533,7 @@ export class BrowserHost {
     );
 
     return toPublicTab(tab);
-  });
+  }).bind(this);
 
   #hasTabCapacity(ownerThreadId: string | null, ownerAgentId: string | null): boolean {
     const tabs = [...this.#tabs.values()].filter((tab) => {
@@ -554,98 +544,64 @@ export class BrowserHost {
     return tabs.length < INPUT_LIMITS.browserTabs;
   }
 
-  activate(tabId: string): Promise<void> {
-    return runBrowserEffect(this.#activateEffect(tabId));
-  }
-
-  readonly #activateEffect = Effect.fn("BrowserHost.activate")(function* (
+  readonly activate = Effect.fn("BrowserHost.activate")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<void, BrowserOperationError> {
-    yield* browserSync(() => this.#requireTab(tabId));
+    yield* this.#requireTab(tabId);
     this.#activeTabId = tabId;
     this.#syncAttachedView();
     this.#emitChanged();
-    yield* browserCall(() => this.#persistState());
-  });
+    yield* this.#persistState();
+  }).bind(this);
 
-  navigate(tabId: string, direction: BrowserNavigationDirection): Promise<void> {
-    return runBrowserEffect(this.#navigateEffect(tabId, direction));
-  }
-
-  readonly #navigateEffect = Effect.fn("BrowserHost.navigate")(function* (
+  readonly navigate = Effect.fn("BrowserHost.navigate")(function* (
     this: BrowserHost,
     tabId: string,
     direction: BrowserNavigationDirection,
   ): Effect.fn.Return<void, BrowserOperationError> {
-    yield* browserCall(() =>
-      this.#enqueue(tabId, (tab) =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            yield* browserCall(() => navigateAndWait(tab.contents, () => navigateHistory(tab.contents, direction)));
-          }),
-        ),
-      ),
+    yield* this.#enqueue(tabId, (tab) =>
+      Effect.gen({ self: this }, function* () {
+        yield* navigateAndWait(tab.contents, () => navigateHistory(tab.contents, direction));
+      }),
     );
-  });
+  }).bind(this);
 
-  loadUrl(tabId: string, url: string): Promise<void> {
-    return runBrowserEffect(this.#loadUrlEffect(tabId, url));
-  }
-
-  readonly #loadUrlEffect = Effect.fn("BrowserHost.loadUrl")(function* (
+  readonly loadUrl = Effect.fn("BrowserHost.loadUrl")(function* (
     this: BrowserHost,
     tabId: string,
     url: string,
   ): Effect.fn.Return<void, BrowserOperationError> {
     const normalizedUrl = yield* browserSync(() => normalizeBrowserUrl(url));
-    yield* browserCall(() =>
-      this.#enqueue(
-        tabId,
-        (tab) =>
-          runBrowserEffect(
-            Effect.gen({ self: this }, function* () {
-              yield* browserCall(() =>
-                navigateAndWait(tab.contents, () => tab.contents.loadURL(normalizedUrl, browserLoadOptions())),
-              );
-              this.#focusTab(tab);
-            }),
-          ),
-        true,
-      ),
+    yield* this.#enqueue(
+      tabId,
+      (tab) =>
+        Effect.gen({ self: this }, function* () {
+          yield* navigateAndWait(tab.contents, () => tab.contents.loadURL(normalizedUrl, browserLoadOptions()));
+          this.#focusTab(tab);
+        }),
+      true,
     );
-  });
+  }).bind(this);
 
-  reload(tabId: string): Promise<void> {
-    return runBrowserEffect(this.#reloadEffect(tabId));
-  }
-
-  readonly #reloadEffect = Effect.fn("BrowserHost.reload")(function* (
+  readonly reload = Effect.fn("BrowserHost.reload")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<void, BrowserOperationError> {
-    yield* browserCall(() =>
-      this.#enqueue(
-        tabId,
-        (tab) =>
-          runBrowserEffect(
-            Effect.gen({ self: this }, function* () {
-              return navigateAndWait(tab.contents, () => {
-                tab.contents.reload();
-                return true;
-              });
-            }),
-          ),
-        true,
-      ),
+    yield* this.#enqueue(
+      tabId,
+      (tab) =>
+        Effect.gen({ self: this }, function* () {
+          return yield* navigateAndWait(tab.contents, () => {
+            tab.contents.reload();
+            return true;
+          });
+        }),
+      true,
     );
-  });
+  }).bind(this);
 
-  close(tabId: string): Promise<void> {
-    return runBrowserEffect(this.#closeEffect(tabId));
-  }
-
-  readonly #closeEffect = Effect.fn("BrowserHost.close")(function* (
+  readonly close = Effect.fn("BrowserHost.close")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<void, BrowserOperationError> {
@@ -670,47 +626,39 @@ export class BrowserHost {
           .find((id) => this.#tabs.has(id)) ??
         null;
       const active = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : undefined;
-      if (active) active.focusOnVisible = true;
+      if (active) {
+        active.focusOnVisible = true;
+        yield* this.#wake(active);
+      }
     }
     this.#syncAttachedView();
     this.#emitChanged();
-    const destroy = tab.queue.then(() =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          yield* browserCall(() => Promise.all(childDrains));
-          yield* Effect.gen({ self: this }, function* () {
-            yield* browserCall(() => this.#recorder.discard(tabId, "tab-closed"));
-          }).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                tab.engine.destroy();
-                if (!tab.contents.isDestroyed()) tab.contents.close();
-              }),
-            ),
-          );
-        }),
-      ),
+    tab.closing = true;
+    const destroy = yield* Effect.forkIn(
+      Effect.gen({ self: this }, function* () {
+        yield* Deferred.await(tab.queue);
+        yield* Effect.all(childDrains, { concurrency: "unbounded", discard: true });
+        const discarded = yield* Effect.exit(this.#recorder.discard(tabId, "tab-closed"));
+        yield* tab.engine.destroy();
+        yield* Scope.close(tab.scope, Exit.void);
+        yield* browserSync(() => {
+          if (!tab.contents.isDestroyed()) tab.contents.close();
+        });
+        if (Exit.isFailure(discarded)) return yield* Effect.failCause(discarded.cause);
+      }),
+      this.#scope,
+      { startImmediately: true, uninterruptible: true },
     );
     this.#closingTabDrains.set(tab.id, destroy);
-    tab.queue = destroy.catch(() => undefined);
-    const statePersistence = this.#persistState();
-    yield* Effect.gen({ self: this }, function* () {
-      yield* browserCall(() => destroy);
-      yield* browserCall(() => statePersistence);
-    }).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          if (this.#closingTabDrains.get(tab.id) === destroy) this.#closingTabDrains.delete(tab.id);
-        }),
-      ),
-    );
-  });
+    const results = yield* Effect.all([Fiber.join(destroy), this.#persistState()].map(Effect.exit), {
+      concurrency: "unbounded",
+    });
+    if (this.#closingTabDrains.get(tab.id) === destroy) this.#closingTabDrains.delete(tab.id);
+    const failure = results.find(Exit.isFailure);
+    if (failure) return yield* Effect.failCause(failure.cause);
+  }, Effect.uninterruptible).bind(this);
 
-  beginTakeover(tabId: string): Promise<void> {
-    return runBrowserEffect(this.#beginTakeoverEffect(tabId));
-  }
-
-  readonly #beginTakeoverEffect = Effect.fn("BrowserHost.beginTakeover")(function* (
+  readonly beginTakeover = Effect.fn("BrowserHost.beginTakeover")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<void, BrowserOperationError> {
@@ -722,7 +670,7 @@ export class BrowserHost {
     tab.diagnostics.clearDiagnostics();
     this.#emitChanged();
     yield* Effect.gen({ self: this }, function* () {
-      yield* browserCall(() => this.#enqueue(tabId, () => this.#recorder.discard(tabId, "tab-closed"), true));
+      yield* this.#enqueue(tabId, () => this.#recorder.discard(tabId, "tab-closed"), true);
     }).pipe(
       Effect.catch((operationFailure) =>
         Effect.gen({ self: this }, function* () {
@@ -733,13 +681,9 @@ export class BrowserHost {
         }),
       ),
     );
-  });
+  }).bind(this);
 
-  prepareSecret(params: DynamicToolCallParams): Promise<PreparedBrowserSecret> {
-    return runBrowserEffect(this.#prepareSecretEffect(params));
-  }
-
-  readonly #prepareSecretEffect = Effect.fn("BrowserHost.prepareSecret")(function* (
+  readonly prepareSecret = Effect.fn("BrowserHost.prepareSecret")(function* (
     this: BrowserHost,
     params: DynamicToolCallParams,
   ): Effect.fn.Return<PreparedBrowserSecret, BrowserOperationError> {
@@ -748,7 +692,7 @@ export class BrowserHost {
       return yield* browserFailure(new Error("Invalid secure authentication request."));
     const args = call.args;
     yield* browserSync(() => this.#requireToolTab(params, args.tabId));
-    const tab = yield* browserSync(() => this.#requireTab(args.tabId));
+    const tab = yield* this.#requireTab(args.tabId);
     if (tab.secret) return yield* browserFailure(new Error(sourceText("error.backend.authActive")));
     const url = yield* browserSync(() => new URL(currentTabUrl(tab)));
     if (url.protocol !== "https:")
@@ -767,27 +711,21 @@ export class BrowserHost {
     this.#invalidateViews(tab);
     this.#syncAttachedView();
     return yield* Effect.gen({ self: this }, function* () {
-      const entry = yield* browserCall(() =>
-        this.#enqueue(
-          args.tabId,
-          (_tab, keepQueueBlocked) =>
-            runBrowserEffect(
-              Effect.gen({ self: this }, function* () {
-                yield* browserCall(() => this.#recorder.discard(args.tabId, "requested"));
-                tab.diagnostics.clearDiagnostics();
-                return yield* browserCall(() =>
-                  boundEngineOperation(
-                    tab,
-                    tab.engine.prepareSecret(args.targets, url.origin, args.submission, args.submitTarget),
-                    10_000,
-                    "Authentication target resolution timed out.",
-                    keepQueueBlocked,
-                  ),
-                );
-              }),
-            ),
-          true,
-        ),
+      const entry = yield* this.#enqueue(
+        args.tabId,
+        (_tab, keepQueueBlocked) =>
+          Effect.gen({ self: this }, function* () {
+            yield* this.#recorder.discard(args.tabId, "requested");
+            tab.diagnostics.clearDiagnostics();
+            return yield* boundEngineOperation(
+              tab,
+              tab.engine.prepareSecret(args.targets, url.origin, args.submission, args.submitTarget),
+              10_000,
+              "Authentication target resolution timed out.",
+              keepQueueBlocked,
+            );
+          }),
+        true,
       );
       return {
         // Password cards do not use digits; keep public metadata within its released bounds.
@@ -800,108 +738,96 @@ export class BrowserHost {
           }
         },
         submit: (secret: string) =>
-          runBrowserEffect(
-            Effect.gen({ self: this }, function* (): Effect.fn.Return<"submitted" | "takeover", BrowserOperationError> {
-              if (tab.secret !== protection || protection.submitted)
-                return yield* browserFailure(new Error(sourceText("error.backend.authExpired")));
-              // A connected page can navigate to the secret's site while the card is open.
-              yield* browserSync(() => this.#requireIsolatedFromConnectedTabs(tab, url.origin));
-              if (args.method !== "password" && !new RegExp(`^[0-9]{${args.digits}}$`, "u").test(secret))
-                return yield* browserFailure(new Error(sourceText("error.backend.authDigitsRequired")));
-              protection.submitted = true;
-              this.#invalidateViews(tab);
-              protection.running = true;
-              this.#syncAttachedView();
-              let kept = false;
-              yield* Effect.gen({ self: this }, function* () {
-                yield* browserCall(() =>
-                  this.#enqueue(
-                    args.tabId,
-                    (_tab, keepQueueBlocked) =>
-                      runBrowserEffect(
-                        Effect.gen({ self: this }, function* () {
-                          yield* browserCall(() =>
-                            boundEngineOperation(
-                              tab,
-                              entry.enter(secret),
-                              10_000,
-                              "Authentication submission timed out.",
-                              keepQueueBlocked,
-                            ),
-                          );
-                          if (!protection.replaced) {
-                            yield* Effect.callback<void>((resume) => {
-                              const contents = tab.contents;
-                              const cleanup = () => {
-                                clearTimeout(timer);
-                                contents.off("did-navigate", finish);
-                                contents.off("destroyed", finish);
-                              };
-                              const finish = () => {
-                                cleanup();
-                                resume(Effect.void);
-                              };
-                              const timer = setTimeout(finish, 5_000);
-                              contents.once("did-navigate", finish);
-                              contents.once("destroyed", finish);
-                              return Effect.sync(cleanup);
-                            });
-                          }
-                          if (!protection.replaced) {
-                            // A reload would restart a single-page sign-in at its first step. Keep the
-                            // document when its fields are empty and nothing a snapshot reads shows the value.
-                            const cleared = yield* browserCall(() =>
-                              boundEngineOperation(
-                                tab,
-                                entry.clear(secret),
-                                10_000,
-                                "Authentication field cleanup timed out.",
-                                keepQueueBlocked,
-                              ).catch(() => false),
-                            );
-                            if (cleared && !protection.replaced) kept = true;
-                          }
-                          if (!protection.replaced && !kept) {
-                            // Load with GET rather than replaying a possible form POST. Keep capture
-                            // blocked until navigation has replaced the document and this operation ends.
-                            yield* browserCall(() =>
-                              boundEngineOperation(
-                                tab,
-                                navigateAndWait(tab.contents, () =>
-                                  tab.contents.loadURL(currentTabUrl(tab), browserLoadOptions()),
-                                ),
-                                10_000,
-                                "Authentication page reload timed out.",
-                                keepQueueBlocked,
-                              ),
-                            );
-                          }
-                        }),
-                      ),
-                    true,
-                  ),
-                );
-              }).pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    protection.running = false;
-                    tab.diagnostics.clearDiagnostics();
-                    if (protection.replaced) {
-                      tab.contents.navigationHistory.clear();
-                      tab.secret = undefined;
-                      this.#syncAttachedView();
-                    } else if (kept) {
-                      tab.secretDocument = true;
-                      tab.secret = undefined;
-                      this.#syncAttachedView();
+          Effect.gen({ self: this }, function* (): Effect.fn.Return<"submitted" | "takeover", BrowserOperationError> {
+            if (tab.secret !== protection || protection.submitted)
+              return yield* browserFailure(new Error(sourceText("error.backend.authExpired")));
+            // A connected page can navigate to the secret's site while the card is open.
+            yield* browserSync(() => this.#requireIsolatedFromConnectedTabs(tab, url.origin));
+            if (args.method !== "password" && !new RegExp(`^[0-9]{${args.digits}}$`, "u").test(secret))
+              return yield* browserFailure(new Error(sourceText("error.backend.authDigitsRequired")));
+            protection.submitted = true;
+            this.#invalidateViews(tab);
+            protection.running = true;
+            this.#syncAttachedView();
+            let kept = false;
+            yield* Effect.gen({ self: this }, function* () {
+              yield* this.#enqueue(
+                args.tabId,
+                (_tab, keepQueueBlocked) =>
+                  Effect.gen({ self: this }, function* () {
+                    yield* boundEngineOperation(
+                      tab,
+                      entry.enter(secret),
+                      10_000,
+                      "Authentication submission timed out.",
+                      keepQueueBlocked,
+                    );
+                    if (!protection.replaced) {
+                      yield* Effect.callback<void>((resume) => {
+                        const contents = tab.contents;
+                        const cleanup = () => {
+                          clearTimeout(timer);
+                          contents.off("did-navigate", finish);
+                          contents.off("destroyed", finish);
+                        };
+                        const finish = () => {
+                          cleanup();
+                          resume(Effect.void);
+                        };
+                        const timer = setTimeout(finish, 5_000);
+                        contents.once("did-navigate", finish);
+                        contents.once("destroyed", finish);
+                        return Effect.sync(cleanup);
+                      });
                     }
-                    this.#emitChanged();
+                    if (!protection.replaced) {
+                      // A reload would restart a single-page sign-in at its first step. Keep the
+                      // document when its fields are empty and nothing a snapshot reads shows the value.
+                      const cleared = yield* boundEngineOperation(
+                        tab,
+                        entry.clear(secret),
+                        10_000,
+                        "Authentication field cleanup timed out.",
+                        keepQueueBlocked,
+                      ).pipe(Effect.catch(() => Effect.succeed(false)));
+                      if (cleared && !protection.replaced) kept = true;
+                    }
+                    if (!protection.replaced && !kept) {
+                      // Load with GET rather than replaying a possible form POST. Keep capture
+                      // blocked until navigation has replaced the document and this operation ends.
+                      yield* boundEngineOperation(
+                        tab,
+                        navigateAndWait(tab.contents, () =>
+                          tab.contents.loadURL(currentTabUrl(tab), browserLoadOptions()),
+                        ),
+                        10_000,
+                        "Authentication page reload timed out.",
+                        keepQueueBlocked,
+                      );
+                    }
                   }),
-                ),
+                true,
               );
-              return protection.replaced || kept ? "submitted" : "takeover";
-            }),
-          ),
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  protection.running = false;
+                  tab.diagnostics.clearDiagnostics();
+                  if (protection.replaced) {
+                    tab.contents.navigationHistory.clear();
+                    tab.secret = undefined;
+                    this.#syncAttachedView();
+                  } else if (kept) {
+                    tab.secretDocument = true;
+                    tab.secret = undefined;
+                    this.#syncAttachedView();
+                  }
+                  this.#emitChanged();
+                }),
+              ),
+            );
+            return protection.replaced || kept ? "submitted" : "takeover";
+          }),
       };
     }).pipe(
       Effect.catch(() =>
@@ -912,7 +838,7 @@ export class BrowserHost {
         }),
       ),
     );
-  });
+  }).bind(this);
 
   /**
    * Pages in one opener group can keep references to each other's documents, including a document
@@ -961,196 +887,141 @@ export class BrowserHost {
     this.#emitChanged();
   }
 
-  setVisible(input: BrowserVisibilityInput): Promise<void> {
-    return runBrowserEffect(this.#setVisibleEffect(input));
-  }
-
-  readonly #setVisibleEffect = Effect.fn("BrowserHost.setVisible")((input: BrowserVisibilityInput) =>
-    browserSync(() => {
+  readonly setVisible = Effect.fn("BrowserHost.setVisible")(function* (
+    this: BrowserHost,
+    input: BrowserVisibilityInput,
+  ) {
+    const active = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : undefined;
+    if (active) yield* this.#wake(active);
+    yield* browserSync(() => {
       const restoreRendererFocus = !input.visible && this.#attachedView?.webContents.isFocused();
       this.#visible = input.visible;
       if (input.bounds) this.#bounds = validateBounds(input.bounds);
       if (input.target) this.#target = input.target;
       this.#syncAttachedView();
       if (restoreRendererFocus) this.#window.webContents.focus();
-    }),
-  );
+    });
+  }).bind(this);
 
-  snapshot(tabId: string): Promise<BrowserSnapshot> {
-    return runBrowserEffect(this.#snapshotEffect(tabId));
-  }
-
-  readonly #snapshotEffect = Effect.fn("BrowserHost.snapshot")(function* (
+  readonly snapshot = Effect.fn("BrowserHost.snapshot")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<BrowserSnapshot, BrowserOperationError> {
-    return yield* browserCall(() =>
-      this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            const revision = tab.revision + 1;
-            return (yield* browserCall(() => readTabSnapshot(tab, revision, keepQueueBlocked))).snapshot;
-          }),
-        ),
-      ),
+    return yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+      Effect.gen({ self: this }, function* () {
+        const revision = tab.revision + 1;
+        return (yield* readTabSnapshot(tab, revision, keepQueueBlocked)).snapshot;
+      }),
     );
-  });
+  }).bind(this);
 
-  act(tabId: string, revision: number, action: BrowserAction): Promise<BrowserSnapshot> {
-    return runBrowserEffect(this.#actEffect(tabId, revision, action));
-  }
-
-  readonly #actEffect = Effect.fn("BrowserHost.act")(function* (
+  readonly act = Effect.fn("BrowserHost.act")(function* (
     this: BrowserHost,
     tabId: string,
     revision: number,
     action: BrowserAction,
   ): Effect.fn.Return<BrowserSnapshot, BrowserOperationError> {
-    return yield* browserCall(() =>
-      this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            if (revision !== tab.revision) {
-              return yield* browserFailure(new Error("Stale browser references. Take a fresh snapshot before acting."));
-            }
-            const target =
-              action.type === "click" || action.type === "type"
-                ? ({ kind: "ref", ref: action.ref, revision } as const)
-                : undefined;
-            const deadline = Date.now() + 10_000;
-            yield* Effect.gen({ self: this }, function* () {
-              const dispatch = () =>
-                runBrowserEffect(
-                  Effect.gen({ self: this }, function* () {
-                    switch (action.type) {
-                      case "click":
-                        if (!target) return yield* browserFailure(new Error("Legacy click requires a target."));
-                        yield* browserCall(() => tab.engine.click(target, {}, deadline));
-                        return;
-                      case "type":
-                        if (!target) return yield* browserFailure(new Error("Legacy type requires a target."));
-                        yield* browserCall(() =>
-                          tab.engine.type(
-                            target,
-                            action.text,
-                            { mode: "replace", submit: action.submit === true },
-                            deadline,
-                          ),
-                        );
-                        return;
-                      case "key":
-                        yield* browserCall(() => tab.engine.press(action.key, undefined, deadline));
-                        return;
-                      case "scroll":
-                        yield* browserCall(() => tab.engine.scroll(undefined, 0, action.deltaY, deadline));
-                        return;
-                      case "back":
-                      case "forward":
-                        yield* browserCall(() =>
-                          navigateAndWait(tab.contents, () => navigateHistory(tab.contents, action.type)),
-                        );
-                        return;
-                      case "reload":
-                        yield* browserCall(() =>
-                          navigateAndWait(tab.contents, () => {
-                            tab.contents.reload();
-                            return true;
-                          }),
-                        );
-                    }
-                  }),
-                );
-              // The deadline the engine carries is checked between its commands, which a renderer that
-              // answers none of them never reaches -- and re-resolving a ref fingerprints the element in
-              // the frame that owns it, so a page wedged after the snapshot hangs the dispatch itself.
-              const dispatchTimeout = Math.max(1, deadline - Date.now());
-              yield* browserCall(() =>
-                boundEngineOperation(tab, dispatch(), dispatchTimeout, "Browser action timed out.", keepQueueBlocked),
-              );
-              const settleTimeout = Math.max(1, deadline - Date.now());
-              const settleCompletion = tab.engine.settle(settleTimeout);
-              yield* Effect.gen({ self: this }, function* () {
-                // Settling bounds its own waiting with timers, but the commands it sends to each frame are
-                // not bounded by them, so a frame that answers none of them holds this action -- and the
-                // tab's queue behind it -- open for good.
-                yield* browserCall(() => withTimeout(settleCompletion, settleTimeout, "Browser action timed out."));
-              }).pipe(
-                Effect.catch((operationFailure) =>
-                  Effect.gen({ self: this }, function* () {
-                    const error = operationFailure.cause;
-                    if (!isTimeoutError(error)) return yield* browserFailure(error);
-                    // The action fails from here as it always did, so nothing else is using the session and the
-                    // unwind can start at once.
-                    keepQueueBlocked(unwindStalledOperation(tab, settleCompletion));
-                    return yield* browserFailure(error);
-                  }),
-                ),
-              );
+    return yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+      Effect.gen({ self: this }, function* () {
+        if (revision !== tab.revision) {
+          return yield* browserFailure(new Error("Stale browser references. Take a fresh snapshot before acting."));
+        }
+        const target =
+          action.type === "click" || action.type === "type"
+            ? ({ kind: "ref", ref: action.ref, revision } as const)
+            : undefined;
+        const deadline = Date.now() + 10_000;
+        yield* Effect.gen({ self: this }, function* () {
+          const dispatch = () =>
+            Effect.gen({ self: this }, function* () {
+              switch (action.type) {
+                case "click":
+                  if (!target) return yield* browserFailure(new Error("Legacy click requires a target."));
+                  yield* tab.engine.click(target, {}, deadline);
+                  return;
+                case "type":
+                  if (!target) return yield* browserFailure(new Error("Legacy type requires a target."));
+                  yield* tab.engine.type(
+                    target,
+                    action.text,
+                    { mode: "replace", submit: action.submit === true },
+                    deadline,
+                  );
+                  return;
+                case "key":
+                  yield* tab.engine.press(action.key, undefined, deadline);
+                  return;
+                case "scroll":
+                  yield* tab.engine.scroll(undefined, 0, action.deltaY, deadline);
+                  return;
+                case "back":
+                case "forward":
+                  yield* navigateAndWait(tab.contents, () => navigateHistory(tab.contents, action.type));
+                  return;
+                case "reload":
+                  yield* navigateAndWait(tab.contents, () => {
+                    tab.contents.reload();
+                    return true;
+                  });
+              }
+            });
+          // The deadline the engine carries is checked between its commands, which a renderer that
+          // answers none of them never reaches -- and re-resolving a ref fingerprints the element in
+          // the frame that owns it, so a page wedged after the snapshot hangs the dispatch itself.
+          const dispatchTimeout = Math.max(1, deadline - Date.now());
+          yield* boundEngineOperation(tab, dispatch(), dispatchTimeout, "Browser action timed out.", keepQueueBlocked);
+          const settleTimeout = Math.max(1, deadline - Date.now());
+          yield* boundEngineOperation(
+            tab,
+            tab.engine.settle(settleTimeout),
+            settleTimeout,
+            "Browser action timed out.",
+            keepQueueBlocked,
+          );
+          tab.diagnostics.action({
+            action: action.type,
+            target: target ? describeBrowserTarget(target) : undefined,
+            outcome: "success",
+          });
+        }).pipe(
+          Effect.catch((operationFailure) =>
+            Effect.gen({ self: this }, function* () {
+              const error = operationFailure.cause;
               tab.diagnostics.action({
                 action: action.type,
                 target: target ? describeBrowserTarget(target) : undefined,
-                outcome: "success",
+                outcome: "error",
+                detail: String(error),
               });
-            }).pipe(
-              Effect.catch((operationFailure) =>
-                Effect.gen({ self: this }, function* () {
-                  const error = operationFailure.cause;
-                  tab.diagnostics.action({
-                    action: action.type,
-                    target: target ? describeBrowserTarget(target) : undefined,
-                    outcome: "error",
-                    detail: String(error),
-                  });
-                  return yield* browserFailure(error);
-                }),
-              ),
-            );
-            const nextRevision = tab.revision + 1;
-            return (yield* browserCall(() => readTabSnapshot(tab, nextRevision, keepQueueBlocked))).snapshot;
-          }),
-        ),
-      ),
+              return yield* browserFailure(error);
+            }),
+          ),
+        );
+        const nextRevision = tab.revision + 1;
+        return (yield* readTabSnapshot(tab, nextRevision, keepQueueBlocked)).snapshot;
+      }),
     );
-  });
+  }).bind(this);
 
-  screenshot(tabId: string): Promise<string> {
-    return runBrowserEffect(this.#screenshotEffect(tabId));
-  }
-
-  readonly #screenshotEffect = Effect.fn("BrowserHost.screenshot")(function* (
+  readonly screenshot = Effect.fn("BrowserHost.screenshot")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<string, BrowserOperationError> {
-    return yield* browserCall(() =>
-      this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            const image = yield* browserCall(() =>
-              boundEngineOperation(
-                tab,
-                tab.engine.screenshot(),
-                10_000,
-                "Browser screenshot timed out.",
-                keepQueueBlocked,
-              ),
-            );
-            return boundedCaptureDataUrl(image);
-          }),
-        ),
-      ),
+    return yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+      Effect.gen({ self: this }, function* () {
+        const image = yield* boundEngineOperation(
+          tab,
+          tab.engine.screenshot(),
+          10_000,
+          "Browser screenshot timed out.",
+          keepQueueBlocked,
+        );
+        return boundedCaptureDataUrl(image);
+      }),
     );
-  });
+  }).bind(this);
 
-  /**
-   * A preview waits behind whatever the agent does on the tab, and its capture resizes the page twice,
-   * which a heavy single-page application answers slowly. So while the tab is busy, or while a capture
-   * takes longer than `PREVIEW_STALE_AFTER_MS`, the card gets the last frame of the same page instead.
-   */
-  capturePreview(tabId: string): Promise<BrowserPreview> {
-    return runBrowserEffect(this.#capturePreviewEffect(tabId));
-  }
-
-  readonly #capturePreviewEffect = Effect.fn("BrowserHost.capturePreview")(function* (
+  readonly capturePreview = Effect.fn("BrowserHost.capturePreview")(function* (
     this: BrowserHost,
     tabId: string,
   ): Effect.fn.Return<BrowserPreview, BrowserOperationError> {
@@ -1158,77 +1029,83 @@ export class BrowserHost {
     if (!tab) return yield* browserFailure(new Error(`Unknown browser tab: ${tabId}`));
     // A preview card on screen does not keep a sleeping tab loaded.
     if (tab.sleeping?.preview) return tab.sleeping.preview;
-    this.#wake(tab);
+    yield* this.#wake(tab);
     if (tab.secret?.submitted)
       return yield* browserFailure(new Error("Browser inspection is protected during authentication. Use takeover."));
     const cached = savedPreview(tab);
     if (cached && tab.pendingOperations > 0) return cached;
-    const started = this.#previewCapture(tab);
-    // A navigation during the capture makes its frame show the page before it, so take one more,
-    // and fail rather than show the wrong page when that one is also out of date.
-    const capture = started.frame.then((frame) => {
+    const started = yield* this.#previewCapture(tab);
+    const capture = Effect.gen({ self: this }, function* () {
+      const frame = yield* Deferred.await(started.frame);
       if (showsCurrentPage(tab, started)) return frame;
-      const retry = this.#previewCapture(tab);
-      return retry.frame.then((retried) => {
-        if (!showsCurrentPage(tab, retry)) throw new Error(sourceText("error.backend.browserPreviewPageChanged"));
-        return retried;
-      });
+      const retry = yield* this.#previewCapture(tab);
+      const retried = yield* Deferred.await(retry.frame);
+      if (!showsCurrentPage(tab, retry))
+        return yield* browserFailure(new Error(sourceText("error.backend.browserPreviewPageChanged")));
+      return retried;
     });
-    if (!cached) return yield* browserCall(() => capture);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    // After a navigation during the capture the saved frame shows the wrong page, so the preview waits.
-    const stale = new Promise<BrowserPreview>((resolve) => {
-      timer = setTimeout(() => {
-        if (savedPreview(tab) === cached) resolve(cached);
-      }, PREVIEW_STALE_AFTER_MS);
-    });
-    return yield* browserCall(() => Promise.race([capture, stale])).pipe(
-      Effect.ensuring(Effect.sync(() => clearTimeout(timer))),
+    if (!cached) return yield* capture;
+    // A stale frame is usable only if navigation has not changed its page.
+    const stale = Effect.sleep(PREVIEW_STALE_AFTER_MS).pipe(
+      Effect.andThen(Effect.suspend(() => (savedPreview(tab) === cached ? Effect.succeed(cached) : Effect.never))),
     );
-  });
+    return yield* Effect.raceFirst(capture, stale);
+  }).bind(this);
 
-  #previewCapture(tab: BrowserHostTab): BrowserPreviewPage & { frame: Promise<BrowserPreview> } {
+  readonly #previewCapture = Effect.fn("BrowserHost.previewCapture")(function* (
+    this: BrowserHost,
+    tab: BrowserHostTab,
+  ) {
     if (tab.previewCapture && showsCurrentPage(tab, tab.previewCapture)) return tab.previewCapture;
     const page = currentPreviewPage(tab);
-    const frame = enqueueTabOperation(tab, (_tab, keepQueueBlocked) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const image = yield* browserCall(() =>
-            boundEngineOperation(tab, tab.engine.screenshot(), 10_000, "Browser preview timed out.", keepQueueBlocked),
-          );
-          const size = image.getSize();
-          if (size.width <= 0 || size.height <= 0) return yield* browserFailure(new Error("Browser preview is empty."));
-
-          const targetAspectRatio = 16 / 10;
-          let cropWidth = size.width;
-          let cropHeight = Math.round(cropWidth / targetAspectRatio);
-          if (cropHeight > size.height) {
-            cropHeight = size.height;
-            cropWidth = Math.round(cropHeight * targetAspectRatio);
-          }
-          const cropped = image.crop({
-            x: Math.max(0, Math.floor((size.width - cropWidth) / 2)),
-            y: 0,
-            width: cropWidth,
-            height: cropHeight,
-          });
-          const preview = cropped.resize({ width: 960, height: 600, quality: "good" });
-          const dataUrl = `data:image/jpeg;base64,${preview.toJPEG(72).toString("base64")}`;
-          const frame = { dataUrl, width: 960, height: 600 };
-          if (showsCurrentPage(tab, page)) tab.preview = { ...page, frame };
-          return frame;
-        }),
-      ),
-    );
+    const frame = Deferred.makeUnsafe<BrowserPreview, BrowserOperationError>();
     const capture = { ...page, frame };
     tab.previewCapture = capture;
-    void frame
-      .finally(() => {
+    yield* Effect.forkIn(
+      Effect.gen({ self: this }, function* () {
+        const result = yield* Effect.exit(
+          enqueueTabOperation(tab, (_tab, keepQueueBlocked) =>
+            Effect.gen({ self: this }, function* () {
+              const image = yield* boundEngineOperation(
+                tab,
+                tab.engine.screenshot(),
+                10_000,
+                "Browser preview timed out.",
+                keepQueueBlocked,
+              );
+              const size = image.getSize();
+              if (size.width <= 0 || size.height <= 0)
+                return yield* browserFailure(new Error("Browser preview is empty."));
+
+              const targetAspectRatio = 16 / 10;
+              let cropWidth = size.width;
+              let cropHeight = Math.round(cropWidth / targetAspectRatio);
+              if (cropHeight > size.height) {
+                cropHeight = size.height;
+                cropWidth = Math.round(cropHeight * targetAspectRatio);
+              }
+              const cropped = image.crop({
+                x: Math.max(0, Math.floor((size.width - cropWidth) / 2)),
+                y: 0,
+                width: cropWidth,
+                height: cropHeight,
+              });
+              const preview = cropped.resize({ width: 960, height: 600, quality: "good" });
+              const dataUrl = `data:image/jpeg;base64,${preview.toJPEG(72).toString("base64")}`;
+              const frame = { dataUrl, width: 960, height: 600 };
+              if (showsCurrentPage(tab, page)) tab.preview = { ...page, frame };
+              return frame;
+            }),
+          ),
+        );
         if (tab.previewCapture === capture) tab.previewCapture = undefined;
-      })
-      .catch(() => undefined);
+        yield* Deferred.done(frame, result);
+      }),
+      tab.scope,
+      { startImmediately: true },
+    );
     return capture;
-  }
+  });
 
   /**
    * A live view of a tab, for a member who is not at this computer.
@@ -1242,22 +1119,13 @@ export class BrowserHost {
     for (const invalidate of [...tab.viewInvalidations]) invalidate();
   }
 
-  /** `onEnded` gets the reason to show when the view stops before its stop function is called. */
-  startView(
-    tabId: string,
-    onFrame: (frame: BrowserScreencastFrame) => void,
-    onEnded?: (reason: string) => void,
-  ): Promise<() => Promise<void>> {
-    return runBrowserEffect(this.#startViewEffect(tabId, onFrame, onEnded));
-  }
-
-  readonly #startViewEffect = Effect.fn("BrowserHost.startView")(function* (
+  readonly startView = Effect.fn("BrowserHost.startView")(function* (
     this: BrowserHost,
     tabId: string,
     onFrame: (frame: BrowserScreencastFrame) => void,
     onEnded?: (reason: string) => void,
-  ): Effect.fn.Return<() => Promise<void>, BrowserOperationError> {
-    const tab = yield* browserSync(() => this.#requireTab(tabId));
+  ): Effect.fn.Return<() => Effect.Effect<void>, BrowserOperationError> {
+    const tab = yield* this.#requireTab(tabId);
     if (tab.secret?.submitted)
       return yield* browserFailure(new Error(sourceText("error.backend.browserViewProtected")));
     const generation = tab.captureGeneration;
@@ -1269,30 +1137,26 @@ export class BrowserHost {
     };
     tab.viewInvalidations.add(invalidate);
     return yield* Effect.gen({ self: this }, function* () {
-      const stop = yield* browserCall(() =>
-        tab.engine.startScreencast(
-          { quality: VIEW_FRAME_QUALITY, maxWidth: VIEW_FRAME_MAX_WIDTH, maxHeight: VIEW_FRAME_MAX_HEIGHT },
-          (frame) => {
-            if (!tab.secret?.submitted && tab.captureGeneration === generation) onFrame(frame);
-          },
-          (error) => {
-            tab.viewInvalidations.delete(invalidate);
-            logger.warn("The live browser view stopped.", { error: toLogValue(error) });
-            onEnded?.("The live browser view stopped. Open a new view to continue.");
-          },
-        ),
+      const stop = yield* tab.engine.startScreencast(
+        { quality: VIEW_FRAME_QUALITY, maxWidth: VIEW_FRAME_MAX_WIDTH, maxHeight: VIEW_FRAME_MAX_HEIGHT },
+        (frame) => {
+          if (!tab.secret?.submitted && tab.captureGeneration === generation) onFrame(frame);
+        },
+        (error) => {
+          tab.viewInvalidations.delete(invalidate);
+          logger.warn("The live browser view stopped.", { error: toLogValue(error) });
+          onEnded?.("The live browser view stopped. Open a new view to continue.");
+        },
       );
       let stopped = false;
       const stopOnce = () =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            tab.viewInvalidations.delete(invalidate);
-            if (stopped) return;
-            stopped = true;
-            yield* browserCall(() => stop());
-          }),
-        );
-      if (invalidated) yield* browserCall(() => stopOnce());
+        Effect.gen({ self: this }, function* () {
+          tab.viewInvalidations.delete(invalidate);
+          if (stopped) return;
+          stopped = true;
+          yield* stop();
+        });
+      if (invalidated) yield* stopOnce();
       return stopOnce;
     }).pipe(
       Effect.catch((operationFailure) =>
@@ -1303,131 +1167,102 @@ export class BrowserHost {
         }),
       ),
     );
-  });
+  }).bind(this);
 
-  /**
-   * Input from the person watching that view. It is not queued either, for the same reason a local
-   * click on the visible tab is not: a pointer that answers when the agent's turn ends is not a
-   * pointer. Anything that can change the page clears the references the agent's last snapshot
-   * handed out, the way taking the tab over does, so the agent takes a fresh one rather than acting
-   * on an element the person moved.
-   */
-  dispatchViewInput(tabId: string, input: BrowserViewportInput): Promise<void> {
-    return runBrowserEffect(this.#dispatchViewInputEffect(tabId, input));
-  }
-
-  readonly #dispatchViewInputEffect = Effect.fn("BrowserHost.dispatchViewInput")(function* (
+  readonly dispatchViewInput = Effect.fn("BrowserHost.dispatchViewInput")(function* (
     this: BrowserHost,
     tabId: string,
     input: BrowserViewportInput,
   ): Effect.fn.Return<void, BrowserOperationError> {
-    const tab = yield* browserSync(() => this.#requireTab(tabId));
+    const tab = yield* this.#requireTab(tabId);
     if (tab.secret?.submitted)
       return yield* browserFailure(new Error(sourceText("error.backend.browserInputProtected")));
     if (input.type !== "pointer" || input.action !== "move") tab.engine.invalidateReferences();
-    yield* browserCall(() => tab.engine.dispatchViewportInput(input));
-  });
+    yield* tab.engine.dispatchViewportInput(input);
+  }).bind(this);
 
   readonly #toolHandlers: BrowserToolHandlers = {
     open: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tab = yield* this.#openEffect(args.url, params.threadId, params.ownerAgentId ?? null);
-          this.#controls.updateTab(params, tab.id);
-          return textResult({ tab });
-        }),
-      ),
-    list_tabs: (_call, params) => runBrowserEffect(browserSync(() => textResult(this.#toolTabs(params)))),
+      Effect.gen({ self: this }, function* () {
+        const tab = yield* this.open(args.url, params.threadId, params.ownerAgentId ?? null);
+        this.#controls.updateTab(params, tab.id);
+        return textResult({ tab });
+      }),
+    list_tabs: (_call, params) => browserSync(() => textResult(this.#toolTabs(params))),
     status: (_call, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const control = {
-            sessions: this.getControlState().sessions.filter((session) => session.threadId === params.threadId),
-          };
-          return textResult({ ...this.#toolTabs(params), control });
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        const control = {
+          sessions: this.getControlState().sessions.filter((session) => session.threadId === params.threadId),
+        };
+        return textResult({ ...this.#toolTabs(params), control });
+      }),
     snapshot: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          const mode = args.image ?? "auto";
-          const capture = yield* browserCall(() =>
-            this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-              runBrowserEffect(
-                Effect.gen({ self: this }, function* () {
-                  const result = yield* browserCall(() => readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked));
-                  const includeImage = mode === "always" || (mode === "auto" && result.recommendImage);
-                  if (!includeImage) return { result, imageUrl: null };
-                  const image = yield* browserCall(() =>
-                    boundEngineOperation(
-                      tab,
-                      tab.engine.screenshot(),
-                      10_000,
-                      "Browser screenshot timed out.",
-                      keepQueueBlocked,
-                    ),
-                  );
-                  return { result, imageUrl: boundedCaptureDataUrl(image) };
-                }),
-              ),
-            ),
-          );
-          return this.#snapshotResult(capture.result, mode, capture.imageUrl);
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        const mode = args.image ?? "auto";
+        const capture = yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+          Effect.gen({ self: this }, function* () {
+            const result = yield* readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked);
+            const includeImage = mode === "always" || (mode === "auto" && result.recommendImage);
+            if (!includeImage) return { result, imageUrl: null };
+            const image = yield* boundEngineOperation(
+              tab,
+              tab.engine.screenshot(),
+              10_000,
+              "Browser screenshot timed out.",
+              keepQueueBlocked,
+            );
+            return { result, imageUrl: boundedCaptureDataUrl(image) };
+          }),
+        );
+        return this.#snapshotResult(capture.result, mode, capture.imageUrl);
+      }),
     navigate: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          const url = args.url;
-          const direction = args.direction;
-          if (!url && !direction) return yield* browserFailure(new Error("navigate requires url or direction."));
-          const timeoutMs = browserToolTimeout(args.timeoutMs);
-          return textResult(
-            yield* this.#runActionEffect(
-              tabId,
-              "navigate",
-              undefined,
-              (tab, deadline) =>
-                runBrowserEffect(
-                  Effect.gen({ self: this }, function* () {
-                    const operationTimeout = remainingTime(deadline, "Browser navigate timed out.");
-                    if (url) {
-                      const normalizedUrl = yield* browserSync(() => normalizeBrowserUrl(url));
-                      tab.requestedUrl = normalizedUrl;
-                      yield* browserCall(() =>
-                        navigateAndWait(
-                          tab.contents,
-                          () => tab.contents.loadURL(normalizedUrl, browserLoadOptions()),
-                          operationTimeout,
-                        ),
-                      );
-                    } else if (direction === "reload") {
-                      yield* browserCall(() =>
-                        navigateAndWait(
-                          tab.contents,
-                          () => {
-                            tab.contents.reload();
-                            return true;
-                          },
-                          operationTimeout,
-                        ),
-                      );
-                    } else if (direction) {
-                      yield* browserCall(() =>
-                        navigateAndWait(tab.contents, () => navigateHistory(tab.contents, direction), operationTimeout),
-                      );
-                    }
-                  }),
-                ),
-              timeoutMs,
-            ),
-          );
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        const url = args.url;
+        const direction = args.direction;
+        if (!url && !direction) return yield* browserFailure(new Error("navigate requires url or direction."));
+        const timeoutMs = browserToolTimeout(args.timeoutMs);
+        return textResult(
+          yield* this.#runAction(
+            tabId,
+            "navigate",
+            undefined,
+            (tab, deadline) =>
+              Effect.gen({ self: this }, function* () {
+                const operationTimeout = remainingTime(deadline, "Browser navigate timed out.");
+                if (url) {
+                  const normalizedUrl = yield* browserSync(() => normalizeBrowserUrl(url));
+                  tab.requestedUrl = normalizedUrl;
+                  yield* navigateAndWait(
+                    tab.contents,
+                    () => tab.contents.loadURL(normalizedUrl, browserLoadOptions()),
+                    operationTimeout,
+                  );
+                } else if (direction === "reload") {
+                  yield* navigateAndWait(
+                    tab.contents,
+                    () => {
+                      tab.contents.reload();
+                      return true;
+                    },
+                    operationTimeout,
+                  );
+                } else if (direction) {
+                  yield* navigateAndWait(
+                    tab.contents,
+                    () => navigateHistory(tab.contents, direction),
+                    operationTimeout,
+                  );
+                }
+              }),
+            timeoutMs,
+          ),
+        );
+      }),
     click: (call, params, hooks) => this.#runInputTool(call, params, hooks),
     type: (call, params, hooks) => this.#runInputTool(call, params, hooks),
     press: (call, params, hooks) => this.#runInputTool(call, params, hooks),
@@ -1438,159 +1273,126 @@ export class BrowserHost {
     drag: (call, params, hooks) => this.#runInputTool(call, params, hooks),
     upload_files: (call, params, hooks) => this.#runInputTool(call, params, hooks),
     wait_for: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          const condition = {
-            target: args.target,
-            text: args.text,
-            url: args.url,
-            state: args.state,
-          };
-          if (!condition.target && !condition.text && !condition.url && !condition.state)
-            return yield* browserFailure(new Error("wait_for requires a condition."));
-          const timeoutMs = browserToolTimeout(args.timeoutMs);
-          return textResult(
-            yield* browserCall(() =>
-              this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-                runBrowserEffect(
-                  Effect.gen({ self: this }, function* () {
-                    const timeoutMessage = "Browser wait condition timed out.";
-                    const deadline = Date.now() + timeoutMs;
-                    // The engine checks this deadline between commands, which a frame that answers none of
-                    // them never reaches.
-                    const waitTimeout = remainingTime(deadline, timeoutMessage);
-                    yield* browserCall(() =>
-                      boundEngineOperation(
-                        tab,
-                        tab.engine.waitFor(condition, waitTimeout),
-                        waitTimeout,
-                        timeoutMessage,
-                        keepQueueBlocked,
-                      ),
-                    );
-                    return (yield* browserCall(() =>
-                      readTabSnapshot(
-                        tab,
-                        tab.revision + 1,
-                        keepQueueBlocked,
-                        remainingTime(deadline, timeoutMessage),
-                        timeoutMessage,
-                      ),
-                    )).snapshot;
-                  }),
-                ),
-              ),
-            ),
-          );
-        }),
-      ),
-    evaluate: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          yield* browserSync(() => this.#requireToolTab(params, args.tabId));
-          return textResult(
-            yield* this.#runEvaluationEffect(
-              args.tabId,
-              args.expression,
-              args.awaitPromise ?? true,
-              browserToolTimeout(args.timeoutMs),
-            ),
-          );
-        }),
-      ),
-    set_environment: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          return textResult(
-            yield* browserCall(() =>
-              this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-                runBrowserEffect(
-                  Effect.gen({ self: this }, function* () {
-                    const environment = resolveEnvironment(args, tab.environment, tab.view.getBounds());
-                    // This also bounds the engine's rollback if applying the environment fails.
-                    yield* browserCall(() =>
-                      boundEngineOperation(
-                        tab,
-                        tab.engine.setEnvironment(environment),
-                        10_000,
-                        "Browser environment change timed out.",
-                        keepQueueBlocked,
-                      ),
-                    );
-                    tab.environment = environment;
-                    yield* browserCall(() => this.#persistState());
-                    this.#emitChanged();
-                    return (yield* browserCall(() => readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked)))
-                      .snapshot;
-                  }),
-                ),
-              ),
-            ),
-          );
-        }),
-      ),
-    recording_start: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          yield* browserCall(() =>
-            this.#enqueue(tabId, (tab) => {
-              this.#requireNoSecretDocument(tab, "Recording");
-              return this.#recorder.start(tabId, tab.contents);
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        const condition = {
+          target: args.target,
+          text: args.text,
+          url: args.url,
+          state: args.state,
+        };
+        if (!condition.target && !condition.text && !condition.url && !condition.state)
+          return yield* browserFailure(new Error("wait_for requires a condition."));
+        const timeoutMs = browserToolTimeout(args.timeoutMs);
+        return textResult(
+          yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+            Effect.gen({ self: this }, function* () {
+              const timeoutMessage = "Browser wait condition timed out.";
+              const deadline = Date.now() + timeoutMs;
+              // The engine checks this deadline between commands, which a frame that answers none of
+              // them never reaches.
+              const waitTimeout = remainingTime(deadline, timeoutMessage);
+              yield* boundEngineOperation(
+                tab,
+                tab.engine.waitFor(condition, waitTimeout),
+                waitTimeout,
+                timeoutMessage,
+                keepQueueBlocked,
+              );
+              return (yield* readTabSnapshot(
+                tab,
+                tab.revision + 1,
+                keepQueueBlocked,
+                remainingTime(deadline, timeoutMessage),
+                timeoutMessage,
+              )).snapshot;
             }),
-          );
-          return textResult({ recording: true, tabId, limits: { durationMs: 300_000, bytes: 104_857_600 } });
-        }),
-      ),
+          ),
+        );
+      }),
+    evaluate: ({ args }, params) =>
+      Effect.gen({ self: this }, function* () {
+        yield* browserSync(() => this.#requireToolTab(params, args.tabId));
+        return textResult(
+          yield* this.#runEvaluation(
+            args.tabId,
+            args.expression,
+            args.awaitPromise ?? true,
+            browserToolTimeout(args.timeoutMs),
+          ),
+        );
+      }),
+    set_environment: ({ args }, params) =>
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        return textResult(
+          yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+            Effect.gen({ self: this }, function* () {
+              const environment = resolveEnvironment(args, tab.environment, tab.view.getBounds());
+              // This also bounds the engine's rollback if applying the environment fails.
+              yield* boundEngineOperation(
+                tab,
+                tab.engine.setEnvironment(environment),
+                10_000,
+                "Browser environment change timed out.",
+                keepQueueBlocked,
+              );
+              tab.environment = environment;
+              yield* this.#persistState();
+              this.#emitChanged();
+              return (yield* readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked)).snapshot;
+            }),
+          ),
+        );
+      }),
+    recording_start: ({ args }, params) =>
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        yield* this.#enqueue(tabId, (tab) => {
+          this.#requireNoSecretDocument(tab, "Recording");
+          return this.#recorder.start(tabId, tab.contents);
+        });
+        return textResult({ recording: true, tabId, limits: { durationMs: 300_000, bytes: 104_857_600 } });
+      }),
     recording_stop: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          yield* browserSync(() => this.#requireToolTab(params, tabId));
-          return textResult({
-            artifact: yield* browserCall(() => this.#enqueue(tabId, () => this.#recorder.stop(tabId))),
-          });
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        yield* browserSync(() => this.#requireToolTab(params, tabId));
+        return textResult({
+          artifact: yield* this.#enqueue(tabId, () => this.#recorder.stop(tabId)),
+        });
+      }),
     act: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          yield* browserSync(() => this.#requireToolTab(params, args.tabId));
-          return textResult(yield* this.#actEffect(args.tabId, args.revision, args.action));
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        yield* browserSync(() => this.#requireToolTab(params, args.tabId));
+        return textResult(yield* this.act(args.tabId, args.revision, args.action));
+      }),
     screenshot: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          yield* browserSync(() => this.#requireToolTab(params, args.tabId));
-          const imageUrl = yield* this.#screenshotEffect(args.tabId);
-          return { success: true, contentItems: [{ type: "inputImage", imageUrl }] };
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        yield* browserSync(() => this.#requireToolTab(params, args.tabId));
+        const imageUrl = yield* this.screenshot(args.tabId);
+        return { success: true, contentItems: [{ type: "inputImage", imageUrl }] };
+      }),
     close_tab: ({ args }, params) =>
-      runBrowserEffect(
-        Effect.gen({ self: this }, function* () {
-          const tabId = args.tabId;
-          // Checked only for a tab that exists, so closing an id that is already gone stays a silent
-          // success and a repeated close is idempotent.
-          const tab = this.#tabs.get(tabId);
-          if (tab) {
-            yield* browserSync(() => this.#requireToolTab(params, tabId));
-            logger.info("Agent closed a browser tab.", {
-              tabId,
-              host: logUrlHost(tab.requestedUrl),
-              agentId: params.ownerAgentId ?? null,
-            });
-          }
-          yield* this.#closeEffect(tabId);
-          return textResult({ closed: true });
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        const tabId = args.tabId;
+        // Checked only for a tab that exists, so closing an id that is already gone stays a silent
+        // success and a repeated close is idempotent.
+        const tab = this.#tabs.get(tabId);
+        if (tab) {
+          yield* browserSync(() => this.#requireToolTab(params, tabId));
+          logger.info("Agent closed a browser tab.", {
+            tabId,
+            host: logUrlHost(tab.requestedUrl),
+            agentId: params.ownerAgentId ?? null,
+          });
+        }
+        yield* this.close(tabId);
+        return textResult({ closed: true });
+      }),
     // Published in BROWSER_TOOL_DEFINITIONS like every other tool, but answered by the agent
     // service, which intercepts the namespace before the call reaches a host. Reaching here
     // means a caller bypassed that, and silently succeeding would tell the model the user had
@@ -1599,11 +1401,7 @@ export class BrowserHost {
     request_takeover: rejectTakeoverTool,
   };
 
-  handleDynamicTool(params: DynamicToolCallParams, hooks: BrowserDynamicToolHooks = {}): Promise<DynamicToolResult> {
-    return runBrowserEffect(this.#handleDynamicToolEffect(params, hooks));
-  }
-
-  readonly #handleDynamicToolEffect = Effect.fn("BrowserHost.handleDynamicTool")(function* (
+  readonly handleDynamicTool = Effect.fn("BrowserHost.handleDynamicTool")(function* (
     this: BrowserHost,
     params: DynamicToolCallParams,
     hooks: BrowserDynamicToolHooks = {},
@@ -1611,7 +1409,7 @@ export class BrowserHost {
     return yield* Effect.gen({ self: this }, function* () {
       const call = yield* browserSync(() => parseBrowserToolCall(params.tool, params.arguments));
       yield* browserSync(() => this.#controls.begin(params, call));
-      return yield* browserCall(() => runBrowserTool(this.#toolHandlers, call.tool, call, params, hooks));
+      return yield* runBrowserTool(this.#toolHandlers, call.tool, call, params, hooks);
     })
       .pipe(
         Effect.catch((operationFailure) =>
@@ -1634,7 +1432,7 @@ export class BrowserHost {
           }),
         ),
       );
-  });
+  }).bind(this);
 
   #toolTabs(params: DynamicToolCallParams): { tabs: BrowserTab[]; activeTabId: string | null } {
     const tabs = this.listTabs().filter((tab) => this.#canUseToolTab(params, tab));
@@ -1644,24 +1442,16 @@ export class BrowserHost {
     return { tabs, activeTabId };
   }
 
-  #runInputTool(
-    call: BrowserInputCall,
-    params: DynamicToolCallParams,
-    hooks: BrowserDynamicToolHooks,
-  ): Promise<DynamicToolResult> {
-    return runBrowserEffect(this.#runInputToolEffect(call, params, hooks));
-  }
-
-  readonly #runInputToolEffect = Effect.fn("BrowserHost.runInputTool")(function* (
+  readonly #runInputTool = Effect.fn("BrowserHost.runInputTool")(function* (
     this: BrowserHost,
     call: BrowserInputCall,
     params: DynamicToolCallParams,
     hooks: BrowserDynamicToolHooks,
   ): Effect.fn.Return<DynamicToolResult, BrowserOperationError> {
     yield* browserSync(() => this.#requireToolTab(params, call.args.tabId));
-    const action = browserInputAction(call, hooks);
+    const action = yield* browserSync(() => browserInputAction(call, hooks));
     return textResult(
-      yield* this.#runActionEffect(
+      yield* this.#runAction(
         call.args.tabId,
         action.name,
         action.target,
@@ -1672,11 +1462,7 @@ export class BrowserHost {
     );
   });
 
-  resolveUploadTarget(params: DynamicToolCallParams): Promise<BrowserUploadAssignment> {
-    return runBrowserEffect(this.#resolveUploadTargetEffect(params));
-  }
-
-  readonly #resolveUploadTargetEffect = Effect.fn("BrowserHost.resolveUploadTarget")(function* (
+  readonly resolveUploadTarget = Effect.fn("BrowserHost.resolveUploadTarget")(function* (
     this: BrowserHost,
     params: DynamicToolCallParams,
   ): Effect.fn.Return<BrowserUploadAssignment, BrowserOperationError> {
@@ -1685,75 +1471,86 @@ export class BrowserHost {
     yield* browserSync(() => this.#requireToolTab(params, tabId));
     const target = args.target;
     const timeoutMs = browserToolTimeout(args.timeoutMs);
-    return yield* browserCall(() =>
-      this.#enqueue(tabId, (tab, keepQueueBlocked) =>
-        // This preflight scans every frame for the input, so an unresponsive one holds it open exactly
-        // as it would the upload itself -- and it is queued ahead of that bounded upload, so without a
-        // bound of its own the tab never reaches the operation the timeout was meant to protect.
-        boundEngineOperation(
-          tab,
-          tab.engine.resolveUploadTarget(target),
-          timeoutMs,
-          "Browser upload target resolution timed out.",
-          keepQueueBlocked,
-        ),
+    return yield* this.#enqueue(tabId, (tab, keepQueueBlocked) =>
+      // This preflight scans every frame for the input, so an unresponsive one holds it open exactly
+      // as it would the upload itself -- and it is queued ahead of that bounded upload, so without a
+      // bound of its own the tab never reaches the operation the timeout was meant to protect.
+      boundEngineOperation(
+        tab,
+        tab.engine.resolveUploadTarget(target),
+        timeoutMs,
+        "Browser upload target resolution timed out.",
+        keepQueueBlocked,
       ),
     );
-  });
+  }).bind(this);
 
-  destroy(): Promise<void> {
+  readonly destroy = Effect.fn("BrowserHost.destroy")(function* (this: BrowserHost) {
+    if (this.#destroying) return yield* Deferred.await(this.#destroying);
+    const done = Deferred.makeUnsafe<void, BrowserOperationError>();
+    this.#destroying = done;
     clearInterval(this.#idleTabSweep);
-    this.#destroyPromise ??= this.#destroyPersistentStorageAndViews();
-    return this.#destroyPromise;
-  }
+    const result = yield* Effect.exit(
+      Effect.gen({ self: this }, function* () {
+        // Capture the persisted tab list before removing native views.
+        const persistence = yield* Effect.forkIn(this.#persistState(), this.#scope, { startImmediately: true });
+        const drains = [...this.#closingTabDrains.values()].map(Fiber.join);
+        this.#session.flushStorageData();
+        for (const tab of this.#tabs.values()) {
+          tab.closing = true;
+          this.#unmountView(tab.view);
+          drains.push(
+            Effect.gen(function* () {
+              yield* Deferred.await(tab.queue);
+              yield* tab.engine.destroy();
+              yield* Scope.close(tab.scope, Exit.void);
+              if (!tab.contents.isDestroyed()) tab.contents.close();
+            }),
+          );
+        }
+        this.#tabs.clear();
+        this.#listeners.clear();
+        this.#controls.dispose();
+        this.#documentListeners.clear();
+        this.#siteVisitListeners.clear();
+        const results = yield* Effect.all(
+          [
+            browserCall(() => this.#session.cookies.flushStore()),
+            Fiber.join(persistence),
+            Effect.all(drains.map(Effect.exit), { concurrency: "unbounded" }).pipe(
+              Effect.flatMap((results) =>
+                this.#recorder.destroy().pipe(
+                  Effect.andThen(
+                    Effect.suspend(() => {
+                      const failure = results.find(Exit.isFailure);
+                      return failure ? Effect.failCause(failure.cause) : Effect.void;
+                    }),
+                  ),
+                ),
+              ),
+            ),
+          ].map(Effect.exit),
+          { concurrency: "unbounded" },
+        );
+        this.#closingTabDrains.clear();
+        this.#session.flushStorageData();
+        yield* this.#persistLock.withPermit(Effect.void);
+        yield* Scope.close(this.#scope, Exit.void);
+        const failure = results.find(Exit.isFailure);
+        if (failure) return yield* Effect.failCause(failure.cause);
+      }).pipe(Effect.uninterruptible),
+    );
+    yield* Deferred.done(done, result);
+    return yield* result;
+  }, Effect.uninterruptible).bind(this);
 
-  #destroyPersistentStorageAndViews(): Promise<void> {
-    return runBrowserEffect(this.#destroyPersistentStorageAndViewsEffect());
-  }
-
-  readonly #destroyPersistentStorageAndViewsEffect = Effect.fn("BrowserHost.destroyPersistentStorageAndViews")(
-    function* (this: BrowserHost): Effect.fn.Return<void, BrowserOperationError> {
-      const statePersistence = this.#persistState();
-      const closingTabDrains = [...this.#closingTabDrains.values()];
-      const activeTabDrains: Promise<void>[] = [];
-      this.#session.flushStorageData();
-      for (const tab of this.#tabs.values()) {
-        this.#unmountView(tab.view);
-        const drain = tab.queue.then(() => {
-          tab.engine.destroy();
-          if (!tab.contents.isDestroyed()) tab.contents.close();
-        });
-        activeTabDrains.push(drain);
-        tab.queue = drain.catch(() => undefined);
-      }
-      const tabDrains = [...closingTabDrains, ...activeTabDrains];
-      const recorderDestruction = Promise.allSettled(tabDrains).then(() => this.#recorder.destroy());
-      this.#tabs.clear();
-      this.#listeners.clear();
-      this.#controls.dispose();
-      this.#documentListeners.clear();
-      this.#siteVisitListeners.clear();
-      const results = yield* browserCall(() =>
-        Promise.allSettled([this.#session.cookies.flushStore(), statePersistence, recorderDestruction, ...tabDrains]),
-      );
-      this.#closingTabDrains.clear();
-      this.#session.flushStorageData();
-      const failure = results.find((result) => result.status === "rejected");
-      if (failure?.status === "rejected") return yield* browserFailure(failure.reason);
-    },
-  );
-
-  flushPersistentStorage(): Promise<void> {
-    return runBrowserEffect(this.#flushPersistentStorageEffect());
-  }
-
-  readonly #flushPersistentStorageEffect = Effect.fn("BrowserHost.flushPersistentStorage")(function* (
+  readonly flushPersistentStorage = Effect.fn("BrowserHost.flushPersistentStorage")(function* (
     this: BrowserHost,
   ): Effect.fn.Return<void, BrowserOperationError> {
     this.#session.flushStorageData();
     yield* browserCall(() => this.#session.cookies.flushStore());
-    yield* browserCall(() => this.#persistState());
-  });
+    yield* this.#persistState();
+  }).bind(this);
 
   #createTab(
     id: string,
@@ -1763,10 +1560,12 @@ export class BrowserHost {
     environment: BrowserEnvironment = defaultBrowserEnvironment(),
     popupOptions?: BrowserWindowConstructorOptions,
   ): BrowserHostTab {
-    if (this.#destroyPromise) throw new Error("BrowserHost is shutting down.");
+    if (this.#destroying) throw new Error("BrowserHost is shutting down.");
     const view = this.#createView(popupOptions);
     this.#mountView(view);
     const diagnostics = new BrowserDiagnostics();
+    const queue = Deferred.makeUnsafe<void>();
+    Deferred.doneUnsafe(queue, Exit.void);
     return {
       id,
       view,
@@ -1776,7 +1575,8 @@ export class BrowserHost {
       ownerThreadId,
       ownerAgentId,
       revision: 0,
-      queue: Promise.resolve(),
+      queue,
+      scope: Scope.makeUnsafe(),
       pendingOperations: 0,
       focusOnVisible: false,
       environment,
@@ -1870,7 +1670,7 @@ export class BrowserHost {
     contents.once("destroyed", () => {
       // Finish native destruction before removing the view and draining queued work.
       setImmediate(() => {
-        void this.close(tab.id).catch((error) =>
+        void runBrowserEffect(this.close(tab.id)).catch((error) =>
           logger.warn("Unable to clean up browser tab", { error: toLogValue(error) }),
         );
       });
@@ -1887,13 +1687,15 @@ export class BrowserHost {
       // Enumeration walks every frame the tab has, and it is queued on the tab, so an unresponsive
       // one stops the tab for good -- and this runs off a navigation, where no caller's deadline
       // covers it.
-      void this.#enqueue(tab.id, (queuedTab, keepQueueBlocked) =>
-        boundEngineOperation(
-          queuedTab,
-          queuedTab.engine.documentIds(),
-          DOCUMENT_ENUMERATION_TIMEOUT_MS,
-          "Browser document enumeration timed out.",
-          keepQueueBlocked,
+      void runBrowserEffect(
+        this.#enqueue(tab.id, (queuedTab, keepQueueBlocked) =>
+          boundEngineOperation(
+            queuedTab,
+            queuedTab.engine.documentIds(),
+            DOCUMENT_ENUMERATION_TIMEOUT_MS,
+            "Browser document enumeration timed out.",
+            keepQueueBlocked,
+          ),
         ),
       )
         .then((documentIds) => {
@@ -1932,7 +1734,7 @@ export class BrowserHost {
       }
       if (!isCloseBrowserTabShortcut(input)) return;
       event.preventDefault();
-      setImmediate(() => void this.close(tab.id).catch(() => undefined));
+      setImmediate(() => void runBrowserEffect(this.close(tab.id)).catch(() => undefined));
     });
     contents.on("context-menu", (event, params) => {
       const items = browserContextMenuItems({
@@ -1974,7 +1776,9 @@ export class BrowserHost {
     contents.on("did-stop-loading", () => {
       if (tab.closing || contents.isDestroyed()) return;
       changed();
-      void this.#syncViewBackground(tab);
+      Effect.runFork(
+        this.#syncViewBackground(tab).pipe(Effect.ignore, Effect.forkIn(tab.scope, { startImmediately: true })),
+      );
     });
     contents.on("console-message", (...eventArgs) => {
       if (this.#takeoverTabIds.has(tab.id) || tab.secret) return;
@@ -2036,7 +1840,7 @@ export class BrowserHost {
       if (!isAllowedMainUrl(event.url)) event.preventDefault();
     });
     contents.setWindowOpenHandler(({ url, referrer, postBody, disposition }) => {
-      if (this.#destroyPromise || this.#tabs.get(tab.id) !== tab) return { action: "deny" };
+      if (this.#destroying || this.#tabs.get(tab.id) !== tab) return { action: "deny" };
       const unsupported = !["foreground-tab", "background-tab", "new-window"].includes(disposition);
       const failure = tab.secret
         ? sourceText("error.backend.popupSecureInput")
@@ -2089,7 +1893,9 @@ export class BrowserHost {
           this.#emitChanged();
           this.#schedulePersist();
           const created = popup;
-          created.queue = created.engine.setEnvironment(created.environment).catch((error) => {
+          void runBrowserEffect(
+            enqueueTabOperation(created, () => created.engine.setEnvironment(created.environment), true),
+          ).catch((error) => {
             logger.warn("Unable to apply popup environment", { error: toLogValue(error) });
           });
           // Links without a native guest need an explicit load; native guests already own
@@ -2159,11 +1965,7 @@ export class BrowserHost {
     return this.#target === "main" && this.#visible && this.#activeTabId === tab.id && this.#attachedView === tab.view;
   }
 
-  #syncViewBackground(tab: BrowserHostTab): Promise<void> {
-    return runBrowserEffect(this.#syncViewBackgroundEffect(tab));
-  }
-
-  readonly #syncViewBackgroundEffect = Effect.fn("BrowserHost.syncViewBackground")(function* (
+  readonly #syncViewBackground = Effect.fn("BrowserHost.syncViewBackground")(function* (
     this: BrowserHost,
     tab: BrowserHostTab,
   ): Effect.fn.Return<void, BrowserOperationError> {
@@ -2203,7 +2005,6 @@ export class BrowserHost {
 
   #syncAttachedView(): void {
     const tab = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : null;
-    if (tab) this.#wake(tab);
     const targetWindow = this.#target === "picture-in-picture" ? this.#pictureInPictureWindow : this.#window;
     if (
       !this.#visible ||
@@ -2292,13 +2093,13 @@ export class BrowserHost {
     if (this.#attachedView === view) this.#attachedView = null;
   }
 
-  #requireTab(tabId: string): BrowserHostTab {
+  readonly #requireTab = Effect.fn("BrowserHost.requireTab")(function* (this: BrowserHost, tabId: string) {
     const tab = this.#tabs.get(tabId);
-    if (!tab) throw new Error(`Unknown browser tab: ${tabId}`);
-    this.#wake(tab);
+    if (!tab) return yield* browserFailure(new Error(`Unknown browser tab: ${tabId}`));
+    yield* this.#wake(tab);
     tab.lastUsedAt = Date.now();
     return tab;
-  }
+  });
 
   #requireToolTab(params: DynamicToolCallParams, tabId: string): void {
     const tab = this.listTabs().find((candidate) => candidate.id === tabId);
@@ -2320,53 +2121,55 @@ export class BrowserHost {
     );
   }
 
-  #enqueue<T>(
+  readonly #enqueue = Effect.fn("BrowserHost.enqueue")(function* <T>(
+    this: BrowserHost,
     tabId: string,
-    operation: (tab: BrowserHostTab, keepQueueBlocked: KeepQueueBlocked) => Promise<T>,
+    operation: (tab: BrowserHostTab, keepQueueBlocked: KeepQueueBlocked) => Effect.Effect<T, BrowserOperationError>,
     allowProtected = false,
-  ): Promise<T> {
-    return enqueueTabOperation(this.#requireTab(tabId), operation, allowProtected);
-  }
+  ) {
+    const tab = yield* this.#requireTab(tabId);
+    return yield* enqueueTabOperation(tab, operation, allowProtected);
+  });
 
-  readonly #runActionEffect = Effect.fn("BrowserHost.runAction")(function* (
+  readonly #runAction = Effect.fn("BrowserHost.runAction")(function* (
     this: BrowserHost,
     tabId: string,
     action: string,
     target: BrowserTarget | undefined,
-    operation: (tab: BrowserHostTab, deadline: number, markDispatched: () => void) => Promise<void>,
+    operation: (
+      tab: BrowserHostTab,
+      deadline: number,
+      markDispatched: () => void,
+    ) => Effect.Effect<void, BrowserOperationError>,
     timeoutMs?: number,
-    onOperationStarted?: (completion: Promise<void>) => void,
+    onOperationStarted?: (completion: Fiber.Fiber<void, BrowserOperationError>) => void,
   ): Effect.fn.Return<BrowserSnapshot | { tabId: string; closed: true; openerTabId?: string }, BrowserOperationError> {
-    const tab = yield* browserSync(() => this.#requireTab(tabId));
-    return yield* browserCall(() =>
-      runTabAction(
-        tab,
-        () => this.#focusedContentsOutsideTabs(),
-        action,
-        target,
-        operation,
-        timeoutMs,
-        onOperationStarted,
-      ),
+    const tab = yield* this.#requireTab(tabId);
+    return yield* runTabAction(
+      tab,
+      () => this.#focusedContentsOutsideTabs(),
+      action,
+      target,
+      operation,
+      timeoutMs,
+      onOperationStarted,
     );
   });
 
-  readonly #runEvaluationEffect = Effect.fn("BrowserHost.runEvaluation")(function* (
+  readonly #runEvaluation = Effect.fn("BrowserHost.runEvaluation")(function* (
     this: BrowserHost,
     tabId: string,
     expression: string,
     awaitPromise: boolean,
     timeoutMs: number,
   ): Effect.fn.Return<BrowserJsonValue, BrowserOperationError> {
-    const tab = yield* browserSync(() => this.#requireTab(tabId));
-    return yield* browserCall(() =>
-      runTabEvaluation(
-        tab,
-        () => this.#requireNoSecretDocument(tab, "Page evaluation"),
-        expression,
-        awaitPromise,
-        timeoutMs,
-      ),
+    const tab = yield* this.#requireTab(tabId);
+    return yield* runTabEvaluation(
+      tab,
+      () => this.#requireNoSecretDocument(tab, "Page evaluation"),
+      expression,
+      awaitPromise,
+      timeoutMs,
     );
   });
 
@@ -2416,12 +2219,23 @@ export class BrowserHost {
   }
 
   #schedulePersist(): void {
-    void this.#persistState().catch((error) => {
-      logger.error("Unable to persist browser tabs:", toLogValue(error));
-    });
+    if (this.#destroying) return;
+    void runBrowserEffect(
+      Effect.forkIn(
+        this.#persistState().pipe(
+          Effect.catch((error) =>
+            Effect.sync(() => {
+              logger.error("Unable to persist browser tabs:", toLogValue(error.cause));
+            }),
+          ),
+        ),
+        this.#scope,
+        { startImmediately: true, uninterruptible: true },
+      ),
+    );
   }
 
-  #persistState(): Promise<void> {
+  readonly #persistState = Effect.fn("BrowserHost.persistState")(function* (this: BrowserHost) {
     const state: StoredBrowserStateV2 = {
       version: 2,
       activeTabId: this.#activeTabId,
@@ -2435,17 +2249,10 @@ export class BrowserHost {
           environment: tab.environment,
         })),
     };
-    this.#persistQueue = this.#persistQueue
-      .catch(() => undefined)
-      .then(() =>
-        runBrowserEffect(
-          Effect.gen({ self: this }, function* () {
-            yield* browserCall(() => writeJsonFileAtomically(this.#statePath, state));
-          }),
-        ),
-      );
-    return this.#persistQueue;
-  }
+    yield* this.#persistLock.withPermit(
+      writeJsonFileAtomically(this.#statePath, state).pipe(Effect.mapError((error) => browserFailure(error.cause))),
+    );
+  });
 }
 
 function currentPreviewPage(tab: BrowserHostTab): BrowserPreviewPage {
@@ -2456,15 +2263,10 @@ function showsCurrentPage(tab: BrowserHostTab, page: BrowserPreviewPage): boolea
   const current = currentPreviewPage(tab);
   return page.url === current.url && page.document === current.document && page.generation === current.generation;
 }
-
-/** Loads the saved URL of a tab that has not loaded its page, with its settings, and no history. */
-function loadSavedPage(tab: BrowserHostTab): Promise<void> {
-  return runBrowserEffect(loadSavedPageEffect(tab));
-}
-const loadSavedPageEffect = Effect.fn("BrowserHost.loadSavedPage")(function* (tab: BrowserHostTab) {
+const loadSavedPage = Effect.fn("BrowserHost.loadSavedPage")(function* (tab: BrowserHostTab) {
   yield* browserCall(() => tab.contents.loadURL("about:blank"));
-  yield* browserCall(() => tab.engine.setEnvironment(tab.environment));
-  yield* browserCall(() => tab.engine.navigate(tab.requestedUrl));
+  yield* tab.engine.setEnvironment(tab.environment);
+  yield* tab.engine.navigate(tab.requestedUrl);
   yield* browserSync(() => tab.contents.navigationHistory.clear());
 });
 

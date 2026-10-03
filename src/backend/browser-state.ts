@@ -4,7 +4,7 @@ import type { BrowserBounds, BrowserEnvironment } from "@openbot/contracts/ipc";
 import { isBoolean, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { legacyAgentId } from "@openbot/contracts/validation";
 import { Effect } from "effect";
-import { browserCall, browserSync, runBrowserEffect } from "./browser-effects";
+import { browserCall, browserSync } from "./browser-effects";
 import type { BrowserToolArguments } from "./browser-tools";
 import { isMissingFileError } from "./file-errors";
 import { isRecord } from "./protocol";
@@ -227,11 +227,7 @@ export interface StoredBrowserStateV2 {
   activeTabId: string | null;
   tabs: Array<StoredBrowserTab & { environment: BrowserEnvironment }>;
 }
-
-export function readBrowserState(path: string): Promise<StoredBrowserStateV2> {
-  return runBrowserEffect(readBrowserStateEffect(path));
-}
-export const readBrowserStateEffect = Effect.fn("Browser.readState")((path: string) =>
+export const readBrowserState = Effect.fn("Browser.readState")((path: string) =>
   Effect.gen(function* () {
     const content = yield* browserCall((signal) => readFile(path, { encoding: "utf8", signal }));
     return yield* browserSync((): StoredBrowserStateV2 => {

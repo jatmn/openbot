@@ -1,3 +1,4 @@
+import { runTestEffect } from "../backend/effect-test-runtime";
 // @vitest-environment node
 
 import { EventEmitter } from "node:events";
@@ -132,8 +133,8 @@ describe("UpdateService", () => {
     });
     service.start(false);
 
-    expect((await service.checkForUpdates()).phase).toBe("unsupported");
-    expect((await service.downloadUpdate()).phase).toBe("unsupported");
+    expect((await runTestEffect(service.checkForUpdates())).phase).toBe("unsupported");
+    expect((await runTestEffect(service.downloadUpdate())).phase).toBe("unsupported");
     expect(await updater.checkForUpdates()).toBeNull();
   });
 
@@ -149,8 +150,8 @@ describe("UpdateService", () => {
     expect(updater.autoInstallOnAppQuit).toBe(false);
     expect(updater.allowPrerelease).toBe(false);
 
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
 
     // No native staging event is emitted: waiting for one is what used to hang macOS forever.
     expect(service.getStatus()).toMatchObject({ phase: "ready", progress: 100, availableVersion: "0.1.1" });
@@ -163,7 +164,7 @@ describe("UpdateService", () => {
     const service = createService(updater, { autoDownload: true });
     service.start(false);
 
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
     await vi.waitFor(() => expect(service.getStatus().phase).toBe("ready"));
     expect(updater.downloadUpdate).toHaveBeenCalledOnce();
     expect(updater.downloadTokens.at(0)).toBe(updater.tokens.at(0));
@@ -185,7 +186,7 @@ describe("UpdateService", () => {
     });
     const service = createService(updater, { autoDownload: true });
     service.start(false);
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
     await vi.waitFor(() => expect(service.getStatus()).toMatchObject({ phase: "ready", availableVersion: "0.1.1" }));
 
     // The same release again keeps the download and the restart action.
@@ -201,7 +202,7 @@ describe("UpdateService", () => {
     expect(updater.downloadTokens.at(-1)).toBe(updater.tokens.at(-1));
 
     // One restart reaches the newest release.
-    await service.installUpdate();
+    await runTestEffect(service.installUpdate());
     expect(updater.quitAndInstall).toHaveBeenCalledOnce();
   });
 
@@ -212,7 +213,7 @@ describe("UpdateService", () => {
     const service = createService(updater, { autoDownload: false });
     service.start(false);
 
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
     expect(service.getStatus().phase).toBe("available");
     expect(updater.downloadUpdate).not.toHaveBeenCalled();
   });
@@ -223,9 +224,9 @@ describe("UpdateService", () => {
     completeDownload(updater);
     const service = createService(updater, { autoDownload: false });
     service.start(false);
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
 
-    service.setAutoDownload(true);
+    runTestEffect(service.setAutoDownload(true));
 
     expect(service.getAutoDownload()).toBe(true);
     await vi.waitFor(() => expect(service.getStatus().phase).toBe("ready"));
@@ -236,9 +237,9 @@ describe("UpdateService", () => {
     makeUpdateAvailable(updater);
     const service = createService(updater, { autoDownload: false });
     service.start(false);
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
 
-    service.setAutoDownload(false);
+    runTestEffect(service.setAutoDownload(false));
 
     expect(service.getStatus().phase).toBe("available");
     expect(updater.downloadUpdate).not.toHaveBeenCalled();
@@ -252,13 +253,13 @@ describe("UpdateService", () => {
     const service = createService(updater, { platform: "win32", beforeInstall });
     service.start(false);
 
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
-    await service.installUpdate();
+    await runTestEffect(service.installUpdate());
     expect(beforeInstall).toHaveBeenCalledOnce();
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true);
-    await expect(service.installUpdate()).rejects.toThrow("not ready");
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow("not ready");
   });
 
   it("refuses the install while another session runs from the same application", async () => {
@@ -271,11 +272,11 @@ describe("UpdateService", () => {
     const service = createService(updater, { platform: "darwin", beforeInstall, checkSiblingInstances });
     service.start(false);
 
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     expect(service.getStatus().phase).toBe("ready");
 
-    await expect(service.installUpdate()).rejects.toThrow(/every other macOS user account/iu);
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow(/every other macOS user account/iu);
     expect(checkSiblingInstances).toHaveBeenCalledOnce();
     expect(beforeInstall).not.toHaveBeenCalled();
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
@@ -283,7 +284,7 @@ describe("UpdateService", () => {
     expect(service.getStatus().phase).toBe("ready");
 
     siblings = [];
-    await service.installUpdate();
+    await runTestEffect(service.installUpdate());
     expect(beforeInstall).toHaveBeenCalledOnce();
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true);
   });
@@ -296,9 +297,9 @@ describe("UpdateService", () => {
     const service = createService(updater, { platform: "darwin", beforeInstall });
     service.start(false);
 
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await runTestEffect(service.installUpdate());
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true);
   });
 
@@ -315,9 +316,9 @@ describe("UpdateService", () => {
       },
     });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await expect(service.installUpdate()).rejects.toThrow("scan failed");
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow("scan failed");
     expect(beforeInstall).not.toHaveBeenCalled();
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
     expect(service.getStatus().phase).toBe("ready");
@@ -331,22 +332,22 @@ describe("UpdateService", () => {
     const service = createService(updater, { platform: "darwin", beforeInstall });
     service.start(false);
 
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     expect(service.getStatus().managedByHost).toBeUndefined();
 
     service.setManagedByHost(true);
     expect(service.getStatus().managedByHost).toBe(true);
 
-    await expect(service.installUpdate()).rejects.toThrow(/installed by the host/iu);
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow(/installed by the host/iu);
     expect(beforeInstall).not.toHaveBeenCalled();
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
     expect(service.getStatus().phase).toBe("ready");
 
     service.setManagedByHost(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await runTestEffect(service.installUpdate());
     expect(beforeInstall).toHaveBeenCalledOnce();
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true);
   });
@@ -366,10 +367,10 @@ describe("UpdateService", () => {
     const beforeInstall = vi.fn(() => prepare);
     const service = createService(updater, { beforeInstall, checkSiblingInstances: () => scan });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    const first = service.installUpdate();
-    const second = service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    const first = runTestEffect(service.installUpdate());
+    const second = runTestEffect(service.installUpdate());
     const rejected = expect(second).rejects.toThrow("not ready");
     finishScan([]);
     await rejected;
@@ -385,8 +386,8 @@ describe("UpdateService", () => {
     const service = createService(updater, { autoDownload: false });
     service.start(false);
     service.setManagedByHost(true);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     expect(updater.checkForUpdates).not.toHaveBeenCalled();
     expect(updater.downloadUpdate).not.toHaveBeenCalled();
     expect(service.getAutoDownload()).toBe(false);
@@ -401,8 +402,8 @@ describe("UpdateService", () => {
     });
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
 
     expect(service.getStatus()).toMatchObject({
       phase: "error",
@@ -421,12 +422,12 @@ describe("UpdateService", () => {
     });
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     expect(service.getStatus().errorCode).toBe("download_failed");
 
     completeDownload(updater);
-    await service.downloadUpdate();
+    await runTestEffect(service.downloadUpdate());
 
     expect(service.getStatus()).toMatchObject({ phase: "ready", availableVersion: "0.1.1" });
   });
@@ -444,8 +445,8 @@ describe("UpdateService", () => {
     );
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    const download = service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    const download = runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
@@ -466,15 +467,15 @@ describe("UpdateService", () => {
     stallDownloadUntilCancelled(updater);
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
     expect(updater.tokens.at(0)?.cancelled).toBe(true);
     expect(updater.checkForUpdates).toHaveBeenCalledOnce();
 
     completeDownload(updater);
-    await service.downloadUpdate();
+    await runTestEffect(service.downloadUpdate());
 
     // A cancellation token is single use, so the retry has to mint a second one.
     expect(updater.checkForUpdates).toHaveBeenCalledTimes(2);
@@ -490,8 +491,8 @@ describe("UpdateService", () => {
     updater.downloadUpdate.mockImplementation(() => new Promise<string[]>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     expect(service.getStatus().phase).toBe("downloading");
 
@@ -512,8 +513,8 @@ describe("UpdateService", () => {
     updater.downloadUpdate.mockImplementation(() => new Promise<string[]>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT - 1);
@@ -530,8 +531,8 @@ describe("UpdateService", () => {
     updater.downloadUpdate.mockImplementation(() => new Promise<string[]>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
     const reported = service.getStatus();
@@ -551,8 +552,8 @@ describe("UpdateService", () => {
     updater.downloadUpdate.mockImplementation(() => new Promise<string[]>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
 
@@ -561,7 +562,7 @@ describe("UpdateService", () => {
     // Offering a restart for an attempt the service already abandoned would be a lie about what is
     // staged on disk; the retry re-checks and starts from a known state.
     expect(service.getStatus()).toMatchObject({ phase: "error", errorCode: "download_failed" });
-    await expect(service.installUpdate()).rejects.toThrow("not ready");
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow("not ready");
   });
 
   it("ignores a late error from an operation the user has moved on from", async () => {
@@ -571,13 +572,13 @@ describe("UpdateService", () => {
     stallDownloadUntilCancelled(updater);
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
-    void service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
 
     completeDownload(updater);
-    await service.downloadUpdate();
+    await runTestEffect(service.downloadUpdate());
     expect(service.getStatus().phase).toBe("ready");
 
     // The abandoned transfer finally reports its failure. The newer download already succeeded.
@@ -598,7 +599,7 @@ describe("UpdateService", () => {
     );
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(CHECK_TIMEOUT);
     expect(service.getStatus().errorCode).toBe("check_failed");
@@ -622,7 +623,7 @@ describe("UpdateService", () => {
     );
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(CHECK_TIMEOUT);
     expect(service.getStatus().errorCode).toBe("check_failed");
@@ -653,12 +654,12 @@ describe("UpdateService", () => {
     );
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(CHECK_TIMEOUT);
     expect(service.getStatus().errorCode).toBe("check_failed");
 
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
 
     // The press is answered with progress, and electron-updater is not asked a second question it
@@ -678,12 +679,12 @@ describe("UpdateService", () => {
     updater.checkForUpdates.mockImplementation(() => new Promise<never>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
     expect(service.getStatus().phase).toBe("checking");
 
-    void service.checkForUpdates();
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
 
     expect(updater.checkForUpdates).toHaveBeenCalledOnce();
@@ -714,7 +715,7 @@ describe("UpdateService", () => {
     const service = createService(updater);
     service.start(false);
 
-    const status = await service.checkForUpdates();
+    const status = await runTestEffect(service.checkForUpdates());
 
     expect(status).toMatchObject({ phase: "error", errorCode: "check_failed" });
     expect(status.message).toMatch(expected);
@@ -726,7 +727,7 @@ describe("UpdateService", () => {
     updater.checkForUpdates.mockImplementation(() => new Promise<never>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(CHECK_TIMEOUT);
@@ -740,7 +741,7 @@ describe("UpdateService", () => {
     updater.checkForUpdates.mockImplementation(() => new Promise<never>(() => undefined));
     const service = createService(updater);
     service.start(false);
-    void service.checkForUpdates();
+    void runTestEffect(service.checkForUpdates());
     await vi.advanceTimersByTimeAsync(0);
     expect(service.getStatus().phase).toBe("checking");
 
@@ -764,9 +765,9 @@ describe("UpdateService", () => {
     );
     const service = createService(updater, { platform: "win32", beforeInstall });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    const install = service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    const install = runTestEffect(service.installUpdate());
     await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(INSTALL_TIMEOUT);
@@ -787,9 +788,9 @@ describe("UpdateService", () => {
     completeDownload(updater);
     const service = createService(updater, { platform: "win32" });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await runTestEffect(service.installUpdate());
     expect(service.getStatus().phase).toBe("installing");
 
     await vi.advanceTimersByTimeAsync(INSTALL_TIMEOUT);
@@ -801,7 +802,7 @@ describe("UpdateService", () => {
     });
     // Shutdown preparation is not transactional, so a second attempt would tear down services
     // concurrently with the first. The user is asked to relaunch instead.
-    await expect(service.installUpdate()).rejects.toThrow("not ready");
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow("not ready");
     expect(updater.quitAndInstall).toHaveBeenCalledOnce();
   });
 
@@ -811,16 +812,16 @@ describe("UpdateService", () => {
     completeDownload(updater);
     const service = createService(updater, { platform: "win32" });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
     updater.quitAndInstall.mockImplementationOnce(() => {
       updater.emit("error", new Error("no update filepath provided"));
     });
 
-    await service.installUpdate();
+    await runTestEffect(service.installUpdate());
 
     expect(service.getStatus()).toMatchObject({ phase: "error", errorCode: "install_failed" });
-    await expect(service.installUpdate()).rejects.toThrow("not ready");
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow("not ready");
     expect(updater.quitAndInstall).toHaveBeenCalledOnce();
   });
 
@@ -834,13 +835,13 @@ describe("UpdateService", () => {
     // the service. The install deadline is the only escape from a restart that never happens, so it
     // has to outlive that teardown.
     const beforeInstall = vi.fn(async () => {
-      service?.stop();
+      if (service) await runTestEffect(service.stop());
     });
     service = createService(updater, { platform: "darwin", beforeInstall });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await runTestEffect(service.installUpdate());
     expect(beforeInstall).toHaveBeenCalledOnce();
     expect(service.getStatus().phase).toBe("installing");
 
@@ -855,9 +856,9 @@ describe("UpdateService", () => {
     stallDownloadUntilCancelled(updater);
     const service = createService(updater);
     service.start(false);
-    await service.checkForUpdates();
+    await runTestEffect(service.checkForUpdates());
     vi.useFakeTimers();
-    void service.downloadUpdate();
+    void runTestEffect(service.downloadUpdate());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DOWNLOAD_STALL_TIMEOUT);
     vi.useRealTimers();
@@ -866,7 +867,7 @@ describe("UpdateService", () => {
     updater.checkForUpdates.mockImplementation(async () => {
       throw new Error("offline");
     });
-    await service.downloadUpdate();
+    await runTestEffect(service.downloadUpdate());
 
     // Starting anyway would leave a transfer the stall watchdog cannot cancel, and an unsettled one
     // blocks every later retry.
@@ -881,9 +882,9 @@ describe("UpdateService", () => {
     completeDownload(updater);
     const service = createService(updater, { platform: "win32" });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await service.installUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await runTestEffect(service.installUpdate());
     // The install fails, which leaves an error phase the ordinary guards would let a check through.
     await vi.advanceTimersByTimeAsync(INSTALL_TIMEOUT);
     expect(service.getStatus().errorCode).toBe("install_failed");
@@ -891,8 +892,8 @@ describe("UpdateService", () => {
 
     // Services are stopped for good by now, so checking or downloading would act on a torn-down app
     // and report a result the user cannot do anything with.
-    await service.checkForUpdates();
-    await service.downloadUpdate();
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
 
     expect(updater.checkForUpdates).toHaveBeenCalledTimes(callsBefore);
     expect(updater.downloadUpdate).toHaveBeenCalledOnce();
@@ -910,9 +911,9 @@ describe("UpdateService", () => {
       }),
     });
     service.start(false);
-    await service.checkForUpdates();
-    await service.downloadUpdate();
-    await expect(service.installUpdate()).rejects.toThrow(/could not restart/iu);
+    await runTestEffect(service.checkForUpdates());
+    await runTestEffect(service.downloadUpdate());
+    await expect(runTestEffect(service.installUpdate())).rejects.toThrow(/could not restart/iu);
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
     expect(service.getStatus().errorCode).toBe("install_failed");
   });
@@ -927,8 +928,8 @@ describe("UpdateService", () => {
     });
     service.start(false);
 
-    expect((await service.checkForUpdates()).phase).toBe("unsupported");
-    expect((await service.downloadUpdate()).phase).toBe("unsupported");
+    expect((await runTestEffect(service.checkForUpdates())).phase).toBe("unsupported");
+    expect((await runTestEffect(service.downloadUpdate())).phase).toBe("unsupported");
     expect(updater.checkForUpdates).not.toHaveBeenCalled();
     expect(updater.downloadUpdate).not.toHaveBeenCalled();
   });
@@ -945,20 +946,20 @@ describe("every busy update phase is bounded", () => {
   const enterPhase: Record<UpdateBusyPhase, (service: UpdateService, updater: FakeUpdater) => Promise<void>> = {
     checking: async (service, updater) => {
       updater.checkForUpdates.mockImplementation(() => new Promise<never>(() => undefined));
-      void service.checkForUpdates();
+      void runTestEffect(service.checkForUpdates());
     },
     downloading: async (service, updater) => {
       makeUpdateAvailable(updater);
       updater.downloadUpdate.mockImplementation(() => new Promise<string[]>(() => undefined));
-      await service.checkForUpdates();
-      void service.downloadUpdate();
+      await runTestEffect(service.checkForUpdates());
+      void runTestEffect(service.downloadUpdate());
     },
     installing: async (service, updater) => {
       makeUpdateAvailable(updater);
       completeDownload(updater);
-      await service.checkForUpdates();
-      await service.downloadUpdate();
-      await service.installUpdate();
+      await runTestEffect(service.checkForUpdates());
+      await runTestEffect(service.downloadUpdate());
+      await runTestEffect(service.installUpdate());
     },
   };
 
@@ -989,7 +990,7 @@ describe("pruneShipItLogs", () => {
       writeFile(join(root, "ShipItState.plist"), "state"),
       ...Array.from({ length: 12 }, (_, index) => writeFile(join(root, `ShipIt_stdout.log.${index + 1}`), "log")),
     ]);
-    await pruneShipItLogs(root);
+    await runTestEffect(pruneShipItLogs(root));
     const entries = await readdir(root);
     expect(entries).toContain("ShipItState.plist");
     expect(entries.filter((entry) => entry.startsWith("ShipIt_stdout.log.")).sort()).toHaveLength(10);

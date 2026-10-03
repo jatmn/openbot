@@ -25,9 +25,9 @@ import type {
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { normalizeEmailAddress, slugifyTeamServerName } from "@openbot/contracts/validation";
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, Result, Schema } from "effect";
-import { type WriteJsonFileOptions, writeFileAtomicallyEffect } from "../backend/atomic-json-file";
-import { RemoteWorkflowError, remoteCall, remoteDecode, runRemoteWorkflow } from "./remote-service-effects";
+import { Context, Deferred, Effect, Layer, Result, Schema } from "effect";
+import { type WriteJsonFileOptions, writeFileAtomically } from "../backend/atomic-json-file";
+import { RemoteWorkflowError, remoteCall, remoteDecode } from "./remote-service-effects";
 
 class TeamStoreFiles extends Context.Service<
   TeamStoreFiles,
@@ -51,7 +51,7 @@ class TeamStoreFiles extends Context.Service<
       copyExclusive: (from, to) => remoteCall(() => copyFile(from, to, constants.COPYFILE_EXCL)),
       remove: (path) => remoteCall(() => rm(path, { force: true })),
       write: (path, content, options) =>
-        writeFileAtomicallyEffect(path, content, options).pipe(
+        writeFileAtomically(path, content, options).pipe(
           Effect.mapError(({ cause }) => new RemoteWorkflowError({ cause })),
         ),
     }),
@@ -188,7 +188,7 @@ export class TeamStore {
     string,
     { member: TeamMemberSummary; sessionId: string; createdAt: string; sessionExpiresAt: string }
   >();
-  #writeChain = Promise.resolve();
+  #writeChain: Deferred.Deferred<void> | null = null;
   /**
    * The file exists but is neither a v2 envelope nor a v1 record - a file a newer build
    * wrote, or a damaged one. `#file` is empty only because something else owns this path,
@@ -210,152 +210,146 @@ export class TeamStore {
     this.#legacyLogoRoot = legacyPath ? join(dirname(legacyPath), `${basename(legacyPath)}.assets`, "logo") : null;
   }
 
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, TeamStoreFiles>): Promise<A> {
-    return runRemoteWorkflow(operation.pipe(Effect.provide(TeamStoreFiles.layer)));
-  }
-
-  initialize(): Promise<void> {
-    return this.#run(this.initializeEffect());
-  }
-  readonly initializeEffect = Effect.fn("TeamStore.initialize")(function* (
-    this: TeamStore,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    let migrated = false;
-    let found = false;
-    const attempt0 = yield* Effect.gen({ self: this }, function* () {
-      const contents = yield* TeamStoreFiles.use((files) => files.readText(this.#path));
-      const parsed = yield* remoteDecode(() => JSON.parse(contents));
-      found = true;
-      if (isStoredTeamFile(parsed)) {
-        this.#file = parsed;
-      } else if (isStoredTeam(parsed)) {
-        this.#file = { version: 2, activeAccountId: ownerAccountId(parsed), hosts: [parsed] };
+  readonly initialize = Effect.fn("TeamStore.initialize")(
+    function* (this: TeamStore): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      let migrated = false;
+      let found = false;
+      const attempt0 = yield* Effect.gen({ self: this }, function* () {
+        const contents = yield* TeamStoreFiles.use((files) => files.readText(this.#path));
+        const parsed = yield* remoteDecode(() => JSON.parse(contents));
+        found = true;
+        if (isStoredTeamFile(parsed)) {
+          this.#file = parsed;
+        } else if (isStoredTeam(parsed)) {
+          this.#file = { version: 2, activeAccountId: ownerAccountId(parsed), hosts: [parsed] };
+          migrated = true;
+        } else {
+          this.#unreadableFile = true;
+        }
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt0)) {
+        const error = attempt0.failure.cause;
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
+          return yield* new RemoteWorkflowError({ cause: error });
+      }
+      // Copied into this store's own file rather than replaced in place. Anything else there
+      // belongs to a build that is not this one, and is left for it.
+      const legacy = this.#unreadableFile ? null : yield* this.#readLegacyRecordEffect();
+      if (legacy && !found) {
+        this.#file = {
+          version: 2,
+          activeAccountId: ownerAccountId(legacy.record),
+          hosts: [legacy.record],
+          // A copy of its own: the host below is edited from here on, and the baseline a later
+          // reconcile compares against has to stay the record as it was imported.
+          legacyImport: { fingerprint: legacy.fingerprint, record: structuredClone(legacy.record) },
+        };
         migrated = true;
-      } else {
-        this.#unreadableFile = true;
+      } else if (legacy && legacy.fingerprint !== this.#file.legacyImport?.fingerprint) {
+        // The older build has been run since it was imported. Neither copy of the host is a
+        // backup of the other - each holds work the other never saw - so they are reconciled
+        // against the record as it was imported rather than one replacing the other.
+        const baseline = this.#file.legacyImport?.record;
+        const index = this.#file.hosts.findIndex((host) => host.serverId === legacy.record.serverId);
+        const mine = index < 0 ? undefined : this.#file.hosts[index];
+        if (mine && baseline && baseline.serverId === legacy.record.serverId) {
+          this.#file.hosts[index] = reconcileHost(baseline, mine, legacy.record);
+        } else if (mine) {
+          // No baseline to reconcile against - an upgrade that never recorded one. Keeping
+          // this build's host and filing the other copy is the only choice that drops
+          // nothing. One record, not a growing pile: every write clones and serializes the
+          // whole file, and the next one to land here comes from the same file this did.
+          this.#file.replacedHosts = [legacy.record];
+        } else {
+          this.#file.hosts.push(legacy.record);
+        }
+        this.#file.legacyImport = { fingerprint: legacy.fingerprint, record: structuredClone(legacy.record) };
+        migrated = true;
       }
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt0)) {
-      const error = attempt0.failure.cause;
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
-        return yield* new RemoteWorkflowError({ cause: error });
-    }
-    // Copied into this store's own file rather than replaced in place. Anything else there
-    // belongs to a build that is not this one, and is left for it.
-    const legacy = this.#unreadableFile ? null : yield* this.#readLegacyRecordEffect();
-    if (legacy && !found) {
-      this.#file = {
-        version: 2,
-        activeAccountId: ownerAccountId(legacy.record),
-        hosts: [legacy.record],
-        // A copy of its own: the host below is edited from here on, and the baseline a later
-        // reconcile compares against has to stay the record as it was imported.
-        legacyImport: { fingerprint: legacy.fingerprint, record: structuredClone(legacy.record) },
-      };
-      migrated = true;
-    } else if (legacy && legacy.fingerprint !== this.#file.legacyImport?.fingerprint) {
-      // The older build has been run since it was imported. Neither copy of the host is a
-      // backup of the other - each holds work the other never saw - so they are reconciled
-      // against the record as it was imported rather than one replacing the other.
-      const baseline = this.#file.legacyImport?.record;
-      const index = this.#file.hosts.findIndex((host) => host.serverId === legacy.record.serverId);
-      const mine = index < 0 ? undefined : this.#file.hosts[index];
-      if (mine && baseline && baseline.serverId === legacy.record.serverId) {
-        this.#file.hosts[index] = reconcileHost(baseline, mine, legacy.record);
-      } else if (mine) {
-        // No baseline to reconcile against - an upgrade that never recorded one. Keeping
-        // this build's host and filing the other copy is the only choice that drops
-        // nothing. One record, not a growing pile: every write clones and serializes the
-        // whole file, and the next one to land here comes from the same file this did.
-        this.#file.replacedHosts = [legacy.record];
-      } else {
-        this.#file.hosts.push(legacy.record);
-      }
-      this.#file.legacyImport = { fingerprint: legacy.fingerprint, record: structuredClone(legacy.record) };
-      migrated = true;
-    }
-    const imported = this.#file.legacyImport?.record.serverId;
-    const importedHost = imported === undefined ? undefined : this.#file.hosts.find((h) => h.serverId === imported);
-    // Every start, not only the one that took the record in: a copy that failed once would
-    // otherwise leave the host without its logo for good, with the file still sitting there.
-    if (importedHost) yield* this.#adoptLegacyLogoEffect(importedHost);
-    const activeAccountId = this.#file.activeAccountId;
-    this.#state =
-      (activeAccountId === null
-        ? // A host that predates accounts, or one upgraded from a file where the owner
-          // account was never recorded. Activating it keeps an offline upgrade showing the
-          // host it showed yesterday. A host left behind by a sign-out has an owner account,
-          // so signing out still unbinds it.
-          this.#file.hosts.find((host) => ownerAccountId(host) === null)
-        : this.#file.hosts.find((host) => ownerAccountId(host) === activeAccountId)) ?? null;
-    if (migrated) yield* this.#persistFileEffect();
-    if (this.#state) yield* this.#pruneEffect();
-  });
+      const imported = this.#file.legacyImport?.record.serverId;
+      const importedHost = imported === undefined ? undefined : this.#file.hosts.find((h) => h.serverId === imported);
+      // Every start, not only the one that took the record in: a copy that failed once would
+      // otherwise leave the host without its logo for good, with the file still sitting there.
+      if (importedHost) yield* this.#adoptLegacyLogoEffect(importedHost);
+      const activeAccountId = this.#file.activeAccountId;
+      this.#state =
+        (activeAccountId === null
+          ? // A host that predates accounts, or one upgraded from a file where the owner
+            // account was never recorded. Activating it keeps an offline upgrade showing the
+            // host it showed yesterday. A host left behind by a sign-out has an owner account,
+            // so signing out still unbinds it.
+            this.#file.hosts.find((host) => ownerAccountId(host) === null)
+          : this.#file.hosts.find((host) => ownerAccountId(host) === activeAccountId)) ?? null;
+      if (migrated) yield* this.#persistFileEffect();
+      if (this.#state) yield* this.#pruneEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   /**
    * Binds the store to `user`'s own host, adopting a host whose owner predates account
    * sign-in. An account with no host leaves the store unconfigured rather than borrowing
    * another account's.
    */
-  activateAccount(user: CentralAuthUser): Promise<void> {
-    return this.#run(this.activateAccountEffect(user));
-  }
-  readonly activateAccountEffect = Effect.fn("TeamStore.activateAccount")(function* (
-    this: TeamStore,
-    user: CentralAuthUser,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const email = yield* remoteDecode(() => normalizeEmail(user.email));
-    const hosts = this.#file.hosts;
-    const unbound = hosts.find((host) => {
-      const owner = hostOwner(host);
-      return owner !== undefined && !owner.accountId && !owner.email;
-    });
-    // Everything below mutates in memory and is committed by the single write at the end,
-    // so a failed write can put the whole file back rather than leave half a switch applied
-    // with the status naming one account and every write going to another.
-    const rollback = structuredClone(this.#file);
-    this.#state =
-      hosts.find((host) => ownerAccountId(host) === user.id) ??
-      hosts.find((host) => {
+
+  readonly activateAccount = Effect.fn("TeamStore.activateAccount")(
+    function* (this: TeamStore, user: CentralAuthUser): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const email = yield* remoteDecode(() => normalizeEmail(user.email));
+      const hosts = this.#file.hosts;
+      const unbound = hosts.find((host) => {
         const owner = hostOwner(host);
-        // Only a host whose owner predates accounts is matched by address. An email can be
-        // released and taken by somebody else, and it must not hand them a host that is
-        // already bound to the account that made it.
-        if (!owner || owner.accountId) return false;
-        return owner.email ? normalizeEmail(owner.email) === email : false;
-      }) ??
-      unbound ??
-      null;
-    this.#file.activeAccountId = user.id;
-    // A host configured before accounts existed has no owner email to match on next time,
-    // so adopting it has to write the binding rather than rely on `syncAccount`.
-    if (this.#state && this.#state === unbound) {
-      const owner = hostOwner(this.#state);
-      if (owner) {
-        owner.accountId = user.id;
-        owner.email = email;
+        return owner !== undefined && !owner.accountId && !owner.email;
+      });
+      // Everything below mutates in memory and is committed by the single write at the end,
+      // so a failed write can put the whole file back rather than leave half a switch applied
+      // with the status naming one account and every write going to another.
+      const rollback = structuredClone(this.#file);
+      this.#state =
+        hosts.find((host) => ownerAccountId(host) === user.id) ??
+        hosts.find((host) => {
+          const owner = hostOwner(host);
+          // Only a host whose owner predates accounts is matched by address. An email can be
+          // released and taken by somebody else, and it must not hand them a host that is
+          // already bound to the account that made it.
+          if (!owner || owner.accountId) return false;
+          return owner.email ? normalizeEmail(owner.email) === email : false;
+        }) ??
+        unbound ??
+        null;
+      this.#file.activeAccountId = user.id;
+      // A host configured before accounts existed has no owner email to match on next time,
+      // so adopting it has to write the binding rather than rely on `syncAccount`.
+      if (this.#state && this.#state === unbound) {
+        const owner = hostOwner(this.#state);
+        if (owner) {
+          owner.accountId = user.id;
+          owner.email = email;
+        }
       }
-    }
-    if (this.#state) {
-      yield* remoteDecode(() => this.#applyAccount(user));
-      this.#dropExpired(this.#state);
-    }
-    return yield* Effect.gen({ self: this }, function* () {
-      yield* this.#recordActiveAccountEffect();
-    }).pipe(
-      Effect.catch(({ cause: error }) =>
-        Effect.gen({ self: this }, function* () {
-          // The file keeps what it had, so nothing is lost. Memory does not go back to the
-          // previous account, though: central authentication has already moved on, and leaving
-          // its host answerable is the failure this whole change exists to prevent. Unbound
-          // until an auth event or a restart records the switch.
-          this.#file = rollback;
-          this.#state = null;
-          return yield* new RemoteWorkflowError({ cause: error });
-        }),
-      ),
-    );
-  });
+      if (this.#state) {
+        yield* remoteDecode(() => this.#applyAccount(user));
+        this.#dropExpired(this.#state);
+      }
+      return yield* Effect.gen({ self: this }, function* () {
+        yield* this.#recordActiveAccountEffect();
+      }).pipe(
+        Effect.catch(({ cause: error }) =>
+          Effect.gen({ self: this }, function* () {
+            // The file keeps what it had, so nothing is lost. Memory does not go back to the
+            // previous account, though: central authentication has already moved on, and leaving
+            // its host answerable is the failure this whole change exists to prevent. Unbound
+            // until an auth event or a restart records the switch.
+            this.#file = rollback;
+            this.#state = null;
+            return yield* new RemoteWorkflowError({ cause: error });
+          }),
+        ),
+      );
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   /**
    * Stops answering for the active host without touching the file. The renderer learns about
@@ -367,28 +361,28 @@ export class TeamStore {
   }
 
   /** Signing out unbinds the host without removing it - signing back in restores it. */
-  deactivate(): Promise<void> {
-    return this.#run(this.deactivateEffect());
-  }
-  readonly deactivateEffect = Effect.fn("TeamStore.deactivate")(function* (
-    this: TeamStore,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const previousState = this.#state;
-    const previousAccountId = this.#file.activeAccountId;
-    this.#state = null;
-    this.#file.activeAccountId = null;
-    return yield* Effect.gen({ self: this }, function* () {
-      yield* this.#recordActiveAccountEffect();
-    }).pipe(
-      Effect.catch(({ cause: error }) =>
-        Effect.gen({ self: this }, function* () {
-          this.#state = previousState;
-          this.#file.activeAccountId = previousAccountId;
-          return yield* new RemoteWorkflowError({ cause: error });
-        }),
-      ),
-    );
-  });
+
+  readonly deactivate = Effect.fn("TeamStore.deactivate")(
+    function* (this: TeamStore): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const previousState = this.#state;
+      const previousAccountId = this.#file.activeAccountId;
+      this.#state = null;
+      this.#file.activeAccountId = null;
+      return yield* Effect.gen({ self: this }, function* () {
+        yield* this.#recordActiveAccountEffect();
+      }).pipe(
+        Effect.catch(({ cause: error }) =>
+          Effect.gen({ self: this }, function* () {
+            this.#state = previousState;
+            this.#file.activeAccountId = previousAccountId;
+            return yield* new RemoteWorkflowError({ cause: error });
+          }),
+        ),
+      );
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   /**
    * A file with no host records nothing an activation could change, so there is nothing to
@@ -456,227 +450,230 @@ export class TeamStore {
    * yet, and the first one to activate adopts it. `#assertNoHostFor` is what keeps a
    * second owner-less host from being created beside it.
    */
-  configure(serverName: string, username: string, password: string): Promise<TeamIdentity> {
-    return this.#run(this.configureEffect(serverName, username, password));
-  }
-  readonly configureEffect = Effect.fn("TeamStore.configure")(function* (
-    this: TeamStore,
-    serverName: string,
-    username: string,
-    password: string,
-  ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
-    if (this.#state)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.alreadyConfigured")) });
-    yield* remoteDecode(() => validateServerName(serverName));
-    yield* remoteDecode(() => validateUsername(username));
-    yield* remoteDecode(() => validatePassword(password));
-    const { publicKey, privateKey } = yield* remoteDecode(() =>
-      generateKeyPairSync("ed25519", {
-        publicKeyEncoding: { type: "spki", format: "pem" },
-        privateKeyEncoding: { type: "pkcs8", format: "pem" },
-      }),
-    );
-    const credentials = yield* hashPasswordEffect(password);
-    // Hashing yields, so a second request could have configured a host meanwhile.
-    if (this.#state)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.alreadyConfigured")) });
-    this.#state = {
-      version: 1,
-      serverId: randomUUID(),
-      serverName: serverName.trim(),
-      enabledOnLaunch: false,
-      publicKey,
-      privateKey,
-      members: [
-        {
-          id: randomUUID(),
-          username: username.trim().toLowerCase(),
-          email: null,
-          name: null,
-          avatarUrl: null,
-          role: "owner",
-          disabled: false,
-          createdAt: new Date().toISOString(),
-          ...credentials,
-        },
-      ],
-      invites: [],
-      sessions: [],
-    };
-    this.#file.hosts.push(this.#state);
-    const attempt3 = yield* Effect.gen({ self: this }, function* () {
-      yield* this.#persistFileEffect();
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt3)) {
-      const error = attempt3.failure.cause;
-      this.#file.hosts.pop();
-      this.#state = null;
-      return yield* new RemoteWorkflowError({ cause: error });
-    }
-    const identity = this.getIdentity();
-    if (!identity)
-      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.team.identityCreateFailed")) });
-    return identity;
-  });
 
-  configureWithAccount(
-    serverName: string,
-    user: CentralAuthUser,
-    logo?: AvatarImageInput | null,
-    options: { serverId?: string } = {},
-  ): Promise<TeamIdentity> {
-    return this.#run(this.configureWithAccountEffect(serverName, user, logo, options));
-  }
-  readonly configureWithAccountEffect = Effect.fn("TeamStore.configureWithAccount")(function* (
-    this: TeamStore,
-    serverName: string,
-    user: CentralAuthUser,
-    logo?: AvatarImageInput | null,
-    options: { serverId?: string } = {},
-  ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
-    const email = yield* remoteDecode(() => normalizeEmail(user.email));
-    yield* remoteDecode(() => this.#assertNoHostFor(user.id, email));
-    yield* remoteDecode(() => validateServerName(serverName));
-    // Both `activateAccount` and `deactivate` set this synchronously, so comparing it
-    // after the awaits below is a reliable answer to "is this still the account that
-    // asked?" - a configuration finishing under someone else's session would otherwise
-    // rebind the store to the account that has just signed out.
-    const activeAccountBefore = this.#file.activeAccountId;
-    const { publicKey, privateKey } = yield* remoteDecode(() =>
-      generateKeyPairSync("ed25519", {
-        publicKeyEncoding: { type: "spki", format: "pem" },
-        privateKeyEncoding: { type: "pkcs8", format: "pem" },
-      }),
-    );
-    const serverLogo = logo ? yield* this.#writeLogoEffect(logo) : undefined;
-    const attempt5 = yield* Effect.gen({ self: this }, function* () {
-      // `#writeLogo` yields, so two concurrent requests could both have passed the guard
-      // above. Re-checking is what stops one account owning two stored hosts, where a
-      // restart would activate the one the status never showed.
+  readonly configure = Effect.fn("TeamStore.configure")(
+    function* (
+      this: TeamStore,
+      serverName: string,
+      username: string,
+      password: string,
+    ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
+      if (this.#state)
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.alreadyConfigured")),
+        });
+      yield* remoteDecode(() => validateServerName(serverName));
+      yield* remoteDecode(() => validateUsername(username));
+      yield* remoteDecode(() => validatePassword(password));
+      const { publicKey, privateKey } = yield* remoteDecode(() =>
+        generateKeyPairSync("ed25519", {
+          publicKeyEncoding: { type: "spki", format: "pem" },
+          privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        }),
+      );
+      const credentials = yield* hashPasswordEffect(password);
+      // Hashing yields, so a second request could have configured a host meanwhile.
+      if (this.#state)
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.alreadyConfigured")),
+        });
+      this.#state = {
+        version: 1,
+        serverId: randomUUID(),
+        serverName: serverName.trim(),
+        enabledOnLaunch: false,
+        publicKey,
+        privateKey,
+        members: [
+          {
+            id: randomUUID(),
+            username: username.trim().toLowerCase(),
+            email: null,
+            name: null,
+            avatarUrl: null,
+            role: "owner",
+            disabled: false,
+            createdAt: new Date().toISOString(),
+            ...credentials,
+          },
+        ],
+        invites: [],
+        sessions: [],
+      };
+      this.#file.hosts.push(this.#state);
+      const attempt3 = yield* Effect.gen({ self: this }, function* () {
+        yield* this.#persistFileEffect();
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt3)) {
+        const error = attempt3.failure.cause;
+        this.#file.hosts.pop();
+        this.#state = null;
+        return yield* new RemoteWorkflowError({ cause: error });
+      }
+      const identity = this.getIdentity();
+      if (!identity)
+        return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.team.identityCreateFailed")) });
+      return identity;
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
+
+  readonly configureWithAccount = Effect.fn("TeamStore.configureWithAccount")(
+    function* (
+      this: TeamStore,
+      serverName: string,
+      user: CentralAuthUser,
+      logo?: AvatarImageInput | null,
+      options: { serverId?: string } = {},
+    ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
+      const email = yield* remoteDecode(() => normalizeEmail(user.email));
       yield* remoteDecode(() => this.#assertNoHostFor(user.id, email));
-      if (this.#file.activeAccountId !== activeAccountBefore) {
+      yield* remoteDecode(() => validateServerName(serverName));
+      // Both `activateAccount` and `deactivate` set this synchronously, so comparing it
+      // after the awaits below is a reliable answer to "is this still the account that
+      // asked?" - a configuration finishing under someone else's session would otherwise
+      // rebind the store to the account that has just signed out.
+      const activeAccountBefore = this.#file.activeAccountId;
+      const { publicKey, privateKey } = yield* remoteDecode(() =>
+        generateKeyPairSync("ed25519", {
+          publicKeyEncoding: { type: "spki", format: "pem" },
+          privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        }),
+      );
+      const serverLogo = logo ? yield* this.#writeLogoEffect(logo) : undefined;
+      const attempt5 = yield* Effect.gen({ self: this }, function* () {
+        // `#writeLogo` yields, so two concurrent requests could both have passed the guard
+        // above. Re-checking is what stops one account owning two stored hosts, where a
+        // restart would activate the one the status never showed.
+        yield* remoteDecode(() => this.#assertNoHostFor(user.id, email));
+        if (this.#file.activeAccountId !== activeAccountBefore) {
+          return yield* new RemoteWorkflowError({
+            cause: new TeamStoreError(sourceText("error.team.accountChangedDuringCreate")),
+          });
+        }
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt5)) {
+        const error = attempt5.failure.cause;
+        if (serverLogo) yield* this.#removeLogoEffect(serverLogo).pipe(Effect.catch(() => Effect.void));
+        return yield* new RemoteWorkflowError({ cause: error });
+      }
+      const created: StoredTeam = {
+        version: 1,
+        serverId: options.serverId ?? randomUUID(),
+        serverName: serverName.trim(),
+        enabledOnLaunch: false,
+        publicKey,
+        privateKey,
+        ...(serverLogo ? { serverLogo } : {}),
+        members: [
+          {
+            id: randomUUID(),
+            accountId: user.id,
+            username: email,
+            email,
+            name: yield* remoteDecode(() => normalizeName(user.name)),
+            avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl)),
+            role: "owner",
+            disabled: false,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        invites: [],
+        sessions: [],
+      };
+      this.#file.hosts.push(created);
+      const previousState = this.#state;
+      const previousAccountId = this.#file.activeAccountId;
+      this.#state = created;
+      this.#file.activeAccountId = user.id;
+      const attempt4 = yield* Effect.gen({ self: this }, function* () {
+        yield* this.#persistFileEffect();
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt4)) {
+        const error = attempt4.failure.cause;
+        this.#file.hosts = this.#file.hosts.filter((host) => host !== created);
+        if (this.#state === created) {
+          this.#state = previousState;
+          this.#file.activeAccountId = previousAccountId;
+        }
+        if (serverLogo) yield* this.#removeLogoEffect(serverLogo).pipe(Effect.catch(() => Effect.void));
+        return yield* new RemoteWorkflowError({ cause: error });
+      }
+      // Writing the file yields as well. The host stays - it is on disk and it belongs to the
+      // account that asked for it - but the caller must not go on to apply this configuration,
+      // its logo and its remote registration, to whichever host is active now.
+      if (this.#state !== created) {
         return yield* new RemoteWorkflowError({
           cause: new TeamStoreError(sourceText("error.team.accountChangedDuringCreate")),
         });
       }
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt5)) {
-      const error = attempt5.failure.cause;
-      if (serverLogo) yield* this.#removeLogoEffect(serverLogo).pipe(Effect.catch(() => Effect.void));
-      return yield* new RemoteWorkflowError({ cause: error });
-    }
-    const created: StoredTeam = {
-      version: 1,
-      serverId: options.serverId ?? randomUUID(),
-      serverName: serverName.trim(),
-      enabledOnLaunch: false,
-      publicKey,
-      privateKey,
-      ...(serverLogo ? { serverLogo } : {}),
-      members: [
-        {
-          id: randomUUID(),
-          accountId: user.id,
-          username: email,
-          email,
-          name: yield* remoteDecode(() => normalizeName(user.name)),
-          avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl)),
-          role: "owner",
-          disabled: false,
-          createdAt: new Date().toISOString(),
-        },
-      ],
-      invites: [],
-      sessions: [],
-    };
-    this.#file.hosts.push(created);
-    const previousState = this.#state;
-    const previousAccountId = this.#file.activeAccountId;
-    this.#state = created;
-    this.#file.activeAccountId = user.id;
-    const attempt4 = yield* Effect.gen({ self: this }, function* () {
-      yield* this.#persistFileEffect();
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt4)) {
-      const error = attempt4.failure.cause;
-      this.#file.hosts = this.#file.hosts.filter((host) => host !== created);
-      if (this.#state === created) {
-        this.#state = previousState;
-        this.#file.activeAccountId = previousAccountId;
-      }
-      if (serverLogo) yield* this.#removeLogoEffect(serverLogo).pipe(Effect.catch(() => Effect.void));
-      return yield* new RemoteWorkflowError({ cause: error });
-    }
-    // Writing the file yields as well. The host stays - it is on disk and it belongs to the
-    // account that asked for it - but the caller must not go on to apply this configuration,
-    // its logo and its remote registration, to whichever host is active now.
-    if (this.#state !== created) {
-      return yield* new RemoteWorkflowError({
-        cause: new TeamStoreError(sourceText("error.team.accountChangedDuringCreate")),
-      });
-    }
-    return identityOf(created);
-  });
+      return identityOf(created);
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  updateIdentity(input: { serverName?: string; logo?: AvatarImageInput | null }): Promise<TeamIdentity> {
-    return this.#run(this.updateIdentityEffect(input));
-  }
-  readonly updateIdentityEffect = Effect.fn("TeamStore.updateIdentity")(function* (
-    this: TeamStore,
-    input: { serverName?: string; logo?: AvatarImageInput | null },
-  ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const serverName = input.serverName;
-    if (serverName !== undefined) yield* remoteDecode(() => validateServerName(serverName));
-    if (input.serverName === undefined && input.logo === undefined) {
-      const identity = this.getIdentity();
-      if (!identity)
-        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.notConfigured")) });
-      return identity;
-    }
+  readonly updateIdentity = Effect.fn("TeamStore.updateIdentity")(
+    function* (
+      this: TeamStore,
+      input: { serverName?: string; logo?: AvatarImageInput | null },
+    ): Effect.fn.Return<TeamIdentity, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const serverName = input.serverName;
+      if (serverName !== undefined) yield* remoteDecode(() => validateServerName(serverName));
+      if (input.serverName === undefined && input.logo === undefined) {
+        const identity = this.getIdentity();
+        if (!identity)
+          return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.notConfigured")) });
+        return identity;
+      }
 
-    const previousName = state.serverName;
-    const previousLogo = state.serverLogo;
-    const nextLogo =
-      input.logo === undefined
-        ? previousLogo
-        : input.logo === null
-          ? undefined
-          : yield* this.#writeLogoEffect(input.logo);
-    // Writing the logo can outlive this host. `#persist` only requires *some* active host, so
-    // without this the name and image asked for here would land on whichever host became
-    // active meanwhile - and the caller would be handed that other account's identity back.
-    if (this.#state !== state) {
-      if (nextLogo && nextLogo.version !== previousLogo?.version) {
-        yield* this.#removeLogoEffect(nextLogo).pipe(Effect.catch(() => Effect.void));
+      const previousName = state.serverName;
+      const previousLogo = state.serverLogo;
+      const nextLogo =
+        input.logo === undefined
+          ? previousLogo
+          : input.logo === null
+            ? undefined
+            : yield* this.#writeLogoEffect(input.logo);
+      // Writing the logo can outlive this host. `#persist` only requires *some* active host, so
+      // without this the name and image asked for here would land on whichever host became
+      // active meanwhile - and the caller would be handed that other account's identity back.
+      if (this.#state !== state) {
+        if (nextLogo && nextLogo.version !== previousLogo?.version) {
+          yield* this.#removeLogoEffect(nextLogo).pipe(Effect.catch(() => Effect.void));
+        }
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
       }
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
-    }
-    if (input.serverName !== undefined) state.serverName = input.serverName.trim();
-    state.serverLogo = nextLogo;
-    const attempt6 = yield* Effect.gen({ self: this }, function* () {
-      yield* this.#persistEffect();
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt6)) {
-      const error = attempt6.failure.cause;
-      state.serverName = previousName;
-      state.serverLogo = previousLogo;
-      if (nextLogo && nextLogo.version !== previousLogo?.version) {
-        yield* this.#removeLogoEffect(nextLogo).pipe(Effect.catch(() => Effect.void));
+      if (input.serverName !== undefined) state.serverName = input.serverName.trim();
+      state.serverLogo = nextLogo;
+      const attempt6 = yield* Effect.gen({ self: this }, function* () {
+        yield* this.#persistEffect();
+      }).pipe(Effect.result);
+      if (Result.isFailure(attempt6)) {
+        const error = attempt6.failure.cause;
+        state.serverName = previousName;
+        state.serverLogo = previousLogo;
+        if (nextLogo && nextLogo.version !== previousLogo?.version) {
+          yield* this.#removeLogoEffect(nextLogo).pipe(Effect.catch(() => Effect.void));
+        }
+        return yield* new RemoteWorkflowError({ cause: error });
       }
-      return yield* new RemoteWorkflowError({ cause: error });
-    }
-    if (previousLogo && previousLogo.version !== nextLogo?.version) {
-      yield* this.#removeLogoEffect(previousLogo).pipe(Effect.catch(() => Effect.void));
-    }
-    // Writing the file yields as well. The change is on disk and belongs to the account that
-    // asked for it, but the caller must not go on to push it to the remote host under the
-    // authentication - and the owner membership - of whichever account is active now.
-    if (this.#state !== state) {
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
-    }
-    return identityOf(state);
-  });
+      if (previousLogo && previousLogo.version !== nextLogo?.version) {
+        yield* this.#removeLogoEffect(previousLogo).pipe(Effect.catch(() => Effect.void));
+      }
+      // Writing the file yields as well. The change is on disk and belongs to the account that
+      // asked for it, but the caller must not go on to push it to the remote host under the
+      // authentication - and the owner membership - of whichever account is active now.
+      if (this.#state !== state) {
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
+      }
+      return identityOf(state);
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   /** The record a build without accounts owns, with the fingerprint that dates it. */
   readonly #readLegacyRecordEffect = Effect.fn("TeamStore.readLegacyRecord")(function* (
@@ -750,21 +747,23 @@ export class TeamStore {
    * both span awaits an account switch can land in, and the launch preference of one
    * account's host must never be written onto another's.
    */
-  setEnabledOnLaunch(serverId: string, enabled: boolean): Promise<void> {
-    return this.#run(this.setEnabledOnLaunchEffect(serverId, enabled));
-  }
-  readonly setEnabledOnLaunchEffect = Effect.fn("TeamStore.setEnabledOnLaunch")(function* (
-    this: TeamStore,
-    serverId: string,
-    enabled: boolean,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    if (state.serverId !== serverId) {
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
-    }
-    state.enabledOnLaunch = enabled;
-    yield* this.#persistEffect();
-  });
+
+  readonly setEnabledOnLaunch = Effect.fn("TeamStore.setEnabledOnLaunch")(
+    function* (
+      this: TeamStore,
+      serverId: string,
+      enabled: boolean,
+    ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      if (state.serverId !== serverId) {
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
+      }
+      state.enabledOnLaunch = enabled;
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   listMembers(): TeamMemberSummary[] {
     const members = this.#requireState().members.map(publicMember);
@@ -783,64 +782,66 @@ export class TeamStore {
    * account swaps the active host, so a directory that was already in flight would
    * otherwise rewrite the new account's owner membership and disable its members.
    */
-  syncRemoteDirectory(serverId: string, remoteMembers: RemoteDirectoryMember[]): Promise<void> {
-    return this.#run(this.syncRemoteDirectoryEffect(serverId, remoteMembers));
-  }
-  readonly syncRemoteDirectoryEffect = Effect.fn("TeamStore.syncRemoteDirectory")(function* (
-    this: TeamStore,
-    serverId: string,
-    remoteMembers: RemoteDirectoryMember[],
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    if (state.serverId !== serverId) {
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
-    }
-    const remoteOwner = remoteMembers.find((member) => member.role === "owner");
-    const localOwner = state.members.find((member) => member.role === "owner");
-    if (remoteOwner && localOwner && remoteOwner.membershipId !== localOwner.id) {
-      if (state.members.some((member) => member.id === remoteOwner.membershipId)) {
-        return yield* new RemoteWorkflowError({
-          cause: new TeamStoreError(sourceText("error.team.ownerMembershipConflict")),
-        });
+
+  readonly syncRemoteDirectory = Effect.fn("TeamStore.syncRemoteDirectory")(
+    function* (
+      this: TeamStore,
+      serverId: string,
+      remoteMembers: RemoteDirectoryMember[],
+    ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      if (state.serverId !== serverId) {
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.serverNotActive")) });
       }
-      const previousOwnerId = localOwner.id;
-      localOwner.id = remoteOwner.membershipId;
-      for (const session of state.sessions) {
-        if (session.memberId === previousOwnerId) session.memberId = remoteOwner.membershipId;
-      }
-    }
-    const remoteIds = new Set(remoteMembers.map((member) => member.membershipId));
-    for (const remote of remoteMembers) {
-      const member = state.members.find((candidate) => candidate.id === remote.membershipId);
-      if (!member) {
-        if (remote.role === "owner")
+      const remoteOwner = remoteMembers.find((member) => member.role === "owner");
+      const localOwner = state.members.find((member) => member.role === "owner");
+      if (remoteOwner && localOwner && remoteOwner.membershipId !== localOwner.id) {
+        if (state.members.some((member) => member.id === remoteOwner.membershipId)) {
           return yield* new RemoteWorkflowError({
-            cause: new TeamStoreError(sourceText("error.team.ownerIdentityMismatch")),
+            cause: new TeamStoreError(sourceText("error.team.ownerMembershipConflict")),
           });
-        state.members.push({
-          id: remote.membershipId,
-          username: yield* remoteDecode(() => normalizeEmail(remote.email)),
-          email: yield* remoteDecode(() => normalizeEmail(remote.email)),
-          name: yield* remoteDecode(() => normalizeName(remote.name)),
-          avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(remote.avatarUrl)),
-          role: remote.role,
-          disabled: remote.status !== "active",
-          createdAt: new Date(remote.createdAt).toISOString(),
-        });
-        continue;
+        }
+        const previousOwnerId = localOwner.id;
+        localOwner.id = remoteOwner.membershipId;
+        for (const session of state.sessions) {
+          if (session.memberId === previousOwnerId) session.memberId = remoteOwner.membershipId;
+        }
       }
-      member.username = yield* remoteDecode(() => normalizeEmail(remote.email));
-      member.email = yield* remoteDecode(() => normalizeEmail(remote.email));
-      member.name = yield* remoteDecode(() => normalizeName(remote.name));
-      member.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(remote.avatarUrl));
-      member.role = remote.role;
-      member.disabled = remote.status !== "active";
-    }
-    for (const member of state.members) {
-      if (member.role !== "owner" && !remoteIds.has(member.id)) member.disabled = true;
-    }
-    yield* this.#persistEffect();
-  });
+      const remoteIds = new Set(remoteMembers.map((member) => member.membershipId));
+      for (const remote of remoteMembers) {
+        const member = state.members.find((candidate) => candidate.id === remote.membershipId);
+        if (!member) {
+          if (remote.role === "owner")
+            return yield* new RemoteWorkflowError({
+              cause: new TeamStoreError(sourceText("error.team.ownerIdentityMismatch")),
+            });
+          state.members.push({
+            id: remote.membershipId,
+            username: yield* remoteDecode(() => normalizeEmail(remote.email)),
+            email: yield* remoteDecode(() => normalizeEmail(remote.email)),
+            name: yield* remoteDecode(() => normalizeName(remote.name)),
+            avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(remote.avatarUrl)),
+            role: remote.role,
+            disabled: remote.status !== "active",
+            createdAt: new Date(remote.createdAt).toISOString(),
+          });
+          continue;
+        }
+        member.username = yield* remoteDecode(() => normalizeEmail(remote.email));
+        member.email = yield* remoteDecode(() => normalizeEmail(remote.email));
+        member.name = yield* remoteDecode(() => normalizeName(remote.name));
+        member.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(remote.avatarUrl));
+        member.role = remote.role;
+        member.disabled = remote.status !== "active";
+      }
+      for (const member of state.members) {
+        if (member.role !== "owner" && !remoteIds.has(member.id)) member.disabled = true;
+      }
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   openRemoteSession(input: {
     sessionId: string;
@@ -922,64 +923,63 @@ export class TeamStore {
     return [...persisted, ...remote];
   }
 
-  createInvite(
-    role: Exclude<TeamRole, "owner">,
-    emailInput?: string,
-    options?: { permanent?: boolean },
-  ): Promise<CreatedInvite> {
-    return this.#run(this.createInviteEffect(role, emailInput, options));
-  }
-  readonly createInviteEffect = Effect.fn("TeamStore.createInvite")(function* (
-    this: TeamStore,
-    role: Exclude<TeamRole, "owner">,
-    emailInput?: string,
-    options?: { permanent?: boolean },
-  ): Effect.fn.Return<CreatedInvite, RemoteWorkflowError, TeamStoreFiles> {
-    if (role !== "admin" && role !== "member")
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Invalid invite role.") });
-    const permanent = options?.permanent ?? false;
-    const email = emailInput?.trim() ? yield* remoteDecode(() => normalizeEmail(emailInput)) : null;
-    // A permanent link is a shareable URL, never an addressed message: binding it to an
-    // email would promise a restriction the token cannot enforce.
-    if (permanent && email)
-      return yield* new RemoteWorkflowError({
-        cause: new TeamStoreError(sourceText("error.team.permanentInviteEmail")),
-      });
-    const state = yield* remoteDecode(() => this.#requireState());
-    if (permanent) {
-      const permanentInvites = state.invites.filter((invite) => invite.permanent === true).length;
-      if (permanentInvites >= INPUT_LIMITS.maxPermanentInvites) {
+  readonly createInvite = Effect.fn("TeamStore.createInvite")(
+    function* (
+      this: TeamStore,
+      role: Exclude<TeamRole, "owner">,
+      emailInput?: string,
+      options?: { permanent?: boolean },
+    ): Effect.fn.Return<CreatedInvite, RemoteWorkflowError, TeamStoreFiles> {
+      if (role !== "admin" && role !== "member")
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Invalid invite role.") });
+      const permanent = options?.permanent ?? false;
+      const email = emailInput?.trim() ? yield* remoteDecode(() => normalizeEmail(emailInput)) : null;
+      // A permanent link is a shareable URL, never an addressed message: binding it to an
+      // email would promise a restriction the token cannot enforce.
+      if (permanent && email)
         return yield* new RemoteWorkflowError({
-          cause: new TeamStoreError(
-            sourceText("error.team.permanentInviteLimit", { limit: INPUT_LIMITS.maxPermanentInvites }),
-          ),
+          cause: new TeamStoreError(sourceText("error.team.permanentInviteEmail")),
         });
+      const state = yield* remoteDecode(() => this.#requireState());
+      if (permanent) {
+        const permanentInvites = state.invites.filter((invite) => invite.permanent === true).length;
+        if (permanentInvites >= INPUT_LIMITS.maxPermanentInvites) {
+          return yield* new RemoteWorkflowError({
+            cause: new TeamStoreError(
+              sourceText("error.team.permanentInviteLimit", { limit: INPUT_LIMITS.maxPermanentInvites }),
+            ),
+          });
+        }
+      } else {
+        const activeInvites = state.invites.filter(
+          (invite) => invite.permanent !== true && invite.usedAt === null && Date.parse(invite.expiresAt) > Date.now(),
+        ).length;
+        if (activeInvites >= INPUT_LIMITS.activeInvites) {
+          return yield* new RemoteWorkflowError({
+            cause: new TeamStoreError(
+              sourceText("error.team.activeInviteLimit", { limit: INPUT_LIMITS.activeInvites }),
+            ),
+          });
+        }
       }
-    } else {
-      const activeInvites = state.invites.filter(
-        (invite) => invite.permanent !== true && invite.usedAt === null && Date.parse(invite.expiresAt) > Date.now(),
-      ).length;
-      if (activeInvites >= INPUT_LIMITS.activeInvites) {
-        return yield* new RemoteWorkflowError({
-          cause: new TeamStoreError(sourceText("error.team.activeInviteLimit", { limit: INPUT_LIMITS.activeInvites })),
-        });
-      }
-    }
-    const token = randomBytes(32).toString("base64url");
-    const invite: StoredInvite = {
-      id: randomUUID(),
-      tokenHash: hashToken(token),
-      role,
-      expiresAt: permanent ? permanentInviteExpiresAt() : new Date(Date.now() + INVITE_TTL_MS).toISOString(),
-      usedAt: null,
-      email,
-      permanent,
-      useCount: 0,
-    };
-    state.invites.push(invite);
-    yield* this.#persistEffect();
-    return { id: invite.id, role, token, expiresAt: invite.expiresAt, email, permanent, useCount: 0 };
-  });
+      const token = randomBytes(32).toString("base64url");
+      const invite: StoredInvite = {
+        id: randomUUID(),
+        tokenHash: hashToken(token),
+        role,
+        expiresAt: permanent ? permanentInviteExpiresAt() : new Date(Date.now() + INVITE_TTL_MS).toISOString(),
+        usedAt: null,
+        email,
+        permanent,
+        useCount: 0,
+      };
+      state.invites.push(invite);
+      yield* this.#persistEffect();
+      return { id: invite.id, role, token, expiresAt: invite.expiresAt, email, permanent, useCount: 0 };
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   previewInvite(token: string): TeamInvitePreview {
     const invite = this.#findUsableInvite(token);
@@ -992,147 +992,151 @@ export class TeamStore {
     };
   }
 
-  acceptInviteWithAccount(token: string, user: CentralAuthUser): Promise<AuthenticatedMember> {
-    return this.#run(this.acceptInviteWithAccountEffect(token, user));
-  }
-  readonly acceptInviteWithAccountEffect = Effect.fn("TeamStore.acceptInviteWithAccount")(function* (
-    this: TeamStore,
-    token: string,
-    user: CentralAuthUser,
-  ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const email = yield* remoteDecode(() => normalizeEmail(user.email));
-    const invite = yield* remoteDecode(() => this.#findUsableInvite(token));
-    if (!invite)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.inviteInvalid")) });
-    if (invite.email && invite.email !== email) {
-      return yield* new RemoteWorkflowError({
-        cause: new TeamStoreError(sourceText("error.team.inviteEmailMismatch")),
-      });
-    }
-    const existingMember = state.members.find((member) => member.email === email || member.username === email);
-    if (existingMember) {
-      if (existingMember.disabled)
-        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberDisabled")) });
-      existingMember.email = email;
-      existingMember.accountId = user.id;
-      existingMember.username = email;
-      existingMember.name = yield* remoteDecode(() => normalizeName(user.name));
-      existingMember.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl));
+  readonly acceptInviteWithAccount = Effect.fn("TeamStore.acceptInviteWithAccount")(
+    function* (
+      this: TeamStore,
+      token: string,
+      user: CentralAuthUser,
+    ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const email = yield* remoteDecode(() => normalizeEmail(user.email));
+      const invite = yield* remoteDecode(() => this.#findUsableInvite(token));
+      if (!invite)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.inviteInvalid")) });
+      if (invite.email && invite.email !== email) {
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.inviteEmailMismatch")),
+        });
+      }
+      const existingMember = state.members.find((member) => member.email === email || member.username === email);
+      if (existingMember) {
+        if (existingMember.disabled)
+          return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberDisabled")) });
+        existingMember.email = email;
+        existingMember.accountId = user.id;
+        existingMember.username = email;
+        existingMember.name = yield* remoteDecode(() => normalizeName(user.name));
+        existingMember.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl));
+        this.#consumeInvite(invite);
+        const result = yield* remoteDecode(() => this.#createSession(existingMember));
+        yield* this.#persistEffect();
+        return result;
+      }
+      yield* remoteDecode(() => requireNewMemberSeat(state));
+      const member: StoredMember = {
+        id: randomUUID(),
+        accountId: user.id,
+        username: email,
+        email,
+        name: yield* remoteDecode(() => normalizeName(user.name)),
+        avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl)),
+        role: invite.role,
+        disabled: false,
+        createdAt: new Date().toISOString(),
+      };
       this.#consumeInvite(invite);
-      const result = yield* remoteDecode(() => this.#createSession(existingMember));
+      state.members.push(member);
+      const result = yield* remoteDecode(() => this.#createSession(member));
       yield* this.#persistEffect();
       return result;
-    }
-    yield* remoteDecode(() => requireNewMemberSeat(state));
-    const member: StoredMember = {
-      id: randomUUID(),
-      accountId: user.id,
-      username: email,
-      email,
-      name: yield* remoteDecode(() => normalizeName(user.name)),
-      avatarUrl: yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl)),
-      role: invite.role,
-      disabled: false,
-      createdAt: new Date().toISOString(),
-    };
-    this.#consumeInvite(invite);
-    state.members.push(member);
-    const result = yield* remoteDecode(() => this.#createSession(member));
-    yield* this.#persistEffect();
-    return result;
-  });
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  loginWithAccount(user: CentralAuthUser): Promise<AuthenticatedMember> {
-    return this.#run(this.loginWithAccountEffect(user));
-  }
-  readonly loginWithAccountEffect = Effect.fn("TeamStore.loginWithAccount")(function* (
-    this: TeamStore,
-    user: CentralAuthUser,
-  ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const email = yield* remoteDecode(() => normalizeEmail(user.email));
-    const member = state.members.find(
-      (candidate) => (candidate.email === email || candidate.username === email) && !candidate.disabled,
-    );
-    if (!member)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.accountNotMember")) });
-    member.email = email;
-    member.accountId = user.id;
-    member.username = email;
-    member.name = yield* remoteDecode(() => normalizeName(user.name));
-    member.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl));
-    const result = yield* remoteDecode(() => this.#createSession(member));
-    yield* this.#persistEffect();
-    return result;
-  });
+  readonly loginWithAccount = Effect.fn("TeamStore.loginWithAccount")(
+    function* (
+      this: TeamStore,
+      user: CentralAuthUser,
+    ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const email = yield* remoteDecode(() => normalizeEmail(user.email));
+      const member = state.members.find(
+        (candidate) => (candidate.email === email || candidate.username === email) && !candidate.disabled,
+      );
+      if (!member)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.accountNotMember")) });
+      member.email = email;
+      member.accountId = user.id;
+      member.username = email;
+      member.name = yield* remoteDecode(() => normalizeName(user.name));
+      member.avatarUrl = yield* remoteDecode(() => normalizeAvatarUrl(user.avatarUrl));
+      const result = yield* remoteDecode(() => this.#createSession(member));
+      yield* this.#persistEffect();
+      return result;
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  acceptInvite(token: string, username: string, password: string): Promise<AuthenticatedMember> {
-    return this.#run(this.acceptInviteEffect(token, username, password));
-  }
-  readonly acceptInviteEffect = Effect.fn("TeamStore.acceptInvite")(function* (
-    this: TeamStore,
-    token: string,
-    username: string,
-    password: string,
-  ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
-    yield* remoteDecode(() => validateUsername(username));
-    yield* remoteDecode(() => validatePassword(password));
-    const state = yield* remoteDecode(() => this.#requireState());
-    const normalizedUsername = username.trim().toLowerCase();
-    const requireJoin = () => {
-      if (state.members.some((member) => member.username === normalizedUsername)) {
-        throw new TeamStoreError(sourceText("error.team.usernameTaken"));
+  readonly acceptInvite = Effect.fn("TeamStore.acceptInvite")(
+    function* (
+      this: TeamStore,
+      token: string,
+      username: string,
+      password: string,
+    ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
+      yield* remoteDecode(() => validateUsername(username));
+      yield* remoteDecode(() => validatePassword(password));
+      const state = yield* remoteDecode(() => this.#requireState());
+      const normalizedUsername = username.trim().toLowerCase();
+      const requireJoin = () => {
+        if (state.members.some((member) => member.username === normalizedUsername)) {
+          throw new TeamStoreError(sourceText("error.team.usernameTaken"));
+        }
+        const invite = this.#findUsableInvite(token);
+        if (!invite) throw new TeamStoreError(sourceText("error.team.inviteInvalid"));
+        if (invite.email) throw new TeamStoreError(sourceText("error.team.inviteRequiresAccount"));
+        requireNewMemberSeat(state);
+        return invite;
+      };
+      requireJoin();
+      const credentials = yield* hashPasswordEffect(password);
+      yield* remoteDecode(() => this.#requireUnchangedState(state));
+      // A concurrent join can take the username, the invitation or the last seat during the hash.
+      const invite = requireJoin();
+      const member: StoredMember = {
+        id: randomUUID(),
+        username: normalizedUsername,
+        email: null,
+        name: null,
+        avatarUrl: null,
+        role: invite.role,
+        disabled: false,
+        createdAt: new Date().toISOString(),
+        ...credentials,
+      };
+      this.#consumeInvite(invite);
+      state.members.push(member);
+      const result = yield* remoteDecode(() => this.#createSession(member));
+      yield* this.#persistEffect();
+      return result;
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
+
+  readonly login = Effect.fn("TeamStore.login")(
+    function* (
+      this: TeamStore,
+      username: string,
+      password: string,
+    ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const member = state.members.find(
+        (candidate) => candidate.username === username.trim().toLowerCase() && !candidate.disabled,
+      );
+      if (!member || !(yield* verifyPasswordEffect(password, member))) {
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.loginIncorrect")) });
       }
-      const invite = this.#findUsableInvite(token);
-      if (!invite) throw new TeamStoreError(sourceText("error.team.inviteInvalid"));
-      if (invite.email) throw new TeamStoreError(sourceText("error.team.inviteRequiresAccount"));
-      requireNewMemberSeat(state);
-      return invite;
-    };
-    requireJoin();
-    const credentials = yield* hashPasswordEffect(password);
-    yield* remoteDecode(() => this.#requireUnchangedState(state));
-    // A concurrent join can take the username, the invitation or the last seat during the hash.
-    const invite = requireJoin();
-    const member: StoredMember = {
-      id: randomUUID(),
-      username: normalizedUsername,
-      email: null,
-      name: null,
-      avatarUrl: null,
-      role: invite.role,
-      disabled: false,
-      createdAt: new Date().toISOString(),
-      ...credentials,
-    };
-    this.#consumeInvite(invite);
-    state.members.push(member);
-    const result = yield* remoteDecode(() => this.#createSession(member));
-    yield* this.#persistEffect();
-    return result;
-  });
-
-  login(username: string, password: string): Promise<AuthenticatedMember> {
-    return this.#run(this.loginEffect(username, password));
-  }
-  readonly loginEffect = Effect.fn("TeamStore.login")(function* (
-    this: TeamStore,
-    username: string,
-    password: string,
-  ): Effect.fn.Return<AuthenticatedMember, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const member = state.members.find(
-      (candidate) => candidate.username === username.trim().toLowerCase() && !candidate.disabled,
-    );
-    if (!member || !(yield* verifyPasswordEffect(password, member))) {
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.loginIncorrect")) });
-    }
-    yield* remoteDecode(() => this.#requireUnchangedState(state));
-    const result = yield* remoteDecode(() => this.#createSession(member));
-    yield* this.#persistEffect();
-    return result;
-  });
+      yield* remoteDecode(() => this.#requireUnchangedState(state));
+      const result = yield* remoteDecode(() => this.#createSession(member));
+      yield* this.#persistEffect();
+      return result;
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   authenticate(token: string): TeamMemberSummary | null {
     return this.authenticateSession(token)?.member ?? null;
@@ -1156,129 +1160,117 @@ export class TeamStore {
     return member ? { member: publicMember(member), sessionId: session.id, sessionExpiresAt: session.expiresAt } : null;
   }
 
-  logout(token: string): Promise<void> {
-    return this.#run(this.logoutEffect(token));
-  }
-  readonly logoutEffect = Effect.fn("TeamStore.logout")(function* (
-    this: TeamStore,
-    token: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const tokenHash = hashToken(token);
-    state.sessions = state.sessions.filter((candidate) => !safeTextEqual(candidate.tokenHash, tokenHash));
-    yield* this.#persistEffect();
-  });
+  readonly logout = Effect.fn("TeamStore.logout")(
+    function* (this: TeamStore, token: string): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const tokenHash = hashToken(token);
+      state.sessions = state.sessions.filter((candidate) => !safeTextEqual(candidate.tokenHash, tokenHash));
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  changePassword(memberId: string, currentPassword: string, nextPassword: string) {
-    return this.#run(this.changePasswordEffect(memberId, currentPassword, nextPassword));
-  }
-  readonly changePasswordEffect = Effect.fn("TeamStore.changePassword")(function* (
-    this: TeamStore,
-    memberId: string,
-    currentPassword: string,
-    nextPassword: string,
-  ) {
-    yield* remoteDecode(() => validatePassword(nextPassword));
-    const state = yield* remoteDecode(() => this.#requireState());
-    const member = state.members.find((candidate) => candidate.id === memberId);
-    if (!member || !(yield* verifyPasswordEffect(currentPassword, member))) {
-      return yield* new RemoteWorkflowError({
-        cause: new TeamStoreError(sourceText("error.team.currentPasswordIncorrect")),
-      });
-    }
-    const credentials = yield* hashPasswordEffect(nextPassword);
-    yield* remoteDecode(() => this.#requireUnchangedState(state));
-    Object.assign(member, credentials);
-    state.sessions = state.sessions.filter((session) => session.memberId !== memberId);
-    yield* this.#persistEffect();
-  });
+  readonly changePassword = Effect.fn("TeamStore.changePassword")(
+    function* (this: TeamStore, memberId: string, currentPassword: string, nextPassword: string) {
+      yield* remoteDecode(() => validatePassword(nextPassword));
+      const state = yield* remoteDecode(() => this.#requireState());
+      const member = state.members.find((candidate) => candidate.id === memberId);
+      if (!member || !(yield* verifyPasswordEffect(currentPassword, member))) {
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.currentPasswordIncorrect")),
+        });
+      }
+      const credentials = yield* hashPasswordEffect(nextPassword);
+      yield* remoteDecode(() => this.#requireUnchangedState(state));
+      Object.assign(member, credentials);
+      state.sessions = state.sessions.filter((session) => session.memberId !== memberId);
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  updateMember(
-    memberId: string,
-    patch: { role?: Exclude<TeamRole, "owner">; disabled?: boolean },
-  ): Promise<TeamMemberSummary> {
-    return this.#run(this.updateMemberEffect(memberId, patch));
-  }
-  readonly updateMemberEffect = Effect.fn("TeamStore.updateMember")(function* (
-    this: TeamStore,
-    memberId: string,
-    patch: { role?: Exclude<TeamRole, "owner">; disabled?: boolean },
-  ): Effect.fn.Return<TeamMemberSummary, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const member = state.members.find((candidate) => candidate.id === memberId);
-    if (!member)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberNotFound")) });
-    if (member.role === "owner")
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.ownerCannotChange")) });
-    if (patch.disabled === false && member.disabled) yield* remoteDecode(() => requireMemberSeat(state));
-    if (patch.role !== undefined) {
-      if (patch.role !== "admin" && patch.role !== "member")
-        return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Invalid role.") });
-      member.role = patch.role;
-    }
-    if (patch.disabled !== undefined) member.disabled = patch.disabled;
-    if (member.disabled) {
-      state.sessions = state.sessions.filter((session) => session.memberId !== member.id);
-    }
-    yield* this.#persistEffect();
-    return publicMember(member);
-  });
+  readonly updateMember = Effect.fn("TeamStore.updateMember")(
+    function* (
+      this: TeamStore,
+      memberId: string,
+      patch: { role?: Exclude<TeamRole, "owner">; disabled?: boolean },
+    ): Effect.fn.Return<TeamMemberSummary, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const member = state.members.find((candidate) => candidate.id === memberId);
+      if (!member)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberNotFound")) });
+      if (member.role === "owner")
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.ownerCannotChange")),
+        });
+      if (patch.disabled === false && member.disabled) yield* remoteDecode(() => requireMemberSeat(state));
+      if (patch.role !== undefined) {
+        if (patch.role !== "admin" && patch.role !== "member")
+          return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Invalid role.") });
+        member.role = patch.role;
+      }
+      if (patch.disabled !== undefined) member.disabled = patch.disabled;
+      if (member.disabled) {
+        state.sessions = state.sessions.filter((session) => session.memberId !== member.id);
+      }
+      yield* this.#persistEffect();
+      return publicMember(member);
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  removeMember(memberId: string): Promise<void> {
-    return this.#run(this.removeMemberEffect(memberId));
-  }
-  readonly removeMemberEffect = Effect.fn("TeamStore.removeMember")(function* (
-    this: TeamStore,
-    memberId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    const member = state.members.find((candidate) => candidate.id === memberId);
-    if (!member)
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberNotFound")) });
-    if (member.role === "owner")
-      return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.ownerCannotRemove")) });
-    state.members = state.members.filter((candidate) => candidate.id !== memberId);
-    state.sessions = state.sessions.filter((session) => session.memberId !== memberId);
-    yield* this.#persistEffect();
-  });
+  readonly removeMember = Effect.fn("TeamStore.removeMember")(
+    function* (this: TeamStore, memberId: string): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      const member = state.members.find((candidate) => candidate.id === memberId);
+      if (!member)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError(sourceText("error.team.memberNotFound")) });
+      if (member.role === "owner")
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError(sourceText("error.team.ownerCannotRemove")),
+        });
+      state.members = state.members.filter((candidate) => candidate.id !== memberId);
+      state.sessions = state.sessions.filter((session) => session.memberId !== memberId);
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  revokeSession(sessionId: string): Promise<void> {
-    return this.#run(this.revokeSessionEffect(sessionId));
-  }
-  readonly revokeSessionEffect = Effect.fn("TeamStore.revokeSession")(function* (
-    this: TeamStore,
-    sessionId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    state.sessions = state.sessions.filter((session) => session.id !== sessionId);
-    this.closeRemoteSession(sessionId);
-    yield* this.#persistEffect();
-  });
+  readonly revokeSession = Effect.fn("TeamStore.revokeSession")(
+    function* (this: TeamStore, sessionId: string): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      state.sessions = state.sessions.filter((session) => session.id !== sessionId);
+      this.closeRemoteSession(sessionId);
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  revokeInvite(inviteId: string): Promise<void> {
-    return this.#run(this.revokeInviteEffect(inviteId));
-  }
-  readonly revokeInviteEffect = Effect.fn("TeamStore.revokeInvite")(function* (
-    this: TeamStore,
-    inviteId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
-    const state = yield* remoteDecode(() => this.#requireState());
-    state.invites = state.invites.filter((invite) => invite.id !== inviteId);
-    yield* this.#persistEffect();
-  });
+  readonly revokeInvite = Effect.fn("TeamStore.revokeInvite")(
+    function* (this: TeamStore, inviteId: string): Effect.fn.Return<void, RemoteWorkflowError, TeamStoreFiles> {
+      const state = yield* remoteDecode(() => this.#requireState());
+      state.invites = state.invites.filter((invite) => invite.id !== inviteId);
+      yield* this.#persistEffect();
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
-  syncAccount(user: CentralAuthUser): Promise<boolean> {
-    return this.#run(this.syncAccountEffect(user));
-  }
-  readonly syncAccountEffect = Effect.fn("TeamStore.syncAccount")(function* (
-    this: TeamStore,
-    user: CentralAuthUser,
-  ): Effect.fn.Return<boolean, RemoteWorkflowError, TeamStoreFiles> {
-    yield* remoteDecode(() => this.#requireState());
-    if (!(yield* remoteDecode(() => this.#applyAccount(user)))) return false;
-    yield* this.#persistEffect();
-    return true;
-  });
+  readonly syncAccount = Effect.fn("TeamStore.syncAccount")(
+    function* (this: TeamStore, user: CentralAuthUser): Effect.fn.Return<boolean, RemoteWorkflowError, TeamStoreFiles> {
+      yield* remoteDecode(() => this.#requireState());
+      if (!(yield* remoteDecode(() => this.#applyAccount(user)))) return false;
+      yield* this.#persistEffect();
+      return true;
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   /** The profile half of `syncAccount`, without its write. Reports whether anything moved. */
   #applyAccount(user: CentralAuthUser): boolean {
@@ -1429,15 +1421,21 @@ export class TeamStore {
       });
     }
     const snapshot = structuredClone(this.#file);
-    const operation = this.#writeChain.then(() =>
-      this.#run(
-        remoteDecode(() => `${JSON.stringify(snapshot)}\n`).pipe(
-          Effect.flatMap((content) => TeamStoreFiles.use((files) => files.write(this.#path, content))),
-        ),
+    const previous = this.#writeChain;
+    const pending = Deferred.makeUnsafe<void>();
+    this.#writeChain = pending;
+    yield* Effect.gen({ self: this }, function* () {
+      if (previous) yield* Deferred.await(previous);
+      const content = yield* remoteDecode(() => `${JSON.stringify(snapshot)}\n`);
+      yield* TeamStoreFiles.use((files) => files.write(this.#path, content));
+    }).pipe(
+      Effect.ensuring(
+        Effect.gen({ self: this }, function* () {
+          if (this.#writeChain === pending) this.#writeChain = null;
+          yield* Deferred.succeed(pending, undefined);
+        }),
       ),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    yield* remoteCall(() => operation);
   });
 }
 

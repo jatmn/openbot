@@ -21,14 +21,16 @@ import {
   WAKE_RECONNECT_STATES,
 } from "@openbot/team-client/hosted-server-wake";
 import { Effect, type Layer } from "effect";
-import { type AccountServiceFailure, AccountServicePlatform, runAccountEffect } from "./account-service-platform";
+import {
+  type AccountRequestClient,
+  type AccountServiceFailure,
+  AccountServicePlatform,
+} from "./account-service-platform";
 
 /** A running server that the joined list does not have yet makes the list refresh at most this often. */
 const RUNNING_REFRESH_INTERVAL_MS = 15_000;
 
-export interface HostedServerAuthClient {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
-}
+export type HostedServerAuthClient = AccountRequestClient;
 
 /**
  * `bun run dev --hosting=test` sets the shared developer key from the encrypted `.env.shared`. This
@@ -61,7 +63,10 @@ export function withHostingDeveloperKey(auth: HostedServerAuthClient, key: strin
 export class HostedServerDesktopService {
   readonly #platform: Layer.Layer<AccountServicePlatform>;
   readonly #lastRunningAt = new Map<string, number>();
-  readonly #statusCheck: ReturnType<typeof createHostedServerStatusCheck>;
+  readonly #statusCheck: {
+    unavailable(serverId: string, options: { wake: boolean }): Effect.Effect<HostedServerAvailability>;
+    forget(serverId: string): void;
+  };
 
   /**
    * `onRunning` gets each running server from a list, so the caller can refresh the joined servers
@@ -77,21 +82,16 @@ export class HostedServerDesktopService {
   ) {
     this.#platform = AccountServicePlatform.layer(auth, openExternal);
     const wake = createHostedServerWake(
-      (serverId) => respond(() => runAccountEffect(this.#requestWakeEffect(serverId), this.#platform)),
+      (serverId) => respond(this.#requestWakeEffect(serverId).pipe(Effect.provide(this.#platform))),
       now,
     );
     this.#statusCheck = createHostedServerStatusCheck(
       (serverId) =>
-        respond(() =>
-          runAccountEffect(
-            AccountServicePlatform.use((platform) =>
-              platform.request(
-                `/v2/hosting/servers/${encodeURIComponent(serverId)}/status`,
-                { method: "GET" },
-                (value) => value,
-              ),
-            ),
-            this.#platform,
+        respond(
+          auth.requestAuthorized(
+            `/v2/hosting/servers/${encodeURIComponent(serverId)}/status`,
+            { method: "GET" },
+            (value) => value,
           ),
         ),
       wake,
@@ -99,11 +99,7 @@ export class HostedServerDesktopService {
     );
   }
 
-  list(): Promise<HostedServerList> {
-    return runAccountEffect(this.listEffect(), this.#platform);
-  }
-
-  listEffect(): Effect.Effect<HostedServerList, AccountServiceFailure, AccountServicePlatform> {
+  list(): Effect.Effect<HostedServerList, AccountServiceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       HostedServerList,
       AccountServiceFailure,
@@ -119,23 +115,16 @@ export class HostedServerDesktopService {
         this.onRunning(server.serverId);
       }
       return list;
-    });
+    }).pipe(Effect.provide(this.#platform));
   }
 
-  plans(): Promise<HostedServerCatalog> {
-    return runAccountEffect(
-      AccountServicePlatform.use((platform) => platform.request("/v2/hosting/plans", { method: "GET" }, decodeCatalog)),
-      this.#platform,
-    );
+  plans(): Effect.Effect<HostedServerCatalog, AccountServiceFailure> {
+    return AccountServicePlatform.use((platform) =>
+      platform.request("/v2/hosting/plans", { method: "GET" }, decodeCatalog),
+    ).pipe(Effect.provide(this.#platform));
   }
 
-  create(input: CreateHostedServerInput): Promise<HostedServerSummary> {
-    return runAccountEffect(this.createEffect(input), this.#platform);
-  }
-
-  createEffect(
-    input: CreateHostedServerInput,
-  ): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+  create(input: CreateHostedServerInput): Effect.Effect<HostedServerSummary, AccountServiceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       HostedServerSummary,
       AccountServiceFailure,
@@ -158,17 +147,12 @@ export class HostedServerDesktopService {
         30_000,
       );
       return yield* this.#open(checkout);
-    });
+    }).pipe(Effect.provide(this.#platform));
   }
 
   /** Opens the payment page again for a server that waits for its first payment. */
-  openCheckout(serverId: string): Promise<HostedServerSummary> {
-    return runAccountEffect(this.openCheckoutEffect(serverId), this.#platform);
-  }
 
-  openCheckoutEffect(
-    serverId: string,
-  ): Effect.Effect<HostedServerSummary, AccountServiceFailure, AccountServicePlatform> {
+  openCheckout(serverId: string): Effect.Effect<HostedServerSummary, AccountServiceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       HostedServerSummary,
       AccountServiceFailure,
@@ -182,14 +166,10 @@ export class HostedServerDesktopService {
         30_000,
       );
       return yield* this.#open(checkout);
-    });
+    }).pipe(Effect.provide(this.#platform));
   }
 
-  delete(input: DeleteHostedServerInput): Promise<void> {
-    return runAccountEffect(this.deleteEffect(input), this.#platform);
-  }
-
-  deleteEffect(input: DeleteHostedServerInput): Effect.Effect<void, AccountServiceFailure, AccountServicePlatform> {
+  delete(input: DeleteHostedServerInput): Effect.Effect<void, AccountServiceFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<
       void,
       AccountServiceFailure,
@@ -206,19 +186,20 @@ export class HostedServerDesktopService {
         () => undefined,
         30_000,
       );
-    });
+    }).pipe(Effect.provide(this.#platform));
   }
 
-  /** The user starts the server. Failure stays a rejected Promise at the listener boundary. */
-  wake(serverId: string): Promise<HostedServerSummary> {
-    return runAccountEffect(this.wakeEffect(serverId), this.#platform);
-  }
-  readonly wakeEffect = Effect.fn("HostedServer.wake")(function* (this: HostedServerDesktopService, serverId: string) {
-    this.#statusCheck.forget(serverId);
-    return yield* this.#requestWakeEffect(serverId);
-  });
+  /** The user starts the server. */
 
-  unavailableHost(serverId: string, wake: boolean): Promise<HostedServerAvailability> {
+  readonly wake = Effect.fn("HostedServer.wake")(
+    function* (this: HostedServerDesktopService, serverId: string) {
+      this.#statusCheck.forget(serverId);
+      return yield* this.#requestWakeEffect(serverId);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#platform)),
+  ).bind(this);
+
+  unavailableHost(serverId: string, wake: boolean): Effect.Effect<HostedServerAvailability> {
     return this.#statusCheck.unavailable(serverId, { wake });
   }
 
@@ -253,15 +234,18 @@ export class HostedServerDesktopService {
 }
 
 /** The account client throws an error with the status and the error code of the answer. The wake helper reads a response. */
-async function respond(request: () => Promise<unknown>): Promise<HostedServerWakeResponse> {
-  try {
-    const value = await request();
-    return { ok: true, status: 200, json: async () => value };
-  } catch (error) {
-    if (!isDynamicRecord(error) || typeof error.status !== "number") throw error;
-    const body = { error: { code: typeof error.code === "string" ? error.code : null } };
-    return { ok: false, status: error.status, json: async () => body };
-  }
+function respond<E extends { cause: unknown }>(
+  request: Effect.Effect<unknown, E>,
+): Effect.Effect<HostedServerWakeResponse, E> {
+  return request.pipe(
+    Effect.map((value) => ({ ok: true, status: 200, json: async () => value })),
+    Effect.catch((failure) => {
+      const error = failure.cause;
+      if (!isDynamicRecord(error) || typeof error.status !== "number") return Effect.fail(failure);
+      const body = { error: { code: typeof error.code === "string" ? error.code : null } };
+      return Effect.succeed({ ok: false, status: error.status, json: async () => body });
+    }),
+  );
 }
 
 function decodeList(value: unknown): HostedServerList {

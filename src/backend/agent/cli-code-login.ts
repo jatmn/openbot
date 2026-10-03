@@ -1,7 +1,8 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Fiber, Schema } from "effect";
+import { stopProcessTree } from "../windows-process-tree";
 import { waitForSuccessfulProcess } from "./provider-status";
 
 /**
@@ -18,9 +19,9 @@ export type CliCodePrompt =
 export interface CliCodeLogin {
   child: ChildProcess;
   /** Settles when the CLI exits: resolves on success, rejects on failure or after `timeoutMs`. */
-  done: Promise<void>;
+  done: Effect.Effect<void, CliCodeLoginFailed>;
   /** Resolves when the CLI has printed what the user needs. Rejects when it exits or goes quiet first. */
-  prompt: Promise<CliCodePrompt>;
+  prompt: Effect.Effect<CliCodePrompt, CliCodeLoginFailed>;
   /** Types the code into the CLI's prompt. Only a `paste` sign-in reads it. */
   submit(code: string): void;
 }
@@ -42,45 +43,56 @@ const MAX_CODE_LENGTH = 2048;
  * flow runs only there: the BSD `script` of macOS stops when its stdin is a socket, which is what
  * Node gives a child, and a FIFO on macOS is a socket too. Windows has no `script`.
  */
-export function startCliCodeLogin(options: {
+export const startCliCodeLogin = Effect.fnUntraced(function* (options: {
   flow: CliCodePrompt["flow"];
   executable: string;
   argv: readonly string[];
   env: Record<string, string>;
   timeoutMs: number;
   platform?: NodeJS.Platform;
-}): CliCodeLogin {
+}) {
   const platform = options.platform ?? process.platform;
-  const command = options.flow === "paste" ? terminalCommand(platform, options.argv) : null;
-  const child = spawn(command?.file ?? options.executable, command?.args ?? [...options.argv], {
-    cwd: process.cwd(),
-    env: { ...process.env, ...options.env, ...(command ? { OPENBOT_LOGIN_EXECUTABLE: options.executable } : {}) },
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: false,
-    windowsHide: platform === "win32",
+  const command = yield* Effect.try({
+    try: () => (options.flow === "paste" ? terminalCommand(platform, options.argv) : null),
+    catch: (cause) => new CliCodeLoginFailed({ cause }),
   });
+  const child = yield* Effect.acquireRelease(
+    Effect.try({
+      try: () =>
+        spawn(command?.file ?? options.executable, command?.args ?? [...options.argv], {
+          cwd: process.cwd(),
+          env: { ...process.env, ...options.env, ...(command ? { OPENBOT_LOGIN_EXECUTABLE: options.executable } : {}) },
+          stdio: ["pipe", "pipe", "pipe"],
+          shell: false,
+          windowsHide: platform === "win32",
+        }),
+      catch: (cause) => new CliCodeLoginFailed({ cause }),
+    }),
+    (child) => stopProcessTree(child).pipe(Effect.orDie),
+  );
   child.stdin?.on("error", () => undefined);
   let submitted = false;
   // After a pasted code, an exit with a failure code is the provider refusing it. A timeout is a
   // signal, so it keeps its own message.
-  const done = runCodeLogin(
-    Effect.tryPromise({
-      try: () => waitForSuccessfulProcess(child, options.timeoutMs),
-      catch: (cause) =>
-        new CliCodeLoginFailed({
-          cause:
-            submitted && child.exitCode !== null ? new Error(sourceText("error.provider.codeLoginRefused")) : cause,
-        }),
-    }),
+  const done = yield* Effect.forkScoped(
+    waitForSuccessfulProcess(child, options.timeoutMs).pipe(
+      Effect.mapError(
+        (failure) =>
+          new CliCodeLoginFailed({
+            cause:
+              submitted && child.exitCode !== null
+                ? new Error(sourceText("error.provider.codeLoginRefused"))
+                : failure.cause,
+          }),
+      ),
+    ),
+    { startImmediately: true },
   );
-  const prompt = runCodeLogin(readCodePrompt(child, options.flow));
-  // Both are awaited by the caller; this only keeps an early exit from being unhandled.
-  done.catch(() => undefined);
-  prompt.catch(() => undefined);
+  const prompt = yield* Effect.forkScoped(readCodePrompt(child, options.flow), { startImmediately: true });
   return {
     child,
-    done,
-    prompt,
+    done: Fiber.join(done),
+    prompt: Fiber.join(prompt),
     submit(code) {
       if (options.flow !== "paste") throw new Error(sourceText("error.provider.codeLoginNotWaiting"));
       const value = normalizePastedCode(code);
@@ -90,8 +102,8 @@ export function startCliCodeLogin(options: {
       submitted = true;
       child.stdin.write(`${value}\r`);
     },
-  };
-}
+  } satisfies CliCodeLogin;
+});
 
 export class CliCodeLoginFailed extends Schema.TaggedError<CliCodeLoginFailed>()("CliCodeLoginFailed", {
   cause: Schema.Defect(),
@@ -139,12 +151,6 @@ const readCodePrompt = Effect.fnUntraced(function* (child: ChildProcess, flow: C
     ),
   );
 });
-
-async function runCodeLogin<A>(effect: Effect.Effect<A, CliCodeLoginFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(effect));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
 
 /** The pasted code, or an error that does not quote it. */
 export function normalizePastedCode(code: string): string {

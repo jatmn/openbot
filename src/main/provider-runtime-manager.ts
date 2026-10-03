@@ -18,7 +18,7 @@ import {
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText, toLogValue } from "@openbot/logging";
-import { Effect, Result, type Scope, Stream } from "effect";
+import { Deferred, Effect, Exit, Fiber, Result, Scope, Stream } from "effect";
 import lockValue from "../../native-runtime.lock.json";
 import { type AgentRuntimeLock, parseAgentRuntimeLock } from "../../scripts/agent-runtime-lock";
 import { type BundledProviderExecutables, configuredCliPath } from "../backend/cli";
@@ -35,9 +35,9 @@ import {
 import { ProviderRuntimeFailure, runRuntime, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 import {
   type BlockedVersions,
-  fetchBlockedVersionsEffect,
-  latestReleaseEffect,
-  readLimitedBodyEffect,
+  fetchBlockedVersions,
+  latestRelease,
+  readLimitedBody,
 } from "./provider-runtime-releases";
 
 const execFileAsync = promisify(execFile);
@@ -129,7 +129,10 @@ export interface ProviderRuntimeManagerOptions {
   availableDiskBytes?: () => Promise<number>;
   /** How long a commit waits for a stage that another program holds open. Tests shorten it. */
   heldStageWaitMs?: number;
-  updateRuntime?: (runtime: ManagedRuntimeId, install: () => Promise<string>) => Promise<void>;
+  updateRuntime?: (
+    runtime: ManagedRuntimeId,
+    install: () => Effect.Effect<string, ProviderRuntimeFailure>,
+  ) => Effect.Effect<void, ProviderRuntimeFailure>;
 }
 
 /**
@@ -161,7 +164,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
   readonly #heldStageWaitMs: number;
   readonly #statuses: Record<ManagedRuntimeId, ProviderRuntimeStatus>;
   readonly #controllers = new Map<ManagedRuntimeId, AbortController>();
-  readonly #tasks = new Map<ManagedRuntimeId, Promise<void>>();
+  readonly #tasks = new Map<ManagedRuntimeId, Fiber.Fiber<void, ProviderRuntimeFailure>>();
   readonly #cancelled = new Set<ManagedRuntimeId>();
   /** Versions of provider CLIs the user installed, kept only to compare against the update target. */
   readonly #systemVersions = new Map<ManagedProviderId, string>();
@@ -169,9 +172,13 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
   readonly #latest = new Map<ManagedProviderId, RuntimeSpec>();
   /** What each running download installs, so a cancel removes the right partial file. */
   readonly #transfers = new Map<ManagedRuntimeId, RuntimeSpec>();
-  readonly #updateRuntime: (runtime: ManagedRuntimeId, install: () => Promise<string>) => Promise<void>;
+  readonly #updateRuntime: (
+    runtime: ManagedRuntimeId,
+    install: () => Effect.Effect<string, ProviderRuntimeFailure>,
+  ) => Effect.Effect<void, ProviderRuntimeFailure>;
   #blocked: BlockedVersions = new Map();
-  #check: Promise<void> | null = null;
+  #check: Deferred.Deferred<void, ProviderRuntimeFailure> | null = null;
+  readonly #scope = Scope.makeUnsafe();
   #checkTimer: NodeJS.Timeout | null = null;
   #revision = 0;
   #stopping = false;
@@ -180,11 +187,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     super();
     this.#root = options.root;
     this.#downloads = options.downloadRoot ?? join(options.root, ".downloads");
-    this.#updateRuntime =
-      options.updateRuntime ??
-      (async (_runtime, install) => {
-        await install();
-      });
+    this.#updateRuntime = options.updateRuntime ?? ((_runtime, install) => install().pipe(Effect.asVoid));
     this.#target = runtimeTarget(options.platform ?? process.platform, options.architecture ?? process.arch);
     this.#fetch = options.fetchImpl ?? fetch;
     this.#lock = options.lock ?? parseAgentRuntimeLock(lockValue);
@@ -207,11 +210,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
       bun: emptyStatus(unsupportedMessage),
     };
   }
-
-  initialize(): Promise<ProviderRuntimeSnapshot> {
-    return runRuntime(this.initializeEffect());
-  }
-  initializeEffect(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+  initialize(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
       yield* runtimeIO(async () => await mkdir(this.#root, { recursive: true }));
       yield* this.#removeAbandonedStagingEffect();
@@ -248,25 +247,24 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     }
     return { revision: this.#revision, providers, toolRuntimes: { bun } };
   }
-
-  /**
-   * Asks each provider's upstream for its latest release, and offers it where it is newer.
-   *
-   * Concurrent calls share one check. A source that does not answer keeps what the last check found,
-   * so one unreachable registry does not take the offers of the others away. Rejects only when no
-   * source answered, which is what a user who asked needs to hear.
-   */
-  checkForUpdates(): Promise<ProviderRuntimeSnapshot> {
-    return runRuntime(this.checkForUpdatesEffect());
-  }
-  checkForUpdatesEffect(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+  checkForUpdates(): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
       const target = this.#target;
       if (!target) return this.getStatus();
-      this.#check ??= this.#runCheck(target).finally(() => {
-        this.#check = null;
-      });
-      yield* runtimeIO(async () => await this.#check);
+      if (this.#check) yield* Deferred.await(this.#check);
+      else {
+        const check = Deferred.makeUnsafe<void, ProviderRuntimeFailure>();
+        this.#check = check;
+        yield* this.#runCheck(target).pipe(
+          Effect.onExit((exit) =>
+            Effect.gen({ self: this }, function* () {
+              yield* Deferred.done(check, exit);
+              this.#check = null;
+            }),
+          ),
+          Effect.uninterruptible,
+        );
+      }
       return this.getStatus();
     });
   }
@@ -274,25 +272,21 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
   /** Checks now and then every hour, until `stop`. The caller starts it once the app is up. */
   startUpdateChecks(intervalMs = UPDATE_CHECK_INTERVAL_MS): void {
     if (this.#checkTimer || !this.#target || this.#stopping) return;
-    const check = () => void this.checkForUpdates().catch(() => undefined);
+    const check = () => void runRuntime(this.checkForUpdates()).catch(() => undefined);
     this.#checkTimer = setInterval(check, intervalMs);
     this.#checkTimer.unref();
     check();
   }
-
-  #runCheck(target: RuntimeTarget): Promise<void> {
-    return runRuntime(this.#runCheckEffect(target));
-  }
-  #runCheckEffect(target: RuntimeTarget): Effect.Effect<void, ProviderRuntimeFailure> {
+  #runCheck(target: RuntimeTarget): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const [blocked, releases] = yield* Effect.all(
         [
-          Effect.result(fetchBlockedVersionsEffect(this.#fetch)),
+          Effect.result(fetchBlockedVersions(this.#fetch)),
           Effect.forEach(
             PROVIDERS,
             (provider) =>
               Effect.result(
-                latestReleaseEffect(provider, { target, lock: this.#lock, fetch: this.#fetch }).pipe(
+                latestRelease(provider, { target, lock: this.#lock, fetch: this.#fetch }).pipe(
                   Effect.tap((release) =>
                     Effect.sync(() => {
                       this.#latest.set(provider, release);
@@ -372,24 +366,12 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * platform, a download already running, the app closing -- is in the status a Settings reader can
    * see, so there is nothing here that only this call site could report.
    */
-  ensureToolRuntimes(): void {
-    for (const tool of MANAGED_TOOL_RUNTIMES) void this.download(tool).catch(() => undefined);
+  ensureToolRuntimes(): Effect.Effect<void> {
+    return Effect.forEach(MANAGED_TOOL_RUNTIMES, (tool) => this.download(tool).pipe(Effect.ignore), { discard: true });
   }
-
-  /**
-   * Starts whatever tool runtime this machine is missing and waits until each one is ready.
-   *
-   * The connection test is the one place that waits: a first credential-based stdio plugin must
-   * pass its test before it can be saved, and without a runtime the test answers `Command not
-   * found` for a machine that only needs a download. Throws when a download fails, so the caller
-   * decides whether the test still runs.
-   */
-  ensureToolRuntimesReady(): Promise<void> {
-    return runRuntime(this.ensureToolRuntimesReadyEffect());
-  }
-  ensureToolRuntimesReadyEffect(): Effect.Effect<void, ProviderRuntimeFailure> {
+  ensureToolRuntimesReady(): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
-      for (const tool of MANAGED_TOOL_RUNTIMES) yield* this.downloadAndWaitEffect(tool);
+      for (const tool of MANAGED_TOOL_RUNTIMES) yield* this.downloadAndWait(tool);
     });
   }
 
@@ -410,11 +392,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     const bin = dirname(executable);
     return { binDirectories: [bin], commandAliases: { npx: join(bin, bunxExecutableName(this.#target)) } };
   }
-
-  download(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
-    return runRuntime(this.downloadEffect(runtime));
-  }
-  downloadEffect(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+  download(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
       if (!this.#target)
         return yield* new ProviderRuntimeFailure({
@@ -454,18 +432,24 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
       });
       // The task is registered without an await between it and the guard above, so a second request
       // for the same runtime finds it and joins it instead of starting a download of its own.
-      const task = this.#updateProviderRuntime(spec, controller.signal)
-        .catch((error: unknown) => {
-          this.#controllers.delete(runtime);
-          this.#tasks.delete(runtime);
-          return this.#handleDownloadFailure(runtime, error);
-        })
-        .finally(() => {
-          this.#controllers.delete(runtime);
-          this.#tasks.delete(runtime);
-          this.#transfers.delete(runtime);
-          this.#cancelled.delete(runtime);
-        });
+      const task = yield* Effect.forkIn(
+        this.#updateProviderRuntime(spec, controller.signal).pipe(
+          Effect.catch((error) => {
+            this.#controllers.delete(runtime);
+            this.#tasks.delete(runtime);
+            return this.#handleDownloadFailure(runtime, error.cause);
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              this.#controllers.delete(runtime);
+              this.#tasks.delete(runtime);
+              this.#transfers.delete(runtime);
+              this.#cancelled.delete(runtime);
+            }),
+          ),
+        ),
+        this.#scope,
+      );
       this.#tasks.set(runtime, task);
       return this.getStatus();
     });
@@ -481,20 +465,19 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
    * holds a first install back only that long. No check is started here: one that already failed
    * would fail again, and the hourly check or the user's own check finds the release later.
    */
-  #awaitReleaseCheck(check: Promise<void>): Effect.Effect<void, ProviderRuntimeFailure> {
-    return runtimeIO(() => check).pipe(
+  #awaitReleaseCheck(
+    check: Deferred.Deferred<void, ProviderRuntimeFailure>,
+  ): Effect.Effect<void, ProviderRuntimeFailure> {
+    return Deferred.await(check).pipe(
       Effect.catch(() => Effect.void),
       Effect.timeoutOrElse({ duration: RELEASE_CHECK_WAIT_MS, orElse: () => Effect.void }),
     );
   }
-
-  downloadAndWait(runtime: ManagedRuntimeId): Promise<void> {
-    return runRuntime(this.downloadAndWaitEffect(runtime));
-  }
-  downloadAndWaitEffect(runtime: ManagedRuntimeId): Effect.Effect<void, ProviderRuntimeFailure> {
+  downloadAndWait(runtime: ManagedRuntimeId): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
-      yield* this.downloadEffect(runtime);
-      yield* runtimeIO(async () => await this.#tasks.get(runtime));
+      yield* this.download(runtime);
+      const task = this.#tasks.get(runtime);
+      if (task) yield* Fiber.join(task);
       const status = this.#statuses[runtime];
       if (status.phase !== "ready")
         return yield* new ProviderRuntimeFailure({
@@ -502,35 +485,28 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
         });
     });
   }
-
-  cancel(runtime: ManagedRuntimeId): Promise<ProviderRuntimeSnapshot> {
-    return runRuntime(this.cancelEffect(runtime));
-  }
-  cancelEffect(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
+  cancel(runtime: ManagedRuntimeId): Effect.Effect<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<ProviderRuntimeSnapshot, ProviderRuntimeFailure> {
       if (this.#statuses[runtime].phase !== "downloading") return this.getStatus();
       const task = this.#tasks.get(runtime);
       const spec = this.#transfers.get(runtime);
       this.#cancelled.add(runtime);
       this.#controllers.get(runtime)?.abort();
-      yield* runtimeIO(async () => await task);
+      if (task) yield* Fiber.join(task);
       if (spec) yield* this.#removePartialEffect(spec);
       yield* this.#inspectEffect(runtime);
       this.#setStatus(runtime, this.#statuses[runtime]);
       return this.getStatus();
     });
   }
-
-  stop(): Promise<void> {
-    return runRuntime(this.stopEffect());
-  }
-  stopEffect(): Effect.Effect<void, ProviderRuntimeFailure> {
+  stop(): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
       this.#stopping = true;
       if (this.#checkTimer) clearInterval(this.#checkTimer);
       this.#checkTimer = null;
       for (const controller of this.#controllers.values()) controller.abort();
-      yield* runtimeIO(async () => await Promise.allSettled(this.#tasks.values()));
+      yield* Effect.forEach(this.#tasks.values(), Fiber.await, { concurrency: "unbounded", discard: true });
+      yield* Scope.close(this.#scope, Exit.void);
     });
   }
 
@@ -591,18 +567,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
       return { ...emptyStatus(), version: yield* this.#previousVersionEffect(spec) };
     });
   }
-
-  /**
-   * One update, from the single look at the shared store to the activation that ends it.
-   *
-   * A sibling instance may have installed this version while the offer sat on screen. That is a
-   * reason to skip the transfer, not the activation: the agent service still runs the old CLI, and
-   * a status of `ready` without the swap leaves the offer on screen with no way to answer it.
-   */
-  #updateProviderRuntime(spec: RuntimeSpec, signal: AbortSignal): Promise<void> {
-    return runRuntime(this.#updateProviderRuntimeEffect(spec, signal));
-  }
-  #updateProviderRuntimeEffect(spec: RuntimeSpec, signal: AbortSignal): Effect.Effect<void, ProviderRuntimeFailure> {
+  #updateProviderRuntime(spec: RuntimeSpec, signal: AbortSignal): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const installed = yield* this.#readStoreEffect(spec);
       if (installed.phase === "ready") {
@@ -667,18 +632,14 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     return Effect.gen({ self: this }, function* () {
       let installed = false;
       const result = yield* Effect.result(
-        runtimeIO(() =>
-          this.#updateRuntime(spec.runtime, () =>
-            runRuntime(
-              Effect.gen({ self: this }, function* () {
-                if (signal) {
-                  installed = yield* this.#runDownloadEffect(spec, signal);
-                  yield* this.#removePartialEffect(spec);
-                }
-                return join(this.#installRoot(spec), "bin", spec.executableName);
-              }),
-            ),
-          ),
+        this.#updateRuntime(spec.runtime, () =>
+          Effect.gen({ self: this }, function* () {
+            if (signal) {
+              installed = yield* this.#runDownloadEffect(spec, signal);
+              yield* this.#removePartialEffect(spec);
+            }
+            return join(this.#installRoot(spec), "bin", spec.executableName);
+          }),
         ),
       );
       if (Result.isFailure(result)) {
@@ -975,7 +936,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
         return yield* new ProviderRuntimeFailure({
           cause: new Error(sourceText("error.provider.metadataHttp", { status: response.status })),
         });
-      const value = yield* readLimitedBodyEffect(response, sourceText("error.provider.metadataTooLarge"));
+      const value = yield* readLimitedBody(response, sourceText("error.provider.metadataTooLarge"));
       if (!value)
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.metadataNoData")) });
       if (expectedSha256 !== null && createHash("sha256").update(value).digest("hex") !== expectedSha256) {
@@ -1016,11 +977,7 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.diskSpace")) });
     });
   }
-
-  #handleDownloadFailure(runtime: ManagedRuntimeId, error: unknown): Promise<void> {
-    return runRuntime(this.#handleDownloadFailureEffect(runtime, error));
-  }
-  #handleDownloadFailureEffect(runtime: ManagedRuntimeId, error: unknown): Effect.Effect<void, ProviderRuntimeFailure> {
+  #handleDownloadFailure(runtime: ManagedRuntimeId, error: unknown): Effect.Effect<void, ProviderRuntimeFailure> {
     return Effect.sync(() => {
       if (this.#cancelled.has(runtime)) return;
       if (this.#stopping && isAbortError(error)) return;
@@ -1470,7 +1427,10 @@ const writeInstallRecord = Effect.fn("ProviderRuntime.writeInstallRecord")(funct
   spec: RuntimeSpec,
 ): Effect.fn.Return<void, ProviderRuntimeFailure> {
   const files: Record<string, string> = {};
-  for (const file of yield* installedFiles(root)) files[file] = yield* runtimeIO(() => sha256File(join(root, file)));
+  for (const file of yield* installedFiles(root))
+    files[file] = yield* sha256File(join(root, file)).pipe(
+      Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+    );
   const record: InstallRecord = {
     layoutVersion: 1,
     runtime: spec.runtime,
@@ -1507,7 +1467,12 @@ const verifyInstallRecord = Effect.fn("ProviderRuntime.verifyInstallRecord")(fun
     return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.runtimeChecksum")) });
   for (const file of files) {
     const expected = record.files[file];
-    if (!isString(expected) || (yield* runtimeIO(() => sha256File(join(root, file)))) !== expected) {
+    if (
+      !isString(expected) ||
+      (yield* sha256File(join(root, file)).pipe(
+        Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+      )) !== expected
+    ) {
       return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.runtimeChecksum")) });
     }
   }

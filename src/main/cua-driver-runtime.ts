@@ -18,10 +18,10 @@ import {
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Deferred, Effect, Exit, Result } from "effect";
 import { CuaDriverActionTap, type ObservedAction, type ObservedPointer } from "./cua-driver-action-tap";
 import { CUA_DRIVER_VENDOR_CALLS_OFF } from "./cua-driver-artifact";
-import { CuaDriverFailure, cuaIO, cuaSync, runCua } from "./cua-driver-effects";
+import { CuaDriverFailure, cuaIO, cuaSync } from "./cua-driver-effects";
 import { LifecycleGate } from "./lifecycle-gate";
 import { forwardDiagnosticLines, stopRemoteProcess } from "./remote-diagnostics";
 
@@ -190,10 +190,7 @@ export interface CuaDriverEndpointInput {
  * be taken before the driver starts. It is kept in the profile so that it is random once rather than
  * once per launch: only a process that can already read this user's profile can read it back.
  */
-export function resolveCuaDriverEndpoint(input: CuaDriverEndpointInput): Promise<CuaDriverEndpoint> {
-  return runCua(resolveCuaDriverEndpointEffect(input));
-}
-export const resolveCuaDriverEndpointEffect = Effect.fn("CuaDriver.endpoint")(function* (
+export const resolveCuaDriverEndpoint = Effect.fn("CuaDriver.endpoint")(function* (
   input: CuaDriverEndpointInput,
 ): Effect.fn.Return<CuaDriverEndpoint, CuaDriverFailure> {
   if (input.platform === "win32") return { kind: "windows-pipe", name: yield* windowsPipeName(input.userDataPath) };
@@ -257,7 +254,7 @@ export interface CuaDriverRuntimeOptions {
    * read the filesystem rather than the answer from startup: otherwise the only way to finish the
    * installation is to restart OpenBot.
    */
-  resolveExecutable?: () => Promise<string | null>;
+  resolveExecutable?: () => Effect.Effect<string | null, CuaDriverFailure>;
   /**
    * Where to link the executable, so the MCP command is the same at each launch.
    *
@@ -296,7 +293,7 @@ export class CuaDriverRuntime {
   /** What the proxies are told to run: the alias once it is linked, the executable otherwise. */
   #command: string | null = null;
   #child: ChildProcess | null = null;
-  readonly #lifecycle = new LifecycleGate<void>();
+  readonly #lifecycle = new LifecycleGate<void, CuaDriverFailure>();
   #state: ComputerUseState;
   /** Mutable, because a user may install the driver while OpenBot runs. */
   #executable: string | null;
@@ -431,40 +428,30 @@ export class CuaDriverRuntime {
    * agent that reaches for the tools, and `warmUp`, which keeps it only for a user who granted
    * them already.
    */
-  start(): Promise<void> {
-    // The gate starts only after a stop that is still running. Both own the socket path: a start
-    // that overtook a stop would have its own socket removed by it, and the daemon would then serve
-    // an address no client can reach, with nothing to say it had happened.
+  start(): Effect.Effect<void, CuaDriverFailure> {
     return this.#lifecycle.start(() =>
-      runCua(
-        Effect.gen({ self: this }, function* () {
-          if (this.running()) return;
-          yield* this.#start();
-          this.#announceMcpServer();
-        }),
-      ),
+      Effect.gen({ self: this }, function* () {
+        if (this.running()) return;
+        yield* this.#start();
+        this.#announceMcpServer();
+      }),
     );
   }
 
-  stop(): Promise<void> {
-    return this.#lifecycle.stop(() => runCua(this.#stop()));
+  stop(): Effect.Effect<void, CuaDriverFailure> {
+    return this.#lifecycle.stop(() => this.#stop());
   }
 
-  /** The panel's answer: starts the daemon if it is not running, then asks it what it may do. */
-  state(): Promise<ComputerUseState> {
-    return runCua(this.#readStateEffect());
-  }
-
-  #readStateEffect = Effect.fn("CuaDriver.state")(function* (
+  readonly state = Effect.fn("CuaDriver.state")(function* (
     this: CuaDriverRuntime,
   ): Effect.fn.Return<ComputerUseState, CuaDriverFailure> {
     if (!this.#options.supported) return this.#publish(this.#initialState());
     if (!this.#executable) {
       const resolve = this.#options.resolveExecutable;
-      this.#executable = resolve ? yield* cuaIO(resolve) : null;
+      this.#executable = resolve ? yield* resolve() : null;
     }
     if (!this.#executable) return this.#publish(this.#initialState());
-    const started = yield* Effect.result(cuaIO(() => this.start()));
+    const started = yield* Effect.result(this.start());
     if (Result.isFailure(started))
       return this.#publish({
         status: "error",
@@ -495,7 +482,7 @@ export class CuaDriverRuntime {
       permissions.some((p) => p.id === id && p.granted),
     );
     return this.#publish({ status: granted ? "ready" : "permissions-required", permissions, message: null });
-  });
+  }).bind(this);
 
   /**
    * Starts the daemon at startup for a user who granted the permissions already, and stops it again
@@ -507,28 +494,27 @@ export class CuaDriverRuntime {
    * opens a window — without them at all. Asking the driver what it may do raises no prompt, so a
    * user who never granted anything sees nothing and keeps no process.
    */
-  warmUp(): Promise<void> {
-    if (!this.#options.supported) return Promise.resolve();
+  readonly warmUp = Effect.fn("CuaDriver.warmUp")(function* (this: CuaDriverRuntime) {
+    if (!this.#options.supported) return;
     this.#quiet = true;
-    return runCua(
-      Effect.gen({ self: this }, function* () {
-        const state = yield* this.#readStateEffect();
-        if (state.status !== "ready") yield* cuaIO(() => this.stop()).pipe(Effect.catch(() => Effect.void));
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            this.#quiet = false;
-          }),
-        ),
+    yield* Effect.gen({ self: this }, function* () {
+      const state = yield* this.state();
+      if (state.status !== "ready") yield* this.stop().pipe(Effect.catch(() => Effect.void));
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          this.#quiet = false;
+        }),
       ),
     );
-  }
+  }).bind(this);
 
   #stop = Effect.fn("CuaDriver.stop")(function* (this: CuaDriverRuntime): Effect.fn.Return<void, CuaDriverFailure> {
     const child = this.#child;
     this.#child = null;
-    yield* cuaIO(() => this.#tap.close());
-    if (child) yield* cuaIO(() => stopRemoteProcess(child));
+    yield* this.#tap.close();
+    if (child)
+      yield* stopRemoteProcess(child).pipe(Effect.mapError((error) => new CuaDriverFailure({ cause: error.cause })));
     yield* this.#removeSocket();
     // No announcement: a stop this process asked for is the teardown, and telling the providers
     // there would deactivate the very sessions the next run resumes.
@@ -581,16 +567,12 @@ export class CuaDriverRuntime {
     // `spawn` reports a missing or unreadable executable through this event, after it returns. An
     // unhandled `error` event on a child process throws in the main process, and Computer Use is
     // an optional function, so it is caught here and reported as a state instead.
-    const spawnFailure = new Promise<never>((_resolve, reject) => {
-      child.once("error", (error: Error) => {
-        if (this.#child === child) this.#child = null;
-        this.#options.onDiagnostic?.(`OpenBot: the Computer Use driver could not start. ${error.message}\n`);
-        reject(error);
-      });
+    const spawnFailure = Deferred.makeUnsafe<never, CuaDriverFailure>();
+    child.once("error", (error: Error) => {
+      if (this.#child === child) this.#child = null;
+      this.#options.onDiagnostic?.(`OpenBot: the Computer Use driver could not start. ${error.message}\n`);
+      Deferred.doneUnsafe(spawnFailure, Exit.fail(new CuaDriverFailure({ cause: error })));
     });
-    // The race below drops the loser, and the child may still report an error after the daemon is
-    // up. This keeps that late rejection handled rather than an unhandled one.
-    spawnFailure.catch(() => undefined);
     child.once("exit", (code) => {
       if (this.#child !== child) return;
       this.#child = null;
@@ -604,10 +586,7 @@ export class CuaDriverRuntime {
     });
 
     const ready = yield* Effect.result(
-      Effect.raceFirst(
-        waitForDriverSocket(this.#options.waitForSocket, socketPath),
-        cuaIO(() => spawnFailure),
-      ),
+      Effect.raceFirst(waitForDriverSocket(this.#options.waitForSocket, socketPath), Deferred.await(spawnFailure)),
     );
     if (Result.isFailure(ready)) {
       yield* this.#stop();
@@ -633,9 +612,9 @@ export class CuaDriverRuntime {
     // A daemon that stops on its own leaves the tap listening, and `listen` returns at once while it
     // does. Without this, the restart would unlink the address below and then hand the providers a
     // path nothing answers on, with no way back except restarting OpenBot.
-    yield* cuaIO(() => this.#tap.close());
+    yield* this.#tap.close();
     if (endpoint.kind === "unix-socket") yield* cuaIO(() => rm(address, { force: true }).catch(() => undefined));
-    const listening = yield* Effect.result(cuaIO(() => this.#tap.listen({ upstream: socketPath, tap: address })));
+    const listening = yield* Effect.result(this.#tap.listen({ upstream: socketPath, tap: address }));
     if (Result.isFailure(listening))
       this.#options.onDiagnostic?.(
         `OpenBot: the Computer Use tap could not listen. ${describe(listening.failure.cause)}\n`,

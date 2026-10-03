@@ -7,6 +7,7 @@ import { readRemoteApiConfig } from "../src/config";
 import type { RemoteTicketClaims } from "../src/protocol";
 import { type RemoteTokenProvider, SignalService } from "../src/signal-service";
 import { RemoteTokenError, RemoteTokenService, signServiceRequest } from "../src/tokens";
+import { runSignal, signalRuntime } from "./signal-runtime";
 
 describe("Remote API proxy addresses", () => {
   it("uses the first forwarded address only when the proxy is trusted", () => {
@@ -44,7 +45,7 @@ describe("signed account notifications", () => {
     });
     const signal = new SignalService(new RemoteTokenService(config), 8);
     const changed = vi.spyOn(signal, "profileChanged");
-    const app = createRemoteApiApp(config, signal);
+    const app = createRemoteApiApp(config, signal, signalRuntime(signal));
     const body = '{ "type": "account-profile-changed", "userId": "user-1" }';
     const timestamp = String(Math.floor(Date.now() / 1000));
     const signature = signServiceRequest(body, timestamp, config.authWebhookSecret);
@@ -77,7 +78,7 @@ describe("signed account notifications", () => {
     });
     const signal = new SignalService(new RemoteTokenService(config), 8);
     const changed = vi.spyOn(signal, "serversChanged");
-    const app = createRemoteApiApp(config, signal);
+    const app = createRemoteApiApp(config, signal, signalRuntime(signal));
     const body = '{ "type": "account-servers-changed", "userId": "user-1" }';
     const timestamp = String(Math.floor(Date.now() / 1000));
     const response = await app.handle(
@@ -124,9 +125,9 @@ describe("Slack request route", () => {
     const refused = async (slackRoute: string | undefined) => {
       const socket = testSocket(crypto.randomUUID());
       signal.connect(socket);
-      await signal.receive(
-        socket,
-        JSON.stringify({ type: "hello", version: 1, peer: "ingress", token: "t", slackRoute }),
+      await runSignal(
+        signal,
+        signal.receive(socket, JSON.stringify({ type: "hello", version: 1, peer: "ingress", token: "t", slackRoute })),
       );
       return socket.messages.at(-1) ?? "";
     };
@@ -138,15 +139,18 @@ describe("Slack request route", () => {
 
     const ingress = testSocket("ingress");
     signal.connect(ingress);
-    await signal.receive(
-      ingress,
-      JSON.stringify({
-        type: "hello",
-        version: 1,
-        peer: "ingress",
-        token: "host-ticket",
-        slackRoute: await route({ hid: "host-1", teams: ["T1"] }),
-      }),
+    await runSignal(
+      signal,
+      signal.receive(
+        ingress,
+        JSON.stringify({
+          type: "hello",
+          version: 1,
+          peer: "ingress",
+          token: "host-ticket",
+          slackRoute: await route({ hid: "host-1", teams: ["T1"] }),
+        }),
+      ),
     );
     expect(ingress.messages.at(-1)).toContain('"type":"ready"');
     ingress.messages.length = 0;
@@ -163,21 +167,24 @@ describe("Slack request route", () => {
     // Another socket cannot answer a request that Signal did not send it.
     const other = testSocket("other");
     signal.connect(other);
-    await signal.receive(
-      other,
-      JSON.stringify({
-        type: "hello",
-        version: 1,
-        peer: "ingress",
-        token: "host-ticket",
-        slackRoute: await route({ hid: "host-1", teams: [] }),
-      }),
+    await runSignal(
+      signal,
+      signal.receive(
+        other,
+        JSON.stringify({
+          type: "hello",
+          version: 1,
+          peer: "ingress",
+          token: "host-ticket",
+          slackRoute: await route({ hid: "host-1", teams: [] }),
+        }),
+      ),
     );
     const answer = { type: "slack-delivery-result", version: 1, requestId: delivery.requestId, status: 200 };
-    await signal.receive(other, JSON.stringify(answer));
+    await runSignal(signal, signal.receive(other, JSON.stringify(answer)));
     expect(other.messages.at(-1)).toContain('"code":"permission_denied"');
 
-    await signal.receive(ingress, JSON.stringify(answer));
+    await runSignal(signal, signal.receive(ingress, JSON.stringify(answer)));
     expect((await pending).status).toBe(200);
 
     // A button press carries the workspace inside the form's `payload`.
@@ -185,7 +192,7 @@ describe("Slack request route", () => {
     const pressed = post(app, press, { contentType: "application/x-www-form-urlencoded" });
     await vi.waitFor(() => expect(ingress.messages).toHaveLength(2));
     expect(JSON.parse(ingress.messages[1] ?? "{}")).toMatchObject({ teamId: "T1", kind: "interactivity" });
-    signal.disconnect(ingress);
+    await runSignal(signal, signal.disconnect(ingress));
     expect((await pressed).status).toBe(503);
   });
 
@@ -194,15 +201,18 @@ describe("Slack request route", () => {
     const connect = async (id: string, linkedAt: number) => {
       const socket = testSocket(id);
       signal.connect(socket);
-      await signal.receive(
-        socket,
-        JSON.stringify({
-          type: "hello",
-          version: 1,
-          peer: "ingress",
-          token: "host-ticket",
-          slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, linkedAt),
-        }),
+      await runSignal(
+        signal,
+        signal.receive(
+          socket,
+          JSON.stringify({
+            type: "hello",
+            version: 1,
+            peer: "ingress",
+            token: "host-ticket",
+            slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, linkedAt),
+          }),
+        ),
       );
       expect(socket.messages.at(-1)).toContain('"type":"ready"');
       socket.messages.length = 0;
@@ -214,9 +224,9 @@ describe("Slack request route", () => {
       const pending = post(app, body);
       await vi.waitFor(() => expect(socket.messages).toHaveLength(1));
       const { requestId } = JSON.parse(socket.messages.pop() ?? "{}");
-      await signal.receive(
-        socket,
-        JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 }),
+      await runSignal(
+        signal,
+        signal.receive(socket, JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 })),
       );
       expect((await pending).status).toBe(200);
     };
@@ -253,15 +263,18 @@ describe("Slack request route", () => {
     const hello = async (linkedAt: number) => {
       const socket = testSocket(crypto.randomUUID());
       signal.connect(socket);
-      await signal.receive(
-        socket,
-        JSON.stringify({
-          type: "hello",
-          version: 1,
-          peer: "ingress",
-          token: "host-ticket",
-          slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, linkedAt),
-        }),
+      await runSignal(
+        signal,
+        signal.receive(
+          socket,
+          JSON.stringify({
+            type: "hello",
+            version: 1,
+            peer: "ingress",
+            token: "host-ticket",
+            slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, linkedAt),
+          }),
+        ),
       );
       return socket;
     };
@@ -282,9 +295,9 @@ describe("Slack request route", () => {
     const pending = post(app, body);
     await vi.waitFor(() => expect(current.messages).toHaveLength(2));
     const { requestId } = JSON.parse(current.messages[1] ?? "{}");
-    await signal.receive(
-      current,
-      JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 }),
+    await runSignal(
+      signal,
+      signal.receive(current, JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 })),
     );
     expect((await pending).status).toBe(200);
   });
@@ -295,15 +308,18 @@ describe("Slack request route", () => {
     const connect = async (id: string, appId: string) => {
       const socket = testSocket(id);
       signal.connect(socket);
-      await signal.receive(
-        socket,
-        JSON.stringify({
-          type: "hello",
-          version: 1,
-          peer: "ingress",
-          token: "host-ticket",
-          slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, 1_000, appId),
-        }),
+      await runSignal(
+        signal,
+        signal.receive(
+          socket,
+          JSON.stringify({
+            type: "hello",
+            version: 1,
+            peer: "ingress",
+            token: "host-ticket",
+            slackRoute: await route({ hid: "host-1", teams: ["T1"] }, 3_600, 1_000, appId),
+          }),
+        ),
       );
       socket.messages.length = 0;
       return socket;
@@ -320,9 +336,9 @@ describe("Slack request route", () => {
     const answer = async (socket: TestSocket, pending: Promise<Response>) => {
       await vi.waitFor(() => expect(socket.messages).toHaveLength(1));
       const { requestId } = JSON.parse(socket.messages.pop() ?? "{}");
-      await signal.receive(
-        socket,
-        JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 }),
+      await runSignal(
+        signal,
+        signal.receive(socket, JSON.stringify({ type: "slack-delivery-result", version: 1, requestId, status: 200 })),
       );
       expect((await pending).status).toBe(200);
     };
@@ -429,7 +445,7 @@ async function slackRoute(
       .setIssuedAt(now - 120)
       .setExpirationTime(now + lifetimeSeconds)
       .sign(privateKey);
-  const app = createRemoteApiApp(config, signal);
+  const app = createRemoteApiApp(config, signal, signalRuntime(signal));
   // What the account service sends when it unlinks or moves a workspace.
   const revoke = async (teamId: string, through: number) => {
     const body = JSON.stringify({ type: "slack-route-revoked", appId: "APROD", teamId, through });

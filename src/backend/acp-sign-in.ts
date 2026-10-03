@@ -1,10 +1,10 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
 import { cliSpawnTarget } from "./cli";
-import { type ProviderClientOperationError, providerFailure, runProviderClientEffect } from "./provider-client-effects";
+import { type ProviderClientOperationError, providerFailure } from "./provider-client-effects";
 import { stopProcessTree } from "./windows-process-tree";
 
 /** The messages this client sends: two requests, and a refusal for each request the server makes. */
@@ -22,25 +22,32 @@ type AcpMessage =
  * `done` settles when the call answers, and the process is stopped then. It rejects when the call
  * fails, the process ends first, or `timeoutMs` passes.
  */
-export function startAcpAuthentication(options: {
+export const startAcpAuthentication = Effect.fnUntraced(function* (options: {
   executable: string;
   argv: readonly string[];
   env: Record<string, string>;
   methodId: string;
   timeoutMs: number;
-}): { child: ChildProcess; done: Promise<void> } {
+}) {
   // Cursor's Windows launcher is a `.cmd` file, which starts only through `cmd.exe`.
   const target = cliSpawnTarget(options.executable, options.argv);
-  const child = spawn(target.command, target.args, {
-    cwd: process.cwd(),
-    env: { ...process.env, ...options.env },
-    windowsVerbatimArguments: target.windowsVerbatimArguments,
-    // The server prints the sign-in URL on stderr. It opens the browser itself, so nothing reads it.
-    stdio: ["pipe", "pipe", "ignore"],
-    shell: false,
-    windowsHide: process.platform === "win32",
-  });
-  const done = runProviderClientEffect(
+  const child = yield* Effect.acquireRelease(
+    Effect.try({
+      try: () =>
+        spawn(target.command, target.args, {
+          cwd: process.cwd(),
+          env: { ...process.env, ...options.env },
+          windowsVerbatimArguments: target.windowsVerbatimArguments,
+          // The server prints the sign-in URL on stderr. It opens the browser itself, so nothing reads it.
+          stdio: ["pipe", "pipe", "ignore"],
+          shell: false,
+          windowsHide: process.platform === "win32",
+        }),
+      catch: providerFailure,
+    }),
+    (child) => stopProcessTree(child).pipe(Effect.orDie),
+  );
+  const done = yield* Effect.forkScoped(
     Effect.callback<void, ProviderClientOperationError>((resume) => {
       let settled = false;
       const settle = (error: Error | null) => {
@@ -95,9 +102,9 @@ export function startAcpAuthentication(options: {
         lines.close();
         child.removeListener("exit", exited);
         child.stdin.end();
-        stopProcessTree(child);
       });
-    }),
+    }).pipe(Effect.ensuring(stopProcessTree(child).pipe(Effect.orDie))),
+    { startImmediately: true },
   );
-  return { child, done };
-}
+  return { child, done: Fiber.join(done) };
+});

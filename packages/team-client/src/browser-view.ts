@@ -24,8 +24,8 @@ function viewFailure(error: unknown): BrowserViewError {
 }
 
 export interface RemoteBrowserView {
-  input(value: BrowserViewInput): Promise<void>;
-  close(): Promise<void>;
+  input(value: BrowserViewInput): Effect.Effect<void, BrowserViewError>;
+  close(): Effect.Effect<void, BrowserViewError>;
 }
 interface View {
   streamId: string;
@@ -127,11 +127,11 @@ export function createRemoteBrowserView(
       );
     });
     return {
-      input: (value) => runTeamEffect(input(value)),
-      close: () => {
+      input,
+      close: Effect.fn("RemoteBrowserView.closeHandle")(function* () {
         if (view === next) disconnect();
-        return runTeamEffect(release(next));
-      },
+        yield* release(next);
+      }),
     };
   });
   return {
@@ -160,7 +160,6 @@ export function createRemoteBrowserView(
         void runTeamEffect(close()).catch(() => undefined);
       }
     },
-    open: (tabId: string, frame: (frame: BrowserViewFrame) => void, ended: () => void) =>
-      runTeamEffect(open(tabId, frame, ended)),
+    open,
   };
 }

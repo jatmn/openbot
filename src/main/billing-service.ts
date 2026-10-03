@@ -6,11 +6,13 @@ import {
 } from "@openbot/contracts/billing";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, type Layer } from "effect";
-import { AccountServicePlatform, runAccountEffect } from "./account-service-platform";
+import {
+  type AccountRequestClient,
+  type AccountServiceFailure,
+  AccountServicePlatform,
+} from "./account-service-platform";
 
-export interface BillingAuthClient {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
-}
+export type BillingAuthClient = AccountRequestClient;
 
 /**
  * The Stripe plan of each server that the account pays for. The renderer never sends a URL: this
@@ -24,12 +26,12 @@ export class BillingDesktopService {
     this.#platform = AccountServicePlatform.layer(auth, openExternal);
   }
 
-  getState(): Promise<BillingState> {
-    return runAccountEffect(readBillingState(), this.#platform);
+  getState(): Effect.Effect<BillingState, AccountServiceFailure> {
+    return readBillingState().pipe(Effect.provide(this.#platform));
   }
 
-  openPortal(request: BillingPortalRequest): Promise<void> {
-    return runAccountEffect(openBillingPortal(request), this.#platform);
+  openPortal(request: BillingPortalRequest): Effect.Effect<void, AccountServiceFailure> {
+    return openBillingPortal(request).pipe(Effect.provide(this.#platform));
   }
 }
 

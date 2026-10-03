@@ -15,7 +15,7 @@
 import { connect, type Socket } from "node:net";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
-import { CuaDriverFailure, runCua } from "./cua-driver-effects";
+import { CuaDriverFailure } from "./cua-driver-effects";
 
 /** How long one read may take before the connection is given up and the tick keeps the last answer. */
 const REQUEST_TIMEOUT_MS = 2_000;
@@ -76,16 +76,14 @@ export class CuaDriverDaemonClient {
    * The result is the tool's own structured payload, which is what the driver's command line
    * prints, so the readers above it see exactly what they saw before.
    */
-  listWindows(): Promise<unknown> {
-    return runCua(
-      this.#request({
-        method: "call",
-        name: "list_windows",
-        args: {},
-        session_id: SESSION_ID,
-        client_kind: "cli",
-      }).pipe(Effect.map((result) => (isDynamicRecord(result) ? result.structuredContent : null))),
-    );
+  listWindows(): Effect.Effect<unknown, CuaDriverFailure> {
+    return this.#request({
+      method: "call",
+      name: "list_windows",
+      args: {},
+      session_id: SESSION_ID,
+      client_kind: "cli",
+    }).pipe(Effect.map((result) => (isDynamicRecord(result) ? result.structuredContent : null)));
   }
 
   /**
@@ -95,21 +93,19 @@ export class CuaDriverDaemonClient {
    * through the tools, so the agent's lease - which is what the rim is about - is visible on this
    * method and on no other.
    */
-  sessions(): Promise<unknown> {
-    return runCua(this.#request({ method: "sessions_list", client_kind: "cli" }));
+  sessions(): Effect.Effect<unknown, CuaDriverFailure> {
+    return this.#request({ method: "sessions_list", client_kind: "cli" });
   }
 
   /** Ends the lease and drops the connection. Safe to call when nothing is connected. */
-  close(): Promise<void> {
-    return runCua(
-      Effect.gen({ self: this }, function* () {
-        if (this.#socket)
-          yield* this.#request({ method: "session_end", session_id: SESSION_ID, client_kind: "cli" }).pipe(
-            Effect.catch(() => Effect.void),
-          );
-      }).pipe(
-        Effect.ensuring(Effect.sync(() => this.#drop(new Error("The Computer Use driver connection was closed.")))),
-      ),
+  close(): Effect.Effect<void, CuaDriverFailure> {
+    return Effect.gen({ self: this }, function* () {
+      if (this.#socket)
+        yield* this.#request({ method: "session_end", session_id: SESSION_ID, client_kind: "cli" }).pipe(
+          Effect.catch(() => Effect.void),
+        );
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => this.#drop(new Error("The Computer Use driver connection was closed.")))),
     );
   }
 

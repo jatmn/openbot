@@ -1,7 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { isNumber, isString } from "@openbot/contracts/runtime-values";
-import { Effect, Result, Schema } from "effect";
+import { Effect } from "effect";
 import { type AgentProvider, RequestTimeoutError } from "./agent-client";
 import { cliSpawnTarget } from "./cli";
 import { JsonLineDecoder, LineTooLongError } from "./jsonl";
@@ -15,6 +15,7 @@ import {
   type RpcError,
   type RpcMessage,
 } from "./protocol";
+import { ProviderClientOperationError } from "./provider-client-effects";
 import { createDiagnosticStream } from "./stderr-diagnostics";
 
 interface PendingRequest {
@@ -103,32 +104,28 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     });
   }
 
-  async stop(): Promise<void> {
+  readonly stop = Effect.fn("CodexAppServer.stop")(function* (this: CodexAppServerClient) {
     const child = this.#process;
     if (!child) return;
-
     this.#stopping = true;
     this.#process = null;
-
-    for (const pending of this.#pending.values()) {
-      pending.reject(new Error("Codex App Server stopped."));
-    }
+    for (const pending of this.#pending.values()) pending.reject(new Error("Codex App Server stopped."));
     this.#pending.clear();
-
     child.stdin.end();
     if (child.exitCode !== null) return;
-
-    await new Promise<void>((resolve) => {
+    yield* Effect.callback<void>((resume) => {
       const forceKill = setTimeout(() => {
         if (child.exitCode === null) child.kill("SIGKILL");
       }, 2_000);
-      child.once("exit", () => {
-        clearTimeout(forceKill);
-        resolve();
-      });
+      const exited = () => resume(Effect.void);
+      child.once("exit", exited);
       child.kill("SIGTERM");
+      return Effect.sync(() => {
+        clearTimeout(forceKill);
+        child.off("exit", exited);
+      });
     });
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Drops this connection's hold on one thread and keeps the app server for the others.
@@ -142,23 +139,15 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
    * A thread this connection never subscribed to answers `NotSubscribed`, which is not an error
    * here: either way this side has stopped using it.
    */
-  async releaseThread(threadId: string): Promise<void> {
+  readonly releaseThread = Effect.fn("CodexAppServer.releaseThread")(function* (
+    this: CodexAppServerClient,
+    threadId: string,
+  ) {
     if (!this.running) return;
-    await this.request("thread/unsubscribe", { threadId }, decodeRecordResponse);
-  }
+    yield* this.request("thread/unsubscribe", { threadId }, decodeRecordResponse);
+  });
 
-  async request<T>(
-    method: string,
-    params: unknown,
-    decoder: ResponseDecoder<T>,
-    timeoutMs = this.#requestTimeoutMs,
-  ): Promise<T> {
-    const result = await Effect.runPromise(Effect.result(this.requestEffect(method, params, decoder, timeoutMs)));
-    if (Result.isFailure(result)) throw result.failure.cause;
-    return result.success;
-  }
-
-  readonly requestEffect = Effect.fn("CodexAppServer.request")(function* <T>(
+  readonly request = Effect.fn("CodexAppServer.request")(function* <T>(
     this: CodexAppServerClient,
     method: string,
     params: unknown,
@@ -166,27 +155,28 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     timeoutMs = this.#requestTimeoutMs,
   ) {
     const id = this.#nextId++;
-    return yield* Effect.callback<T, AppServerRequestFailed>((resume) => {
+    return yield* Effect.callback<T, ProviderClientOperationError>((resume) => {
       this.#pending.set(id, {
         resolve: (value) =>
           resume(
             Effect.try({
               try: () => decoder(value),
-              catch: (cause) => new AppServerRequestFailed({ cause }),
+              catch: (cause) => new ProviderClientOperationError({ cause }),
             }),
           ),
-        reject: (cause) => resume(Effect.fail(new AppServerRequestFailed({ cause }))),
+        reject: (cause) => resume(Effect.fail(new ProviderClientOperationError({ cause }))),
       });
       try {
         this.#write({ method, id, params });
       } catch (cause) {
-        resume(Effect.fail(new AppServerRequestFailed({ cause })));
+        resume(Effect.fail(new ProviderClientOperationError({ cause })));
       }
       return Effect.sync(() => this.#pending.delete(id));
     }).pipe(
       Effect.timeoutOrElse({
         duration: timeoutMs,
-        orElse: () => Effect.fail(new AppServerRequestFailed({ cause: new RequestTimeoutError("Codex", method) })),
+        orElse: () =>
+          Effect.fail(new ProviderClientOperationError({ cause: new RequestTimeoutError("Codex", method) })),
       }),
       Effect.ensuring(Effect.sync(() => this.#pending.delete(id))),
     );
@@ -266,6 +256,3 @@ function redactDiagnostic(message: string): string {
 }
 
 /** Kept inside the adapter; public callers still receive the native protocol error. */
-export class AppServerRequestFailed extends Schema.TaggedError<AppServerRequestFailed>()("AppServerRequestFailed", {
-  cause: Schema.Defect(),
-}) {}

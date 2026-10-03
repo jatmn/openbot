@@ -2,10 +2,10 @@
 
 import { readFile, rm } from "node:fs/promises";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result } from "effect";
+import { Effect, Result, Semaphore } from "effect";
 import { z } from "zod";
 import { writeJsonFileAtomically } from "../backend/atomic-json-file";
-import { GitHubOperationError, githubCall, githubDecode, runGitHubEffect } from "./github-effects";
+import { GitHubOperationError, githubCall, githubDecode } from "./github-effects";
 import type { SecretCipher } from "./provider-credential-store";
 
 const githubConnectorRecordSchema = z.object({
@@ -44,7 +44,7 @@ export class GitHubConnectorStore {
   readonly #path: string;
   readonly #cipher: SecretCipher;
   #record: GitHubConnectorRecord | null = null;
-  #queue: Promise<void> = Promise.resolve();
+  readonly #queue = Semaphore.makeUnsafe(1);
 
   constructor(path: string, cipher: SecretCipher) {
     this.#path = path;
@@ -52,11 +52,8 @@ export class GitHubConnectorStore {
   }
 
   /** Reads the file. Returns the error when the file is there but cannot be read. */
-  load(): Promise<Error | null> {
-    return runGitHubEffect(this.loadEffect());
-  }
 
-  readonly loadEffect = Effect.fn("GitHubConnectorStore.load")(function* (this: GitHubConnectorStore) {
+  readonly load = Effect.fn("GitHubConnectorStore.load")(function* (this: GitHubConnectorStore) {
     this.#record = null;
     const result = yield* this.#readEffect().pipe(Effect.result);
     if (Result.isFailure(result)) {
@@ -71,35 +68,24 @@ export class GitHubConnectorStore {
     return this.#record;
   }
 
-  write(record: GitHubConnectorRecord): Promise<void> {
-    return this.#enqueue(() => runGitHubEffect(this.#writeEffect(record)));
-  }
+  readonly write = Effect.fn("GitHubConnectorStore.write")(
+    function* (this: GitHubConnectorStore, record: GitHubConnectorRecord) {
+      const encrypted = yield* githubDecode(() => this.#cipher.encrypt(JSON.stringify(record)).toString("base64"));
+      yield* writeJsonFileAtomically(this.#path, { version: 1, record: encrypted }, { createDirectory: true }).pipe(
+        Effect.mapError((error) => new GitHubOperationError({ cause: error.cause })),
+      );
+      this.#record = record;
+    },
+    (operation) => this.#queue.withPermit(operation).pipe(Effect.uninterruptible),
+  );
 
-  readonly #writeEffect = Effect.fn("GitHubConnectorStore.write")(function* (
-    this: GitHubConnectorStore,
-    record: GitHubConnectorRecord,
-  ) {
-    const encrypted = yield* githubDecode(() => this.#cipher.encrypt(JSON.stringify(record)).toString("base64"));
-    yield* githubCall(() =>
-      writeJsonFileAtomically(this.#path, { version: 1, record: encrypted }, { createDirectory: true }),
-    );
-    this.#record = record;
-  });
-
-  clear(): Promise<void> {
-    return this.#enqueue(() => runGitHubEffect(this.#clearEffect()));
-  }
-
-  readonly #clearEffect = Effect.fn("GitHubConnectorStore.clear")(function* (this: GitHubConnectorStore) {
-    yield* githubCall(() => rm(this.#path, { force: true }));
-    this.#record = null;
-  });
-
-  #enqueue(change: () => Promise<void>): Promise<void> {
-    const result = this.#queue.then(change, change);
-    this.#queue = result.catch(() => undefined);
-    return result;
-  }
+  readonly clear = Effect.fn("GitHubConnectorStore.clear")(
+    function* (this: GitHubConnectorStore) {
+      yield* githubCall(() => rm(this.#path, { force: true }));
+      this.#record = null;
+    },
+    (operation) => this.#queue.withPermit(operation).pipe(Effect.uninterruptible),
+  );
 
   readonly #readEffect = Effect.fn("GitHubConnectorStore.read")(function* (
     this: GitHubConnectorStore,

@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { type GitHubOperationError, githubCall, runGitHubEffect } from "./github-effects";
+import { GitHubOperationError, githubCall } from "./github-effects";
 // The GitHub MCP server that agents reach on this computer. It forwards to GitHub's remote MCP
 // server with the token for each call: the bot token of the repository that the call names, or
 // the user token.
@@ -36,14 +36,14 @@ export interface GitHubMcpProxyOptions {
   /** The bearer that agents send. It stays the same across restarts, so a resumed session keeps working. */
   secret: () => string;
   /** The user token, or null while the connection is not active. */
-  userToken: () => Promise<string | null>;
+  userToken: () => Effect.Effect<string | null, GitHubOperationError>;
   /** The bot token of `owner/name`, or null when the user token applies. */
   botToken: (owner: string, name: string) => string | null;
 }
 
 interface Upstream {
   client: Client;
-  ready: Promise<void>;
+  ready: Effect.Effect<void, GitHubOperationError>;
 }
 
 /**
@@ -73,56 +73,64 @@ export class GitHubMcpProxy {
    * Listens on `preferredPort` when it is free, so a resumed session finds the same URL, and on a new
    * port when it is not. Returns the port.
    */
-  async start(preferredPort: number | null): Promise<number> {
+  readonly start = Effect.fn("GitHubMcpProxy.start")(function* (this: GitHubMcpProxy, preferredPort: number | null) {
     if (this.#port !== null) return this.#port;
-    let server: HttpServer;
-    try {
-      server = await this.#listen(preferredPort ?? 0);
-    } catch (error) {
-      if (preferredPort === null) throw error;
-      server = await this.#listen(0);
-    }
+    const server = yield* this.#listen(preferredPort ?? 0).pipe(
+      Effect.catch((error) => (preferredPort === null ? Effect.fail(error) : this.#listen(0))),
+    );
     const address = server.address();
     if (!address || isString(address)) {
       server.close();
-      throw new Error("The GitHub MCP proxy has no loopback port.");
+      return yield* new GitHubOperationError({ cause: new Error("The GitHub MCP proxy has no loopback port.") });
     }
     this.#server = server;
     this.#port = address.port;
     return address.port;
-  }
+  });
 
-  /** Closes the upstream clients of tokens that no longer apply. */
-  retain(tokens: ReadonlySet<string>): void {
+  readonly retain = Effect.fn("GitHubMcpProxy.retain")(function* (this: GitHubMcpProxy, tokens: ReadonlySet<string>) {
+    const removed: Client[] = [];
     for (const [token, upstream] of this.#upstreams) {
       if (tokens.has(token)) continue;
       this.#upstreams.delete(token);
-      void runGitHubEffect(githubCall(() => upstream.client.close()).pipe(Effect.catch(() => Effect.void)));
+      removed.push(upstream.client);
     }
-  }
+    yield* Effect.forEach(removed, (client) => githubCall(() => client.close()).pipe(Effect.catch(() => Effect.void)), {
+      concurrency: "unbounded",
+    });
+  });
 
-  async stop(): Promise<void> {
-    this.retain(new Set());
+  readonly stop = Effect.fn("GitHubMcpProxy.stop")(function* (this: GitHubMcpProxy) {
+    yield* this.retain(new Set());
     const server = this.#server;
     this.#server = null;
     this.#port = null;
-    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+    if (server)
+      yield* Effect.callback<void>((resume) => {
+        server.close(() => resume(Effect.void));
+      });
+  });
 
-  #listen(port: number): Promise<HttpServer> {
-    const server = createServer((request, response) => void this.#handle(request, response));
-    return new Promise((resolve, reject) => {
-      server.once("error", reject);
+  #listen(port: number): Effect.Effect<HttpServer, GitHubOperationError> {
+    return Effect.callback((resume) => {
+      const server = createServer((request, response) => {
+        void Effect.runPromise(this.#handleEffect(request, response).pipe(Effect.mapError((error) => error.cause)));
+      });
+      let transferred = false;
+      const failed = (cause: Error) => resume(Effect.fail(new GitHubOperationError({ cause })));
+      server.once("error", failed);
       server.listen(port, "127.0.0.1", () => {
-        server.off("error", reject);
-        resolve(server);
+        transferred = true;
+        server.off("error", failed);
+        resume(Effect.succeed(server));
+      });
+      return Effect.sync(() => {
+        server.off("error", failed);
+        if (!transferred) server.close();
       });
     });
   }
 
-  #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    return runGitHubEffect(this.#handleEffect(request, response));
-  }
   readonly #handleEffect = Effect.fn("GitHubMcpProxy.handle")(function* (
     this: GitHubMcpProxy,
     request: IncomingMessage,
@@ -138,7 +146,7 @@ export class GitHubMcpProxy {
       response.end();
       return;
     }
-    const userToken = yield* githubCall(() => this.#options.userToken());
+    const userToken = yield* this.#options.userToken();
     if (!userToken) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "github_not_connected" }));
@@ -161,7 +169,9 @@ export class GitHubMcpProxy {
     const transport = new StreamableHTTPServerTransport({});
     yield* Effect.gen(function* () {
       yield* githubCall(() => mcp.connect(transport));
-      const body = yield* githubCall(() => readJsonBody(request, MAX_BODY_BYTES));
+      const body = yield* readJsonBody(request, MAX_BODY_BYTES).pipe(
+        Effect.mapError((error) => new GitHubOperationError({ cause: error.cause })),
+      );
       yield* githubCall(() => transport.handleRequest(request, response, body));
     }).pipe(
       Effect.catch(() =>
@@ -192,7 +202,7 @@ export class GitHubMcpProxy {
     this: GitHubMcpProxy,
     userToken: string,
   ): Effect.fn.Return<Server, GitHubOperationError> {
-    const user = yield* this.#upstreamEffect(userToken);
+    const user = yield* this.#upstream(userToken);
     const capabilities = user.getServerCapabilities() ?? {};
     const instructions = user.getInstructions();
     const mcp = new Server(
@@ -206,7 +216,8 @@ export class GitHubMcpProxy {
         ...(instructions ? { instructions } : {}),
       },
     );
-    const forward = <T>(token: string, call: (client: Client) => Promise<T>) => this.#call(token, call);
+    const forward = <T>(token: string, call: (client: Client) => Promise<T>) =>
+      Effect.runPromise(this.#call(token, call).pipe(Effect.mapError((error) => error.cause)));
     mcp.setRequestHandler(ListToolsRequestSchema, ({ params }, extra) =>
       forward(userToken, (client) => client.listTools(params, requestOptions(extra.signal))),
     );
@@ -242,29 +253,26 @@ export class GitHubMcpProxy {
   });
 
   /** One call on the client of `token`. A session that GitHub ended opens again once. */
-  #call<T>(token: string, call: (client: Client) => Promise<T>): Promise<T> {
-    return runGitHubEffect(this.#callEffect(token, call));
-  }
-  readonly #callEffect = Effect.fn("GitHubMcpProxy.call")(function* <T>(
+  readonly #call = Effect.fn("GitHubMcpProxy.call")(function* <T>(
     this: GitHubMcpProxy,
     token: string,
     call: (client: Client) => Promise<T>,
   ): Effect.fn.Return<T, GitHubOperationError> {
-    const client = yield* this.#upstreamEffect(token);
+    const client = yield* this.#upstream(token);
     return yield* githubCall(() => call(client)).pipe(
       Effect.catch((failure) =>
         Effect.gen({ self: this }, function* () {
           const error = failure.cause;
           if (!(error instanceof StreamableHTTPError && error.code === 404)) return yield* failure;
-          this.#drop(token, client);
-          const replacement = yield* this.#upstreamEffect(token);
+          yield* this.#drop(token, client);
+          const replacement = yield* this.#upstream(token);
           return yield* githubCall(() => call(replacement));
         }),
       ),
     );
   });
 
-  readonly #upstreamEffect = Effect.fn("GitHubMcpProxy.upstream")(function* (
+  readonly #upstream = Effect.fn("GitHubMcpProxy.upstream")(function* (
     this: GitHubMcpProxy,
     token: string,
   ): Effect.fn.Return<Client, GitHubOperationError> {
@@ -274,23 +282,21 @@ export class GitHubMcpProxy {
       const transport = new StreamableHTTPClientTransport(new URL(this.#options.upstreamUrl), {
         requestInit: { headers: { Authorization: `Bearer ${token}` } },
       });
-      upstream = { client, ready: runGitHubEffect(githubCall(() => client.connect(transport))) };
+      upstream = { client, ready: yield* Effect.cached(githubCall(() => client.connect(transport))) };
       this.#upstreams.set(token, upstream);
     }
     const current = upstream;
-    yield* githubCall(() => current.ready).pipe(
-      Effect.tapError(() => Effect.sync(() => this.#drop(token, current.client))),
-    );
+    yield* current.ready.pipe(Effect.tapError(() => this.#drop(token, current.client)));
     return current.client;
   });
 
   /** Closes `client` only while it is the client of `token`: a parallel call can have opened a new one. */
-  #drop(token: string, client: Client): void {
+  readonly #drop = Effect.fn("GitHubMcpProxy.drop")(function* (this: GitHubMcpProxy, token: string, client: Client) {
     const upstream = this.#upstreams.get(token);
     if (upstream?.client !== client) return;
     this.#upstreams.delete(token);
-    void runGitHubEffect(githubCall(() => client.close()).pipe(Effect.catch(() => Effect.void)));
-  }
+    yield* githubCall(() => client.close()).pipe(Effect.catch(() => Effect.void));
+  });
 
   #authorized(request: IncomingMessage): boolean {
     const header = request.headers.authorization;

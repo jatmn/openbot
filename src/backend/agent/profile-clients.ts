@@ -20,7 +20,7 @@ export class ProfileClients {
   }
 
   /** Runs one generation on `client`, and forgets the client when it ends. */
-  runEffect<A, E, R>(
+  run<A, E, R>(
     client: AgentClient,
     generate: (cancelled: () => boolean) => Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E, R> {
@@ -39,16 +39,16 @@ export class ProfileClients {
   }
 
   /** Ends every disposable generation that may reach an endpoint the user has taken out. */
-  stopOpenCode(): void {
+  readonly stopOpenCode = Effect.fn("ProfileClients.stopOpenCode")(function* (this: ProfileClients) {
     for (const [client, generation] of this.#clients) {
       if (client.provider !== "opencode") continue;
       // The generation is cancelled as well as the client stopped. A generation still preparing its
       // workspace holds no process, so the stop reaches nothing, and its own `start()` would then
       // spawn the process with the endpoints as they were before this change.
       generation.cancelled = true;
-      void client.stop().catch(() => undefined);
+      yield* client.stop().pipe(Effect.ignore);
     }
-  }
+  }).bind(this);
 
   /** Every client, forgotten, for the caller to stop at shutdown. */
   release(): AgentClient[] {

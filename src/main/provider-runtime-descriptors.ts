@@ -33,11 +33,11 @@ import {
 } from "../backend/cli";
 import { sha256File } from "../backend/file-hash";
 import {
-  assertSafeArchiveEffect,
-  extractArchiveEffect,
-  extractZipFilesEffect,
-  extractZipTreeEffect,
-  rejectNonRegularFilesEffect,
+  assertSafeArchive,
+  extractArchive,
+  extractZipFiles,
+  extractZipTree,
+  rejectNonRegularFiles,
 } from "./provider-runtime-archive";
 import { ProviderRuntimeFailure, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 
@@ -192,9 +192,9 @@ const withNpmPackage = Effect.fn("ProviderRuntime.withNpmPackage")(function* (
     runtimeIO(() => mkdir(extracted, { recursive: true })),
     () =>
       Effect.gen(function* () {
-        yield* assertSafeArchiveEffect(downloadedPath, ["package"], expected.archivePathError);
-        yield* extractArchiveEffect(downloadedPath, extracted);
-        yield* rejectNonRegularFilesEffect(extracted);
+        yield* assertSafeArchive(downloadedPath, ["package"], expected.archivePathError);
+        yield* extractArchive(downloadedPath, extracted);
+        yield* rejectNonRegularFiles(extracted);
         const packageRoot = join(extracted, "package");
         const text = yield* runtimeIO(() => readFile(join(packageRoot, "package.json"), "utf8"));
         const packageManifest = yield* runtimeSync(() => JSON.parse(text));
@@ -240,13 +240,9 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       lock,
       downloadSmallFile,
     }: ProviderStageContext): Effect.fn.Return<void, ProviderRuntimeFailure> {
-      yield* assertSafeArchiveEffect(
-        downloadedPath,
-        CODEX_ARCHIVE_ROOTS,
-        sourceText("error.provider.codexArchivePath"),
-      );
-      yield* extractArchiveEffect(downloadedPath, staging);
-      yield* rejectNonRegularFilesEffect(staging);
+      yield* assertSafeArchive(downloadedPath, CODEX_ARCHIVE_ROOTS, sourceText("error.provider.codexArchivePath"));
+      yield* extractArchive(downloadedPath, staging);
+      yield* rejectNonRegularFiles(staging);
       const license = yield* downloadSmallFile(
         `${lock.codex.repository}/raw/${encodeURIComponent(codexTag(spec.version))}/LICENSE`,
         pinnedHash(spec, lock.codex.licenseSha256),
@@ -346,9 +342,16 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     ): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const artifact = lock.claude.artifacts[spec.target];
       const executable = join(root, "bin", spec.executableName);
-      if ((yield* runtimeIO(() => sha256File(executable))) !== artifact.binarySha256)
+      if (
+        (yield* sha256File(executable).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })))) !==
+        artifact.binarySha256
+      )
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.claudeChecksum")) });
-      if ((yield* runtimeIO(() => sha256File(join(root, "LICENSE.md")))) !== lock.claude.licenseSha256) {
+      if (
+        (yield* sha256File(join(root, "LICENSE.md")).pipe(
+          Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+        )) !== lock.claude.licenseSha256
+      ) {
         return yield* new ProviderRuntimeFailure({
           cause: new Error(sourceText("error.provider.claudeLicenseChecksum")),
         });
@@ -429,10 +432,17 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     ): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const artifact = lock.opencode.artifacts[spec.target];
       const executable = join(root, "bin", spec.executableName);
-      if ((yield* runtimeIO(() => sha256File(executable))) !== artifact.binarySha256) {
+      if (
+        (yield* sha256File(executable).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })))) !==
+        artifact.binarySha256
+      ) {
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.opencodeChecksum")) });
       }
-      if ((yield* runtimeIO(() => sha256File(join(root, "LICENSE")))) !== lock.opencode.licenseSha256) {
+      if (
+        (yield* sha256File(join(root, "LICENSE")).pipe(
+          Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+        )) !== lock.opencode.licenseSha256
+      ) {
         return yield* new ProviderRuntimeFailure({
           cause: new Error(sourceText("error.provider.opencodeLicenseChecksum")),
         });
@@ -495,15 +505,26 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       lock: AgentRuntimeLock,
     ): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const executable = join(root, "bin", spec.executableName);
-      if ((yield* runtimeIO(() => sha256File(executable))) !== lock.grok.artifacts[spec.target].assetSha256) {
+      if (
+        (yield* sha256File(executable).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })))) !==
+        lock.grok.artifacts[spec.target].assetSha256
+      ) {
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.grokChecksum")) });
       }
-      if ((yield* runtimeIO(() => sha256File(join(root, "LICENSE")))) !== lock.grok.licenseSha256) {
+      if (
+        (yield* sha256File(join(root, "LICENSE")).pipe(
+          Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+        )) !== lock.grok.licenseSha256
+      ) {
         return yield* new ProviderRuntimeFailure({
           cause: new Error(sourceText("error.provider.grokLicenseChecksum")),
         });
       }
-      if ((yield* runtimeIO(() => sha256File(join(root, "THIRD-PARTY-NOTICES")))) !== lock.grok.noticesSha256) {
+      if (
+        (yield* sha256File(join(root, "THIRD-PARTY-NOTICES")).pipe(
+          Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+        )) !== lock.grok.noticesSha256
+      ) {
         return yield* new ProviderRuntimeFailure({
           cause: new Error(sourceText("error.provider.grokNoticesChecksum")),
         });
@@ -539,7 +560,7 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       const bin = join(staging, "bin");
       const harness = antigravityHarnessName(spec.target);
       yield* runtimeIO(() => mkdir(bin, { recursive: true }));
-      yield* extractZipFilesEffect(
+      yield* extractZipFiles(
         downloadedPath,
         bin,
         [spec.executableName, harness],
@@ -575,8 +596,12 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       const artifact = lock.antigravity.artifacts[spec.target];
       const [executable, harness] = yield* Effect.all(
         [
-          runtimeIO(() => sha256File(join(root, "bin", artifact.executable))),
-          runtimeIO(() => sha256File(join(root, "bin", artifact.harness))),
+          sha256File(join(root, "bin", artifact.executable)).pipe(
+            Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+          ),
+          sha256File(join(root, "bin", artifact.harness)).pipe(
+            Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+          ),
         ],
         { concurrency: "unbounded" },
       );
@@ -620,12 +645,12 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     }: ProviderStageContext): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const message = sourceText("error.provider.cursorArchivePath");
       if (spec.target === "win32-x64") {
-        yield* extractZipTreeEffect(downloadedPath, staging, CURSOR_ARCHIVE_ROOT, message);
+        yield* extractZipTree(downloadedPath, staging, CURSOR_ARCHIVE_ROOT, message);
       } else {
-        yield* assertSafeArchiveEffect(downloadedPath, [CURSOR_ARCHIVE_ROOT], message);
-        yield* extractArchiveEffect(downloadedPath, staging);
+        yield* assertSafeArchive(downloadedPath, [CURSOR_ARCHIVE_ROOT], message);
+        yield* extractArchive(downloadedPath, staging);
       }
-      yield* rejectNonRegularFilesEffect(staging);
+      yield* rejectNonRegularFiles(staging);
       yield* runtimeIO(() => rename(join(staging, CURSOR_ARCHIVE_ROOT), join(staging, "bin")));
       yield* runtimeIO(() => access(join(staging, "bin", spec.executableName)));
       yield* runtimeIO(() =>
@@ -646,7 +671,9 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       lock: AgentRuntimeLock,
     ): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const files = Object.entries(lock.cursor.artifacts[spec.target].files);
-      const hashes = yield* runtimeIO(() => Promise.all(files.map(([name]) => sha256File(join(root, "bin", name)))));
+      const hashes = yield* Effect.forEach(files, ([name]) => sha256File(join(root, "bin", name)), {
+        concurrency: "unbounded",
+      }).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })));
       if (files.some(([, sha256], index) => hashes[index] !== sha256)) {
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.cursorChecksum")) });
       }
@@ -737,9 +764,13 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
       const artifact = lock.cline.artifacts[spec.target];
       const [executable, bootstrap, license] = yield* Effect.all(
         [
-          runtimeIO(() => sha256File(join(root, "bin", spec.executableName))),
-          runtimeIO(() => sha256File(join(root, "extensions", "plugin-sandbox-bootstrap.js"))),
-          runtimeIO(() => sha256File(join(root, "LICENSE"))),
+          sha256File(join(root, "bin", spec.executableName)).pipe(
+            Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+          ),
+          sha256File(join(root, "extensions", "plugin-sandbox-bootstrap.js")).pipe(
+            Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+          ),
+          sha256File(join(root, "LICENSE")).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause }))),
         ],
         { concurrency: "unbounded" },
       );
@@ -825,9 +856,16 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     ): Effect.fn.Return<void, ProviderRuntimeFailure> {
       const artifact = lock.bun.artifacts[spec.target];
       const executable = join(root, "bin", spec.executableName);
-      if ((yield* runtimeIO(() => sha256File(executable))) !== artifact.binarySha256)
+      if (
+        (yield* sha256File(executable).pipe(Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })))) !==
+        artifact.binarySha256
+      )
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.bunChecksum")) });
-      if ((yield* runtimeIO(() => sha256File(join(root, "LICENSE.md")))) !== lock.bun.licenseSha256) {
+      if (
+        (yield* sha256File(join(root, "LICENSE.md")).pipe(
+          Effect.mapError(({ cause }) => new ProviderRuntimeFailure({ cause })),
+        )) !== lock.bun.licenseSha256
+      ) {
         return yield* new ProviderRuntimeFailure({ cause: new Error(sourceText("error.provider.bunLicenseChecksum")) });
       }
       // Only the size, because the second name is the same bytes: hashing 80MB twice on every start

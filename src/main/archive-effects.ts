@@ -1,6 +1,6 @@
 import { Effect, Result, Schema } from "effect";
 
-/** Preserves archive failures at the existing Promise interfaces. */
+/** Keeps archive failures typed until the native caller boundary. */
 export class ArchiveOperationError extends Schema.TaggedError<ArchiveOperationError>()("ArchiveOperationError", {
   cause: Schema.Defect(),
 }) {}

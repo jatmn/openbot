@@ -1,7 +1,13 @@
-import { Context, Effect, Layer, Result, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
+import type { CentralAuthOperationError } from "./central-auth-effects";
 
 export interface AccountRequestClient {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
+  requestAuthorized<T>(
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs?: number,
+  ): Effect.Effect<T, CentralAuthOperationError>;
 }
 
 class AccountRequestFailure extends Schema.TaggedError<AccountRequestFailure>()("AccountRequestFailure", {
@@ -30,23 +36,12 @@ export class AccountServicePlatform extends Context.Service<
       AccountServicePlatform,
       AccountServicePlatform.of({
         request: <T>(path: string, init: RequestInit, decode: (value: unknown) => T, timeoutMs?: number) =>
-          Effect.tryPromise({
-            try: () => auth.requestAuthorized(path, init, decode, timeoutMs),
-            catch: (cause) => new AccountRequestFailure({ cause }),
-          }),
+          auth
+            .requestAuthorized(path, init, decode, timeoutMs)
+            .pipe(Effect.mapError((error) => new AccountRequestFailure({ cause: error.cause }))),
         openPage: (url) =>
           Effect.tryPromise({ try: () => openExternal(url), catch: (cause) => new AccountPageFailure({ cause }) }),
       }),
     );
   }
-}
-
-/** No resources are acquired by this layer. Preserve native account failures at the IPC boundary. */
-export async function runAccountEffect<A>(
-  operation: Effect.Effect<A, AccountServiceFailure, AccountServicePlatform>,
-  platform: Layer.Layer<AccountServicePlatform>,
-): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation.pipe(Effect.provide(platform))));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

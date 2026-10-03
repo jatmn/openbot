@@ -10,7 +10,7 @@ import {
   type RuntimeSpec,
   type RuntimeTarget,
 } from "./provider-runtime-descriptors";
-import { ProviderRuntimeFailure, runRuntime, runtimeIO, runtimeSync } from "./provider-runtime-effects";
+import { ProviderRuntimeFailure, runtimeIO, runtimeSync } from "./provider-runtime-effects";
 
 /**
  * The latest release of each provider CLI, read from the source that publishes it.
@@ -254,22 +254,13 @@ const LATEST_RELEASES: Record<
   }),
 };
 
-export function latestRelease(provider: ManagedProviderId, context: LatestReleaseContext): Promise<RuntimeSpec> {
-  return runRuntime(latestReleaseEffect(provider, context));
-}
-
-export function latestReleaseEffect(
+export function latestRelease(
   provider: ManagedProviderId,
   context: LatestReleaseContext,
 ): Effect.Effect<RuntimeSpec, ProviderRuntimeFailure> {
   return LATEST_RELEASES[provider](context);
 }
-
-/** Reads the block list. Rejects when it cannot be read, so the caller keeps the last one it had. */
-export function fetchBlockedVersions(fetch: Fetch): Promise<BlockedVersions> {
-  return runRuntime(fetchBlockedVersionsEffect(fetch));
-}
-export const fetchBlockedVersionsEffect = Effect.fn("ProviderRelease.fetchBlockedVersions")(function* (
+export const fetchBlockedVersions = Effect.fn("ProviderRelease.fetchBlockedVersions")(function* (
   fetch: Fetch,
 ): Effect.fn.Return<BlockedVersions, ProviderRuntimeFailure> {
   const value = yield* fetchJsonEffect(fetch, BLOCKED_VERSIONS_URL);
@@ -398,18 +389,10 @@ const requestEffect = Effect.fn("ProviderRelease.request")(function* (
 const readTextEffect = Effect.fn("ProviderRelease.readText")(function* (
   response: Response,
 ): Effect.fn.Return<string, ProviderRuntimeFailure> {
-  const value = yield* readLimitedBodyEffect(response, sourceText("error.provider.releaseMetadataTooLarge"));
+  const value = yield* readLimitedBody(response, sourceText("error.provider.releaseMetadataTooLarge"));
   return value ? new TextDecoder().decode(value) : "";
 });
-
-/**
- * Reads a small metadata body, and stops at the first byte past `MAX_METADATA_BYTES`: a server that
- * sends no `content-length` cannot make OpenBot buffer an unbounded body. `null` for no body.
- */
-export function readLimitedBody(response: Response, tooLargeMessage: string): Promise<Uint8Array | null> {
-  return runRuntime(readLimitedBodyEffect(response, tooLargeMessage));
-}
-export const readLimitedBodyEffect = Effect.fn("ProviderRelease.readLimitedBody")(function* (
+export const readLimitedBody = Effect.fn("ProviderRelease.readLimitedBody")(function* (
   response: Response,
   tooLargeMessage: string,
 ): Effect.fn.Return<Uint8Array | null, ProviderRuntimeFailure> {

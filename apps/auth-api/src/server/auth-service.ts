@@ -9,7 +9,7 @@ import {
 } from "@openbot/contracts/validation";
 import { Context, Effect, Layer, Result, Schema } from "effect";
 import { randomToken, sha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
+import type { RemoteFailure } from "./remote-control-plane";
 import { PERSISTENT_SESSION_EXPIRES_AT } from "./session-policy";
 import { EMAIL_CODE_DELIVERY_BUDGET_MS, RATE_LIMITED_DELIVERY_ERROR } from "./smtp-email-delivery";
 import type {
@@ -39,8 +39,8 @@ interface AuthServiceOptions {
   delivery: EmailCodeDelivery | null;
   exposeDevelopmentCode?: boolean;
   now?: () => number;
-  flushSessionRevocations?: () => Promise<void>;
-  profileChanged?: (userId: string) => Promise<void>;
+  flushSessionRevocations?: () => Effect.Effect<void, RemoteFailure>;
+  profileChanged?: (userId: string) => Effect.Effect<void, RemoteFailure>;
 }
 
 export interface EmailSignInStart {
@@ -57,8 +57,8 @@ class AuthDependencies extends Context.Service<
     delivery: EmailCodeDelivery | null;
     exposeDevelopmentCode: boolean;
     now: () => number;
-    flushSessionRevocations: () => Promise<void>;
-    profileChanged: (userId: string) => Promise<void>;
+    flushSessionRevocations: () => Effect.Effect<void, RemoteFailure>;
+    profileChanged: (userId: string) => Effect.Effect<void, RemoteFailure>;
   }
 >()("@openbot/auth-api/AuthDependencies") {}
 
@@ -73,8 +73,8 @@ export class AuthService {
       delivery: options.delivery,
       exposeDevelopmentCode: options.exposeDevelopmentCode ?? false,
       now: options.now ?? Date.now,
-      flushSessionRevocations: options.flushSessionRevocations ?? (async () => undefined),
-      profileChanged: options.profileChanged ?? (async () => undefined),
+      flushSessionRevocations: options.flushSessionRevocations ?? (() => Effect.void),
+      profileChanged: options.profileChanged ?? (() => Effect.void),
     });
   }
 
@@ -82,118 +82,123 @@ export class AuthService {
     return this.#configured;
   }
 
-  #run<A>(operation: Effect.Effect<A, AuthServiceError | AuthOperationError, AuthDependencies>): Promise<A> {
-    return runApiEffect(operation.pipe(Effect.provide(this.#layer)));
-  }
-
-  startEmailSignIn(emailInput: string, sourceIp: string, idempotencyKey?: string): Promise<EmailSignInStart> {
-    return this.#run(this.#startEmailSignInEffect(emailInput, sourceIp, idempotencyKey));
-  }
-
-  readonly #startEmailSignInEffect = Effect.fn("AuthService.startEmailSignIn")(function* (
-    this: AuthService,
-    emailInput: string,
-    sourceIp: string,
-    idempotencyKey?: string,
-  ): Effect.fn.Return<EmailSignInStart, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    if (!this.configured) {
-      return yield* new AuthServiceError(
-        503,
-        "email_delivery_not_configured",
-        "Email sign-in delivery is not configured.",
-      );
-    }
-    const email = yield* authValidate(() => normalizeEmail(emailInput));
-    const now = dependencies.now();
-    if (idempotencyKey !== undefined && !isUuidV4(idempotencyKey)) {
-      return yield* new AuthServiceError(400, "invalid_idempotency_key", "The sign-in request identifier is invalid.");
-    }
-    const challengeId = idempotencyKey ?? randomToken();
-    const challengeHash = yield* authCall(() => sha256(challengeId));
-    if (idempotencyKey) {
-      const existing = yield* authCall(() => dependencies.repository.findEmailChallenge(challengeHash));
-      if (existing) return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
-    }
-
-    yield* this.#enforceRateLimit(`start:email:${email}`, 5, now);
-    yield* this.#enforceRateLimit(`start:ip:${normalizeSourceIp(sourceIp)}`, 20, now);
-
-    if (idempotencyKey) {
-      const existing = yield* authCall(() => dependencies.repository.findEmailChallenge(challengeHash));
-      if (existing) return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
-    }
-
-    const latestChallenge = yield* authCall(() => dependencies.repository.latestEmailChallengeAt(email));
-    if (latestChallenge !== null && latestChallenge > now - RESEND_COOLDOWN_MS) {
-      const retryAfterSeconds = Math.max(1, Math.ceil((latestChallenge + RESEND_COOLDOWN_MS - now) / 1_000));
-      return yield* new AuthServiceError(
-        429,
-        "code_recently_sent",
-        `Wait ${retryAfterSeconds} seconds before requesting another code.`,
-        retryAfterSeconds,
-      );
-    }
-
-    const code = dependencies.exposeDevelopmentCode
-      ? yield* authCall(() => developmentOneTimeCode(challengeId))
-      : generateOneTimeCode();
-    const expiresAt = now + CHALLENGE_TTL_MS;
-    const codeHash = yield* authCall(() => sha256(normalizeOneTimeCode(code)));
-    const sourceIpHash = yield* authCall(() => sha256(normalizeSourceIp(sourceIp)));
-    const created = yield* authCall(() =>
-      dependencies.repository.createEmailChallenge({
-        idHash: challengeHash,
-        email,
-        codeHash,
-        sourceIpHash,
-        createdAt: now,
-        expiresAt,
-        maxAttempts: 5,
-      }),
-    );
-    if (!created) {
-      const existing = yield* authCall(() => dependencies.repository.findEmailChallenge(challengeHash));
-      if (!existing) return yield* new AuthOperationError({ message: "Account operation failed." });
-      return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
-    }
-    const delivery = dependencies.delivery;
-    const deliveryResult = yield* Effect.result(
-      delivery
-        ? Effect.tryPromise({ try: () => delivery.send({ email, code, expiresAt }), catch: safeDeliveryError })
-        : Effect.void,
-    );
-    if (Result.isFailure(deliveryResult)) {
-      const deliveryError = deliveryResult.failure;
-      console.error("Email code delivery failed:", deliveryError);
-      if (AMBIGUOUS_DELIVERY_ERRORS.has(deliveryError)) {
-        const retryAfterSeconds = Math.max(
-          1,
-          Math.ceil((now + EMAIL_CODE_DELIVERY_BUDGET_MS - dependencies.now()) / 1_000),
-        );
+  readonly startEmailSignIn = Effect.fn("AuthService.startEmailSignIn")(
+    function* (
+      this: AuthService,
+      emailInput: string,
+      sourceIp: string,
+      idempotencyKey?: string,
+    ): Effect.fn.Return<EmailSignInStart, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      if (!this.configured) {
         return yield* new AuthServiceError(
-          409,
-          "email_delivery_pending",
-          "OpenBot could not confirm delivery. Check again when the countdown ends.",
+          503,
+          "email_delivery_not_configured",
+          "Email sign-in delivery is not configured.",
+        );
+      }
+      const email = yield* authValidate(() => normalizeEmail(emailInput));
+      const now = dependencies.now();
+      if (idempotencyKey !== undefined && !isUuidV4(idempotencyKey)) {
+        return yield* new AuthServiceError(
+          400,
+          "invalid_idempotency_key",
+          "The sign-in request identifier is invalid.",
+        );
+      }
+      const challengeId = idempotencyKey ?? randomToken();
+      const challengeHash = yield* sha256(challengeId).pipe(Effect.mapError(authFailure));
+      if (idempotencyKey) {
+        const existing = yield* dependencies.repository
+          .findEmailChallenge(challengeHash)
+          .pipe(Effect.mapError(authFailure));
+        if (existing) return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
+      }
+
+      yield* this.#enforceRateLimit(`start:email:${email}`, 5, now);
+      yield* this.#enforceRateLimit(`start:ip:${normalizeSourceIp(sourceIp)}`, 20, now);
+
+      if (idempotencyKey) {
+        const existing = yield* dependencies.repository
+          .findEmailChallenge(challengeHash)
+          .pipe(Effect.mapError(authFailure));
+        if (existing) return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
+      }
+
+      const latestChallenge = yield* dependencies.repository
+        .latestEmailChallengeAt(email)
+        .pipe(Effect.mapError(authFailure));
+      if (latestChallenge !== null && latestChallenge > now - RESEND_COOLDOWN_MS) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((latestChallenge + RESEND_COOLDOWN_MS - now) / 1_000));
+        return yield* new AuthServiceError(
+          429,
+          "code_recently_sent",
+          `Wait ${retryAfterSeconds} seconds before requesting another code.`,
           retryAfterSeconds,
         );
       }
-      yield* authCall(() =>
-        dependencies.repository.completeEmailChallengeDelivery(challengeHash, "failed", dependencies.now()),
-      );
-      return yield* emailDeliveryFailure(deliveryError, "OpenBot could not send the sign-in code.");
-    }
-    yield* authCall(() =>
-      dependencies.repository.completeEmailChallengeDelivery(challengeHash, "sent", dependencies.now()),
-    );
 
-    return {
-      challengeId,
-      expiresAt,
-      resendAt: now + RESEND_COOLDOWN_MS,
-      ...(dependencies.exposeDevelopmentCode ? { developmentCode: code } : {}),
-    };
-  });
+      const code = dependencies.exposeDevelopmentCode
+        ? yield* developmentOneTimeCode(challengeId).pipe(Effect.mapError(authFailure))
+        : generateOneTimeCode();
+      const expiresAt = now + CHALLENGE_TTL_MS;
+      const codeHash = yield* sha256(normalizeOneTimeCode(code)).pipe(Effect.mapError(authFailure));
+      const sourceIpHash = yield* sha256(normalizeSourceIp(sourceIp)).pipe(Effect.mapError(authFailure));
+      const created = yield* dependencies.repository
+        .createEmailChallenge({
+          idHash: challengeHash,
+          email,
+          codeHash,
+          sourceIpHash,
+          createdAt: now,
+          expiresAt,
+          maxAttempts: 5,
+        })
+        .pipe(Effect.mapError(authFailure));
+      if (!created) {
+        const existing = yield* dependencies.repository
+          .findEmailChallenge(challengeHash)
+          .pipe(Effect.mapError(authFailure));
+        if (!existing) return yield* new AuthOperationError({ message: "Account operation failed." });
+        return yield* this.#replayEmailSignIn(existing, email, challengeId, now);
+      }
+      const delivery = dependencies.delivery;
+      const deliveryResult = yield* Effect.result(
+        delivery ? delivery.send({ email, code, expiresAt }).pipe(Effect.mapError(safeDeliveryError)) : Effect.void,
+      );
+      if (Result.isFailure(deliveryResult)) {
+        const deliveryError = deliveryResult.failure;
+        console.error("Email code delivery failed:", deliveryError);
+        if (AMBIGUOUS_DELIVERY_ERRORS.has(deliveryError)) {
+          const retryAfterSeconds = Math.max(
+            1,
+            Math.ceil((now + EMAIL_CODE_DELIVERY_BUDGET_MS - dependencies.now()) / 1_000),
+          );
+          return yield* new AuthServiceError(
+            409,
+            "email_delivery_pending",
+            "OpenBot could not confirm delivery. Check again when the countdown ends.",
+            retryAfterSeconds,
+          );
+        }
+        yield* dependencies.repository
+          .completeEmailChallengeDelivery(challengeHash, "failed", dependencies.now())
+          .pipe(Effect.mapError(authFailure));
+        return yield* emailDeliveryFailure(deliveryError, "OpenBot could not send the sign-in code.");
+      }
+      yield* dependencies.repository
+        .completeEmailChallengeDelivery(challengeHash, "sent", dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+
+      return {
+        challengeId,
+        expiresAt,
+        resendAt: now + RESEND_COOLDOWN_MS,
+        ...(dependencies.exposeDevelopmentCode ? { developmentCode: code } : {}),
+      };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   readonly #replayEmailSignIn = Effect.fn("AuthService.replayEmailSignIn")(function* (
     this: AuthService,
@@ -240,171 +245,163 @@ export class AuthService {
       expiresAt: challenge.expiresAt,
       resendAt: challenge.createdAt + RESEND_COOLDOWN_MS,
       ...(dependencies.exposeDevelopmentCode
-        ? { developmentCode: yield* authCall(() => developmentOneTimeCode(challengeId)) }
+        ? { developmentCode: yield* developmentOneTimeCode(challengeId).pipe(Effect.mapError(authFailure)) }
         : {}),
     };
   });
 
-  verifyEmailCode(input: {
-    challengeId: string;
-    code: string;
-    sourceIp: string;
-  }): Promise<{ sessionToken: string; user: AuthUser }> {
-    return this.#run(this.#verifyEmailCodeEffect(input));
-  }
-
-  readonly #verifyEmailCodeEffect = Effect.fn("AuthService.verifyEmailCode")(function* (
-    this: AuthService,
-    input: {
-      challengeId: string;
-      code: string;
-      sourceIp: string;
+  readonly verifyEmailCode = Effect.fn("AuthService.verifyEmailCode")(
+    function* (
+      this: AuthService,
+      input: {
+        challengeId: string;
+        code: string;
+        sourceIp: string;
+      },
+    ): Effect.fn.Return<
+      { sessionToken: string; user: AuthUser },
+      AuthServiceError | AuthOperationError,
+      AuthDependencies
+    > {
+      const dependencies = yield* AuthDependencies;
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`verify:ip:${normalizeSourceIp(input.sourceIp)}`, 30, now);
+      if (!input.challengeId || input.challengeId.length > 128 || input.code.length > 32) {
+        return yield* new AuthServiceError(400, "invalid_sign_in_code", "The sign-in code is invalid.");
+      }
+      const idHash = yield* sha256(input.challengeId).pipe(Effect.mapError(authFailure));
+      const normalizedCode = yield* authValidate(() => safeNormalizeCode(input.code));
+      const codeHash = yield* sha256(normalizedCode).pipe(Effect.mapError(authFailure));
+      const result = yield* dependencies.repository
+        .verifyEmailChallenge({
+          idHash,
+          codeHash,
+          now,
+          session: {
+            id: crypto.randomUUID(),
+            token: randomToken(),
+            expiresAt: PERSISTENT_SESSION_EXPIRES_AT,
+          },
+        })
+        .pipe(Effect.mapError(authFailure));
+      return yield* authValidate(() => verificationResult(result));
     },
-  ): Effect.fn.Return<
-    { sessionToken: string; user: AuthUser },
-    AuthServiceError | AuthOperationError,
-    AuthDependencies
-  > {
-    const dependencies = yield* AuthDependencies;
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`verify:ip:${normalizeSourceIp(input.sourceIp)}`, 30, now);
-    if (!input.challengeId || input.challengeId.length > 128 || input.code.length > 32) {
-      return yield* new AuthServiceError(400, "invalid_sign_in_code", "The sign-in code is invalid.");
-    }
-    const idHash = yield* authCall(() => sha256(input.challengeId));
-    const normalizedCode = yield* authValidate(() => safeNormalizeCode(input.code));
-    const codeHash = yield* authCall(() => sha256(normalizedCode));
-    const result = yield* authCall(() =>
-      dependencies.repository.verifyEmailChallenge({
-        idHash,
-        codeHash,
-        now,
-        session: {
-          id: crypto.randomUUID(),
-          token: randomToken(),
-          expiresAt: PERSISTENT_SESSION_EXPIRES_AT,
-        },
-      }),
-    );
-    return yield* authValidate(() => verificationResult(result));
-  });
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  authenticate(sessionToken: string): Promise<AuthUser | null> {
-    return this.#run(this.#authenticateEffect(sessionToken));
-  }
+  readonly authenticate = Effect.fn("AuthService.authenticate")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      return yield* dependencies.repository
+        .authenticate(sessionToken, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #authenticateEffect = Effect.fn("AuthService.authenticate")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    return yield* authCall(() => dependencies.repository.authenticate(sessionToken, dependencies.now()));
-  });
+  readonly authenticateDesktopSession = Effect.fn("AuthService.authenticateDesktopSession")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      return yield* dependencies.repository
+        .authenticateDesktopSession(sessionToken, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  authenticateDesktopSession(sessionToken: string): Promise<AuthUser | null> {
-    return this.#run(this.#authenticateDesktopSessionEffect(sessionToken));
-  }
+  readonly updateName = Effect.fn("AuthService.updateName")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      nameInput: string,
+    ): Effect.fn.Return<AuthUser, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      const validation = validateProfileName(nameInput);
+      if (validation.error) {
+        return yield* new AuthServiceError(400, "invalid_profile_name", "Enter a valid display name.");
+      }
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`profile:user:${user.id}`, 20, now);
+      const updated = yield* dependencies.repository
+        .updateUserName(user.id, validation.name, now)
+        .pipe(Effect.mapError(authFailure));
+      if (user.name !== updated.name) yield* dependencies.profileChanged(user.id).pipe(Effect.catch(() => Effect.void));
+      return updated;
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #authenticateDesktopSessionEffect = Effect.fn("AuthService.authenticateDesktopSession")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    return yield* authCall(() => dependencies.repository.authenticateDesktopSession(sessionToken, dependencies.now()));
-  });
+  readonly updateAvatar = Effect.fn("AuthService.updateAvatar")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      avatarUrl: string | null,
+      expectedAvatarUrl: string | null,
+    ): Effect.fn.Return<AuthUser, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`avatar:user:${user.id}`, 20, now);
+      const updated = yield* dependencies.repository
+        .updateUserAvatar(user.id, avatarUrl, expectedAvatarUrl, now)
+        .pipe(Effect.mapError(authFailure));
+      if (!updated) {
+        return yield* new AuthServiceError(
+          409,
+          "avatar_conflict",
+          "The account avatar changed during this request. Try again.",
+        );
+      }
+      if (user.avatarUrl !== updated.avatarUrl)
+        yield* dependencies.profileChanged(user.id).pipe(Effect.catch(() => Effect.void));
+      return updated;
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  updateName(sessionToken: string, nameInput: string): Promise<AuthUser> {
-    return this.#run(this.#updateNameEffect(sessionToken, nameInput));
-  }
+  readonly enforceTeamInviteRateLimit = Effect.fn("AuthService.enforceTeamInviteRateLimit")(
+    function* (
+      this: AuthService,
+      userId: string,
+      recipientEmail: string,
+      sourceIp: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const now = dependencies.now();
+      const email = yield* authValidate(() => normalizeEmail(recipientEmail));
+      yield* this.#enforceRateLimit(`invite:user:${userId}`, 20, now);
+      yield* this.#enforceRateLimit(`invite:email:${email}`, 5, now);
+      yield* this.#enforceRateLimit(`invite:ip:${normalizeSourceIp(sourceIp)}`, 30, now);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #updateNameEffect = Effect.fn("AuthService.updateName")(function* (
-    this: AuthService,
-    sessionToken: string,
-    nameInput: string,
-  ): Effect.fn.Return<AuthUser, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    const validation = validateProfileName(nameInput);
-    if (validation.error) {
-      return yield* new AuthServiceError(400, "invalid_profile_name", "Enter a valid display name.");
-    }
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`profile:user:${user.id}`, 20, now);
-    const updated = yield* authCall(() => dependencies.repository.updateUserName(user.id, validation.name, now));
-    if (user.name !== updated.name) yield* authCall(() => dependencies.profileChanged(user.id).catch(() => undefined));
-    return updated;
-  });
-
-  updateAvatar(sessionToken: string, avatarUrl: string | null, expectedAvatarUrl: string | null): Promise<AuthUser> {
-    return this.#run(this.#updateAvatarEffect(sessionToken, avatarUrl, expectedAvatarUrl));
-  }
-
-  readonly #updateAvatarEffect = Effect.fn("AuthService.updateAvatar")(function* (
-    this: AuthService,
-    sessionToken: string,
-    avatarUrl: string | null,
-    expectedAvatarUrl: string | null,
-  ): Effect.fn.Return<AuthUser, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`avatar:user:${user.id}`, 20, now);
-    const updated = yield* authCall(() =>
-      dependencies.repository.updateUserAvatar(user.id, avatarUrl, expectedAvatarUrl, now),
-    );
-    if (!updated) {
-      return yield* new AuthServiceError(
-        409,
-        "avatar_conflict",
-        "The account avatar changed during this request. Try again.",
-      );
-    }
-    if (user.avatarUrl !== updated.avatarUrl)
-      yield* authCall(() => dependencies.profileChanged(user.id).catch(() => undefined));
-    return updated;
-  });
-
-  enforceTeamInviteRateLimit(userId: string, recipientEmail: string, sourceIp: string): Promise<void> {
-    return this.#run(this.#enforceTeamInviteRateLimitEffect(userId, recipientEmail, sourceIp));
-  }
-
-  readonly #enforceTeamInviteRateLimitEffect = Effect.fn("AuthService.enforceTeamInviteRateLimit")(function* (
-    this: AuthService,
-    userId: string,
-    recipientEmail: string,
-    sourceIp: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const now = dependencies.now();
-    const email = yield* authValidate(() => normalizeEmail(recipientEmail));
-    yield* this.#enforceRateLimit(`invite:user:${userId}`, 20, now);
-    yield* this.#enforceRateLimit(`invite:email:${email}`, 5, now);
-    yield* this.#enforceRateLimit(`invite:ip:${normalizeSourceIp(sourceIp)}`, 30, now);
-  });
-
-  enforceTeamTunnelRateLimit(userId: string, sourceIp: string): Promise<void> {
-    return this.#run(this.#enforceTeamTunnelRateLimitEffect(userId, sourceIp));
-  }
-
-  readonly #enforceTeamTunnelRateLimitEffect = Effect.fn("AuthService.enforceTeamTunnelRateLimit")(function* (
-    this: AuthService,
-    userId: string,
-    sourceIp: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`team-tunnel:user:${userId}`, 20, now);
-    yield* this.#enforceRateLimit(`team-tunnel:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
-  });
+  readonly enforceTeamTunnelRateLimit = Effect.fn("AuthService.enforceTeamTunnelRateLimit")(
+    function* (
+      this: AuthService,
+      userId: string,
+      sourceIp: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`team-tunnel:user:${userId}`, 20, now);
+      yield* this.#enforceRateLimit(`team-tunnel:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** A claim is 32 random bytes; this limit stops a caller that guesses claims from many VMs. */
-  enforceHostedServerClaimRateLimit(sourceIp: string): Promise<void> {
-    return this.#run(this.#enforceHostedServerClaimRateLimitEffect(sourceIp));
-  }
 
-  readonly #enforceHostedServerClaimRateLimitEffect = Effect.fn("AuthService.enforceHostedServerClaimRateLimit")(
+  readonly enforceHostedServerClaimRateLimit = Effect.fn("AuthService.enforceHostedServerClaimRateLimit")(
     function* (
       this: AuthService,
       sourceIp: string,
@@ -412,264 +409,259 @@ export class AuthService {
       const dependencies = yield* AuthDependencies;
       yield* this.#enforceRateLimit(`hosted-claim:ip:${normalizeSourceIp(sourceIp)}`, 30, dependencies.now());
     },
-  );
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  issueTeamAuthTicket(
-    sessionToken: string,
-    serverId: string,
-    sourceIp: string,
-  ): Promise<{ ticket: string; expiresAt: number }> {
-    return this.#run(this.#issueTeamAuthTicketEffect(sessionToken, serverId, sourceIp));
-  }
+  readonly issueTeamAuthTicket = Effect.fn("AuthService.issueTeamAuthTicket")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      serverId: string,
+      sourceIp: string,
+    ): Effect.fn.Return<
+      { ticket: string; expiresAt: number },
+      AuthServiceError | AuthOperationError,
+      AuthDependencies
+    > {
+      const dependencies = yield* AuthDependencies;
+      yield* authValidate(() => validateTeamServerId(serverId));
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`team-ticket:user:${user.id}`, 30, now);
+      yield* this.#enforceRateLimit(`team-ticket:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
+      const ticket = randomToken();
+      const expiresAt = now + TEAM_TICKET_TTL_MS;
+      const ticketHash = yield* sha256(ticket).pipe(Effect.mapError(authFailure));
+      yield* dependencies.repository
+        .createTeamAuthTicket({
+          ticketHash,
+          userId: user.id,
+          serverId,
+          createdAt: now,
+          expiresAt,
+        })
+        .pipe(Effect.mapError(authFailure));
+      return { ticket, expiresAt };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #issueTeamAuthTicketEffect = Effect.fn("AuthService.issueTeamAuthTicket")(function* (
-    this: AuthService,
-    sessionToken: string,
-    serverId: string,
-    sourceIp: string,
-  ): Effect.fn.Return<{ ticket: string; expiresAt: number }, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    yield* authValidate(() => validateTeamServerId(serverId));
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`team-ticket:user:${user.id}`, 30, now);
-    yield* this.#enforceRateLimit(`team-ticket:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
-    const ticket = randomToken();
-    const expiresAt = now + TEAM_TICKET_TTL_MS;
-    const ticketHash = yield* authCall(() => sha256(ticket));
-    yield* authCall(() =>
-      dependencies.repository.createTeamAuthTicket({
-        ticketHash,
-        userId: user.id,
-        serverId,
-        createdAt: now,
-        expiresAt,
-      }),
-    );
-    return { ticket, expiresAt };
-  });
+  readonly redeemTeamAuthTicket = Effect.fn("AuthService.redeemTeamAuthTicket")(
+    function* (
+      this: AuthService,
+      ticket: string,
+      serverId: string,
+      sourceIp: string,
+    ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      yield* authValidate(() => validateTeamServerId(serverId));
+      if (!ticket || ticket.length > 128) return null;
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`team-ticket-redeem:ip:${normalizeSourceIp(sourceIp)}`, 120, now);
+      const ticketHash = yield* sha256(ticket).pipe(Effect.mapError(authFailure));
+      return yield* dependencies.repository
+        .redeemTeamAuthTicket({
+          ticketHash,
+          serverId,
+          now,
+        })
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  redeemTeamAuthTicket(ticket: string, serverId: string, sourceIp: string): Promise<AuthUser | null> {
-    return this.#run(this.#redeemTeamAuthTicketEffect(ticket, serverId, sourceIp));
-  }
+  readonly issueMobileAuthTicket = Effect.fn("AuthService.issueMobileAuthTicket")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      sourceIp: string,
+      host?: MobileConnectHostBinding,
+    ): Effect.fn.Return<
+      { ticket: string; expiresAt: number },
+      AuthServiceError | AuthOperationError,
+      AuthDependencies
+    > {
+      const dependencies = yield* AuthDependencies;
+      const user = yield* this.authenticateDesktopSession(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`mobile-ticket:user:${user.id}`, 30, now);
+      yield* this.#enforceRateLimit(`mobile-ticket:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
+      const ticket = randomToken();
+      const expiresAt = now + TEAM_TICKET_TTL_MS;
+      const ticketHash = yield* sha256(ticket).pipe(Effect.mapError(authFailure));
+      yield* dependencies.repository
+        .replaceMobileAuthTicket({
+          host,
+          ticketHash,
+          userId: user.id,
+          serverId: MOBILE_CONNECT_SERVER_ID,
+          createdAt: now,
+          expiresAt,
+        })
+        .pipe(Effect.mapError(authFailure));
+      return { ticket, expiresAt };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #redeemTeamAuthTicketEffect = Effect.fn("AuthService.redeemTeamAuthTicket")(function* (
-    this: AuthService,
-    ticket: string,
-    serverId: string,
-    sourceIp: string,
-  ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    yield* authValidate(() => validateTeamServerId(serverId));
-    if (!ticket || ticket.length > 128) return null;
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`team-ticket-redeem:ip:${normalizeSourceIp(sourceIp)}`, 120, now);
-    const ticketHash = yield* authCall(() => sha256(ticket));
-    return yield* authCall(() =>
-      dependencies.repository.redeemTeamAuthTicket({
-        ticketHash,
-        serverId,
-        now,
-      }),
-    );
-  });
+  readonly redeemMobileAuthTicket = Effect.fn("AuthService.redeemMobileAuthTicket")(
+    function* (
+      this: AuthService,
+      ticket: string,
+      deviceInput: MobileAuthDeviceIdentity,
+      sourceIp: string,
+    ): Effect.fn.Return<MobileAuthSessionResult | null, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      if (!ticket || ticket.length > 128) return null;
+      const device = yield* authValidate(() => normalizeMobileDevice(deviceInput));
+      const now = dependencies.now();
+      yield* this.#enforceRateLimit(`mobile-ticket-redeem:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
+      const ticketHash = yield* sha256(ticket).pipe(Effect.mapError(authFailure));
+      const redeemed = yield* dependencies.repository
+        .redeemMobileAuthTicket({
+          ticketHash,
+          serverId: MOBILE_CONNECT_SERVER_ID,
+          now,
+          session: {
+            id: crypto.randomUUID(),
+            token: randomToken(),
+            expiresAt: PERSISTENT_SESSION_EXPIRES_AT,
+          },
+          device,
+        })
+        .pipe(Effect.mapError(authFailure));
+      yield* dependencies.flushSessionRevocations().pipe(Effect.mapError(authFailure));
+      return redeemed;
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  issueMobileAuthTicket(
-    sessionToken: string,
-    sourceIp: string,
-    host?: MobileConnectHostBinding,
-  ): Promise<{ ticket: string; expiresAt: number }> {
-    return this.#run(this.#issueMobileAuthTicketEffect(sessionToken, sourceIp, host));
-  }
+  readonly listMobileAuthDevices = Effect.fn("AuthService.listMobileAuthDevices")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<MobileAuthDevice[], AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      return yield* dependencies.repository
+        .listMobileAuthDevices(user.id, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #issueMobileAuthTicketEffect = Effect.fn("AuthService.issueMobileAuthTicket")(function* (
-    this: AuthService,
-    sessionToken: string,
-    sourceIp: string,
-    host?: MobileConnectHostBinding,
-  ): Effect.fn.Return<{ ticket: string; expiresAt: number }, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const user = yield* this.#authenticateDesktopSessionEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`mobile-ticket:user:${user.id}`, 30, now);
-    yield* this.#enforceRateLimit(`mobile-ticket:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
-    const ticket = randomToken();
-    const expiresAt = now + TEAM_TICKET_TTL_MS;
-    const ticketHash = yield* authCall(() => sha256(ticket));
-    yield* authCall(() =>
-      dependencies.repository.replaceMobileAuthTicket({
-        host,
-        ticketHash,
-        userId: user.id,
-        serverId: MOBILE_CONNECT_SERVER_ID,
-        createdAt: now,
-        expiresAt,
-      }),
-    );
-    return { ticket, expiresAt };
-  });
+  readonly authenticateMobileSession = Effect.fn("AuthService.authenticateMobileSession")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      return yield* dependencies.repository
+        .authenticateMobileSession(sessionToken, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  redeemMobileAuthTicket(
-    ticket: string,
-    deviceInput: MobileAuthDeviceIdentity,
-    sourceIp: string,
-  ): Promise<MobileAuthSessionResult | null> {
-    return this.#run(this.#redeemMobileAuthTicketEffect(ticket, deviceInput, sourceIp));
-  }
-
-  readonly #redeemMobileAuthTicketEffect = Effect.fn("AuthService.redeemMobileAuthTicket")(function* (
-    this: AuthService,
-    ticket: string,
-    deviceInput: MobileAuthDeviceIdentity,
-    sourceIp: string,
-  ): Effect.fn.Return<MobileAuthSessionResult | null, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    if (!ticket || ticket.length > 128) return null;
-    const device = yield* authValidate(() => normalizeMobileDevice(deviceInput));
-    const now = dependencies.now();
-    yield* this.#enforceRateLimit(`mobile-ticket-redeem:ip:${normalizeSourceIp(sourceIp)}`, 60, now);
-    const ticketHash = yield* authCall(() => sha256(ticket));
-    const redeemed = yield* authCall(() =>
-      dependencies.repository.redeemMobileAuthTicket({
-        ticketHash,
-        serverId: MOBILE_CONNECT_SERVER_ID,
-        now,
-        session: {
-          id: crypto.randomUUID(),
-          token: randomToken(),
-          expiresAt: PERSISTENT_SESSION_EXPIRES_AT,
-        },
-        device,
-      }),
-    );
-    yield* authCall(() => dependencies.flushSessionRevocations());
-    return redeemed;
-  });
-
-  listMobileAuthDevices(sessionToken: string): Promise<MobileAuthDevice[]> {
-    return this.#run(this.#listMobileAuthDevicesEffect(sessionToken));
-  }
-
-  readonly #listMobileAuthDevicesEffect = Effect.fn("AuthService.listMobileAuthDevices")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<MobileAuthDevice[], AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    return yield* authCall(() => dependencies.repository.listMobileAuthDevices(user.id, dependencies.now()));
-  });
-
-  authenticateMobileSession(sessionToken: string): Promise<AuthUser | null> {
-    return this.#run(this.#authenticateMobileSessionEffect(sessionToken));
-  }
-
-  readonly #authenticateMobileSessionEffect = Effect.fn("AuthService.authenticateMobileSession")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<AuthUser | null, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    return yield* authCall(() => dependencies.repository.authenticateMobileSession(sessionToken, dependencies.now()));
-  });
-
-  revokeMobileAuthDevice(sessionToken: string, sessionId: string): Promise<void> {
-    return this.#run(this.#revokeMobileAuthDeviceEffect(sessionToken, sessionId));
-  }
-
-  readonly #revokeMobileAuthDeviceEffect = Effect.fn("AuthService.revokeMobileAuthDevice")(function* (
-    this: AuthService,
-    sessionToken: string,
-    sessionId: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    if (!isUuidV4(sessionId)) {
-      return yield* new AuthServiceError(400, "invalid_mobile_session", "The mobile session ID is invalid.");
-    }
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    yield* authCall(() => dependencies.repository.revokeMobileAuthDevice(user.id, sessionId, dependencies.now()));
-    yield* authCall(() => dependencies.flushSessionRevocations());
-  });
-
-  listAccountSessions(sessionToken: string): Promise<Awaited<ReturnType<AuthRepository["listAccountSessions"]>>> {
-    return this.#run(this.#listAccountSessionsEffect(sessionToken));
-  }
-
-  readonly #listAccountSessionsEffect = Effect.fn("AuthService.listAccountSessions")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<
-    Awaited<ReturnType<AuthRepository["listAccountSessions"]>>,
-    AuthServiceError | AuthOperationError,
-    AuthDependencies
-  > {
-    const dependencies = yield* AuthDependencies;
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    return yield* authCall(() =>
-      dependencies.repository.listAccountSessions(user.id, sessionToken, dependencies.now()),
-    );
-  });
-
-  revokeAccountSession(sessionToken: string, sessionId: string): Promise<void> {
-    return this.#run(this.#revokeAccountSessionEffect(sessionToken, sessionId));
-  }
-
-  readonly #revokeAccountSessionEffect = Effect.fn("AuthService.revokeAccountSession")(function* (
-    this: AuthService,
-    sessionToken: string,
-    sessionId: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    if (!isUuidV4(sessionId)) return yield* new AuthServiceError(400, "invalid_session", "The session ID is invalid.");
-    const user = yield* this.#authenticateEffect(sessionToken);
-    if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
-    if (!(yield* this.#authenticateDesktopSessionEffect(sessionToken))) {
-      const sessions = yield* authCall(() =>
-        dependencies.repository.listAccountSessions(user.id, sessionToken, dependencies.now()),
-      );
-      if (sessions.some((session) => session.sessionId === sessionId && session.kind === "desktop")) {
-        return yield* new AuthServiceError(
-          403,
-          "desktop_session_protected",
-          "Desktop sessions cannot be disconnected from mobile.",
-        );
+  readonly revokeMobileAuthDevice = Effect.fn("AuthService.revokeMobileAuthDevice")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      sessionId: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      if (!isUuidV4(sessionId)) {
+        return yield* new AuthServiceError(400, "invalid_mobile_session", "The mobile session ID is invalid.");
       }
-    }
-    yield* authCall(() => dependencies.repository.revokeAccountSession(user.id, sessionId, dependencies.now()));
-    yield* authCall(() => dependencies.flushSessionRevocations());
-  });
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      yield* dependencies.repository
+        .revokeMobileAuthDevice(user.id, sessionId, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+      yield* dependencies.flushSessionRevocations().pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  logout(sessionToken: string): Promise<void> {
-    return this.#run(this.#logoutEffect(sessionToken));
-  }
+  readonly listAccountSessions = Effect.fn("AuthService.listAccountSessions")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<
+      Effect.Success<ReturnType<AuthRepository["listAccountSessions"]>>,
+      AuthServiceError | AuthOperationError,
+      AuthDependencies
+    > {
+      const dependencies = yield* AuthDependencies;
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      return yield* dependencies.repository
+        .listAccountSessions(user.id, sessionToken, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #logoutEffect = Effect.fn("AuthService.logout")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    yield* authCall(() => dependencies.repository.revokeSession(sessionToken, dependencies.now()));
-    yield* authCall(() => dependencies.flushSessionRevocations());
-  });
+  readonly revokeAccountSession = Effect.fn("AuthService.revokeAccountSession")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+      sessionId: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      if (!isUuidV4(sessionId))
+        return yield* new AuthServiceError(400, "invalid_session", "The session ID is invalid.");
+      const user = yield* this.authenticate(sessionToken);
+      if (!user) return yield* new AuthServiceError(401, "unauthorized", "The session is invalid.");
+      if (!(yield* this.authenticateDesktopSession(sessionToken))) {
+        const sessions = yield* dependencies.repository
+          .listAccountSessions(user.id, sessionToken, dependencies.now())
+          .pipe(Effect.mapError(authFailure));
+        if (sessions.some((session) => session.sessionId === sessionId && session.kind === "desktop")) {
+          return yield* new AuthServiceError(
+            403,
+            "desktop_session_protected",
+            "Desktop sessions cannot be disconnected from mobile.",
+          );
+        }
+      }
+      yield* dependencies.repository
+        .revokeAccountSession(user.id, sessionId, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+      yield* dependencies.flushSessionRevocations().pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  logoutMobileSession(sessionToken: string): Promise<void> {
-    return this.#run(this.#logoutMobileSessionEffect(sessionToken));
-  }
+  readonly logout = Effect.fn("AuthService.logout")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      yield* dependencies.repository.revokeSession(sessionToken, dependencies.now()).pipe(Effect.mapError(authFailure));
+      yield* dependencies.flushSessionRevocations().pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
-  readonly #logoutMobileSessionEffect = Effect.fn("AuthService.logoutMobileSession")(function* (
-    this: AuthService,
-    sessionToken: string,
-  ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
-    const dependencies = yield* AuthDependencies;
-    const revoked = yield* authCall(() =>
-      dependencies.repository.revokeMobileSession(sessionToken, dependencies.now()),
-    );
-    if (!revoked) return yield* new AuthServiceError(401, "unauthorized", "The mobile session is invalid.");
-    yield* authCall(() => dependencies.flushSessionRevocations());
-  });
+  readonly logoutMobileSession = Effect.fn("AuthService.logoutMobileSession")(
+    function* (
+      this: AuthService,
+      sessionToken: string,
+    ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
+      const dependencies = yield* AuthDependencies;
+      const revoked = yield* dependencies.repository
+        .revokeMobileSession(sessionToken, dependencies.now())
+        .pipe(Effect.mapError(authFailure));
+      if (!revoked) return yield* new AuthServiceError(401, "unauthorized", "The mobile session is invalid.");
+      yield* dependencies.flushSessionRevocations().pipe(Effect.mapError(authFailure));
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   readonly #enforceRateLimit = Effect.fn("AuthService.enforceRateLimit")(function* (
     this: AuthService,
@@ -678,10 +670,10 @@ export class AuthService {
     now: number,
   ): Effect.fn.Return<void, AuthServiceError | AuthOperationError, AuthDependencies> {
     const dependencies = yield* AuthDependencies;
-    const keyHash = yield* authCall(() => sha256(key));
-    const result = yield* authCall(() =>
-      dependencies.repository.incrementRateLimit(keyHash, Math.floor(now / RATE_WINDOW_MS) * RATE_WINDOW_MS, limit),
-    );
+    const keyHash = yield* sha256(key).pipe(Effect.mapError(authFailure));
+    const result = yield* dependencies.repository
+      .incrementRateLimit(keyHash, Math.floor(now / RATE_WINDOW_MS) * RATE_WINDOW_MS, limit)
+      .pipe(Effect.mapError(authFailure));
     if (!result.allowed) {
       const retryAfterSeconds = Math.max(1, Math.ceil((result.windowStart + RATE_WINDOW_MS - now) / 1_000));
       return yield* new AuthServiceError(
@@ -735,10 +727,6 @@ function authFailure(error: unknown): AuthServiceError | AuthOperationError {
   return error instanceof AuthServiceError ? error : new AuthOperationError({ message: "Account operation failed." });
 }
 
-function authCall<A>(operation: () => Promise<A>): Effect.Effect<A, AuthServiceError | AuthOperationError> {
-  return Effect.tryPromise({ try: operation, catch: authFailure });
-}
-
 function authValidate<A>(operation: () => A): Effect.Effect<A, AuthServiceError | AuthOperationError> {
   return Effect.try({ try: operation, catch: authFailure });
 }
@@ -750,13 +738,13 @@ export function generateOneTimeCode(): string {
   return `${raw.slice(0, 4)}-${raw.slice(4)}`;
 }
 
-async function developmentOneTimeCode(challengeId: string): Promise<string> {
-  const digest = await sha256(`development-code:${challengeId}`);
+const developmentOneTimeCode = Effect.fn("Auth.developmentCode")(function* (challengeId: string) {
+  const digest = yield* sha256(`development-code:${challengeId}`);
   const raw = [...digest.slice(0, ONE_TIME_CODE_LENGTH)]
     .map((character) => ONE_TIME_CODE_ALPHABET[character.charCodeAt(0) & 31])
     .join("");
   return `${raw.slice(0, 4)}-${raw.slice(4)}`;
-}
+});
 
 export function normalizeOneTimeCode(value: string): string {
   const normalized = normalizeSharedOneTimeCode(value);

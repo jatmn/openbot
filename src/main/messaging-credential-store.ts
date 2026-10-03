@@ -7,31 +7,18 @@ import { readFile, rm } from "node:fs/promises";
 import type { MessagingCredentialState } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { registerSecretValue } from "@openbot/logging";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Result, Semaphore } from "effect";
 import { z } from "zod";
-import { writeFileAtomicallyEffect } from "../backend/atomic-json-file";
-import type { MessagingCredentials } from "../backend/messaging/messaging-service";
+import { writeFileAtomically } from "../backend/atomic-json-file";
+import { type MessagingCredentials, MessagingOperationFailed } from "../backend/messaging/messaging-service";
 import type { SecretCipher } from "./provider-credential-store";
 
-class MessagingCredentialFailure extends Schema.TaggedError<MessagingCredentialFailure>()(
-  "MessagingCredentialFailure",
-  {
-    cause: Schema.Defect(),
-  },
-) {}
-
-function messagingIO<A>(operation: () => Promise<A>): Effect.Effect<A, MessagingCredentialFailure> {
-  return Effect.tryPromise({ try: operation, catch: (cause) => new MessagingCredentialFailure({ cause }) });
+function messagingIO<A>(operation: () => Promise<A>): Effect.Effect<A, MessagingOperationFailed> {
+  return Effect.tryPromise({ try: operation, catch: (cause) => new MessagingOperationFailed({ cause }) });
 }
 
-function messagingSync<A>(operation: () => A): Effect.Effect<A, MessagingCredentialFailure> {
-  return Effect.try({ try: operation, catch: (cause) => new MessagingCredentialFailure({ cause }) });
-}
-
-async function runMessaging<A>(operation: Effect.Effect<A, MessagingCredentialFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
+function messagingSync<A>(operation: () => A): Effect.Effect<A, MessagingOperationFailed> {
+  return Effect.try({ try: operation, catch: (cause) => new MessagingOperationFailed({ cause }) });
 }
 
 /**
@@ -58,7 +45,7 @@ export class MessagingCredentialStore implements MessagingCredentials {
   #values = new Map<string, Record<string, string>>();
   #loaded = false;
   #loadError: Error | null = null;
-  #writeChain: Promise<void> = Promise.resolve();
+  #writes = Semaphore.makeUnsafe(1);
 
   constructor(path: string, cipher: SecretCipher) {
     this.#path = path;
@@ -66,22 +53,20 @@ export class MessagingCredentialStore implements MessagingCredentials {
   }
 
   /** Reads the envelope. A file that cannot be read does not stop startup, and stays until the user saves. */
-  load(): Promise<Error | null> {
-    return runMessaging(
-      Effect.gen({ self: this }, function* () {
-        this.#values = new Map();
-        this.#loadError = null;
-        const result = yield* Effect.result(this.#read());
-        if (Result.isSuccess(result)) this.#values = result.success;
-        else {
-          const error = result.failure.cause;
-          this.#loadError =
-            error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
-        }
-        this.#loaded = true;
-        return this.#loadError;
-      }),
-    );
+  load(): Effect.Effect<Error | null> {
+    return Effect.gen({ self: this }, function* () {
+      this.#values = new Map();
+      this.#loadError = null;
+      const result = yield* Effect.result(this.#read());
+      if (Result.isSuccess(result)) this.#values = result.success;
+      else {
+        const error = result.failure.cause;
+        this.#loadError =
+          error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
+      }
+      this.#loaded = true;
+      return this.#loadError;
+    });
   }
 
   get(connectionId: string): Record<string, string> | null {
@@ -100,20 +85,20 @@ export class MessagingCredentialStore implements MessagingCredentials {
     return this.#loadError ? "unreadable" : "missing";
   }
 
-  async set(connectionId: string, values: Record<string, string>): Promise<void> {
-    for (const value of Object.values(values)) registerSecretValue(value);
-    await this.#edit((next) => {
+  set(connectionId: string, values: Record<string, string>): Effect.Effect<void, MessagingOperationFailed> {
+    return this.#edit((next) => {
+      for (const value of Object.values(values)) registerSecretValue(value);
       next.set(connectionId, { ...values });
       return true;
     });
   }
 
-  async clear(connectionId: string): Promise<void> {
-    await this.#edit((next) => next.delete(connectionId));
+  clear(connectionId: string): Effect.Effect<void, MessagingOperationFailed> {
+    return this.#edit((next) => next.delete(connectionId));
   }
 
-  async retain(connectionIds: ReadonlySet<string>): Promise<void> {
-    await this.#edit((next) => {
+  retain(connectionIds: ReadonlySet<string>): Effect.Effect<void, MessagingOperationFailed> {
+    return this.#edit((next) => {
       let changed = false;
       for (const connectionId of [...next.keys()])
         if (!connectionIds.has(connectionId)) changed = next.delete(connectionId) || changed;
@@ -122,25 +107,21 @@ export class MessagingCredentialStore implements MessagingCredentials {
   }
 
   /** One change after the previous one, each from the values the previous change committed. */
-  async #edit(change: (next: Map<string, Record<string, string>>) => boolean): Promise<void> {
-    const operation = this.#writeChain.then(() =>
-      runMessaging(
-        Effect.gen({ self: this }, function* () {
-          const next = yield* messagingSync(() => {
-            if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
-            const values = new Map(this.#loadError ? [] : this.#values);
-            return change(values) ? values : null;
-          });
-          if (!next) return;
-          if (next.size === 0) yield* messagingIO(() => rm(this.#path, { force: true }));
-          else yield* this.#write(next);
-          this.#values = next;
-          this.#loadError = null;
-        }).pipe(Effect.uninterruptible),
-      ),
+  #edit(change: (next: Map<string, Record<string, string>>) => boolean): Effect.Effect<void, MessagingOperationFailed> {
+    return this.#writes.withPermit(
+      Effect.gen({ self: this }, function* () {
+        const next = yield* messagingSync(() => {
+          if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
+          const values = new Map(this.#loadError ? [] : this.#values);
+          return change(values) ? values : null;
+        });
+        if (!next) return;
+        if (next.size === 0) yield* messagingIO(() => rm(this.#path, { force: true }));
+        else yield* this.#write(next);
+        this.#values = next;
+        this.#loadError = null;
+      }).pipe(Effect.uninterruptible),
     );
-    this.#writeChain = operation.catch(() => undefined);
-    await operation;
   }
 
   #read = Effect.fn("MessagingCredentialStore.read")(function* (this: MessagingCredentialStore) {
@@ -148,7 +129,7 @@ export class MessagingCredentialStore implements MessagingCredentials {
       Effect.catch(({ cause }) =>
         cause instanceof Error && "code" in cause && cause.code === "ENOENT"
           ? Effect.succeed(null)
-          : Effect.fail(new MessagingCredentialFailure({ cause })),
+          : Effect.fail(new MessagingOperationFailed({ cause })),
       ),
     );
     if (source === null) return new Map<string, Record<string, string>>();
@@ -175,8 +156,8 @@ export class MessagingCredentialStore implements MessagingCredentials {
         connections[connectionId] = this.#cipher.encrypt(JSON.stringify(value)).toString("base64");
       return `${JSON.stringify({ version: 1, connections })}\n`;
     });
-    yield* writeFileAtomicallyEffect(this.#path, content, { createDirectory: true }).pipe(
-      Effect.mapError(({ cause }) => new MessagingCredentialFailure({ cause })),
+    yield* writeFileAtomically(this.#path, content, { createDirectory: true }).pipe(
+      Effect.mapError(({ cause }) => new MessagingOperationFailed({ cause })),
     );
   });
 }

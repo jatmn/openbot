@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, type ManagedRuntime, Result, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 
 export class CentralAuthOperationError extends Schema.TaggedError<CentralAuthOperationError>()(
   "CentralAuthOperationError",
@@ -30,13 +30,4 @@ export class CentralAuthTransport extends Context.Service<
       }),
     );
   }
-}
-
-export async function runCentralAuthEffect<A>(
-  runtime: ManagedRuntime.ManagedRuntime<CentralAuthTransport, never>,
-  operation: Effect.Effect<A, CentralAuthOperationError, CentralAuthTransport>,
-): Promise<A> {
-  const result = await runtime.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

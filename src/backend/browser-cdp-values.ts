@@ -1,34 +1,32 @@
 import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
-import { browserCall, browserFailure, runBrowserEffect } from "./browser-effects";
+import { type BrowserOperationError, browserFailure } from "./browser-effects";
 
 const AUTOMATION_WORLD_NAME = "openbot-browser-automation";
 
 export type CdpResult = DynamicRecord;
 
-export type SendCommand = (method: string, params?: DynamicRecord, sessionId?: string) => Promise<CdpResult>;
+export type SendCommand = (
+  method: string,
+  params?: DynamicRecord,
+  sessionId?: string,
+) => Effect.Effect<CdpResult, BrowserOperationError>;
 
 export function assertBeforeDeadline(deadline: number | undefined): void {
   if (deadline !== undefined && Date.now() >= deadline) throw new Error("Browser wait condition timed out.");
 }
 
-export function automationContextId(send: SendCommand, sessionId?: string): Promise<number> {
-  return runBrowserEffect(automationContextIdEffect(send, sessionId));
-}
-
-export const automationContextIdEffect = Effect.fn("Browser.automationContextId")(function* (
+export const automationContextId = Effect.fn("Browser.automationContextId")(function* (
   send: SendCommand,
   sessionId?: string,
 ) {
-  const tree = yield* browserCall(() => send("Page.getFrameTree", {}, sessionId));
+  const tree = yield* send("Page.getFrameTree", {}, sessionId);
   const frameId = frameTreeRootId(tree);
   if (!frameId) return yield* browserFailure(new Error("The browser automation world has no frame."));
-  const world = yield* browserCall(() =>
-    send(
-      "Page.createIsolatedWorld",
-      { frameId, worldName: AUTOMATION_WORLD_NAME, grantUniveralAccess: false },
-      sessionId,
-    ),
+  const world = yield* send(
+    "Page.createIsolatedWorld",
+    { frameId, worldName: AUTOMATION_WORLD_NAME, grantUniveralAccess: false },
+    sessionId,
   );
   const contextId = numberValue(world.executionContextId);
   if (!contextId) return yield* browserFailure(new Error("The browser automation world is unavailable."));

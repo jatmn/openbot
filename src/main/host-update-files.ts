@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, rename, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { z } from "zod";
 import type { HostManagerConfig, HostTenantStatus, HostUpdateState } from "../../packages/contracts/src/host-manager";
 import { isMissingFileError } from "../backend/file-errors";
@@ -55,24 +55,14 @@ const fileCall = <A>(operation: () => Promise<A>) =>
     try: operation,
     catch: (cause) => new HostProtocolFileError({ cause }),
   });
-async function runFileEffect<A>(operation: Effect.Effect<A, HostProtocolFileError>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
-}
-
-/** Each ancestor is immutable to tenants. Never accept a symlink as a directory. */
-export function verifyHostDirectory(path: string, hostUid = 0): Promise<void> {
-  return runFileEffect(verifyHostDirectoryEffect(path, hostUid));
-}
-export const verifyHostDirectoryEffect: (path: string, hostUid?: number) => Effect.Effect<void, HostProtocolFileError> =
+export const verifyHostDirectory: (path: string, hostUid?: number) => Effect.Effect<void, HostProtocolFileError> =
   Effect.fn("HostFiles.verifyDirectory")(function* (
     path: string,
     hostUid = 0,
   ): Effect.fn.Return<void, HostProtocolFileError> {
     const absolute = resolve(path);
     const parent = dirname(absolute);
-    if (parent !== absolute) yield* verifyHostDirectoryEffect(parent, hostUid);
+    if (parent !== absolute) yield* verifyHostDirectory(parent, hostUid);
     const info = yield* fileCall(() => lstat(absolute));
     // Tests use a private directory below the OS temporary directory. Production always uses UID 0.
     if (!info.isDirectory() || (info.uid !== 0 && info.uid !== hostUid) || (info.mode & 0o022) !== 0) {
@@ -81,11 +71,7 @@ export const verifyHostDirectoryEffect: (path: string, hostUid?: number) => Effe
       });
     }
   });
-
-export function readOwnedJson<T>(path: string, uid: number, schema: z.ZodType<T>): Promise<T> {
-  return runFileEffect(readOwnedJsonEffect(path, uid, schema));
-}
-export const readOwnedJsonEffect = Effect.fn("HostFiles.readOwnedJson")(function* <T>(
+export const readOwnedJson = Effect.fn("HostFiles.readOwnedJson")(function* <T>(
   path: string,
   uid: number,
   schema: z.ZodType<T>,
@@ -113,15 +99,7 @@ export const readOwnedJsonEffect = Effect.fn("HostFiles.readOwnedJson")(function
     (handle) => fileCall(() => handle.close()),
   );
 });
-
-/** Rename replaces the directory entry; it never opens an existing destination or symlink. */
-export function writeProtocolJson(
-  path: string,
-  value: HostUpdateState | HostTenantStatus | HostManagerConfig,
-): Promise<void> {
-  return runFileEffect(writeProtocolJsonEffect(path, value));
-}
-export const writeProtocolJsonEffect = Effect.fn("HostFiles.writeProtocolJson")(function* (
+export const writeProtocolJson = Effect.fn("HostFiles.writeProtocolJson")(function* (
   path: string,
   value: HostUpdateState | HostTenantStatus | HostManagerConfig,
 ): Effect.fn.Return<void, HostProtocolFileError> {
@@ -153,29 +131,21 @@ export const writeProtocolJsonEffect = Effect.fn("HostFiles.writeProtocolJson")(
       ),
   );
 });
-
-export function readHostConfig(directory = HOST_MANAGER_DIRECTORY, hostUid = 0): Promise<HostManagerConfig | null> {
-  return runFileEffect(readHostConfigEffect(directory, hostUid));
-}
-export const readHostConfigEffect = Effect.fn("HostFiles.readConfig")(function* (
+export const readHostConfig = Effect.fn("HostFiles.readConfig")(function* (
   directory = HOST_MANAGER_DIRECTORY,
   hostUid = 0,
 ): Effect.fn.Return<HostManagerConfig | null, HostProtocolFileError> {
   return yield* Effect.gen(function* () {
-    yield* verifyHostDirectoryEffect(directory, hostUid);
-    return yield* readOwnedJsonEffect(join(directory, "config.json"), hostUid, hostConfigSchema);
+    yield* verifyHostDirectory(directory, hostUid);
+    return yield* readOwnedJson(join(directory, "config.json"), hostUid, hostConfigSchema);
   }).pipe(Effect.catch((failure) => (isMissingFileError(failure.cause) ? Effect.succeed(null) : Effect.fail(failure))));
 });
-
-export function verifyTenantDirectory(directory: string, uid: number, hostUid = 0): Promise<string> {
-  return runFileEffect(verifyTenantDirectoryEffect(directory, uid, hostUid));
-}
-export const verifyTenantDirectoryEffect = Effect.fn("HostFiles.verifyTenantDirectory")(function* (
+export const verifyTenantDirectory = Effect.fn("HostFiles.verifyTenantDirectory")(function* (
   directory: string,
   uid: number,
   hostUid = 0,
 ): Effect.fn.Return<string, HostProtocolFileError> {
-  yield* verifyHostDirectoryEffect(join(directory, "tenants"), hostUid);
+  yield* verifyHostDirectory(join(directory, "tenants"), hostUid);
   const path = join(directory, "tenants", String(uid));
   const info = yield* fileCall(() => lstat(path));
   // The parent is root-owned, so a tenant cannot replace this directory with a symlink.

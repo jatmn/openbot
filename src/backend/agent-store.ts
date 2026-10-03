@@ -48,15 +48,15 @@ import { type DynamicRecord, isBoolean, isNumber, isOneOf, isString } from "@ope
 import { isGeneratedAgentId, isUuidV4, legacyAgentId } from "@openbot/contracts/validation";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
-import { Effect, Result, Stream } from "effect";
+import { Effect, Result, Semaphore, Stream } from "effect";
 import { ProfileCreationRecovery } from "./agent/profile-creation-recovery";
-import { writeFileAtomicallyEffect } from "./atomic-json-file";
+import { writeFileAtomically } from "./atomic-json-file";
 import { automationRoot } from "./automation-command";
 import type { AgentModelChange } from "./database/agent-roster";
 import { OpenBotDatabase, type ProviderSession, stableThreadId } from "./openbot-database";
 import { isPathInside } from "./path-containment";
 import { isRecord } from "./protocol";
-import { runStored, StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
+import { StoredStateFailure, storedIO, storedSync } from "./stored-state-effects";
 
 type StoredAgent = AgentSummary & { access: AgentAccess; computerUse: boolean };
 type PersistedStoredAgent = Omit<StoredAgent, "avatarUrl" | "provider" | "access" | "computerUse"> & {
@@ -140,8 +140,8 @@ export class AgentStore {
   readonly #profileCreationRecovery: ProfileCreationRecovery;
   readonly #database: OpenBotDatabase;
   #state: StoredState = { version: 2, examplesInitialized: false, agents: [] };
-  #avatarUpdateQueue: Promise<void> = Promise.resolve();
-  #creationQueue: Promise<void> = Promise.resolve();
+  readonly #avatarUpdateQueue = Semaphore.makeUnsafe(1);
+  readonly #creationQueue = Semaphore.makeUnsafe(1);
 
   constructor(userDataPath: string, homePath: string, database = new OpenBotDatabase(userDataPath)) {
     const openbotRoot = join(homePath, "OpenBot");
@@ -177,10 +177,7 @@ export class AgentStore {
     return this.#automationRoot;
   }
 
-  initialize(): Promise<void> {
-    return runStored(this.initializeEffect());
-  }
-  initializeEffect = Effect.fn("AgentStore.initialize")(function* (
+  initialize = Effect.fn("AgentStore.initialize")(function* (
     this: AgentStore,
   ): Effect.fn.Return<void, StoredStateFailure> {
     try {
@@ -196,7 +193,7 @@ export class AgentStore {
         { concurrency: "unbounded" },
       );
 
-      yield* this.#database.initializeEffect();
+      yield* this.#database.initialize();
       const persisted = this.#database.listAgents();
       if (persisted.length > 0 || this.#database.hasAggregateEvents("agents", "agents")) {
         // Repaired field by field rather than accepted or refused as a whole. One stored value this build
@@ -230,7 +227,7 @@ export class AgentStore {
         }
       } else {
         const legacy = yield* this.#readStateEffect();
-        yield* this.#database.backupLegacyFileEffect(this.#statePath);
+        yield* this.#database.backupLegacyFile(this.#statePath);
         const sessions: Array<{ agent: StoredAgent; externalSessionId: string }> = [];
         legacy.agents = legacy.agents.map((agent) => {
           if (!agent.threadId) return agent;
@@ -259,8 +256,8 @@ export class AgentStore {
       }
       yield* this.#reconcileLegacyDirectoriesEffect();
       yield* this.#recoverPendingDuplicationsEffect();
-      yield* this.#profileCreationRecovery.recoverEffect(this.#database, (agentId) =>
-        this.deleteAgentEffect(agentId).pipe(Effect.asVoid),
+      yield* this.#profileCreationRecovery.recover(this.#database, (agentId) =>
+        this.deleteAgent(agentId).pipe(Effect.asVoid),
       );
       // Last, so that a thread belonging to an agent the two recoveries above have just removed is gone
       // rather than re-adopted.
@@ -268,20 +265,17 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   list(): AgentSummary[] {
     return this.#state.agents.map((agent) => ({ ...agent }));
   }
 
-  createAgent(input: Omit<CreateAgentInput, "initialMessage">, profileOperationId?: string): Promise<AgentSummary> {
-    return this.#enqueueCreation(() => this.#createAgent(input, profileOperationId));
+  createAgent(input: Omit<CreateAgentInput, "initialMessage">, profileOperationId?: string) {
+    return this.#creationQueue.withPermit(this.#createAgent(input, profileOperationId));
   }
 
-  #createAgent(input: Omit<CreateAgentInput, "initialMessage">, profileOperationId?: string): Promise<AgentSummary> {
-    return runStored(this.#createAgentEffect(input, profileOperationId));
-  }
-  #createAgentEffect = Effect.fn("AgentStore.createAgent")(function* (
+  #createAgent = Effect.fn("AgentStore.createAgent")(function* (
     this: AgentStore,
     input: Omit<CreateAgentInput, "initialMessage">,
     profileOperationId?: string,
@@ -297,7 +291,7 @@ export class AgentStore {
       const record = this.#createRecord(`agent-${randomUUID()}`, name, "", description);
       record.avatarSeed = input.avatarSeed;
       record.avatarHue = input.avatarHue;
-      if (profileOperationId) yield* this.#profileCreationRecovery.beginEffect(record.id, profileOperationId);
+      if (profileOperationId) yield* this.#profileCreationRecovery.begin(record.id, profileOperationId);
       yield* storedIO(() => mkdir(record.workspacePath, { recursive: true, mode: 0o700 }));
       this.#state.agents.unshift(record);
       try {
@@ -313,29 +307,17 @@ export class AgentStore {
     }
   }, Effect.uninterruptible);
 
-  duplicateAgent(sourceId: string, operationId: string = randomUUID()): Promise<AgentSummary> {
-    if (!isUuidV4(operationId)) throw new Error("Invalid agent duplication operation id.");
-    return this.#enqueueCreation(() => this.#duplicateAgent(sourceId, operationId));
+  duplicateAgent(sourceId: string, operationId: string = randomUUID()) {
+    return this.#creationQueue.withPermit(this.#duplicateAgent(sourceId, operationId));
   }
 
-  #enqueueCreation<T>(create: () => Promise<T>): Promise<T> {
-    const operation = this.#creationQueue.then(create);
-    this.#creationQueue = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
-  }
-
-  #duplicateAgent(sourceId: string, operationId: string): Promise<AgentSummary> {
-    return runStored(this.#duplicateAgentEffect(sourceId, operationId));
-  }
-  #duplicateAgentEffect = Effect.fn("AgentStore.duplicateAgent")(function* (
+  #duplicateAgent = Effect.fn("AgentStore.duplicateAgent")(function* (
     this: AgentStore,
     sourceId: string,
     operationId: string,
   ): Effect.fn.Return<AgentSummary, StoredStateFailure> {
     try {
+      if (!isUuidV4(operationId)) throw new Error("Invalid agent duplication operation id.");
       if (this.#database.commandResult(duplicationCommandId(operationId)) !== undefined) {
         throw new Error("This agent duplication operation is already committed.");
       }
@@ -480,15 +462,7 @@ export class AgentStore {
     };
   }
 
-  commitAgentDuplication(
-    id: string,
-    operationId: string,
-    sourceAgentId: string,
-    layout: SidebarLayoutSnapshot,
-  ): Promise<DuplicateAgentResult> {
-    return runStored(this.commitAgentDuplicationEffect(id, operationId, sourceAgentId, layout));
-  }
-  commitAgentDuplicationEffect = Effect.fn("AgentStore.commitAgentDuplication")(function* (
+  commitAgentDuplication = Effect.fn("AgentStore.commitAgentDuplication")(function* (
     this: AgentStore,
     id: string,
     operationId: string,
@@ -530,7 +504,7 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   saveReviewedProfile(agentId: string, draft: AgentProfileDraft): AgentSummary {
     draft = decodeAgentProfileDraft(draft);
@@ -585,10 +559,8 @@ export class AgentStore {
   }
 
   /** `initiatingAgentId` names the agent that asked for the change, for the audit entry of a model change. */
-  updateAgent(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
-    return runStored(this.updateAgentEffect(input, initiatingAgentId));
-  }
-  updateAgentEffect = Effect.fn("AgentStore.updateAgent")(function* (
+
+  updateAgent = Effect.fn("AgentStore.updateAgent")(function* (
     this: AgentStore,
     input: UpdateAgentInput,
     initiatingAgentId?: string,
@@ -669,7 +641,7 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   setMarketplaceSource(agentId: string, source: NonNullable<AgentSummary["marketplaceSource"]>): AgentSummary {
     const agent = this.#requireAgent(agentId);
@@ -679,19 +651,11 @@ export class AgentStore {
     return { ...agent, marketplaceSource: structuredClone(source) };
   }
 
-  async setAvatar(agentId: string, image: AvatarImageInput | null): Promise<AgentSummary> {
-    const operation = this.#avatarUpdateQueue.then(() => this.#setAvatar(agentId, image));
-    this.#avatarUpdateQueue = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
+  setAvatar(agentId: string, image: AvatarImageInput | null) {
+    return this.#avatarUpdateQueue.withPermit(this.#setAvatar(agentId, image));
   }
 
-  #setAvatar(agentId: string, image: AvatarImageInput | null): Promise<AgentSummary> {
-    return runStored(this.#setAvatarEffect(agentId, image));
-  }
-  #setAvatarEffect = Effect.fn("AgentStore.setAvatar")(function* (
+  #setAvatar = Effect.fn("AgentStore.setAvatar")(function* (
     this: AgentStore,
     agentId: string,
     image: AvatarImageInput | null,
@@ -722,7 +686,7 @@ export class AgentStore {
       const directory = join(this.#avatarsRoot, agent.id);
       const target = join(directory, `${version}.${extension}`);
       yield* storedIO(() => mkdir(directory, { recursive: true, mode: 0o700 }));
-      yield* writeFileAtomicallyEffect(target, image.bytes).pipe(
+      yield* writeFileAtomically(target, image.bytes).pipe(
         Effect.mapError(({ cause }) => new StoredStateFailure({ cause })),
       );
       agent.avatarUrl = agentAvatarUrl(agent.id, version, image.mimeType);
@@ -755,10 +719,7 @@ export class AgentStore {
     };
   }
 
-  deleteAgent(id: string): Promise<AgentSummary | null> {
-    return runStored(this.deleteAgentEffect(id));
-  }
-  deleteAgentEffect = Effect.fn("AgentStore.deleteAgent")(function* (
+  deleteAgent = Effect.fn("AgentStore.deleteAgent")(function* (
     this: AgentStore,
     id: string,
   ): Effect.fn.Return<AgentSummary | null, StoredStateFailure> {
@@ -798,12 +759,9 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
-  getOrCreate(id: string, name?: string, title?: string): Promise<AgentSummary> {
-    return runStored(this.getOrCreateEffect(id, name, title));
-  }
-  getOrCreateEffect = Effect.fn("AgentStore.getOrCreate")(function* (
+  getOrCreate = Effect.fn("AgentStore.getOrCreate")(function* (
     this: AgentStore,
     id: string,
     name?: string,
@@ -815,13 +773,10 @@ export class AgentStore {
       yield* storedIO(() => mkdir(existing.workspacePath, { recursive: true, mode: 0o700 }));
       return { ...existing };
     }
-    return yield* storedIO(() => this.#enqueueCreation(() => this.#getOrCreate(id, name, title)));
-  });
+    return yield* this.#creationQueue.withPermit(this.#getOrCreate(id, name, title));
+  }).bind(this);
 
-  #getOrCreate(id: string, name?: string, title?: string): Promise<AgentSummary> {
-    return runStored(this.#getOrCreateEffect(id, name, title));
-  }
-  #getOrCreateEffect = Effect.fn("AgentStore.getOrCreate")(function* (
+  #getOrCreate = Effect.fn("AgentStore.getOrCreate")(function* (
     this: AgentStore,
     id: string,
     name?: string,
@@ -1228,10 +1183,7 @@ export class AgentStore {
     }
   }, Effect.uninterruptible);
 
-  ensureThreadId(id: string): Promise<string> {
-    return runStored(this.ensureThreadIdEffect(id));
-  }
-  ensureThreadIdEffect = Effect.fn("AgentStore.ensureThreadId")(function* (
+  ensureThreadId = Effect.fn("AgentStore.ensureThreadId")(function* (
     this: AgentStore,
     id: string,
   ): Effect.fn.Return<string, StoredStateFailure> {
@@ -1240,7 +1192,7 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Derived from the agent id, never minted at random, and that is what makes losing a roster row
@@ -1286,10 +1238,7 @@ export class AgentStore {
     });
   }
 
-  updatePreview(id: string, preview: string): Promise<void> {
-    return runStored(this.updatePreviewEffect(id, preview));
-  }
-  updatePreviewEffect = Effect.fn("AgentStore.updatePreview")(function* (
+  updatePreview = Effect.fn("AgentStore.updatePreview")(function* (
     this: AgentStore,
     id: string,
     preview: string,
@@ -1302,7 +1251,7 @@ export class AgentStore {
     } catch (cause) {
       return yield* new StoredStateFailure({ cause });
     }
-  }, Effect.uninterruptible);
+  }, Effect.uninterruptible).bind(this);
 
   #readStateEffect = Effect.fn("AgentStore.readState")(function* (
     this: AgentStore,

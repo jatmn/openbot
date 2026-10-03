@@ -35,37 +35,33 @@ export class ManagedSkillService {
     private readonly slug = MANAGED_SKILL_SLUG,
   ) {}
 
-  syncAll(agents: AgentSummary[]): Promise<void> {
-    return runManaged(
-      Effect.gen({ self: this }, function* () {
-        const content = yield* Effect.result(this.content());
-        if (Result.isFailure(content)) {
-          this.reportFailure(this.sourcePath, content.failure.cause);
-          return;
-        }
-        const results = yield* Effect.forEach(
-          agents,
-          (agent) => Effect.result(syncTargets(agent.workspacePath, content.success, this.slug)),
-          { concurrency: "unbounded" },
-        );
-        for (const [index, result] of results.entries()) {
-          if (Result.isSuccess(result)) this.reportResult(result.success);
-          else this.reportFailure(agents[index]?.workspacePath ?? "unknown workspace", result.failure.cause);
-        }
-      }),
-    );
+  syncAll(agents: AgentSummary[]): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function* () {
+      const content = yield* Effect.result(this.content());
+      if (Result.isFailure(content)) {
+        this.reportFailure(this.sourcePath, content.failure.cause);
+        return;
+      }
+      const results = yield* Effect.forEach(
+        agents,
+        (agent) => Effect.result(syncTargets(agent.workspacePath, content.success, this.slug)),
+        { concurrency: "unbounded" },
+      );
+      for (const [index, result] of results.entries()) {
+        if (Result.isSuccess(result)) this.reportResult(result.success);
+        else this.reportFailure(agents[index]?.workspacePath ?? "unknown workspace", result.failure.cause);
+      }
+    });
   }
 
-  syncAgent(agent: AgentSummary): Promise<void> {
-    return runManaged(
-      Effect.gen({ self: this }, function* () {
-        const result = yield* Effect.result(
-          this.content().pipe(Effect.flatMap((content) => syncTargets(agent.workspacePath, content, this.slug))),
-        );
-        if (Result.isSuccess(result)) this.reportResult(result.success);
-        else this.reportFailure(agent.workspacePath, result.failure.cause);
-      }),
-    );
+  syncAgent(agent: AgentSummary): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function* () {
+      const result = yield* Effect.result(
+        this.content().pipe(Effect.flatMap((content) => syncTargets(agent.workspacePath, content, this.slug))),
+      );
+      if (Result.isSuccess(result)) this.reportResult(result.success);
+      else this.reportFailure(agent.workspacePath, result.failure.cause);
+    });
   }
 
   private content(): Effect.Effect<string, ManagedSkillFailure> {
@@ -233,10 +229,7 @@ function isFileExistsError(error: unknown): boolean {
 }
 
 /** Read only OpenBot-owned skills from the active provider's skill folder. */
-export function listManagedSkillsForChat(agent: AgentSummary): Promise<InstalledSkill[]> {
-  return runManaged(listManagedSkillsForChatEffect(agent));
-}
-export const listManagedSkillsForChatEffect = Effect.fn("ManagedSkill.listForChat")(function* (agent: AgentSummary) {
+export const listManagedSkillsForChat = Effect.fn("ManagedSkill.listForChat")(function* (agent: AgentSummary) {
   const root = yield* managedIO(() => realpath(agent.workspacePath));
   const reads = agentProviderDescriptor(agent.provider).skillFolders;
   const directory = join(root, MANAGED_SKILL_FOLDERS.find((folder) => reads.includes(folder)) ?? reads[0]);
@@ -288,9 +281,4 @@ function managedIO<A>(operation: () => Promise<A>): Effect.Effect<A, ManagedSkil
 }
 function managedSync<A>(operation: () => A): Effect.Effect<A, ManagedSkillFailure> {
   return Effect.try({ try: operation, catch: (cause) => new ManagedSkillFailure({ cause }) });
-}
-async function runManaged<A>(operation: Effect.Effect<A, ManagedSkillFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

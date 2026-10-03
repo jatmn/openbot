@@ -1,3 +1,6 @@
+import type { AgentLifecycleFailed } from "../backend/agent-service";
+import type { CentralAuthOperationError } from "./central-auth-effects";
+import type { SkillMarketplaceFailure } from "./skill-marketplace-service";
 // Link-only agent templates on the account Worker.
 //
 // Publishing sends the agent's instructions, routines and skills - never workspace files or
@@ -76,8 +79,13 @@ function snapshotProblemText(problem: AgentTemplateSnapshotProblem): string {
 const SKILL_STAGING = ".openbot/template-skills";
 
 interface AgentTemplateAuth {
-  requestAuthorized<T>(path: string, init: RequestInit, decoder: (value: unknown) => T, timeoutMs?: number): Promise<T>;
-  downloadAuthorized(path: string): Promise<Uint8Array>;
+  requestAuthorized<T>(
+    path: string,
+    init: RequestInit,
+    decoder: (value: unknown) => T,
+    timeoutMs?: number,
+  ): Effect.Effect<T, CentralAuthOperationError>;
+  downloadAuthorized(path: string): Effect.Effect<Uint8Array, CentralAuthOperationError>;
   resolveApiUrl(path: string): string;
 }
 
@@ -96,8 +104,8 @@ interface AgentTemplateAgents {
     description: string;
     avatarSeed: string;
     avatarHue: AgentTemplateSnapshot["avatarHue"];
-  }): Promise<AgentSummary>;
-  setAvatar(agentId: string, image: AvatarImageInput | null): Promise<AgentSummary>;
+  }): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
+  setAvatar(agentId: string, image: AvatarImageInput | null): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
   createRoutine(
     input: {
       agentId: string;
@@ -109,14 +117,22 @@ interface AgentTemplateAgents {
     },
     options?: { recordConversationEvent?: boolean },
   ): { id: string };
-  deleteAgent(agentId: string): Promise<void>;
+  deleteAgent(agentId: string): Effect.Effect<void, AgentLifecycleFailed>;
 }
 
 interface AgentTemplateSkills {
-  listTemplateSkills(agentId: string): Promise<AgentTemplateSkill[]>;
-  installVersion(input: { agentId: string; skillId: string; versionId: string }): Promise<unknown>;
+  listTemplateSkills(agentId: string): Effect.Effect<AgentTemplateSkill[], SkillMarketplaceFailure>;
+  installVersion(input: {
+    agentId: string;
+    skillId: string;
+    versionId: string;
+  }): Effect.Effect<unknown, SkillMarketplaceFailure>;
   library(): Pick<LocalSkillLibrary, "list" | "create" | "bundle" | "withdraw">;
-  installLocal(input: { agentId: string; skillId: string; revision: number }): Promise<unknown>;
+  installLocal(input: {
+    agentId: string;
+    skillId: string;
+    revision: number;
+  }): Effect.Effect<unknown, SkillMarketplaceFailure>;
 }
 
 /** What the Worker keeps about one template the signed-in user published. */
@@ -133,11 +149,7 @@ export class AgentTemplateService {
     private readonly skills: AgentTemplateSkills,
   ) {}
 
-  preview(agentId: string): Promise<AgentTemplatePreview> {
-    return runTemplate(this.previewEffect(agentId));
-  }
-
-  previewEffect(agentId: string): Effect.Effect<AgentTemplatePreview, AgentTemplateFailure> {
+  preview(agentId: string): Effect.Effect<AgentTemplatePreview, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentTemplatePreview, AgentTemplateFailure> {
       const agent = yield* templateSync(() => this.requireAgent(agentId));
       // Signed out or offline, the agent still previews; it reads as not published.
@@ -146,13 +158,16 @@ export class AgentTemplateService {
       // not depend on each other, so they run together.
       const [owned, skills, avatarImage] = yield* Effect.all(
         [
-          this.ownedEffect(agentId).pipe(Effect.catch(() => Effect.succeed(null))),
-          templateIO(() => this.skills.listTemplateSkills(agentId)).pipe(
-            Effect.map((value) => ({ value, error: null })),
-            Effect.catch((error) => Effect.succeed({ value: [], error: message(error.cause) })),
-          ),
+          this.owned(agentId).pipe(Effect.catch(() => Effect.succeed(null))),
+          this.skills
+            .listTemplateSkills(agentId)
+            .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })))
+            .pipe(
+              Effect.map((value) => ({ value, error: null })),
+              Effect.catch((error) => Effect.succeed({ value: [], error: message(error.cause) })),
+            ),
           // An avatar file that cannot be read is shown as no avatar: it must not hide the dialog.
-          this.readAvatarEffect(agentId).pipe(Effect.catch(() => Effect.succeed(null))),
+          this.readAvatar(agentId).pipe(Effect.catch(() => Effect.succeed(null))),
         ],
         { concurrency: "unbounded" },
       );
@@ -169,19 +184,12 @@ export class AgentTemplateService {
     });
   }
 
-  publish({ agentId, card }: PublishAgentTemplateInput): Promise<AgentTemplatePublication> {
-    return runTemplate(this.publishEffect({ agentId, card }));
-  }
-
-  publishEffect({
-    agentId,
-    card,
-  }: PublishAgentTemplateInput): Effect.Effect<AgentTemplatePublication, AgentTemplateFailure> {
+  publish({ agentId, card }: PublishAgentTemplateInput): Effect.Effect<AgentTemplatePublication, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentTemplatePublication, AgentTemplateFailure> {
       if (card && !isAgentTemplateCardPng(card))
         return yield* new AgentTemplateFailure({ cause: new Error(sourceText("error.marketplace.shareCardInvalid")) });
       const agent = yield* templateSync(() => this.requireAgent(agentId));
-      const snapshot = yield* this.snapshotEffect(agent);
+      const snapshot = yield* this.snapshot(agent);
       // The first real cause, so the owner knows what to change.
       const problem = agentTemplateSnapshotProblem(snapshot);
       if (problem) return yield* new AgentTemplateFailure({ cause: new Error(snapshotProblemText(problem)) });
@@ -191,67 +199,46 @@ export class AgentTemplateService {
       const form = new FormData();
       form.set("snapshot", JSON.stringify(snapshot));
       form.set("sourceAgentId", agentId);
-      const avatar = yield* this.readAvatarEffect(agentId);
+      const avatar = yield* this.readAvatar(agentId);
       if (avatar) form.set("avatar", new Blob([toArrayBuffer(avatar.bytes)], { type: avatar.mimeType }), "avatar");
       if (card) form.set("card", new Blob([toArrayBuffer(card)], { type: "image/png" }), "card.png");
-      const owned = yield* templateIO(() =>
-        this.auth.requestAuthorized(
-          "/v1/agent-templates/",
-          { method: "POST", body: form },
-          decodeOwnedTemplate,
-          30_000,
-        ),
-      );
+      const owned = yield* this.auth
+        .requestAuthorized("/v1/agent-templates/", { method: "POST", body: form }, decodeOwnedTemplate, 30_000)
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
       return this.publication(owned);
     });
   }
 
-  unpublish(agentId: string): Promise<void> {
-    return runTemplate(this.unpublishEffect(agentId));
-  }
-
-  unpublishEffect(agentId: string): Effect.Effect<void, AgentTemplateFailure> {
+  unpublish(agentId: string): Effect.Effect<void, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<void, AgentTemplateFailure> {
-      const owned = yield* this.ownedEffect(agentId);
+      const owned = yield* this.owned(agentId);
       if (!owned) return;
-      yield* templateIO(() =>
-        this.auth.requestAuthorized(
-          `/v1/agent-templates/${encodeURIComponent(owned.id)}`,
-          { method: "DELETE" },
-          decodeDeleted,
-        ),
-      );
+      yield* this.auth
+        .requestAuthorized(`/v1/agent-templates/${encodeURIComponent(owned.id)}`, { method: "DELETE" }, decodeDeleted)
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
     });
   }
 
-  get(templateId: string): Promise<AgentTemplateDetail> {
-    return runTemplate(this.getEffect(templateId));
-  }
-
-  getEffect(templateId: string): Effect.Effect<AgentTemplateDetail, AgentTemplateFailure> {
+  get(templateId: string): Effect.Effect<AgentTemplateDetail, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentTemplateDetail, AgentTemplateFailure> {
       if (!isAgentTemplateId(templateId))
         return yield* new AgentTemplateFailure({ cause: new Error(sourceText("error.marketplace.linkInvalid")) });
-      const detail = yield* templateIO(() =>
-        this.auth.requestAuthorized(
+      const detail = yield* this.auth
+        .requestAuthorized(
           `/v1/agent-templates/${encodeURIComponent(templateId)}`,
           { method: "GET" },
           decodeAgentTemplateDetail,
-        ),
-      );
+        )
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
       return { ...detail, avatarUrl: detail.avatarUrl ? this.auth.resolveApiUrl(detail.avatarUrl) : null };
     });
   }
 
-  install(input: InstallAgentTemplateInput): Promise<InstallAgentTemplateResult> {
-    return runTemplate(this.installEffect(input));
-  }
-
-  installEffect(input: InstallAgentTemplateInput): Effect.Effect<InstallAgentTemplateResult, AgentTemplateFailure> {
+  install(input: InstallAgentTemplateInput): Effect.Effect<InstallAgentTemplateResult, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<InstallAgentTemplateResult, AgentTemplateFailure> {
       if (!validTimezone(input.timezone))
         return yield* new AgentTemplateFailure({ cause: new Error(sourceText("error.marketplace.timezoneInvalid")) });
-      const detail = yield* this.getEffect(input.templateId);
+      const detail = yield* this.get(input.templateId);
       // The owner can republish while the dialog is open; only the version the user read is installed.
       if (detail.updatedAt !== input.expectedUpdatedAt)
         return yield* new AgentTemplateFailure({
@@ -261,7 +248,9 @@ export class AgentTemplateService {
       // skill with the same name is reused only when its text is the same: a template never revises a
       // skill the user already has.
       const library = yield* templateSync(() => this.skills.library());
-      const localSkills = yield* templateIO(() => library.list());
+      const localSkills = yield* library
+        .list()
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
       const reused = new Map<string, { id: string; revision: number }>();
       for (const skill of detail.skills) {
         if (skill.kind !== "embedded") continue;
@@ -269,7 +258,11 @@ export class AgentTemplateService {
         const current = localSkills.find((candidate) => candidate.slug === slug);
         if (!current) continue;
         const text = new TextDecoder().decode(
-          normalizedFiles(yield* templateIO(() => library.bundle(current.id, current.version)))["SKILL.md"],
+          normalizedFiles(
+            yield* library
+              .bundle(current.id, current.version)
+              .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause }))),
+          )["SKILL.md"],
         );
         if (text !== skill.markdown)
           return yield* new AgentTemplateFailure({
@@ -280,38 +273,40 @@ export class AgentTemplateService {
       let avatar: AvatarImageInput | null = null;
       if (detail.avatarUrl) {
         const avatarUrl = detail.avatarUrl;
-        const bytes = yield* templateIO(() => this.auth.downloadAuthorized(avatarUrl));
+        const bytes = yield* this.auth
+          .downloadAuthorized(avatarUrl)
+          .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
         const mimeType = imageMimeType(bytes);
         if (!mimeType)
           return yield* new AgentTemplateFailure({ cause: new Error(sourceText("error.marketplace.avatarInvalid")) });
         avatar = { mimeType, bytes };
       }
 
-      let agent = yield* templateIO(() =>
-        this.agents.createAgentProfile({
+      let agent = yield* this.agents
+        .createAgentProfile({
           name: detail.name,
           ...(detail.title ? { title: detail.title } : {}),
           description: detail.description,
           avatarSeed: detail.avatarSeed,
           avatarHue: detail.avatarHue,
-        }),
-      );
+        })
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
       const published: Array<{ id: string; revision: number }> = [];
       {
         const outcome = yield* Effect.result(
           Effect.gen({ self: this }, function* () {
             for (const skill of detail.skills) {
               if (skill.kind === "marketplace") {
-                yield* templateIO(() =>
-                  this.skills.installVersion({ agentId: agent.id, skillId: skill.skillId, versionId: skill.versionId }),
-                );
+                yield* this.skills
+                  .installVersion({ agentId: agent.id, skillId: skill.skillId, versionId: skill.versionId })
+                  .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
                 continue;
               }
               const existing = reused.get(inspectSkillMarkdown(skill.markdown).slug);
               if (existing) {
-                yield* templateIO(() =>
-                  this.skills.installLocal({ agentId: agent.id, skillId: existing.id, revision: existing.revision }),
-                );
+                yield* this.skills
+                  .installLocal({ agentId: agent.id, skillId: existing.id, revision: existing.revision })
+                  .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
                 continue;
               }
               const folder = `${SKILL_STAGING}/${skill.slug}`;
@@ -319,11 +314,13 @@ export class AgentTemplateService {
               yield* Effect.gen({ self: this }, function* () {
                 yield* templateIO(() => mkdir(target, { recursive: true }));
                 yield* templateIO(() => writeFile(join(target, "SKILL.md"), skill.markdown, { flag: "wx" }));
-                const revision = yield* templateIO(() => library.create(agent.id, folder));
+                const revision = yield* library
+                  .create(agent.id, folder)
+                  .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
                 published.push({ id: revision.id, revision: revision.version });
-                yield* templateIO(() =>
-                  this.skills.installLocal({ agentId: agent.id, skillId: revision.id, revision: revision.version }),
-                );
+                yield* this.skills
+                  .installLocal({ agentId: agent.id, skillId: revision.id, revision: revision.version })
+                  .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
               }).pipe(
                 Effect.ensuring(
                   Effect.gen({ self: this }, function* () {
@@ -346,15 +343,18 @@ export class AgentTemplateService {
                   { recordConversationEvent: false },
                 ),
               );
-            if (avatar) agent = yield* templateIO(() => this.agents.setAvatar(agent.id, avatar));
+            if (avatar)
+              agent = yield* this.agents
+                .setAvatar(agent.id, avatar)
+                .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
           }),
         );
         if (Result.isFailure(outcome)) {
           const error = outcome.failure.cause;
-          yield* templateIO(() => this.agents.deleteAgent(agent.id).catch(() => undefined));
+          yield* this.agents.deleteAgent(agent.id).pipe(Effect.catch(() => Effect.void));
           // A failed install leaves the shared library as it was.
           for (const skill of published.reverse())
-            yield* templateIO(() => library.withdraw(skill.id, skill.revision).catch(() => undefined));
+            yield* library.withdraw(skill.id, skill.revision).pipe(Effect.catch(() => Effect.void));
           return yield* new AgentTemplateFailure({ cause: error });
         }
       }
@@ -362,9 +362,14 @@ export class AgentTemplateService {
     });
   }
 
-  snapshotEffect(agent: AgentSummary): Effect.Effect<AgentTemplateSnapshot, AgentTemplateFailure> {
+  snapshot(agent: AgentSummary): Effect.Effect<AgentTemplateSnapshot, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AgentTemplateSnapshot, AgentTemplateFailure> {
-      return this.profile(agent, yield* templateIO(() => this.skills.listTemplateSkills(agent.id)));
+      return this.profile(
+        agent,
+        yield* this.skills
+          .listTemplateSkills(agent.id)
+          .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause }))),
+      );
     });
   }
 
@@ -385,7 +390,7 @@ export class AgentTemplateService {
     });
   }
 
-  readAvatarEffect(agentId: string): Effect.Effect<AvatarImageInput | null, AgentTemplateFailure> {
+  readAvatar(agentId: string): Effect.Effect<AvatarImageInput | null, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<AvatarImageInput | null, AgentTemplateFailure> {
       const avatar = this.agents.resolveAvatar(agentId);
       if (!avatar) return null;
@@ -393,11 +398,11 @@ export class AgentTemplateService {
     });
   }
 
-  ownedEffect(agentId: string): Effect.Effect<OwnedTemplate | null, AgentTemplateFailure> {
+  owned(agentId: string): Effect.Effect<OwnedTemplate | null, AgentTemplateFailure> {
     return Effect.gen({ self: this }, function* (): Effect.fn.Return<OwnedTemplate | null, AgentTemplateFailure> {
-      const mine = yield* templateIO(() =>
-        this.auth.requestAuthorized("/v1/agent-templates/mine", { method: "GET" }, decodeOwnedTemplates),
-      );
+      const mine = yield* this.auth
+        .requestAuthorized("/v1/agent-templates/mine", { method: "GET" }, decodeOwnedTemplates)
+        .pipe(Effect.mapError((error) => new AgentTemplateFailure({ cause: error.cause })));
       return mine.find((template) => template.sourceAgentId === agentId) ?? null;
     });
   }
@@ -475,16 +480,11 @@ function message(error: unknown): string {
   return error instanceof Error && error.message ? error.message : "The skills could not be read.";
 }
 
-class AgentTemplateFailure extends Schema.TaggedError<AgentTemplateFailure>()("AgentTemplateFailure", {
+export class AgentTemplateFailure extends Schema.TaggedError<AgentTemplateFailure>()("AgentTemplateFailure", {
   cause: Schema.Defect(),
 }) {}
 function templateIO<A>(operation: () => Promise<A>): Effect.Effect<A, AgentTemplateFailure> {
   return Effect.tryPromise({ try: operation, catch: (cause) => new AgentTemplateFailure({ cause }) });
-}
-async function runTemplate<A>(operation: Effect.Effect<A, AgentTemplateFailure>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }
 
 function templateSync<A>(operation: () => A): Effect.Effect<A, AgentTemplateFailure> {

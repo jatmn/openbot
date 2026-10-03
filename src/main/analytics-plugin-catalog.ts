@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { McpServerConfig } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { Effect } from "effect";
-import { analyticsIO, analyticsSync, runAnalytics } from "./analytics-effects";
+import { analyticsIO, analyticsSync } from "./analytics-effects";
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 
@@ -21,10 +21,7 @@ export interface CatalogPluginServer {
  * Reads the plugin catalog that ships in the app resources. A missing or damaged catalog gives no
  * servers, so every configured server reports as `custom`: analytics must never stop startup.
  */
-export function loadCatalogPluginServers(root: string): Promise<CatalogPluginServer[]> {
-  return runAnalytics(loadCatalogPluginServersEffect(root));
-}
-export const loadCatalogPluginServersEffect = Effect.fn("Analytics.loadPluginCatalog")(
+export const loadCatalogPluginServers = Effect.fn("Analytics.loadPluginCatalog")(
   function* (root: string) {
     const contents = yield* analyticsIO(() => readFile(join(root, "catalog.json"), "utf8"));
     const catalog = yield* analyticsSync(() => JSON.parse(contents));

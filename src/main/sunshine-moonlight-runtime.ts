@@ -26,7 +26,7 @@ import {
   runDesktopEffect,
 } from "./remote-desktop-effects";
 import type { RemoteDesktopRuntimePaths } from "./remote-desktop-runtime-artifact";
-import { forwardDiagnosticLines, stopRemoteProcessEffect } from "./remote-diagnostics";
+import { forwardDiagnosticLines, stopRemoteProcess } from "./remote-diagnostics";
 
 export class SunshineApiError extends Schema.TaggedError<SunshineApiError>()("SunshineApiError", {
   status: Schema.Int,
@@ -113,10 +113,7 @@ const claimedSunshineBasePorts = new Set<number>();
 const webRtcReservations = new Map<number, ReturnType<typeof createTcpServer>>();
 
 /** Reserve a Sunshine base port whose whole port family is free on loopback. */
-export function allocateSunshineBasePort(): Promise<number> {
-  return runDesktopEffect(allocateSunshineBasePortEffect());
-}
-const allocateSunshineBasePortEffect = Effect.fn("RemoteDesktop.allocateSunshineBasePort")(function* () {
+export const allocateSunshineBasePort = Effect.fn("RemoteDesktop.allocateSunshineBasePort")(function* () {
   let candidate = SUNSHINE_DEFAULT_BASE_PORT;
   for (
     let attempt = 0;
@@ -153,10 +150,7 @@ export function releaseSunshineBasePort(basePort: number): void {
 }
 
 /** Reserve a block of consecutive UDP ports for one Moonlight WebRTC streamer. */
-export function allocateWebRtcPortRange(): Promise<MoonlightWebRtcPortRange> {
-  return runDesktopEffect(allocateWebRtcPortRangeEffect());
-}
-const allocateWebRtcPortRangeEffect = Effect.fn("RemoteDesktop.allocateWebRtcPortRange")(function* () {
+export const allocateWebRtcPortRange = Effect.fn("RemoteDesktop.allocateWebRtcPortRange")(function* () {
   const size = MOONLIGHT_WEBRTC_RANGE_SIZE;
   for (let min = MOONLIGHT_WEBRTC_RANGE_START; min + size - 1 <= 65_535; min += size) {
     const range = { min, max: min + size - 1 };
@@ -332,12 +326,12 @@ interface SunshineMoonlightRuntimeOptions {
   platform: "darwin" | "win32" | "linux";
   credentials: { username: string; password: string };
   getDisplays: () => RemoteDesktopDisplay[];
-  getIceServers: () => Promise<RemoteDesktopIceServer[]>;
+  getIceServers: () => Effect.Effect<RemoteDesktopIceServer[], RemoteDesktopOperationError>;
   spawnProcess?: RemoteRuntimeSpawn;
   onDiagnostic?: (source: "sunshine" | "moonlight", message: string) => void;
-  allocateSunshineBasePort?: () => Promise<number>;
-  allocateMoonlightPort?: () => Promise<number>;
-  allocateWebRtcPortRange?: () => Promise<MoonlightWebRtcPortRange>;
+  allocateSunshineBasePort?: () => Effect.Effect<number, RemoteDesktopOperationError>;
+  allocateMoonlightPort?: () => Effect.Effect<number, RemoteDesktopOperationError>;
+  allocateWebRtcPortRange?: () => Effect.Effect<MoonlightWebRtcPortRange, RemoteDesktopOperationError>;
 }
 
 export class SunshineMoonlightRuntime {
@@ -352,7 +346,7 @@ export class SunshineMoonlightRuntime {
   #screenCaptureDenied = false;
   readonly #moonlightHeader = `X-OpenBot-Remote-${randomBytes(32).toString("hex")}`;
   #selectedDisplayId: string | null = null;
-  readonly #lifecycle = new LifecycleGate<SunshineMoonlightRuntimeState>();
+  readonly #lifecycle = new LifecycleGate<SunshineMoonlightRuntimeState, RemoteDesktopOperationError>();
   /** Set by a stop that arrives while a start runs. The start then opens nothing more and fails. */
   #stopRequested = false;
   #sunshineBasePort: number | null = null;
@@ -395,26 +389,15 @@ export class SunshineMoonlightRuntime {
     return this.#screenCaptureDenied;
   }
 
-  start(): Promise<SunshineMoonlightRuntimeState> {
-    return this.#lifecycle.start(() =>
-      runDesktopEffect(
-        Effect.gen({ self: this }, function* () {
-          return this.#state ? { ...this.#state } : yield* this.#startEffect();
-        }),
-      ),
-    );
-  }
+  readonly start = Effect.fn("SunshineMoonlightRuntime.start")(() =>
+    this.#lifecycle.start(() =>
+      Effect.gen({ self: this }, function* () {
+        return this.#state ? { ...this.#state } : yield* this.#startEffect();
+      }),
+    ),
+  );
 
-  checkSetup(): Promise<
-    Pick<
-      RemoteDesktopSetupStatus,
-      "hostName" | "username" | "screenRecording" | "accessibility" | "guiSession" | "displays" | "restartRequired"
-    >
-  > {
-    return runDesktopEffect(this.#checkSetupOperation());
-  }
-
-  readonly #checkSetupOperation = Effect.fn("SunshineMoonlightRuntime.checkSetup")(function* (
+  readonly checkSetup = Effect.fn("SunshineMoonlightRuntime.checkSetup")(function* (
     this: SunshineMoonlightRuntime,
   ): Effect.fn.Return<
     Pick<
@@ -430,13 +413,9 @@ export class SunshineMoonlightRuntime {
       join(this.#options.stateDirectory, "sunshine-cert.pem"),
       sunshineSetupSchema,
     );
-  });
+  }).bind(this);
 
-  test(action: "start" | "status" | "stop"): Promise<RemoteDesktopTestStatus> {
-    return runDesktopEffect(this.#testOperation(action));
-  }
-
-  readonly #testOperation = Effect.fn("SunshineMoonlightRuntime.test")(function* (
+  readonly test = Effect.fn("SunshineMoonlightRuntime.test")(function* (
     this: SunshineMoonlightRuntime,
     action: "start" | "status" | "stop",
   ): Effect.fn.Return<RemoteDesktopTestStatus, RemoteDesktopOperationError> {
@@ -457,13 +436,9 @@ export class SunshineMoonlightRuntime {
       certificate,
       sunshineTestSchema,
     );
-  });
+  }).bind(this);
 
-  selectDisplay(displayId: string): Promise<void> {
-    return runDesktopEffect(this.#selectDisplayOperation(displayId));
-  }
-
-  readonly #selectDisplayOperation = Effect.fn("SunshineMoonlightRuntime.selectDisplay")(function* (
+  readonly selectDisplay = Effect.fn("SunshineMoonlightRuntime.selectDisplay")(function* (
     this: SunshineMoonlightRuntime,
     displayId: string,
   ): Effect.fn.Return<void, RemoteDesktopOperationError> {
@@ -471,32 +446,24 @@ export class SunshineMoonlightRuntime {
     if (!this.#state) return;
     yield* this.#writeSunshineConfigEffect();
     const sunshine = this.#sunshine;
-    if (sunshine) yield* stopRemoteProcessEffect(sunshine);
+    if (sunshine) yield* stopRemoteProcess(sunshine);
     this.#sunshine = null;
     // Reuse the already allocated ports: Moonlight paired against this Sunshine HTTP port, so a
     // reallocation here would orphan every existing pairing.
     yield* this.#startSunshineOnceEffect();
     if (this.#state) this.#state = { ...this.#state, selectedDisplayId: displayId };
-  });
+  }).bind(this);
 
-  stop(): Promise<void> {
-    return this.#lifecycle.stop(
-      () => this.#stop(),
-      // A start can wait 20 seconds for each process. Stopping its processes now makes that wait fail
-      // at once, and the flag keeps it from starting a new one. Then `#stop` closes what it opened.
+  readonly stop = Effect.fn("SunshineMoonlightRuntime.stop")(() =>
+    this.#lifecycle.stop(
+      () => this.#stopEffect(),
       () =>
-        runDesktopEffect(
-          Effect.gen({ self: this }, function* () {
-            this.#stopRequested = true;
-            yield* this.#stopChildrenEffect();
-          }),
-        ),
-    );
-  }
-
-  #stop(): Promise<void> {
-    return runDesktopEffect(this.#stopEffect());
-  }
+        Effect.gen({ self: this }, function* () {
+          this.#stopRequested = true;
+          yield* this.#stopChildrenEffect();
+        }),
+    ),
+  );
 
   readonly #stopEffect = Effect.fn("SunshineMoonlightRuntime.stop")(function* (
     this: SunshineMoonlightRuntime,
@@ -554,9 +521,9 @@ export class SunshineMoonlightRuntime {
         if (this.#sunshineBasePort === null) {
           const allocateSunshine = this.#options.allocateSunshineBasePort;
           if (allocateSunshine) {
-            this.#sunshineBasePort = desktopResult(yield* Effect.result(desktopCall(() => allocateSunshine())));
+            this.#sunshineBasePort = desktopResult(yield* Effect.result(allocateSunshine()));
           } else {
-            this.#sunshineBasePort = desktopResult(yield* Effect.result(allocateSunshineBasePortEffect()));
+            this.#sunshineBasePort = desktopResult(yield* Effect.result(allocateSunshineBasePort()));
             this.#ownsSunshineAllocation = true;
           }
         }
@@ -565,15 +532,15 @@ export class SunshineMoonlightRuntime {
         desktopResult(yield* Effect.result(desktopSync(() => this.#throwIfStopRequested())));
         if (this.#moonlightPort === null) {
           this.#moonlightPort = desktopResult(
-            yield* Effect.result(desktopCall(() => (this.#options.allocateMoonlightPort ?? reservePort)())),
+            yield* Effect.result((this.#options.allocateMoonlightPort ?? reservePort)()),
           );
         }
         if (this.#webRtcRange === null) {
           const allocateWebRtc = this.#options.allocateWebRtcPortRange;
           if (allocateWebRtc) {
-            this.#webRtcRange = desktopResult(yield* Effect.result(desktopCall(() => allocateWebRtc())));
+            this.#webRtcRange = desktopResult(yield* Effect.result(allocateWebRtc()));
           } else {
-            this.#webRtcRange = desktopResult(yield* Effect.result(allocateWebRtcPortRangeEffect()));
+            this.#webRtcRange = desktopResult(yield* Effect.result(allocateWebRtcPortRange()));
             this.#ownsWebRtcRange = true;
           }
         }
@@ -637,10 +604,7 @@ export class SunshineMoonlightRuntime {
     this.#moonlight = null;
     this.#sunshine = null;
     yield* Effect.all(
-      [
-        moonlight ? stopRemoteProcessEffect(moonlight) : Effect.void,
-        sunshine ? stopRemoteProcessEffect(sunshine) : Effect.void,
-      ],
+      [moonlight ? stopRemoteProcess(moonlight) : Effect.void, sunshine ? stopRemoteProcess(sunshine) : Effect.void],
       { concurrency: "unbounded" },
     );
   });
@@ -784,13 +748,13 @@ export class SunshineMoonlightRuntime {
         lastError = error;
         const sunshine = this.#sunshine;
         if (sunshine) {
-          yield* stopRemoteProcessEffect(sunshine).pipe(Effect.catch(() => Effect.void));
+          yield* stopRemoteProcess(sunshine).pipe(Effect.catch(() => Effect.void));
           this.#sunshine = null;
         }
         if (attempt + 1 >= SUNSHINE_START_ATTEMPTS) break;
         if (this.#ownsSunshineAllocation && this.#sunshineBasePort !== null) {
           releaseSunshineBasePort(this.#sunshineBasePort);
-          this.#sunshineBasePort = yield* allocateSunshineBasePortEffect();
+          this.#sunshineBasePort = yield* allocateSunshineBasePort();
         }
         yield* this.#writeSunshineConfigEffect();
       }
@@ -1093,7 +1057,7 @@ export class SunshineMoonlightRuntime {
             return;
           }
           void runDesktopEffect(
-            desktopCall(() => this.#options.getIceServers()).pipe(
+            this.#options.getIceServers().pipe(
               Effect.flatMap((servers) =>
                 desktopSync(() => {
                   response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -1424,10 +1388,7 @@ function readinessAttemptTimeout(deadline: number): number {
   return Math.max(1, Math.min(READINESS_ATTEMPT_TIMEOUT_MS, deadline - Date.now()));
 }
 
-function reservePort(): Promise<number> {
-  return runDesktopEffect(reservePortEffect());
-}
-const reservePortEffect = Effect.fn("RemoteDesktop.reservePort")(() =>
+const reservePort = Effect.fn("RemoteDesktop.reservePort")(() =>
   Effect.acquireUseRelease(
     listenTcpEffect(0),
     (server) =>

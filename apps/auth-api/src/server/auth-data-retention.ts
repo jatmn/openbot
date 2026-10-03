@@ -1,5 +1,4 @@
 import { Context, Effect, Layer, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 
 const RATE_LIMIT_WINDOW_MS = 15 * 60_000;
 
@@ -97,6 +96,6 @@ const prune = Effect.fn("AuthRetention.prune")(function* (now: number) {
   return deleted;
 });
 
-export function pruneExpiredAuthData(database: D1Database, now: number): Promise<AuthRetentionResult> {
-  return runApiEffect(prune(now).pipe(Effect.provide(Layer.succeed(AuthRetentionDatabase)(database))));
+export function pruneExpiredAuthData(database: D1Database, now: number) {
+  return prune(now).pipe(Effect.provide(Layer.succeed(AuthRetentionDatabase)(database)));
 }

@@ -72,12 +72,8 @@ export class OpenBotDatabase {
     return this.#core.path;
   }
 
-  initialize(): Promise<void> {
+  initialize() {
     return this.#core.initialize();
-  }
-
-  initializeEffect() {
-    return this.#core.initializeEffect();
   }
 
   close(): void {
@@ -104,12 +100,8 @@ export class OpenBotDatabase {
     return this.#core.hasAggregateEvents(aggregateType, aggregateId);
   }
 
-  backupLegacyFile(path: string): Promise<void> {
+  backupLegacyFile(path: string) {
     return this.#core.backupLegacyFile(path);
-  }
-
-  backupLegacyFileEffect(path: string) {
-    return this.#core.backupLegacyFileEffect(path);
   }
 
   recordPendingHostedSiteTerminalEvent(event: PendingHostedSiteTerminalEvent): void {

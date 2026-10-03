@@ -6,7 +6,6 @@ import {
 import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { Effect, Schema } from "effect";
 import { importPKCS8, SignJWT } from "jose";
-import { runApiEffect } from "./effect-runtime";
 
 /**
  * Forwards a sealed iOS Live Activity update from a host to Apple Push Notification service. The host
@@ -58,11 +57,7 @@ export class ApnsLiveActivitySender {
     this.#now = now;
   }
 
-  send(push: LiveActivityRelayPush): Promise<LiveActivityRelayResult> {
-    return runApiEffect(this.#send(push));
-  }
-
-  readonly #send = Effect.fn("ApnsLiveActivitySender.send")(function* (
+  readonly send = Effect.fn("ApnsLiveActivitySender.send")(function* (
     this: ApnsLiveActivitySender,
     push: LiveActivityRelayPush,
   ): Effect.fn.Return<LiveActivityRelayResult, ApnsProviderError> {
@@ -102,7 +97,7 @@ export class ApnsLiveActivitySender {
     );
     if (reason === "ExpiredProviderToken" || reason === "InvalidProviderToken") this.#token = null;
     return GONE_REASONS.has(reason) ? "gone" : "rejected";
-  });
+  }).bind(this);
 
   /** Only resolved values cross Worker requests; pending I/O remains with its invocation. */
   readonly #providerToken = Effect.fn("ApnsLiveActivitySender.providerToken")(function* (

@@ -8,7 +8,6 @@ import {
   isRoutineSchedule,
   isSkillCategory,
   type MarketplaceAgentDetail,
-  type MarketplaceAgentPage,
   type MarketplaceAgentQuery,
   type MarketplaceAgentRoutine,
   type MarketplaceAgentSkill,
@@ -17,7 +16,6 @@ import {
 } from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { Effect, Result, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 import {
   decodeMarketplaceCursor,
   encodeMarketplaceCursor,
@@ -73,13 +71,7 @@ export class AgentMarketplaceError extends Schema.TaggedError<AgentMarketplaceEr
 export class AgentMarketplace {
   constructor(private readonly bindings: Pick<WorkerBindings, "DB" | "SKILLS">) {}
 
-  list(input: MarketplaceAgentQuery = {}): Promise<MarketplaceAgentPage> {
-    return runApiEffect(this.listEffect(input).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  listEffect(
-    input: MarketplaceAgentQuery = {},
-  ): Effect.Effect<MarketplaceAgentPage, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  list(input: MarketplaceAgentQuery = {}) {
     return Effect.fn("AgentMarketplace.list")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -149,16 +141,10 @@ export class AgentMarketplace {
               : null,
         };
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  get(agentId: string): Promise<MarketplaceAgentDetail> {
-    return runApiEffect(this.getEffect(agentId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  getEffect(
-    agentId: string,
-  ): Effect.Effect<MarketplaceAgentDetail, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  get(agentId: string) {
     return Effect.fn("AgentMarketplace.get")(() =>
       Effect.gen({ self: this }, function* () {
         const row = yield* this.approvedRowEffect(agentId);
@@ -168,22 +154,10 @@ export class AgentMarketplace {
           );
         return yield* marketplaceDecode(() => publicDetail(row));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  setCreatorAvatar(userId: string, listingId: string, show: boolean): Promise<void> {
-    return runApiEffect(
-      this.setCreatorAvatarEffect(userId, listingId, show).pipe(
-        Effect.provide(MarketplaceStorage.layer(this.bindings)),
-      ),
-    );
-  }
-
-  setCreatorAvatarEffect(
-    userId: string,
-    listingId: string,
-    show: boolean,
-  ): Effect.Effect<void, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  setCreatorAvatar(userId: string, listingId: string, show: boolean) {
     return Effect.fn("AgentMarketplace.setCreatorAvatar")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -200,16 +174,10 @@ export class AgentMarketplace {
             marketplaceError(new AgentMarketplaceError(404, "agent_not_found", "The owned agent was not found.")),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  listMine(userId: string): Promise<AgentSubmissionWire[]> {
-    return runApiEffect(this.listMineEffect(userId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  listMineEffect(
-    userId: string,
-  ): Effect.Effect<AgentSubmissionWire[], AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  listMine(userId: string) {
     return Effect.fn("AgentMarketplace.listMine")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -230,7 +198,7 @@ export class AgentMarketplace {
         );
         return yield* marketplaceDecode(() => (result.results ?? []).map(submission));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   submit(input: {
@@ -240,18 +208,7 @@ export class AgentMarketplace {
     agentId?: string;
     category?: SkillCategory;
     showCreatorAvatar?: boolean;
-  }): Promise<AgentSubmissionWire> {
-    return runApiEffect(this.submitEffect(input).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  submitEffect(input: {
-    user: AuthUser;
-    snapshot: unknown;
-    avatar: { bytes: Uint8Array; mimeType: string } | null;
-    agentId?: string;
-    category?: SkillCategory;
-    showCreatorAvatar?: boolean;
-  }): Effect.Effect<AgentSubmissionWire, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  }) {
     return Effect.fn("AgentMarketplace.submit")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -372,7 +329,7 @@ export class AgentMarketplace {
               .run(),
           );
           if (input.showCreatorAvatar !== undefined)
-            yield* this.setCreatorAvatarEffect(input.user.id, agentId, input.showCreatorAvatar);
+            yield* this.setCreatorAvatar(input.user.id, agentId, input.showCreatorAvatar);
           yield* marketplaceCall(() =>
             bindings.DB.prepare("UPDATE marketplace_agents SET updated_at = ? WHERE id = ?").bind(now, agentId).run(),
           );
@@ -397,14 +354,10 @@ export class AgentMarketplace {
           );
         return yield* marketplaceDecode(() => submission(row));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   avatar(agentId: string) {
-    return runApiEffect(this.avatarEffect(agentId).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  avatarEffect(agentId: string) {
     return Effect.fn("AgentMarketplace.avatar")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -422,22 +375,10 @@ export class AgentMarketplace {
           );
         return object;
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  recordInstall(agentId: string, userId: string, receiptId: string): Promise<void> {
-    return runApiEffect(
-      this.recordInstallEffect(agentId, userId, receiptId).pipe(
-        Effect.provide(MarketplaceStorage.layer(this.bindings)),
-      ),
-    );
-  }
-
-  recordInstallEffect(
-    agentId: string,
-    userId: string,
-    receiptId: string,
-  ): Effect.Effect<void, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  recordInstall(agentId: string, userId: string, receiptId: string) {
     return Effect.fn("AgentMarketplace.recordInstall")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -460,18 +401,10 @@ export class AgentMarketplace {
               .run(),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  listPending(): Promise<AgentSubmissionWire[]> {
-    return runApiEffect(this.listPendingEffect().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))));
-  }
-
-  listPendingEffect(): Effect.Effect<
-    AgentSubmissionWire[],
-    AgentMarketplaceError | AgentMarketplaceStorageError,
-    MarketplaceStorage
-  > {
+  listPending() {
     return Effect.fn("AgentMarketplace.listPending")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -488,20 +421,10 @@ export class AgentMarketplace {
         );
         return yield* marketplaceDecode(() => (result.results ?? []).map(submission));
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  review(versionId: string, status: "approved" | "rejected", note: string | null): Promise<void> {
-    return runApiEffect(
-      this.reviewEffect(versionId, status, note).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  reviewEffect(
-    versionId: string,
-    status: "approved" | "rejected",
-    note: string | null,
-  ): Effect.Effect<void, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  review(versionId: string, status: "approved" | "rejected", note: string | null) {
     return Effect.fn("AgentMarketplace.review")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -543,19 +466,10 @@ export class AgentMarketplace {
               .run(),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
-  setFeatured(agentId: string, featured: boolean): Promise<void> {
-    return runApiEffect(
-      this.setFeaturedEffect(agentId, featured).pipe(Effect.provide(MarketplaceStorage.layer(this.bindings))),
-    );
-  }
-
-  setFeaturedEffect(
-    agentId: string,
-    featured: boolean,
-  ): Effect.Effect<void, AgentMarketplaceError | AgentMarketplaceStorageError, MarketplaceStorage> {
+  setFeatured(agentId: string, featured: boolean) {
     return Effect.fn("AgentMarketplace.setFeatured")(() =>
       Effect.gen({ self: this }, function* () {
         const bindings = yield* MarketplaceStorage;
@@ -572,7 +486,7 @@ export class AgentMarketplace {
             marketplaceError(new AgentMarketplaceError(404, "agent_not_found", "The agent was not found.")),
           );
       }),
-    )();
+    )().pipe(Effect.provide(MarketplaceStorage.layer(this.bindings)));
   }
 
   private validateSkillsEffect(

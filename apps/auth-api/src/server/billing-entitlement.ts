@@ -1,5 +1,4 @@
 import { Effect, Schema } from "effect";
-import { runApiEffect } from "./effect-runtime";
 
 class BillingEntitlementError extends Schema.TaggedError<BillingEntitlementError>()("BillingEntitlementError", {}) {}
 
@@ -22,15 +21,8 @@ export interface BillingEntitlement {
  * that the unpaid invoice is for. Stripe must cancel the subscription or mark it unpaid after the last
  * retry (docs/hosted-servers.md, Production), or the plan lasts for that whole period.
  */
-export function getServerEntitlement(
-  database: D1Database,
-  serverId: string,
-  now = Date.now(),
-): Promise<BillingEntitlement | null> {
-  return runApiEffect(getServerEntitlementEffect(database, serverId, now));
-}
 
-export const getServerEntitlementEffect = Effect.fn("Billing.getServerEntitlement")(function* (
+export const getServerEntitlement = Effect.fn("Billing.getServerEntitlement")(function* (
   database: D1Database,
   serverId: string,
   now = Date.now(),

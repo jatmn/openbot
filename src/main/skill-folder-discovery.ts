@@ -11,7 +11,7 @@ import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
 import { parse as parseYaml } from "yaml";
-import { type ArchiveOperationError, archiveCall, archiveResult, runArchiveEffect } from "./archive-effects";
+import { type ArchiveOperationError, archiveCall, archiveResult } from "./archive-effects";
 import { OWNERSHIP_MARKER } from "./managed-skill-service";
 
 /**
@@ -30,13 +30,7 @@ const MAX_SKILL_FILE_BYTES = 256 * 1024;
  * these folders and never writes to them. `exclude` holds the folder names in the lock file, which
  * the installed list already shows.
  */
-export function listFolderSkills(
-  agent: Pick<AgentSummary, "provider" | "workspacePath">,
-  exclude: ReadonlySet<string>,
-): Promise<InstalledSkill[]> {
-  return runArchiveEffect(listFolderSkillsEffect(agent, exclude));
-}
-export const listFolderSkillsEffect = Effect.fn("SkillFolder.listFolderSkills")(function* (
+export const listFolderSkills = Effect.fn("SkillFolder.listFolderSkills")(function* (
   agent: Pick<AgentSummary, "provider" | "workspacePath">,
   exclude: ReadonlySet<string>,
 ): Effect.fn.Return<InstalledSkill[], ArchiveOperationError> {

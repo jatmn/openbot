@@ -1,10 +1,11 @@
 import type { AgentEvent, ConversationMessage } from "@openbot/contracts/ipc";
 import { CONVERSATION_PLAN_ITEM_TYPE, MESSAGING_LIMITS } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Deferred, Effect, Schema, type Scope } from "effect";
 import type { DeliveryContext, MailboxStore, MessagingOrigin } from "../mailbox-store";
 import type { OpenBotDatabase } from "../openbot-database";
 import { type MessagingContextMessage, messagingPromptText } from "./messaging-prompt";
+import type { MessagingOperationFailed } from "./messaging-service";
 import { type MessagingLink, MessagingStore } from "./messaging-store";
 
 /** A file the agent attached to its answer, ready to upload. */
@@ -67,9 +68,9 @@ export interface MessagingPromptContext {
 export interface MessagingThreadsHooks {
   schedule(agentId: string): void;
   busy(agentId: string): boolean;
-  interrupt(agentId: string, turnId: string, threadId: string): Promise<void>;
+  interrupt(agentId: string, turnId: string, threadId: string): Effect.Effect<void, MessagingThreadFailed>;
   /** Removes live provider state for an execution thread before its rows are deleted. */
-  forgetThread(threadId: string): Promise<void>;
+  forgetThread(threadId: string): Effect.Effect<void, MessagingThreadFailed>;
 }
 
 /**
@@ -92,10 +93,15 @@ export class MessagingThreads {
   readonly #mailbox: MailboxStore;
   readonly #hooks: MessagingThreadsHooks;
   readonly #listeners = new Set<(activity: MessagingActivity) => void>();
-  readonly #admissions = new Map<string, Promise<unknown>>();
+  readonly #admissions = new Map<string, Deferred.Deferred<void>>();
   /** The external message each running turn answers, by turn id. */
   readonly #turnOrigins = new Map<string, { origin: MessagingOrigin | null; followUp: boolean }>();
-  #contextSource: ((link: MessagingLink, origin: MessagingOrigin) => Promise<MessagingPromptContext>) | null = null;
+  #contextSource:
+    | ((
+        link: MessagingLink,
+        origin: MessagingOrigin,
+      ) => Effect.Effect<MessagingPromptContext, MessagingOperationFailed>)
+    | null = null;
 
   constructor(database: OpenBotDatabase, mailbox: MailboxStore, hooks: MessagingThreadsHooks) {
     this.store = new MessagingStore(database);
@@ -110,12 +116,20 @@ export class MessagingThreads {
   }
 
   setContextSource(
-    source: ((link: MessagingLink, origin: MessagingOrigin) => Promise<MessagingPromptContext>) | null,
+    source:
+      | ((
+          link: MessagingLink,
+          origin: MessagingOrigin,
+        ) => Effect.Effect<MessagingPromptContext, MessagingOperationFailed>)
+      | null,
   ): void {
     this.#contextSource = source;
   }
 
-  async receive(input: MessagingReceiveInput): Promise<MessagingReceiveResult> {
+  readonly receive = Effect.fn("MessagingThreads.receive")(function* (
+    this: MessagingThreads,
+    input: MessagingReceiveInput,
+  ): Effect.fn.Return<MessagingReceiveResult, MessagingThreadFailed> {
     if (this.#mailbox.deliveryForKey(input.idempotencyKey)) return { status: "duplicate" };
     const link = this.store.ensureLink({
       connectionId: input.connectionId,
@@ -130,22 +144,23 @@ export class MessagingThreads {
     const agentId = link.agentId;
     // One admission at a time for each agent: the enqueue awaits file copies, and the queue limits
     // must count the requests before it.
-    const previous = this.#admissions.get(agentId) ?? Promise.resolve();
-    const admission = previous.then(() => this.#admit(agentId, link, input));
-    const settled = admission.catch(() => undefined);
-    this.#admissions.set(agentId, settled);
-    try {
-      return await admission;
-    } finally {
-      if (this.#admissions.get(agentId) === settled) this.#admissions.delete(agentId);
-    }
-  }
+    const previous = this.#admissions.get(agentId);
+    const completed = Deferred.makeUnsafe<void>();
+    this.#admissions.set(agentId, completed);
+    return yield* Effect.gen({ self: this }, function* () {
+      if (previous) yield* Deferred.await(previous);
+      return yield* this.#admit(agentId, link, input);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          Deferred.doneUnsafe(completed, Effect.void);
+          if (this.#admissions.get(agentId) === completed) this.#admissions.delete(agentId);
+        }),
+      ),
+    );
+  }, Effect.uninterruptible);
 
-  #admit(agentId: string, link: MessagingLink, input: MessagingReceiveInput): Promise<MessagingReceiveResult> {
-    return runThreads(this.#admitEffect(agentId, link, input));
-  }
-
-  readonly #admitEffect = Effect.fn("MessagingThreads.admit")(function* (
+  readonly #admit = Effect.fn("MessagingThreads.admit")(function* (
     this: MessagingThreads,
     agentId: string,
     link: MessagingLink,
@@ -163,16 +178,16 @@ export class MessagingThreads {
     );
     if (pending.length >= AGENT_QUEUE_LIMIT || byAuthor.length >= AUTHOR_QUEUE_LIMIT) return { status: "busy", link };
     const waiting = this.#hooks.busy(agentId);
-    const receipt = yield* threadsIo(() =>
-      this.#mailbox.enqueue({
+    const receipt = yield* this.#mailbox
+      .enqueue({
         sender: { kind: "user" },
         messaging: { ...input.origin, linkId: link.linkId },
         recipientAgentIds: [agentId],
         text: input.text || "(The message has no text.)",
         sourcePaths: input.sourcePaths,
         idempotencyKey: input.idempotencyKey,
-      }),
-    );
+      })
+      .pipe(Effect.mapError((error) => new MessagingThreadFailed({ cause: error.cause })));
     const deliveryId = receipt.deliveries[0]?.id;
     if (!deliveryId)
       return yield* new MessagingThreadFailed({
@@ -193,11 +208,7 @@ export class MessagingThreads {
     return this.#mailbox.messagingOrigin(deliveryId) !== null;
   }
 
-  prepare(context: DeliveryContext): Promise<{ threadId: string; text: string } | null> {
-    return runThreads(this.prepareEffect(context));
-  }
-
-  readonly prepareEffect = Effect.fn("MessagingThreads.prepare")(function* (
+  readonly prepare = Effect.fn("MessagingThreads.prepare")(function* (
     this: MessagingThreads,
     context: DeliveryContext,
   ): Effect.fn.Return<{ threadId: string; text: string } | null, MessagingThreadFailed> {
@@ -209,7 +220,7 @@ export class MessagingThreads {
     // presents it as a teammate's reply, and the turn's answer is posted to the conversation.
     if (context.delivery.sender.kind === "agent") return { threadId: link.threadId, text: context.delivery.text };
     const connection = this.store.connection(link.connectionId);
-    const prompt = yield* this.#promptContextEffect(link, origin);
+    const prompt = yield* this.#promptContext(link, origin);
     if (prompt.cursor) this.store.touch(link.linkId, prompt.cursor);
     return {
       threadId: link.threadId,
@@ -228,7 +239,7 @@ export class MessagingThreads {
   });
 
   /** The prompt context from the platform, or none when it is slow or fails: the message still runs. */
-  readonly #promptContextEffect = Effect.fn("MessagingThreads.promptContext")(function* (
+  readonly #promptContext = Effect.fn("MessagingThreads.promptContext")(function* (
     this: MessagingThreads,
     link: MessagingLink,
     origin: MessagingOrigin,
@@ -242,7 +253,7 @@ export class MessagingThreads {
     };
     const source = this.#contextSource;
     if (!source) return fallback;
-    return yield* threadsIo(() => source(link, origin)).pipe(
+    return yield* source(link, origin).pipe(
       Effect.timeout(CONTEXT_TIMEOUT_MS),
       Effect.catch(() => Effect.succeed(fallback)),
     );
@@ -253,7 +264,7 @@ export class MessagingThreads {
    * API never see them, and reports turn starts and ends. Approvals are not taken: the host still
    * shows them.
    */
-  event(event: AgentEvent): boolean {
+  event(event: AgentEvent, scope: Scope.Scope): boolean {
     switch (event.type) {
       case "conversation":
         return event.snapshot.threadId !== null && this.store.linkForThread(event.snapshot.threadId) !== null;
@@ -278,7 +289,12 @@ export class MessagingThreads {
         const started = this.#turnOrigins.get(event.turnId) ?? { origin: null, followUp: false };
         this.#turnOrigins.delete(event.turnId);
         this.store.touch(link.linkId);
-        void this.#finished(link, event.turnId, event.status, started.origin, started.followUp);
+        Effect.runFork(
+          this.#finished(link, event.turnId, event.status, started.origin, started.followUp).pipe(
+            Effect.uninterruptible,
+            Effect.forkIn(scope, { startImmediately: true }),
+          ),
+        );
         return true;
       }
       default:
@@ -313,12 +329,7 @@ export class MessagingThreads {
     return running?.delivery.turnId && origin ? { turnId: running.delivery.turnId, origin } : null;
   }
 
-  /** Stops what one author asked for in this link: the running turn and queued messages. */
-  stop(linkId: string, authorId: string): Promise<boolean> {
-    return runThreads(this.stopEffect(linkId, authorId));
-  }
-
-  readonly stopEffect = Effect.fn("MessagingThreads.stop")(function* (
+  readonly stop = Effect.fn("MessagingThreads.stop")(function* (
     this: MessagingThreads,
     linkId: string,
     authorId: string,
@@ -330,12 +341,16 @@ export class MessagingThreads {
       const origin = this.#mailbox.messagingOrigin(context.delivery.id);
       if (!origin || origin.authorId !== authorId) continue;
       if (context.delivery.status === "queued") {
-        yield* threadsIo(() => this.#mailbox.cancel(link.agentId, context.delivery.id));
+        yield* this.#mailbox
+          .cancel(link.agentId, context.delivery.id)
+          .pipe(Effect.mapError((error) => new MessagingThreadFailed({ cause: error.cause })));
         this.#publish({ type: "cancelled", link, origin });
         stopped = true;
       } else if (context.delivery.status === "running" && context.delivery.turnId) {
         const turnId = context.delivery.turnId;
-        yield* threadsIo(() => this.#hooks.interrupt(link.agentId, turnId, link.threadId));
+        yield* this.#hooks
+          .interrupt(link.agentId, turnId, link.threadId)
+          .pipe(Effect.mapError((error) => new MessagingThreadFailed({ cause: error.cause })));
         stopped = true;
       }
     }
@@ -348,31 +363,18 @@ export class MessagingThreads {
     return this.#mailbox.pendingMessagingReturns(linkId) > 0;
   }
 
-  /** Removes the agent's links and execution threads, and takes it out of every connection. The mailbox leaves separately. */
-  deleteForAgent(agentId: string): Promise<void> {
-    return runThreads(this.deleteForAgentEffect(agentId));
-  }
-
-  readonly deleteForAgentEffect = Effect.fn("MessagingThreads.deleteForAgent")(function* (
+  readonly deleteForAgent = Effect.fn("MessagingThreads.deleteForAgent")(function* (
     this: MessagingThreads,
     agentId: string,
   ): Effect.fn.Return<void, MessagingThreadFailed> {
     for (const threadId of this.store.threadIdsForAgent(agentId))
-      yield* threadsIo(() => this.#hooks.forgetThread(threadId));
+      yield* this.#hooks
+        .forgetThread(threadId)
+        .pipe(Effect.mapError((error) => new MessagingThreadFailed({ cause: error.cause })));
     yield* threadsStep(() => this.store.deleteForAgent(agentId));
   });
 
-  #finished(
-    link: MessagingLink,
-    turnId: string,
-    status: string,
-    origin: MessagingOrigin | null,
-    followUp: boolean,
-  ): Promise<void> {
-    return runThreads(this.#finishedEffect(link, turnId, status, origin, followUp));
-  }
-
-  readonly #finishedEffect = Effect.fn("MessagingThreads.finished")(function* (
+  readonly #finished = Effect.fn("MessagingThreads.finished")(function* (
     this: MessagingThreads,
     link: MessagingLink,
     turnId: string,
@@ -386,7 +388,9 @@ export class MessagingThreads {
     for (const message of messages) {
       if (message.author === "user") continue;
       for (const attachment of message.attachments ?? []) {
-        const resolved = yield* threadsIo(() => this.#mailbox.resolveAttachment(attachment.id));
+        const resolved = yield* this.#mailbox
+          .resolveAttachment(attachment.id)
+          .pipe(Effect.mapError((error) => new MessagingThreadFailed({ cause: error.cause })));
         if (resolved) files.push(resolved);
       }
     }
@@ -430,14 +434,4 @@ export class MessagingThreadFailed extends Schema.TaggedError<MessagingThreadFai
 
 function threadsStep<A>(run: () => A): Effect.Effect<A, MessagingThreadFailed> {
   return Effect.try({ try: run, catch: (cause) => new MessagingThreadFailed({ cause }) });
-}
-
-function threadsIo<A>(run: () => Promise<A>): Effect.Effect<A, MessagingThreadFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new MessagingThreadFailed({ cause }) });
-}
-
-async function runThreads<A>(operation: Effect.Effect<A, MessagingThreadFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

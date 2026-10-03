@@ -120,7 +120,8 @@ const tlsPaths =
     ? { certificate: config.tlsCertificatePath, privateKey: config.tlsPrivateKeyPath }
     : undefined;
 
-const app = createRemoteApiApp(config, signal);
+const signalRuntime = ManagedRuntime.make(signal.dependencies);
+const app = createRemoteApiApp(config, signal, signalRuntime);
 const listen = () =>
   app.listen({
     hostname: config.host,
@@ -216,7 +217,8 @@ const shutdown = () => {
       await app.stop(true);
     } finally {
       try {
-        await signal.close();
+        await signalRuntime.dispose();
+        signal.close();
       } finally {
         await controlPlane.dispose();
       }

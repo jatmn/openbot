@@ -30,7 +30,7 @@ export class RemoteRequest extends Context.Service<
     return Layer.succeed(
       RemoteRequest,
       RemoteRequest.of({
-        request: (serverId, path, decoder, init) => remoteCall(() => request(serverId, path, decoder, init)),
+        request,
       }),
     );
   }

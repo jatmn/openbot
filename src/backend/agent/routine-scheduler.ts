@@ -20,7 +20,7 @@ import type {
 import { routineConversationEventItemType, routineRunConversationEventItemType } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isBoolean } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Result, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { AgentRoutineStore } from "../agent-routine-store";
 import type { AgentStore } from "../agent-store";
 import type { MailboxStore } from "../mailbox-store";
@@ -57,9 +57,9 @@ export interface RoutineHooks {
   emitError(code: string, error: unknown, agentId?: string): void;
   emitQueue(agentId: string): void;
   scheduleDrain(agentId: string): void;
-  interrupt(agentId: string, turnId: string): Promise<void>;
+  interrupt(agentId: string, turnId: string): Effect.Effect<void, RoutineOperationFailed>;
   /** The in-flight drain for an agent, so a deletion can wait for a run that is still starting. */
-  awaitDrain(agentId: string): Promise<void> | undefined;
+  awaitDrain(agentId: string): Effect.Effect<void, RoutineOperationFailed> | undefined;
   syncMailboxMessages(snapshot: ConversationSnapshot): void;
   listAgents(): AgentSummary[];
   /**
@@ -191,11 +191,7 @@ export class RoutineScheduler implements RoutineDueSource {
     return routine;
   }
 
-  delete(input: DeleteRoutineInput, options: RoutineMutationOptions = {}): Promise<void> {
-    return runRoutine(this.deleteEffect(input, options));
-  }
-
-  readonly deleteEffect = Effect.fn("RoutineScheduler.delete")(function* (
+  readonly delete = Effect.fn("RoutineScheduler.delete")(function* (
     this: RoutineScheduler,
     input: DeleteRoutineInput,
     options: RoutineMutationOptions = {},
@@ -271,20 +267,12 @@ export class RoutineScheduler implements RoutineDueSource {
     );
   }, Effect.uninterruptible);
 
-  test(input: TestRoutineInput): Promise<RoutineRun> {
-    return runRoutine(this.testEffect(input));
-  }
-
-  runWithPayload(input: TestRoutineInput & { payload: string }): Promise<RoutineRun> {
-    return runRoutine(this.runWithPayloadEffect(input));
-  }
-
-  readonly testEffect = Effect.fn("RoutineScheduler.test")(function* (this: RoutineScheduler, input: TestRoutineInput) {
-    return yield* this.runWithPayloadEffect({ ...input, payload: "" });
+  readonly test = Effect.fn("RoutineScheduler.test")(function* (this: RoutineScheduler, input: TestRoutineInput) {
+    return yield* this.runWithPayload({ ...input, payload: "" });
   });
 
   /** Store the event in the run instruction so recovery retains it. */
-  readonly runWithPayloadEffect = Effect.fn("RoutineScheduler.runWithPayload")(function* (
+  readonly runWithPayload = Effect.fn("RoutineScheduler.runWithPayload")(function* (
     this: RoutineScheduler,
     input: TestRoutineInput & { payload: string },
   ) {
@@ -325,13 +313,18 @@ export class RoutineScheduler implements RoutineDueSource {
    * toast, although the model's corrected retry then creates the routine. Other errors are faults
    * and still throw.
    */
-  async handleTool(params: DynamicToolCallParams, senderAgentId: string): Promise<OpenBotToolResponse | null> {
-    try {
-      return await this.#handleTool(params, senderAgentId);
-    } catch (error) {
-      if (!(error instanceof RoutineInputError)) throw error;
-      return openBotToolFailure(error.message);
-    }
+  handleTool(
+    params: DynamicToolCallParams,
+    senderAgentId: string,
+  ): Effect.Effect<OpenBotToolResponse | null, RoutineOperationFailed> {
+    return this.#handleTool(params, senderAgentId).pipe(
+      Effect.catchDefect((cause) => Effect.fail(new RoutineOperationFailed({ cause }))),
+      Effect.catch((failure) =>
+        failure.cause instanceof RoutineInputError
+          ? Effect.succeed(openBotToolFailure(failure.cause.message))
+          : Effect.fail(failure),
+      ),
+    );
   }
 
   /** The target agent of a routine tool call. An unknown agent is a request the model can correct. */
@@ -345,7 +338,11 @@ export class RoutineScheduler implements RoutineDueSource {
     return agentId;
   }
 
-  async #handleTool(params: DynamicToolCallParams, senderAgentId: string): Promise<OpenBotToolResponse | null> {
+  readonly #handleTool = Effect.fn("RoutineScheduler.handleTool")(function* (
+    this: RoutineScheduler,
+    params: DynamicToolCallParams,
+    senderAgentId: string,
+  ) {
     if (params.tool === "list_routines") {
       const args = routineToolArguments(params.arguments, ["agentId"]);
       const agentId = this.#toolAgentId(args, senderAgentId);
@@ -446,7 +443,7 @@ export class RoutineScheduler implements RoutineDueSource {
         INPUT_LIMITS.identifier,
         "routineId is required.",
       );
-      await this.delete({ agentId, routineId }, { turnId: agentId === senderAgentId ? params.turnId : undefined });
+      yield* this.delete({ agentId, routineId }, { turnId: agentId === senderAgentId ? params.turnId : undefined });
       return openBotToolResult({ deleted: true, agentId, routineId });
     }
 
@@ -459,19 +456,13 @@ export class RoutineScheduler implements RoutineDueSource {
         INPUT_LIMITS.identifier,
         "routineId is required.",
       );
-      return openBotToolResult(await this.test({ agentId, routineId }));
+      return openBotToolResult(yield* this.test({ agentId, routineId }));
     }
 
     return null;
-  }
+  });
 
-  resumePendingRuns(): Promise<void> {
-    return runRoutine(this.resumePendingRunsEffect());
-  }
-
-  readonly resumePendingRunsEffect = Effect.fn("RoutineScheduler.resumePendingRuns")(function* (
-    this: RoutineScheduler,
-  ) {
+  readonly resumePendingRuns = Effect.fn("RoutineScheduler.resumePendingRuns")(function* (this: RoutineScheduler) {
     const pending = yield* routineStep(() => this.#routines.pendingRuns());
     for (const run of pending)
       yield* this.#enqueueRunEffect(run).pipe(
@@ -534,11 +525,7 @@ export class RoutineScheduler implements RoutineDueSource {
     return this.#routines.nextDueAt(this.#hooks.excludedAgents());
   }
 
-  processDue(now = new Date(), active: () => boolean = () => true): Promise<void> {
-    return runRoutine(this.processDueEffect(now, active));
-  }
-
-  readonly processDueEffect = Effect.fn("RoutineScheduler.processDue")(function* (
+  readonly processDue = Effect.fn("RoutineScheduler.processDue")(function* (
     this: RoutineScheduler,
     now = new Date(),
     active: () => boolean = () => true,
@@ -599,11 +586,13 @@ export class RoutineScheduler implements RoutineDueSource {
   ) {
     recordRestartActivity();
     const validateRecipient = yield* routineStep(() => this.#mailbox.prepareDelivery([run.agentId]));
-    const agent = yield* routineIo(() => this.#store.getOrCreate(run.agentId));
+    const agent = yield* this.#store
+      .getOrCreate(run.agentId)
+      .pipe(Effect.mapError((failure) => new RoutineOperationFailed({ cause: failure.cause })));
     return yield* Effect.gen({ self: this }, function* () {
       yield* routineStep(validateRecipient);
-      const receipt = yield* routineIo(() =>
-        this.#mailbox.enqueue({
+      const receipt = yield* this.#mailbox
+        .enqueue({
           sender: {
             kind: "routine",
             routineId: run.routineId,
@@ -616,8 +605,8 @@ export class RoutineScheduler implements RoutineDueSource {
           draftIds: [],
           replyToMessageId: null,
           idempotencyKey: run.triggerId ? `routine:${run.triggerId}:${run.scheduledFor}` : `routine:manual:${run.id}`,
-        }),
-      );
+        })
+        .pipe(Effect.mapError((failure) => new RoutineOperationFailed({ cause: failure.cause })));
       const deliveryId = receipt.deliveries[0]?.id;
       if (!deliveryId)
         return yield* new RoutineOperationFailed({ cause: new Error("Unable to create the routine delivery.") });
@@ -627,7 +616,9 @@ export class RoutineScheduler implements RoutineDueSource {
         this.#hooks.syncMailboxMessages(current);
         return current;
       });
-      yield* routineIo(() => this.#store.updatePreview(agent.id, run.instruction));
+      yield* this.#store
+        .updatePreview(agent.id, run.instruction)
+        .pipe(Effect.mapError((failure) => new RoutineOperationFailed({ cause: failure.cause })));
       yield* routineStep(() => {
         this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
         this.#conversation.emitConversation(snapshot, "routine.run-queued", {
@@ -661,7 +652,7 @@ export class RoutineScheduler implements RoutineDueSource {
     });
     if (startingRun) {
       const drain = this.#hooks.awaitDrain(agentId);
-      if (drain) yield* routineIo(() => drain);
+      if (drain) yield* drain;
     }
 
     const cancellableRuns: RoutineRun[] = [];
@@ -688,7 +679,7 @@ export class RoutineScheduler implements RoutineDueSource {
     if (!this.#store.activeProviderSession(agentId)) {
       return yield* new RoutineOperationFailed({ cause: new Error(sourceText("error.backend.routineRunNoSession")) });
     }
-    for (const turnId of activeTurnIds) yield* routineIo(() => this.#hooks.interrupt(agentId, turnId));
+    for (const turnId of activeTurnIds) yield* this.#hooks.interrupt(agentId, turnId);
     return cancellableRuns;
   });
 
@@ -802,16 +793,6 @@ export class RoutineOperationFailed extends Schema.TaggedError<RoutineOperationF
   cause: Schema.Defect(),
 }) {}
 
-function routineIo<A>(run: () => Promise<A>): Effect.Effect<A, RoutineOperationFailed> {
-  return Effect.tryPromise({ try: run, catch: (cause) => new RoutineOperationFailed({ cause }) });
-}
-
 function routineStep<A>(run: () => A): Effect.Effect<A, RoutineOperationFailed> {
   return Effect.try({ try: run, catch: (cause) => new RoutineOperationFailed({ cause }) });
-}
-
-async function runRoutine<A>(operation: Effect.Effect<A, RoutineOperationFailed>): Promise<A> {
-  const result = await Effect.runPromise(Effect.result(operation));
-  if (Result.isFailure(result)) throw result.failure.cause;
-  return result.success;
 }

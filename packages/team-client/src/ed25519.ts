@@ -1,7 +1,6 @@
 import { getPublicKeyAsync, hashes, signAsync, verifyAsync } from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2.js";
 import { Effect, Schema } from "effect";
-import { runTeamEffect } from "./effect-boundary";
 
 class Ed25519Error extends Schema.TaggedError<Ed25519Error>()("Ed25519Error", { message: Schema.String }) {}
 
@@ -23,7 +22,7 @@ export interface Ed25519Identity {
   publicKeyPem: string;
 }
 
-export const createEd25519IdentityEffect = Effect.fn("Ed25519.createIdentity")(function* (
+export const createEd25519Identity = Effect.fn("Ed25519.createIdentity")(function* (
   randomBytes: (size: number) => Uint8Array,
 ) {
   const generated = yield* Effect.try({ try: () => randomBytes(ED25519_SECRET_KEY_BYTES), catch: cryptoError });
@@ -36,19 +35,11 @@ export const createEd25519IdentityEffect = Effect.fn("Ed25519.createIdentity")(f
   return { secretKey, publicKeyPem };
 });
 
-export function createEd25519Identity(randomBytes: (size: number) => Uint8Array): Promise<Ed25519Identity> {
-  return runTeamEffect(createEd25519IdentityEffect(randomBytes));
-}
-
-export const signEd25519Effect = Effect.fn("Ed25519.sign")(function* (message: Uint8Array, secretKey: Uint8Array) {
+export const signEd25519 = Effect.fn("Ed25519.sign")(function* (message: Uint8Array, secretKey: Uint8Array) {
   return yield* Effect.tryPromise({ try: () => signAsync(message, secretKey), catch: cryptoError });
 });
 
-export function signEd25519(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array> {
-  return runTeamEffect(signEd25519Effect(message, secretKey));
-}
-
-export const verifyEd25519PemEffect = Effect.fn("Ed25519.verify")(function* (
+export const verifyEd25519Pem = Effect.fn("Ed25519.verify")(function* (
   signature: Uint8Array,
   message: Uint8Array,
   publicKeyPem: string,
@@ -59,10 +50,6 @@ export const verifyEd25519PemEffect = Effect.fn("Ed25519.verify")(function* (
     catch: cryptoError,
   });
 });
-
-export function verifyEd25519Pem(signature: Uint8Array, message: Uint8Array, publicKeyPem: string): Promise<boolean> {
-  return runTeamEffect(verifyEd25519PemEffect(signature, message, publicKeyPem));
-}
 
 function encodePublicKeyPem(publicKey: Uint8Array): string {
   if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) throw new Error("The Ed25519 public key is invalid.");

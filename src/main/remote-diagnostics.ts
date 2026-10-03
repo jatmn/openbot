@@ -3,28 +3,16 @@ import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { redactText } from "@openbot/logging";
-import { Effect } from "effect";
-import {
-  desktopCall,
-  desktopFailure,
-  type RemoteDesktopOperationError,
-  runDesktopEffect,
-} from "./remote-desktop-effects";
+import { Deferred, Effect } from "effect";
+import { desktopCall, desktopFailure, type RemoteDesktopOperationError } from "./remote-desktop-effects";
 
 const MAX_LOG_BYTES = 1024 * 1024;
 const MAX_LINE_CHARACTERS = 8_000;
 
 /** The appends for each file run one at a time, so a rotation never races a write. */
-const queues = new Map<string, Promise<void>>();
+const queues = new Map<string, Deferred.Deferred<void>>();
 
-export function appendRemoteDiagnosticLog(
-  directory: string,
-  name: string,
-  message: string | Uint8Array,
-): Promise<void> {
-  return runDesktopEffect(appendRemoteDiagnosticLogEffect(directory, name, message));
-}
-export const appendRemoteDiagnosticLogEffect = Effect.fn("RemoteDesktop.appendDiagnosticLog")(function* (
+export const appendRemoteDiagnosticLog = Effect.fn("RemoteDesktop.appendDiagnosticLog")(function* (
   directory: string,
   name: string,
   message: string | Uint8Array,
@@ -32,12 +20,21 @@ export const appendRemoteDiagnosticLogEffect = Effect.fn("RemoteDesktop.appendDi
   const safeName = name.replace(/[^a-zA-Z0-9_-]/gu, "-").slice(0, 80);
   const path = join(directory, `${safeName}.log`);
   const clean = Buffer.from(message).toString("utf8").split("\n").map(redactDiagnosticLine).join("\n");
-  const queue = (queues.get(path) ?? Promise.resolve())
-    .then(() => (clean ? runDesktopEffect(writeDiagnosticEffect(directory, path, clean)) : undefined))
-    .catch(() => undefined);
-  queues.set(path, queue);
-  yield* desktopCall(() => queue);
-});
+  const previous = queues.get(path);
+  const pending = Deferred.makeUnsafe<void>();
+  queues.set(path, pending);
+  yield* Effect.gen(function* () {
+    if (previous) yield* Deferred.await(previous);
+    if (clean) yield* writeDiagnosticEffect(directory, path, clean).pipe(Effect.ignore);
+  }).pipe(
+    Effect.ensuring(
+      Effect.gen(function* () {
+        if (queues.get(path) === pending) queues.delete(path);
+        yield* Deferred.succeed(pending, undefined);
+      }),
+    ),
+  );
+}, Effect.uninterruptible);
 
 // The shared rules need `=` or `:` after a credential name. Sunshine and Moonlight also print
 // `token <value>`, which this log redacted before it used them.
@@ -108,10 +105,7 @@ interface ManagedChildProcess {
   removeListener?(event: string, listener: (...args: unknown[]) => unknown): unknown;
 }
 
-export function stopRemoteProcess(child: ManagedChildProcess, graceMs = 2_000): Promise<void> {
-  return runDesktopEffect(stopRemoteProcessEffect(child, graceMs));
-}
-export const stopRemoteProcessEffect = Effect.fn("RemoteDesktop.stopProcess")(function* (
+export const stopRemoteProcess = Effect.fn("RemoteDesktop.stopProcess")(function* (
   child: ManagedChildProcess,
   graceMs = 2_000,
 ) {

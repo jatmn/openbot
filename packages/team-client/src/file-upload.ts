@@ -6,8 +6,7 @@ import {
   TEAM_PROTOCOL_V2_MAX_FILE_BYTES,
 } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
-import { Effect, Schema } from "effect";
-import { runTeamEffect } from "./effect-boundary";
+import { Deferred, Effect, Schema } from "effect";
 
 export class FileTransferError extends Schema.TaggedError<FileTransferError>()("FileTransferError", {
   message: Schema.String,
@@ -34,13 +33,12 @@ export interface RemoteFileUpload {
 /** The slowest upload rate a transfer waits for, in bytes per millisecond (256 KB/s). */
 const MINIMUM_UPLOAD_RATE = 256;
 
-export function createRemoteFileSender(send: (data: string | ArrayBuffer) => Promise<void>, createId: () => string) {
+export function createRemoteFileSender<E, R>(
+  send: (data: string | ArrayBuffer) => Effect.Effect<void, E, R>,
+  createId: () => string,
+) {
   const pending = new Map<string, { opened: () => void; reject: (error: Error) => void; error: Error | null }>();
-  const sendFrame = (data: string | ArrayBuffer) =>
-    Effect.tryPromise({
-      try: () => send(data),
-      catch: fileTransferError,
-    });
+  const sendFrame = (data: string | ArrayBuffer) => send(data).pipe(Effect.mapError(fileTransferError));
   const upload = Effect.fn("RemoteFileSender.upload")(function* (
     input: RemoteFileUpload,
     onProgress?: (sent: number, total: number) => void,
@@ -54,12 +52,13 @@ export function createRemoteFileSender(send: (data: string | ArrayBuffer) => Pro
       return yield* new FileTransferError({ message: sourceText("error.remote.attachmentTooLarge") });
     if (pending.size !== 0) return yield* new FileTransferError({ message: sourceText("error.remote.attachmentBusy") });
     const transferId = createId();
-    let opened = () => {};
-    let reject = (_error: Error) => {};
-    const acknowledged = new Promise<void>((resolve, fail) => {
-      opened = resolve;
-      reject = fail;
-    });
+    const acknowledged = Deferred.makeUnsafe<void, FileTransferError>();
+    const opened = () => {
+      Deferred.doneUnsafe(acknowledged, Effect.void);
+    };
+    const reject = (error: Error) => {
+      Deferred.doneUnsafe(acknowledged, Effect.fail(fileTransferError(error)));
+    };
     const transfer: { opened: () => void; reject: (error: Error) => void; error: Error | null } = {
       opened,
       reject,
@@ -78,7 +77,7 @@ export function createRemoteFileSender(send: (data: string | ArrayBuffer) => Pro
       // Observe rejection before starting I/O, including a synchronous native disconnect.
       yield* Effect.all(
         [
-          Effect.tryPromise({ try: () => acknowledged, catch: fileTransferError }),
+          Deferred.await(acknowledged),
           sendFrame(
             encodeTeamProtocolV2Frame({
               version: 2,
@@ -123,9 +122,8 @@ export function createRemoteFileSender(send: (data: string | ArrayBuffer) => Pro
     }
   });
   return {
-    uploadEffect: upload,
-    cancelUploadEffect: cancelUpload,
-    cancelUpload: () => runTeamEffect(cancelUpload()),
+    upload,
+    cancelUpload,
     receive(data: string) {
       const frame = decodeTeamProtocolV2FileControlFrame(data);
       const transfer = pending.get(frame.transferId);
@@ -143,7 +141,5 @@ export function createRemoteFileSender(send: (data: string | ArrayBuffer) => Pro
       }
       pending.clear();
     },
-    upload: (input: RemoteFileUpload, onProgress?: (sent: number, total: number) => void) =>
-      runTeamEffect(upload(input, onProgress)),
   };
 }

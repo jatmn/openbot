@@ -3,14 +3,13 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { sortConversationMessages } from "@openbot/contracts/conversation-order";
 import type { AgentEvent, ConversationSnapshot } from "@openbot/contracts/ipc";
-import { Effect, Result } from "effect";
+import { Deferred, Effect, Result } from "effect";
 import {
   type AttachmentOperationError,
   attachmentCall,
   attachmentFailure,
   attachmentResult,
   attachmentSync,
-  runAttachmentEffect,
 } from "../attachment-effects";
 import type { GeneratedAttachmentSource, MailboxStore } from "../mailbox-store";
 import { isWithin, rebaseLegacyWorkspacePath, sharedPathFromInput, workspacePathFromInput } from "../workspace-paths";
@@ -69,7 +68,7 @@ export class AttachmentGateway {
   readonly #mailbox: MailboxStore;
   readonly #sharedRoot: string;
   readonly #hooks: AttachmentGatewayHooks;
-  readonly #inFlight = new Map<string, Promise<OpenBotToolResponse>>();
+  readonly #inFlight = new Map<string, Deferred.Deferred<OpenBotToolResponse, AttachmentOperationError>>();
 
   constructor(options: AttachmentGatewayOptions) {
     this.#conversation = options.conversation;
@@ -78,48 +77,45 @@ export class AttachmentGateway {
     this.#hooks = options.hooks;
   }
 
-  attachFiles(
+  readonly attachFiles = Effect.fn("AttachmentGateway.attachFiles")(function* (
+    this: AttachmentGateway,
     senderAgentId: string,
     params: { threadId: string; turnId: string; callId: string },
     paths: string[],
     messageId: string,
-  ): Promise<OpenBotToolResponse> {
+  ) {
     const inFlight = this.#inFlight.get(messageId);
-    if (inFlight) return inFlight;
-    const command = this.#attachFilesToResponse(senderAgentId, params, paths, messageId);
-    this.#inFlight.set(messageId, command);
-    return command.finally(() => {
-      if (this.#inFlight.get(messageId) === command) this.#inFlight.delete(messageId);
-    });
-  }
+    if (inFlight) return yield* Deferred.await(inFlight);
+    const completion = Deferred.makeUnsafe<OpenBotToolResponse, AttachmentOperationError>();
+    this.#inFlight.set(messageId, completion);
+    const exit = yield* Effect.exit(this.#attachFilesToResponse(senderAgentId, params, paths, messageId));
+    yield* Deferred.done(completion, exit);
+    if (this.#inFlight.get(messageId) === completion) this.#inFlight.delete(messageId);
+    return yield* exit;
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Opens local files for a caller that stages them itself instead of attaching them to a conversation
    * -- `browser-uploads.ts` copies them into a private staging directory before a page ever sees them.
    * The handles belong to the caller, which must close every one it is given.
    */
-  openSources(agentId: string, paths: string[], scope: AttachmentSourceScope): Promise<GeneratedAttachmentSource[]> {
+  openSources(
+    agentId: string,
+    paths: string[],
+    scope: AttachmentSourceScope,
+  ): Effect.Effect<GeneratedAttachmentSource[], AttachmentOperationError> {
     return this.#openSources(agentId, paths, scope);
   }
 
-  pendingCommands(): Promise<OpenBotToolResponse>[] {
-    return [...this.#inFlight.values()];
+  pendingCommands(): Effect.Effect<OpenBotToolResponse, AttachmentOperationError>[] {
+    return [...this.#inFlight.values()].map(Deferred.await);
   }
 
   dispose(): void {
     this.#inFlight.clear();
   }
 
-  #attachFilesToResponse(
-    senderAgentId: string,
-    params: { threadId: string; turnId: string; callId: string },
-    paths: string[],
-    messageId: string,
-  ): Promise<OpenBotToolResponse> {
-    return runAttachmentEffect(this.#attachFilesToResponseEffect(senderAgentId, params, paths, messageId));
-  }
-
-  readonly #attachFilesToResponseEffect = Effect.fn("AttachmentGateway.attachFilesToResponse")(function* (
+  readonly #attachFilesToResponse = Effect.fn("AttachmentGateway.attachFilesToResponse")(function* (
     this: AttachmentGateway,
     senderAgentId: string,
     params: { threadId: string; turnId: string; callId: string },
@@ -143,16 +139,16 @@ export class AttachmentGateway {
     }
 
     return yield* Effect.acquireUseRelease(
-      this.#openSourcesEffect(senderAgentId, paths, WORKSPACE_OR_SHARED),
+      this.#openSources(senderAgentId, paths, WORKSPACE_OR_SHARED),
       (sources) =>
         Effect.gen({ self: this }, function* () {
-          const attachments = yield* attachmentCall(() =>
-            this.#mailbox.stageGeneratedAttachments({
+          const attachments = yield* this.#mailbox
+            .stageGeneratedAttachments({
               sources,
               ownerAgentId: senderAgentId,
               ownerThreadId: publicThreadId,
-            }),
-          );
+            })
+            .pipe(Effect.mapError((failure) => attachmentFailure(failure.cause)));
           const message: ConversationSnapshot["messages"][number] = {
             id: messageId,
             turnId: params.turnId,
@@ -182,9 +178,9 @@ export class AttachmentGateway {
           } catch (error) {
             const messageIndex = snapshot.messages.findIndex((candidate) => candidate.id === messageId);
             if (messageIndex >= 0) snapshot.messages.splice(messageIndex, 1);
-            yield* attachmentCall(() =>
-              this.#mailbox.discardStagedGeneratedAttachments(attachments.map((attachment) => attachment.id)),
-            );
+            yield* this.#mailbox
+              .discardStagedGeneratedAttachments(attachments.map((attachment) => attachment.id))
+              .pipe(Effect.mapError((failure) => attachmentFailure(failure.cause)));
             return yield* attachmentFailure(error);
           }
           try {
@@ -209,11 +205,7 @@ export class AttachmentGateway {
     );
   });
 
-  #openSources(agentId: string, paths: string[], scope: AttachmentSourceScope): Promise<GeneratedAttachmentSource[]> {
-    return runAttachmentEffect(this.#openSourcesEffect(agentId, paths, scope));
-  }
-
-  readonly #openSourcesEffect = Effect.fn("AttachmentGateway.openSources")(function* (
+  readonly #openSources = Effect.fn("AttachmentGateway.openSources")(function* (
     this: AttachmentGateway,
     agentId: string,
     paths: string[],

@@ -25,7 +25,8 @@ import {
   encodeTeamProtocolV5WebRtcHttpRequest,
 } from "@openbot/contracts/team-protocol/v5-webrtc-adapter";
 import { sourceText } from "@openbot/i18n/source";
-import { Context, Effect, Layer, ManagedRuntime, Result, Schema } from "effect";
+import { Context, Deferred, Effect, Layer, Result, Schema } from "effect";
+import type { CentralAuthOperationError } from "./central-auth-effects";
 import type { RemoteConnectionBootstrap } from "./central-auth-manager";
 import type {
   RemoteHostSummary,
@@ -33,7 +34,7 @@ import type {
   RemoteInviteRecord,
   RemoteMemberRecord,
 } from "./central-auth-records";
-import { RemoteWorkflowError, remoteCall, remoteDecode } from "./remote-service-effects";
+import { RemoteWorkflowError, remoteDecode } from "./remote-service-effects";
 import type { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcFileTransfer } from "./team-webrtc-file-transfer";
 
@@ -53,24 +54,42 @@ interface TeamWebRtcClientTransportEvents {
 
 interface TeamWebRtcClientTransportOptions {
   bridge: TeamWebRtcBridge;
-  listHosts: () => Promise<RemoteHostSummary[]>;
-  startSession: (hostId: string) => Promise<{ sessionId: string; hostId: string; expiresAt: number }>;
-  issueTicket: (sessionId: string, clientPublicKey: string) => Promise<RemoteConnectionBootstrap>;
-  endSession: (sessionId: string) => Promise<void>;
+  listHosts: () => Effect.Effect<RemoteHostSummary[], CentralAuthOperationError>;
+  startSession: (
+    hostId: string,
+  ) => Effect.Effect<{ sessionId: string; hostId: string; expiresAt: number }, CentralAuthOperationError>;
+  issueTicket: (
+    sessionId: string,
+    clientPublicKey: string,
+  ) => Effect.Effect<RemoteConnectionBootstrap, CentralAuthOperationError>;
+  endSession: (sessionId: string) => Effect.Effect<void, CentralAuthOperationError>;
   createInvite: (
     hostId: string,
     input: { role: "admin" | "member"; email?: string; permanent?: boolean },
-  ) => Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }>;
-  listInvites: (hostId: string) => Promise<RemoteInviteRecord[]>;
-  previewInvite: (token: string) => Promise<RemoteInvitePreview>;
-  acceptInvite: (token: string) => Promise<{ hostId: string; membershipId: string; role: "admin" | "member" }>;
-  revokeInvite: (inviteId: string) => Promise<void>;
-  listMembers: (hostId: string) => Promise<RemoteMemberRecord[]>;
-  updateMember: (hostId: string, membershipId: string, role: "admin" | "member", reactivate?: boolean) => Promise<void>;
-  removeMember: (hostId: string, membershipId: string) => Promise<void>;
+  ) => Effect.Effect<
+    { inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number },
+    CentralAuthOperationError
+  >;
+  listInvites: (hostId: string) => Effect.Effect<RemoteInviteRecord[], CentralAuthOperationError>;
+  previewInvite: (token: string) => Effect.Effect<RemoteInvitePreview, CentralAuthOperationError>;
+  acceptInvite: (
+    token: string,
+  ) => Effect.Effect<{ hostId: string; membershipId: string; role: "admin" | "member" }, CentralAuthOperationError>;
+  revokeInvite: (inviteId: string) => Effect.Effect<void, CentralAuthOperationError>;
+  listMembers: (hostId: string) => Effect.Effect<RemoteMemberRecord[], CentralAuthOperationError>;
+  updateMember: (
+    hostId: string,
+    membershipId: string,
+    role: "admin" | "member",
+    reactivate?: boolean,
+  ) => Effect.Effect<void, CentralAuthOperationError>;
+  removeMember: (hostId: string, membershipId: string) => Effect.Effect<void, CentralAuthOperationError>;
   getPrincipalId: () => string;
   controlPlaneUrl: string;
-  downloadHostLogo: (hostId: string, version: string) => Promise<{ bytes: Uint8Array; mimeType: string }>;
+  downloadHostLogo: (
+    hostId: string,
+    version: string,
+  ) => Effect.Effect<{ bytes: Uint8Array; mimeType: string }, CentralAuthOperationError>;
   transferDirectory: string;
 }
 
@@ -79,7 +98,7 @@ interface ActiveHost {
   expiresAt: number;
   principalId: string;
   connected: boolean;
-  connecting: Promise<void> | null;
+  connecting: Deferred.Deferred<void, RemoteWorkflowError> | null;
   cancelled: boolean;
   cancelConnectionWait: (() => void) | null;
   expirationTimer: ReturnType<typeof setTimeout> | null;
@@ -119,9 +138,10 @@ class TeamClientBridge extends Context.Service<
 
 export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTransportEvents> {
   readonly #options: TeamWebRtcClientTransportOptions;
-  readonly #runtime: ManagedRuntime.ManagedRuntime<TeamClientBridge, never>;
-  readonly #operations = new Set<Promise<unknown>>();
-  #stopping: Promise<void> | null = null;
+  readonly #platform: Layer.Layer<TeamClientBridge>;
+  #stopped = false;
+  readonly #operations = new Set<Deferred.Deferred<void>>();
+  #stopping: Deferred.Deferred<void, RemoteWorkflowError> | null = null;
   readonly #active = new Map<string, ActiveHost>();
   // A failed attempt used to end its session, so each retry against an offline host was a create, a
   // ticket and an end: three Worker requests and a Signal webhook. Only `disconnect` ends it now.
@@ -142,15 +162,13 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   constructor(options: TeamWebRtcClientTransportOptions) {
     super();
     this.#options = options;
-    this.#runtime = ManagedRuntime.make(
-      Layer.succeed(
-        TeamClientBridge,
-        TeamClientBridge.of({
-          send: (...args) => remoteCall(() => options.bridge.send(...args)),
-          connect: (...args) => remoteCall(() => options.bridge.connect(...args)),
-          disconnect: (hostId) => remoteCall(() => options.bridge.disconnect(hostId)),
-        }),
-      ),
+    this.#platform = Layer.succeed(
+      TeamClientBridge,
+      TeamClientBridge.of({
+        send: (...args) => options.bridge.send(...args),
+        connect: (...args) => options.bridge.connect(...args),
+        disconnect: (hostId) => options.bridge.disconnect(hostId),
+      }),
     );
     this.#files = new TeamWebRtcFileTransfer(
       options.bridge,
@@ -165,14 +183,17 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     options.bridge.on("error", this.#onError);
   }
 
-  listHosts(): Promise<RemoteHostSummary[]> {
-    return this.#run(this.listHostsEffect());
-  }
-  readonly listHostsEffect = Effect.fn("TeamWebRtcClient.listHosts")(function* (
+  readonly listHosts = Effect.fn("TeamWebRtcClient.listHosts")(function* (
     this: TeamWebRtcClientTransport,
-  ): Effect.fn.Return<RemoteHostSummary[], RemoteWorkflowError, TeamClientBridge> {
-    return yield* remoteCall(() => this.#options.listHosts());
-  });
+  ): Effect.fn.Return<RemoteHostSummary[], RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        return yield* this.#options
+          .listHosts()
+          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+      }),
+    );
+  }).bind(this);
 
   pinHostKey(hostId: string, publicKey: string): void {
     this.#hostPublicKeys.set(hostId, publicKey);
@@ -183,103 +204,150 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   }
 
   downloadHostLogo(hostId: string, version: string) {
-    return this.#run(remoteCall(() => this.#options.downloadHostLogo(hostId, version)));
+    return this.#owned(
+      this.#options
+        .downloadHostLogo(hostId, version)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   createInvite(hostId: string, input: { role: "admin" | "member"; email?: string }) {
-    return this.#run(remoteCall(() => this.#options.createInvite(hostId, input)));
+    return this.#owned(
+      this.#options
+        .createInvite(hostId, input)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   listInvites(hostId: string) {
-    return this.#run(remoteCall(() => this.#options.listInvites(hostId)));
+    return this.#owned(
+      this.#options
+        .listInvites(hostId)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   previewInvite(token: string) {
-    return this.#run(remoteCall(() => this.#options.previewInvite(token)));
+    return this.#owned(
+      this.#options
+        .previewInvite(token)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   acceptInvite(token: string) {
-    return this.#run(remoteCall(() => this.#options.acceptInvite(token)));
+    return this.#owned(
+      this.#options
+        .acceptInvite(token)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   revokeInvite(inviteId: string) {
-    return this.#run(remoteCall(() => this.#options.revokeInvite(inviteId)));
+    return this.#owned(
+      this.#options
+        .revokeInvite(inviteId)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   listMembers(hostId: string) {
-    return this.#run(remoteCall(() => this.#options.listMembers(hostId)));
+    return this.#owned(
+      this.#options
+        .listMembers(hostId)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   updateMember(hostId: string, membershipId: string, role: "admin" | "member", reactivate = false) {
-    return this.#run(remoteCall(() => this.#options.updateMember(hostId, membershipId, role, reactivate)));
+    return this.#owned(
+      this.#options
+        .updateMember(hostId, membershipId, role, reactivate)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
   removeMember(hostId: string, membershipId: string) {
-    return this.#run(remoteCall(() => this.#options.removeMember(hostId, membershipId)));
+    return this.#owned(
+      this.#options
+        .removeMember(hostId, membershipId)
+        .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause }))),
+    );
   }
 
-  leaveHost(hostId: string): Promise<void> {
-    return this.#run(this.leaveHostEffect(hostId));
-  }
-  readonly leaveHostEffect = Effect.fn("TeamWebRtcClient.leaveHost")(function* (
+  readonly leaveHost = Effect.fn("TeamWebRtcClient.leaveHost")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    const host = (yield* remoteCall(() => this.#options.listHosts())).find((candidate) => candidate.hostId === hostId);
-    if (!host) return;
-    if (host.role === "owner")
-      return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.ownerCannotLeave")) });
-    yield* remoteCall(() => this.#options.removeMember(hostId, host.membershipId));
-  });
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        const host = (yield* this.#options
+          .listHosts()
+          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))).find(
+          (candidate) => candidate.hostId === hostId,
+        );
+        if (!host) return;
+        if (host.role === "owner")
+          return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.ownerCannotLeave")) });
+        yield* this.#options
+          .removeMember(hostId, host.membershipId)
+          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+      }),
+    );
+  }).bind(this);
 
-  sendDesktop(hostId: string, data: string | ArrayBuffer): Promise<void> {
-    return this.#run(this.sendDesktopEffect(hostId, data));
-  }
-  readonly sendDesktopEffect = Effect.fn("TeamWebRtcClient.sendDesktop")(function* (
+  readonly sendDesktop = Effect.fn("TeamWebRtcClient.sendDesktop")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     data: string | ArrayBuffer,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    yield* this.#ensureConnectedEffect(hostId);
-    yield* TeamClientBridge.use((bridge) => bridge.send(hostId, "desktop", data));
-  });
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#ensureConnected(hostId);
+        yield* TeamClientBridge.use((bridge) => bridge.send(hostId, "desktop", data));
+      }),
+    );
+  }).bind(this);
 
-  requestRuntimeSnapshot(hostId: string): Promise<void> {
-    return this.#run(this.requestRuntimeSnapshotEffect(hostId));
-  }
-  readonly requestRuntimeSnapshotEffect = Effect.fn("TeamWebRtcClient.requestRuntimeSnapshot")(function* (
+  readonly requestRuntimeSnapshot = Effect.fn("TeamWebRtcClient.requestRuntimeSnapshot")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    yield* this.#sendEventControlEffect(hostId, { type: "runtime-snapshot-request" });
-  });
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#sendEventControlEffect(hostId, { type: "runtime-snapshot-request" });
+      }),
+    );
+  }).bind(this);
 
-  setTyping(hostId: string, agentId: string | null, typing: boolean): Promise<void> {
-    return this.#run(this.setTypingEffect(hostId, agentId, typing));
-  }
-  readonly setTypingEffect = Effect.fn("TeamWebRtcClient.setTyping")(function* (
+  readonly setTyping = Effect.fn("TeamWebRtcClient.setTyping")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     agentId: string | null,
     typing: boolean,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    yield* this.#sendEventControlEffect(hostId, { type: "team-typing", agentId, typing });
-  });
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#sendEventControlEffect(hostId, { type: "team-typing", agentId, typing });
+      }),
+    );
+  }).bind(this);
 
-  setDirectTyping(hostId: string, recipientMemberId: string, typing: boolean): Promise<void> {
-    return this.#run(this.setDirectTypingEffect(hostId, recipientMemberId, typing));
-  }
-  readonly setDirectTypingEffect = Effect.fn("TeamWebRtcClient.setDirectTyping")(function* (
+  readonly setDirectTyping = Effect.fn("TeamWebRtcClient.setDirectTyping")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     recipientMemberId: string,
     typing: boolean,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    yield* this.#sendEventControlEffect(hostId, { type: "team-direct-typing", recipientMemberId, typing });
-  });
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#sendEventControlEffect(hostId, { type: "team-direct-typing", recipientMemberId, typing });
+      }),
+    );
+  }).bind(this);
 
-  connect(hostId: string): Promise<void> {
-    return this.#ensureConnected(hostId);
+  connect(hostId: string): Effect.Effect<void, RemoteWorkflowError> {
+    return this.#owned(this.#ensureConnected(hostId));
   }
 
   /**
@@ -291,41 +359,21 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     return this.#active.get(hostId)?.connected === true;
   }
 
-  request(
-    hostId: string,
-    path: string,
-    init: { method?: string; body?: unknown; preserveSemanticTags?: boolean; agentCreateModel?: boolean } = {},
-  ): Promise<TeamProtocolV2Json | undefined> {
-    return this.#run(this.requestEffect(hostId, path, init));
-  }
-  readonly requestEffect = Effect.fn("TeamWebRtcClient.request")(function* (
+  readonly request = Effect.fn("TeamWebRtcClient.request")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     path: string,
     init: { method?: string; body?: unknown; preserveSemanticTags?: boolean; agentCreateModel?: boolean } = {},
-  ): Effect.fn.Return<TeamProtocolV2Json | undefined, RemoteWorkflowError, TeamClientBridge> {
-    const response = yield* this.requestResponseEffect(hostId, path, init);
-    return response.status === 204 ? undefined : response.body;
-  });
+  ): Effect.fn.Return<TeamProtocolV2Json | undefined, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        const response = yield* this.requestResponse(hostId, path, init);
+        return response.status === 204 ? undefined : response.body;
+      }),
+    );
+  }).bind(this);
 
-  requestResponse(
-    hostId: string,
-    path: string,
-    init: {
-      method?: string;
-      body?: unknown;
-      contentType?: string;
-      preserveSemanticTags?: boolean;
-      agentCreateModel?: boolean;
-    } = {},
-  ): Promise<{
-    status: number;
-    body: TeamProtocolV2Json;
-    file?: { bytes: Uint8Array; name: string; mimeType: string };
-  }> {
-    return this.#run(this.requestResponseEffect(hostId, path, init));
-  }
-  readonly requestResponseEffect = Effect.fn("TeamWebRtcClient.requestResponse")(function* (
+  readonly requestResponse = Effect.fn("TeamWebRtcClient.requestResponse")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     path: string,
@@ -342,182 +390,205 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       body: TeamProtocolV2Json;
       file?: { bytes: Uint8Array; name: string; mimeType: string };
     },
-    RemoteWorkflowError,
-    TeamClientBridge
+    RemoteWorkflowError
   > {
-    yield* this.#ensureConnectedEffect(hostId);
-    const method = (init.method ?? "GET").toUpperCase();
-    const binary = binaryBody(init.body);
-    const sideRoute = teamSideRouteCodec(path);
-    const bodyTransferId = binary
-      ? yield* this.#files.sendEffect(hostId, {
-          name: "upload",
-          mimeType: init.contentType ?? "application/octet-stream",
-          bytes: binary,
-        })
-      : null;
-    const requestId = crypto.randomUUID();
-    const frame = yield* remoteDecode(() =>
-      encodeTeamProtocolV2Frame({
-        version: 2,
-        type: "request",
-        requestId,
-        operation: "http.request",
-        payload: {
-          method,
-          path,
-          body: binary
-            ? null
-            : sideRoute
-              ? sideRoute.request(path, init.body)
-              : encodeTeamProtocolV5WebRtcHttpRequest(method, path, init.body, {
-                  preserveSemanticTags: init.preserveSemanticTags,
-                  agentCreateModel: init.agentCreateModel,
-                }),
-          capabilities: [...TEAM_CURRENT_CAPABILITIES],
-          ...(bodyTransferId ? { bodyTransferId } : {}),
-          ...(init.contentType ? { contentType: init.contentType } : {}),
-        },
-      }),
-    );
-    const result = new Promise<TeamProtocolV2Json>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#pending.delete(requestId);
-        reject(new TeamWebRtcRequestError(504, "remote_timeout", sourceText("error.remote.requestTimeout")));
-      }, TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT_MILLISECONDS);
-      this.#pending.set(requestId, { hostId, resolve, reject, timer });
-    });
-    void result.catch(() => undefined);
-    const attempt1 = yield* Effect.gen({ self: this }, function* () {
-      yield* TeamClientBridge.use((bridge) => bridge.send(hostId, "rpc", frame));
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt1)) {
-      const error = attempt1.failure.cause;
-      const pending = this.#pending.get(requestId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.#pending.delete(requestId);
-        pending.reject(error instanceof Error ? error : new Error(sourceText("error.remote.requestFailed")));
-      }
-    }
-    const envelope = yield* remoteCall(() => result).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        yield* this.#ensureConnected(hostId);
+        const method = (init.method ?? "GET").toUpperCase();
+        const binary = binaryBody(init.body);
+        const sideRoute = teamSideRouteCodec(path);
+        const bodyTransferId = binary
+          ? yield* this.#files.send(hostId, {
+              name: "upload",
+              mimeType: init.contentType ?? "application/octet-stream",
+              bytes: binary,
+            })
+          : null;
+        const requestId = crypto.randomUUID();
+        const frame = yield* remoteDecode(() =>
+          encodeTeamProtocolV2Frame({
+            version: 2,
+            type: "request",
+            requestId,
+            operation: "http.request",
+            payload: {
+              method,
+              path,
+              body: binary
+                ? null
+                : sideRoute
+                  ? sideRoute.request(path, init.body)
+                  : encodeTeamProtocolV5WebRtcHttpRequest(method, path, init.body, {
+                      preserveSemanticTags: init.preserveSemanticTags,
+                      agentCreateModel: init.agentCreateModel,
+                    }),
+              capabilities: [...TEAM_CURRENT_CAPABILITIES],
+              ...(bodyTransferId ? { bodyTransferId } : {}),
+              ...(init.contentType ? { contentType: init.contentType } : {}),
+            },
+          }),
+        );
+        const result = Deferred.makeUnsafe<TeamProtocolV2Json, RemoteWorkflowError>();
+        {
+          const resolve = (value: TeamProtocolV2Json) => {
+            Deferred.doneUnsafe(result, Effect.succeed(value));
+          };
+          const reject = (cause: Error) => {
+            Deferred.doneUnsafe(result, Effect.fail(new RemoteWorkflowError({ cause })));
+          };
+          const timer = setTimeout(() => {
+            this.#pending.delete(requestId);
+            reject(new TeamWebRtcRequestError(504, "remote_timeout", sourceText("error.remote.requestTimeout")));
+          }, TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT_MILLISECONDS);
+          this.#pending.set(requestId, { hostId, resolve, reject, timer });
+        }
+        const attempt1 = yield* Effect.gen({ self: this }, function* () {
+          yield* TeamClientBridge.use((bridge) => bridge.send(hostId, "rpc", frame));
+        }).pipe(Effect.result);
+        if (Result.isFailure(attempt1)) {
+          const error = attempt1.failure.cause;
           const pending = this.#pending.get(requestId);
           if (pending) {
             clearTimeout(pending.timer);
             this.#pending.delete(requestId);
+            pending.reject(error instanceof Error ? error : new Error(sourceText("error.remote.requestFailed")));
           }
-        }),
-      ),
-    );
-    if (!isDynamicRecord(envelope) || !isNumber(envelope.status) || !Object.hasOwn(envelope, "body")) {
-      return yield* new RemoteWorkflowError({
-        cause: new TeamWebRtcRequestError(502, "protocol_error", "The host returned an invalid response."),
-      });
-    }
-    const fileRecord = isDynamicRecord(envelope.file) ? envelope.file : null;
-    const transferId = fileRecord && isString(fileRecord.transferId) ? fileRecord.transferId : null;
-    const file = transferId ? yield* this.#files.consumeEffect(hostId, transferId) : undefined;
-    // The envelope check above catches a frame that is not shaped like a response. This catches a
-    // well-formed frame whose *body* the released V3 adapter refuses, which is the same kind of
-    // failure and has to carry the same code: a plain error here reads to the caller as an ordinary
-    // request failure, so the host stays healthy and reconnectable while talking nonsense.
-    const status = envelope.status;
-    const body = file
-      ? null
-      : yield* remoteDecode(() =>
-          sideRoute
-            ? sideRoute.response(path, status, envelope.body)
-            : decodeTeamProtocolV5WebRtcHttpResponse(method, path, status, envelope.body),
-        ).pipe(
-          Effect.mapError(
-            () =>
-              new RemoteWorkflowError({
-                cause: new TeamWebRtcRequestError(502, "protocol_error", "The host returned an invalid response body."),
-              }),
+        }
+        const envelope = yield* Deferred.await(result).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              const pending = this.#pending.get(requestId);
+              if (pending) {
+                clearTimeout(pending.timer);
+                this.#pending.delete(requestId);
+              }
+            }),
           ),
         );
-    return { status: envelope.status, body, ...(file ? { file } : {}) };
-  });
+        if (!isDynamicRecord(envelope) || !isNumber(envelope.status) || !Object.hasOwn(envelope, "body")) {
+          return yield* new RemoteWorkflowError({
+            cause: new TeamWebRtcRequestError(502, "protocol_error", "The host returned an invalid response."),
+          });
+        }
+        const fileRecord = isDynamicRecord(envelope.file) ? envelope.file : null;
+        const transferId = fileRecord && isString(fileRecord.transferId) ? fileRecord.transferId : null;
+        const file = transferId ? yield* this.#files.consume(hostId, transferId) : undefined;
+        // The envelope check above catches a frame that is not shaped like a response. This catches a
+        // well-formed frame whose *body* the released V3 adapter refuses, which is the same kind of
+        // failure and has to carry the same code: a plain error here reads to the caller as an ordinary
+        // request failure, so the host stays healthy and reconnectable while talking nonsense.
+        const status = envelope.status;
+        const body = file
+          ? null
+          : yield* remoteDecode(() =>
+              sideRoute
+                ? sideRoute.response(path, status, envelope.body)
+                : decodeTeamProtocolV5WebRtcHttpResponse(method, path, status, envelope.body),
+            ).pipe(
+              Effect.mapError(
+                () =>
+                  new RemoteWorkflowError({
+                    cause: new TeamWebRtcRequestError(
+                      502,
+                      "protocol_error",
+                      "The host returned an invalid response body.",
+                    ),
+                  }),
+              ),
+            );
+        return { status: envelope.status, body, ...(file ? { file } : {}) };
+      }),
+    );
+  }).bind(this);
 
-  disconnect(hostId: string): Promise<void> {
-    return this.#run(this.disconnectEffect(hostId));
-  }
-  readonly disconnectEffect = Effect.fn("TeamWebRtcClient.disconnect")(function* (
+  readonly disconnect = Effect.fn("TeamWebRtcClient.disconnect")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
-  ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    const active = this.#active.get(hostId);
-    const sessionId = active?.sessionId || this.#retainedSessions.get(hostId)?.sessionId;
-    if (active) {
-      active.cancelled = true;
-      active.cancelConnectionWait?.();
-    }
-    // A request sent before disconnect may have committed. Fail it without replaying the request.
-    for (const [requestId, pending] of this.#pending) {
-      if (pending.hostId !== hostId) continue;
-      clearTimeout(pending.timer);
-      this.#pending.delete(requestId);
-      pending.reject(
-        new TeamWebRtcRequestError(503, "remote_disconnected", sourceText("error.remote.hostDisconnected")),
-      );
-    }
-    if (active?.expirationTimer) clearTimeout(active.expirationTimer);
-    this.#active.delete(hostId);
-    this.#retainedSessions.delete(hostId);
-    this.#files.setPeerAuthenticated(hostId, false);
-    let disconnectError: unknown;
-    const attempt2 = yield* Effect.gen({ self: this }, function* () {
-      yield* TeamClientBridge.use((bridge) => bridge.disconnect(hostId));
-    }).pipe(Effect.result);
-    if (Result.isFailure(attempt2)) {
-      const error = attempt2.failure.cause;
-      disconnectError = error;
-    }
-    if (sessionId) yield* remoteCall(() => this.#options.endSession(sessionId)).pipe(Effect.catch(() => Effect.void));
-    if (disconnectError) return yield* new RemoteWorkflowError({ cause: disconnectError });
-  });
-
-  #run<A>(operation: Effect.Effect<A, RemoteWorkflowError, TeamClientBridge>): Promise<A> {
-    const promise = this.#runtime.runPromise(Effect.result(operation)).then((result) => {
-      if (Result.isFailure(result)) throw result.failure.cause;
-      return result.success;
-    });
-    this.#operations.add(promise);
-    void promise.then(
-      () => this.#operations.delete(promise),
-      () => this.#operations.delete(promise),
+  ): Effect.fn.Return<void, RemoteWorkflowError> {
+    return yield* this.#owned(
+      Effect.gen({ self: this }, function* () {
+        const active = this.#active.get(hostId);
+        const sessionId = active?.sessionId || this.#retainedSessions.get(hostId)?.sessionId;
+        if (active) {
+          active.cancelled = true;
+          active.cancelConnectionWait?.();
+        }
+        // A request sent before disconnect may have committed. Fail it without replaying the request.
+        for (const [requestId, pending] of this.#pending) {
+          if (pending.hostId !== hostId) continue;
+          clearTimeout(pending.timer);
+          this.#pending.delete(requestId);
+          pending.reject(
+            new TeamWebRtcRequestError(503, "remote_disconnected", sourceText("error.remote.hostDisconnected")),
+          );
+        }
+        if (active?.expirationTimer) clearTimeout(active.expirationTimer);
+        this.#active.delete(hostId);
+        this.#retainedSessions.delete(hostId);
+        this.#files.setPeerAuthenticated(hostId, false);
+        let disconnectError: unknown;
+        const attempt2 = yield* Effect.gen({ self: this }, function* () {
+          yield* TeamClientBridge.use((bridge) => bridge.disconnect(hostId));
+        }).pipe(Effect.result);
+        if (Result.isFailure(attempt2)) {
+          const error = attempt2.failure.cause;
+          disconnectError = error;
+        }
+        if (sessionId)
+          yield* this.#options
+            .endSession(sessionId)
+            .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+            .pipe(Effect.catch(() => Effect.void));
+        if (disconnectError) return yield* new RemoteWorkflowError({ cause: disconnectError });
+      }),
     );
-    return promise;
+  }).bind(this);
+
+  #owned<A>(operation: Effect.Effect<A, RemoteWorkflowError, TeamClientBridge>): Effect.Effect<A, RemoteWorkflowError> {
+    return Effect.suspend(() => {
+      if (this.#stopped)
+        return Effect.fail(
+          new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.connectionCancelled")) }),
+        );
+      const done = Deferred.makeUnsafe<void>();
+      this.#operations.add(done);
+      return operation.pipe(
+        Effect.provide(this.#platform),
+        Effect.ensuring(
+          Effect.sync(() => this.#operations.delete(done)).pipe(Effect.andThen(Deferred.succeed(done, undefined))),
+        ),
+      );
+    });
   }
 
-  stop(): Promise<void> {
-    if (!this.#stopping) this.#stopping = this.#stop();
-    return this.#stopping;
-  }
-  async #stop(): Promise<void> {
-    const hostIds = new Set([...this.#active.keys(), ...this.#retainedSessions.keys()]);
-    await Promise.allSettled([...hostIds].map((hostId) => this.disconnect(hostId)));
-    this.#options.bridge.off("connected", this.#onConnected);
-    this.#options.bridge.off("disconnected", this.#onDisconnected);
-    this.#options.bridge.off("data", this.#onData);
-    this.#options.bridge.off("path", this.#onPath);
-    this.#options.bridge.off("error", this.#onError);
-    await this.#files.stop();
-    await Promise.allSettled([...this.#operations]);
-    await this.#runtime.dispose();
-  }
+  readonly stop = Effect.fn("TeamWebRtcClient.stop")(function* (this: TeamWebRtcClientTransport) {
+    if (this.#stopping) return yield* Deferred.await(this.#stopping);
+    const done = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    this.#stopping = done;
+    return yield* Effect.gen({ self: this }, function* () {
+      const hostIds = new Set([...this.#active.keys(), ...this.#retainedSessions.keys()]);
+      yield* Effect.forEach([...hostIds], (hostId) => this.disconnect(hostId).pipe(Effect.catch(() => Effect.void)), {
+        concurrency: "unbounded",
+      });
+      this.#options.bridge.off("connected", this.#onConnected);
+      this.#options.bridge.off("disconnected", this.#onDisconnected);
+      this.#options.bridge.off("data", this.#onData);
+      this.#options.bridge.off("path", this.#onPath);
+      this.#options.bridge.off("error", this.#onError);
+      yield* this.#files.stop();
+      while (this.#operations.size)
+        yield* Effect.forEach([...this.#operations], Deferred.await, { concurrency: "unbounded" });
+      this.#stopped = true;
+    }).pipe(Effect.onExit((exit) => Deferred.done(done, exit)));
+  }).bind(this);
 
   /** Whether a transfer is moving right now, either direction. */
   hasActiveTransfers(): boolean {
     return this.#files.hasActiveTransfers();
   }
 
-  #ensureConnected(hostId: string): Promise<void> {
-    return this.#run(this.#ensureConnectedEffect(hostId));
-  }
-  readonly #ensureConnectedEffect = Effect.fn("TeamWebRtcClient.ensureConnected")(function* (
+  readonly #ensureConnected = Effect.fn("TeamWebRtcClient.ensureConnected")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
   ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
@@ -525,16 +596,16 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     let current: ActiveHost | RetainedSession | undefined =
       this.#active.get(hostId) ?? this.#retainedSessions.get(hostId);
     if (current?.expiresAt && current.expiresAt <= Date.now() + 30_000) {
-      yield* this.disconnectEffect(hostId);
+      yield* this.disconnect(hostId);
       current = undefined;
     }
     if (current && current.principalId !== principalId) {
-      yield* this.disconnectEffect(hostId);
+      yield* this.disconnect(hostId);
       current = undefined;
     }
     if (current?.connected) return;
     const connecting = current?.connecting;
-    if (connecting) return yield* remoteCall(() => connecting);
+    if (connecting) return yield* Deferred.await(connecting);
     const active: ActiveHost = {
       sessionId: current?.sessionId ?? "",
       expiresAt: current?.expiresAt ?? 0,
@@ -546,20 +617,21 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       expirationTimer: null,
       authentication: null,
     };
-    const operation = this.#connect(hostId, active, current?.sessionId || null).catch((error) => {
-      if (this.#active.get(hostId) === active) this.#active.delete(hostId);
-      throw error;
-    });
-    active.connecting = operation;
+    const done = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    active.connecting = done;
     this.#retainedSessions.delete(hostId);
     this.#active.set(hostId, active);
-    return yield* remoteCall(() => operation);
+    return yield* this.#connect(hostId, active, current?.sessionId || null).pipe(
+      Effect.onExit((exit) => Deferred.done(done, exit)),
+      Effect.onError(() =>
+        Effect.sync(() => {
+          if (this.#active.get(hostId) === active) this.#active.delete(hostId);
+        }),
+      ),
+    );
   });
 
-  #connect(hostId: string, active: ActiveHost, existingSessionId: string | null): Promise<void> {
-    return this.#run(this.#connectEffect(hostId, active, existingSessionId));
-  }
-  readonly #connectEffect = Effect.fn("TeamWebRtcClient.connect")(function* (
+  readonly #connect = Effect.fn("TeamWebRtcClient.connect")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     active: ActiveHost,
@@ -579,7 +651,9 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     let startedNewSession = false;
     const bootstrap = yield* Effect.gen({ self: this }, function* () {
       if (!sessionId) {
-        const session = yield* remoteCall(() => this.#options.startSession(hostId));
+        const session = yield* this.#options
+          .startSession(hostId)
+          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
         sessionId = session.sessionId;
         active.sessionId = sessionId;
         active.expiresAt = session.expiresAt;
@@ -588,7 +662,9 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       }
       const ticketSessionId = sessionId;
       return yield* Effect.gen({ self: this }, function* () {
-        const ticket = yield* remoteCall(() => this.#options.issueTicket(ticketSessionId, clientPublicKey));
+        const ticket = yield* this.#options
+          .issueTicket(ticketSessionId, clientPublicKey)
+          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
         yield* this.#assertCurrentEffect(hostId, active, ticketSessionId);
         return ticket;
       }).pipe(
@@ -596,14 +672,21 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
           Effect.gen({ self: this }, function* () {
             // Only an ended session is replaced. Other failures keep it for the next ticket request.
             if (!existingSessionId || !isEndedSessionError(failure.cause)) return yield* failure;
-            yield* remoteCall(() => this.#options.endSession(existingSessionId)).pipe(Effect.catch(() => Effect.void));
-            const session = yield* remoteCall(() => this.#options.startSession(hostId));
+            yield* this.#options
+              .endSession(existingSessionId)
+              .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+              .pipe(Effect.catch(() => Effect.void));
+            const session = yield* this.#options
+              .startSession(hostId)
+              .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
             sessionId = session.sessionId;
             active.sessionId = sessionId;
             active.expiresAt = session.expiresAt;
             startedNewSession = true;
             yield* this.#assertCurrentEffect(hostId, active, session.sessionId);
-            const ticket = yield* remoteCall(() => this.#options.issueTicket(session.sessionId, clientPublicKey));
+            const ticket = yield* this.#options
+              .issueTicket(session.sessionId, clientPublicKey)
+              .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
             yield* this.#assertCurrentEffect(hostId, active, session.sessionId);
             return ticket;
           }),
@@ -614,7 +697,10 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         Effect.gen({ self: this }, function* () {
           const failedSessionId = sessionId;
           if (failedSessionId && !this.#retainSession(hostId, active, failedSessionId)) {
-            yield* remoteCall(() => this.#options.endSession(failedSessionId)).pipe(Effect.catch(() => Effect.void));
+            yield* this.#options
+              .endSession(failedSessionId)
+              .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+              .pipe(Effect.catch(() => Effect.void));
           }
           return yield* failure;
         }),
@@ -624,7 +710,14 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     const connectedSessionId = active.sessionId;
     let cleanupConnectionWait: () => void = () => undefined;
     // Subscribe before bridge.connect: a bridge can deliver authentication events before it resolves.
-    const connected = new Promise<void>((resolve, reject) => {
+    const connected = Deferred.makeUnsafe<void, RemoteWorkflowError>();
+    {
+      const resolve = () => {
+        Deferred.doneUnsafe(connected, Effect.void);
+      };
+      const reject = (cause: Error) => {
+        Deferred.doneUnsafe(connected, Effect.fail(new RemoteWorkflowError({ cause })));
+      };
       const cleanup = () => {
         clearTimeout(timer);
         this.off("connected", onConnected);
@@ -651,9 +744,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       };
       this.on("connected", onConnected);
       this.on("error", onError);
-    });
-    // The wait can fail while the bridge is still starting; observe that rejection immediately.
-    void connected.catch(() => undefined);
+    }
     active.authentication = {
       ticket: bootstrap.ticket,
       clientPublicKey,
@@ -675,7 +766,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         }),
       );
       yield* this.#assertCurrentEffect(hostId, active, connectedSessionId);
-      yield* remoteCall(() => connected);
+      yield* Deferred.await(connected);
       this.#scheduleExpiration(hostId, active);
     }).pipe(
       Effect.catch((failure) =>
@@ -684,7 +775,10 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
           if (this.#active.get(hostId) === active) this.#active.delete(hostId);
           yield* TeamClientBridge.use((bridge) => bridge.disconnect(hostId)).pipe(Effect.catch(() => Effect.void));
           if (!retained)
-            yield* remoteCall(() => this.#options.endSession(connectedSessionId)).pipe(Effect.catch(() => Effect.void));
+            yield* this.#options
+              .endSession(connectedSessionId)
+              .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+              .pipe(Effect.catch(() => Effect.void));
           return yield* failure;
         }),
       ),
@@ -718,7 +812,10 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
     if (!active.cancelled && this.#active.get(hostId) === active) return;
     yield* TeamClientBridge.use((bridge) => bridge.disconnect(hostId)).pipe(Effect.catch(() => Effect.void));
-    yield* remoteCall(() => this.#options.endSession(sessionId)).pipe(Effect.catch(() => Effect.void));
+    yield* this.#options
+      .endSession(sessionId)
+      .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+      .pipe(Effect.catch(() => Effect.void));
     return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.remote.connectionCancelled")) });
   });
 
@@ -727,7 +824,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     hostId: string,
     control: TeamProtocolV1CurrentEventControl,
   ): Effect.fn.Return<void, RemoteWorkflowError, TeamClientBridge> {
-    yield* this.#ensureConnectedEffect(hostId);
+    yield* this.#ensureConnected(hostId);
     yield* TeamClientBridge.use((bridge) =>
       bridge.send(
         hostId,
@@ -757,7 +854,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         active.expirationTimer = null;
         if (this.#active.get(hostId) !== active) return;
         if (remaining > MAXIMUM_TIMER_DELAY_MILLISECONDS) this.#scheduleExpiration(hostId, active);
-        else void this.disconnect(hostId).catch(() => undefined);
+        else void Effect.runPromise(this.disconnect(hostId)).catch(() => undefined);
       },
       Math.min(remaining, MAXIMUM_TIMER_DELAY_MILLISECONDS),
     );
@@ -765,7 +862,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   }
 
   readonly #onConnected = (hostId: string, binding?: { localFingerprint: string; remoteFingerprint: string }): void => {
-    void this.#run(this.#beginAuthenticationEffect(hostId, binding));
+    void Effect.runPromise(this.#owned(this.#beginAuthenticationEffect(hostId, binding))).catch(() => undefined);
   };
   readonly #beginAuthenticationEffect = Effect.fn("TeamWebRtcClient.beginAuthentication")(function* (
     this: TeamWebRtcClientTransport,
@@ -865,19 +962,14 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       }
       return;
     }
-    if (authFrame?.type === "auth-ready") void this.#handleAuthentication(hostId, authFrame);
+    if (authFrame?.type === "auth-ready")
+      void Effect.runPromise(this.#owned(this.#handleAuthentication(hostId, authFrame))).catch(() => undefined);
     else if (authFrame?.type === "auth-confirmed") this.#handleAuthenticationConfirmation(hostId, authFrame);
     else if (channel === "rpc") this.#handleRpc(hostId, data);
     else if (channel === "events") this.#handleEvent(hostId, data);
   };
 
-  #handleAuthentication(
-    hostId: string,
-    frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-ready" }>,
-  ): Promise<void> {
-    return this.#run(this.#handleAuthenticationEffect(hostId, frame));
-  }
-  readonly #handleAuthenticationEffect = Effect.fn("TeamWebRtcClient.handleAuthentication")(function* (
+  readonly #handleAuthentication = Effect.fn("TeamWebRtcClient.handleAuthentication")(function* (
     this: TeamWebRtcClientTransport,
     hostId: string,
     frame: Extract<TeamProtocolV2AuthFrame, { type: "auth-ready" }>,
@@ -1046,7 +1138,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       pending.reject(error);
     }
     this.emit("error", hostId, error.code, error.message);
-    void this.disconnect(hostId).catch(() => undefined);
+    void Effect.runPromise(this.disconnect(hostId)).catch(() => undefined);
   }
 
   readonly #onPath = (hostId: string, path: "p2p" | "relay"): void => {
@@ -1059,8 +1151,10 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   };
 
   #sendRecoverable(hostId: string, channel: "events", data: string): void {
-    void this.#run(
-      TeamClientBridge.use((bridge) => bridge.send(hostId, channel, data)).pipe(Effect.catch(() => Effect.void)),
+    void Effect.runPromise(
+      this.#owned(
+        TeamClientBridge.use((bridge) => bridge.send(hostId, channel, data)).pipe(Effect.catch(() => Effect.void)),
+      ),
     );
   }
 }

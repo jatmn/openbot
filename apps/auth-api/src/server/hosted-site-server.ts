@@ -7,9 +7,8 @@ import {
 import { Effect } from "effect";
 import { getServerEntitlement } from "./billing-entitlement";
 import { sha256 } from "./crypto";
-import { runApiEffect } from "./effect-runtime";
 import { HostedSiteInputError } from "./hosted-site-contract";
-import { siteCall } from "./hosted-site-effects";
+import { siteCall, siteFailure } from "./hosted-site-effects";
 
 /**
  * The sites that one request can see and change.
@@ -36,15 +35,8 @@ export function scopeServerId(scope: HostedSiteScope): string | null {
  * token is refused, and never falls back to the unlinked bucket, so a forged host id cannot use
  * another server's slots.
  */
-export function resolveHostedSiteScope(
-  database: D1Database,
-  userId: string,
-  request: Request,
-): Promise<HostedSiteScope> {
-  return runApiEffect(resolveHostedSiteScopeEffect(database, userId, request));
-}
 
-export const resolveHostedSiteScopeEffect = Effect.fn("HostedSites.resolveScope")(function* (
+export const resolveHostedSiteScope = Effect.fn("HostedSites.resolveScope")(function* (
   database: D1Database,
   userId: string,
   request: Request,
@@ -63,7 +55,7 @@ export const resolveHostedSiteScopeEffect = Effect.fn("HostedSites.resolveScope"
       .first<{ owner_user_id: string; machine_token_hash: string | null }>(),
   );
   const expected = host?.machine_token_hash ?? "";
-  const provided = yield* siteCall(() => sha256(machineToken));
+  const provided = yield* sha256(machineToken).pipe(Effect.mapError(siteFailure));
   let difference = expected.length ^ provided.length;
   for (let index = 0; index < provided.length; index += 1) {
     difference |= expected.charCodeAt(index) ^ provided.charCodeAt(index);
@@ -74,17 +66,14 @@ export const resolveHostedSiteScopeEffect = Effect.fn("HostedSites.resolveScope"
 });
 
 /** The active-site limit of a server's plan, or of the unlinked bucket. Plan limits read only the entitlement. */
-export function hostedSiteLimit(database: D1Database, serverId: string | null, now: number): Promise<number> {
-  return runApiEffect(hostedSiteLimitEffect(database, serverId, now));
-}
 
-export const hostedSiteLimitEffect = Effect.fn("HostedSites.limit")(function* (
+export const hostedSiteLimit = Effect.fn("HostedSites.limit")(function* (
   database: D1Database,
   serverId: string | null,
   now: number,
 ) {
   if (serverId === null) return HOSTED_SITE_UNLINKED_LIMIT;
-  const entitlement = yield* siteCall(() => getServerEntitlement(database, serverId, now));
+  const entitlement = yield* getServerEntitlement(database, serverId, now).pipe(Effect.mapError(siteFailure));
   return siteLimitForPlan(entitlement?.plan ?? null);
 });
 

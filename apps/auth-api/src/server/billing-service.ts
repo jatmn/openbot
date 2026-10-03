@@ -21,7 +21,9 @@ import type { HostedServerCatalog, HostedServerCatalogPlan } from "@openbot/cont
 import { isDynamicRecord, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { Context, Effect, Layer, Schema } from "effect";
 import { type AccountAnalytics, type BillingAction, NO_ACCOUNT_ANALYTICS } from "./account-analytics";
-import { runApiEffect } from "./effect-runtime";
+import type { HostedFailure } from "./hosted-server-service";
+import type { RemoteFailure } from "./remote-control-plane";
+import type { StripeTransportError } from "./stripe-client";
 import {
   isBillingCurrency,
   parseStripeEvent,
@@ -71,11 +73,12 @@ function billingCall<A>(operation: () => Promise<A>): Effect.Effect<A, BillingEr
   });
 }
 
-function stripeRequest<A>(operation: () => Promise<A>): Effect.Effect<A, StripeRequestError | BillingOperationError> {
-  return Effect.tryPromise({
-    try: operation,
-    catch: (error) => (error instanceof StripeRequestError ? error : new BillingOperationError({})),
-  });
+function stripeRequest<A>(
+  operation: () => Effect.Effect<A, StripeRequestError | StripeTransportError>,
+): Effect.Effect<A, StripeRequestError | BillingOperationError> {
+  return operation().pipe(
+    Effect.mapError((error) => (error instanceof StripeRequestError ? error : new BillingOperationError({}))),
+  );
 }
 
 function stripeFailure(error: StripeRequestError | BillingOperationError): BillingError | BillingOperationError {
@@ -125,7 +128,7 @@ export interface BillingServiceOptions {
    * Runs after the webhook stores a subscription. Hosted servers use it to start or stop a server, so
    * billing does not know about the provider. An error makes Stripe send the event again.
    */
-  onSubscriptionSynced?: (sync: SubscriptionSync) => Promise<void>;
+  onSubscriptionSynced?: (sync: SubscriptionSync) => Effect.Effect<void, HostedFailure | RemoteFailure>;
   analytics?: AccountAnalytics;
 }
 
@@ -161,16 +164,14 @@ class BillingDependencies extends Context.Service<
     database: D1Database;
     stripe: StripeClient;
     now: () => number;
-    onSubscriptionSynced: ((sync: SubscriptionSync) => Promise<void>) | null;
+    onSubscriptionSynced: ((sync: SubscriptionSync) => Effect.Effect<void, HostedFailure | RemoteFailure>) | null;
     analytics: AccountAnalytics;
   }
 >()("auth-api/BillingService/Dependencies") {}
 
 export class BillingService {
   readonly #layer: Layer.Layer<BillingDependencies>;
-  #run<A>(operation: Effect.Effect<A, BillingError | BillingOperationError, BillingDependencies>): Promise<A> {
-    return runApiEffect(operation.pipe(Effect.provide(this.#layer)));
-  }
+
   readonly #secretKey: string;
   readonly #webhookSecret: string | null;
   readonly #analytics: AccountAnalytics;
@@ -193,395 +194,407 @@ export class BillingService {
   }
 
   /** The plans with their Stripe prices. A plan with no price in each currency and interval is left out. */
-  catalog(): Promise<HostedServerCatalog> {
-    return this.#run(this.#catalogEffect());
-  }
 
-  readonly #catalogEffect = Effect.fn("BillingService.catalog")(function* (
-    this: BillingService,
-  ): Effect.fn.Return<HostedServerCatalog, BillingError | BillingOperationError, BillingDependencies> {
-    const prices = yield* this.#prices();
-    const plans = BILLING_PLANS.flatMap((plan): HostedServerCatalogPlan[] => {
-      const amounts: Partial<HostedServerCatalogPlan["prices"]> = {};
-      for (const currency of BILLING_CURRENCIES) {
-        const month = priceAmount(prices.get(billingLookupKey(plan.id, "month")), currency);
-        const year = priceAmount(prices.get(billingLookupKey(plan.id, "year")), currency);
-        if (month === null || year === null) return [];
-        amounts[currency] = { month, year };
-      }
-      const { eur, usd, pln } = amounts;
-      if (!eur || !usd || !pln) return [];
-      const entry = {
-        id: plan.id,
-        diskGb: plan.storageGb,
-        memberLimit: plan.memberLimit,
-        relativeSpeed: plan.relativeSpeed,
-        prices: { eur, usd, pln },
-      };
-      return [entry];
-    });
-    if (plans.length === 0) return yield* plansUnavailable();
-    return { plans };
-  });
+  readonly catalog = Effect.fn("BillingService.catalog")(
+    function* (
+      this: BillingService,
+    ): Effect.fn.Return<HostedServerCatalog, BillingError | BillingOperationError, BillingDependencies> {
+      const prices = yield* this.#prices();
+      const plans = BILLING_PLANS.flatMap((plan): HostedServerCatalogPlan[] => {
+        const amounts: Partial<HostedServerCatalogPlan["prices"]> = {};
+        for (const currency of BILLING_CURRENCIES) {
+          const month = priceAmount(prices.get(billingLookupKey(plan.id, "month")), currency);
+          const year = priceAmount(prices.get(billingLookupKey(plan.id, "year")), currency);
+          if (month === null || year === null) return [];
+          amounts[currency] = { month, year };
+        }
+        const { eur, usd, pln } = amounts;
+        if (!eur || !usd || !pln) return [];
+        const entry = {
+          id: plan.id,
+          diskGb: plan.storageGb,
+          memberLimit: plan.memberLimit,
+          relativeSpeed: plan.relativeSpeed,
+          prices: { eur, usd, pln },
+        };
+        return [entry];
+      });
+      if (plans.length === 0) return yield* plansUnavailable();
+      return { plans };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * The Stripe customer of the account. The service makes it before the first Checkout, so two open
    * Checkouts use one customer and the webhook always knows the account.
    */
-  ensureCustomer(user: { id: string; email: string }): Promise<string> {
-    return this.#run(this.#ensureCustomerEffect(user));
-  }
 
-  readonly #ensureCustomerEffect = Effect.fn("BillingService.ensureCustomer")(function* (
-    this: BillingService,
-    user: { id: string; email: string },
-  ): Effect.fn.Return<string, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const existing = yield* this.#customerId(user.id);
-    // A customer deleted in the Stripe Dashboard cannot pay, so the account gets a new one.
-    if (existing && !(yield* this.#stripeCall(() => dependencies.stripe.isCustomerDeleted(existing)))) return existing;
-    const created = yield* this.#stripeCall(() =>
-      dependencies.stripe.createCustomer(
-        { userId: user.id, email: user.email },
-        existing ? `openbot-customer-${user.id}-after-${existing}` : `openbot-customer-${user.id}`,
-      ),
-    );
-    const now = dependencies.now();
-    const store = existing
-      ? dependencies.database
-          .prepare(
-            "UPDATE billing_customers SET stripe_customer_id = ?, updated_at = ? WHERE user_id = ? AND stripe_customer_id = ?",
-          )
-          .bind(created, now, user.id, existing)
-      : dependencies.database
-          .prepare(
-            `INSERT INTO billing_customers(user_id, stripe_customer_id, created_at, updated_at)
+  readonly ensureCustomer = Effect.fn("BillingService.ensureCustomer")(
+    function* (
+      this: BillingService,
+      user: { id: string; email: string },
+    ): Effect.fn.Return<string, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const existing = yield* this.#customerId(user.id);
+      // A customer deleted in the Stripe Dashboard cannot pay, so the account gets a new one.
+      if (existing && !(yield* this.#stripeCall(() => dependencies.stripe.isCustomerDeleted(existing))))
+        return existing;
+      const created = yield* this.#stripeCall(() =>
+        dependencies.stripe.createCustomer(
+          { userId: user.id, email: user.email },
+          existing ? `openbot-customer-${user.id}-after-${existing}` : `openbot-customer-${user.id}`,
+        ),
+      );
+      const now = dependencies.now();
+      const store = existing
+        ? dependencies.database
+            .prepare(
+              "UPDATE billing_customers SET stripe_customer_id = ?, updated_at = ? WHERE user_id = ? AND stripe_customer_id = ?",
+            )
+            .bind(created, now, user.id, existing)
+        : dependencies.database
+            .prepare(
+              `INSERT INTO billing_customers(user_id, stripe_customer_id, created_at, updated_at)
              VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-          )
-          .bind(user.id, created, now, now);
-    yield* billingCall(() => store.run());
-    const stored = yield* this.#customerId(user.id);
-    if (!stored)
-      return yield* new BillingError(500, "billing_customer_failed", "The billing account could not be saved.");
-    return stored;
-  });
+            )
+            .bind(user.id, created, now, now);
+      yield* billingCall(() => store.run());
+      const stored = yield* this.#customerId(user.id);
+      if (!stored)
+        return yield* new BillingError(500, "billing_customer_failed", "The billing account could not be saved.");
+      return stored;
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** A Stripe Checkout page that starts the plan of one server. */
-  createCheckout(request: CheckoutRequest): Promise<{ sessionId: string; url: string }> {
-    return this.#run(this.#createCheckoutEffect(request));
-  }
 
-  readonly #createCheckoutEffect = Effect.fn("BillingService.createCheckout")(function* (
-    this: BillingService,
-    request: CheckoutRequest,
-  ): Effect.fn.Return<{ sessionId: string; url: string }, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const price = (yield* this.#prices()).get(billingLookupKey(request.plan, request.interval));
-    const amount = priceAmount(price, request.currency);
-    if (!price || amount === null) return yield* plansUnavailable();
-    const customerId = yield* this.#ensureCustomerEffect(request.user);
-    const returnUrl = checkoutReturnUrl(request.origin, request.target, request.serverId);
-    const session = yield* this.#stripeCall(() =>
-      dependencies.stripe.createCheckoutSession({
-        customerId,
-        priceId: price.id,
+  readonly createCheckout = Effect.fn("BillingService.createCheckout")(
+    function* (
+      this: BillingService,
+      request: CheckoutRequest,
+    ): Effect.fn.Return<{ sessionId: string; url: string }, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const price = (yield* this.#prices()).get(billingLookupKey(request.plan, request.interval));
+      const amount = priceAmount(price, request.currency);
+      if (!price || amount === null) return yield* plansUnavailable();
+      const customerId = yield* this.ensureCustomer(request.user);
+      const returnUrl = checkoutReturnUrl(request.origin, request.target, request.serverId);
+      const session = yield* this.#stripeCall(() =>
+        dependencies.stripe.createCheckoutSession({
+          customerId,
+          priceId: price.id,
+          currency: request.currency,
+          userId: request.user.id,
+          serverId: request.serverId,
+          successUrl: returnUrl,
+          cancelUrl: `${returnUrl}${returnUrl.includes("?") ? "&" : "?"}cancelled=1`,
+          nowSeconds: Math.floor(dependencies.now() / 1_000),
+        }),
+      );
+      dependencies.analytics.track(request.user.id, {
+        name: "billing_action",
+        action: "checkout_started",
+        plan: request.plan,
+        interval: request.interval,
         currency: request.currency,
-        userId: request.user.id,
-        serverId: request.serverId,
-        successUrl: returnUrl,
-        cancelUrl: `${returnUrl}${returnUrl.includes("?") ? "&" : "?"}cancelled=1`,
-        nowSeconds: Math.floor(dependencies.now() / 1_000),
-      }),
-    );
-    dependencies.analytics.track(request.user.id, {
-      name: "billing_action",
-      action: "checkout_started",
-      plan: request.plan,
-      interval: request.interval,
-      currency: request.currency,
-      amount,
-    });
-    return { sessionId: session.id, url: session.url };
-  });
+        amount,
+      });
+      return { sessionId: session.id, url: session.url };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Closes a Checkout page. `paid` when the user paid on it, so no second page must open. The plan of a
    * paid page is stored now: its webhook can be late, or can fail each time.
    */
-  closeCheckout(sessionId: string): Promise<"closed" | "paid"> {
-    return this.#run(this.#closeCheckoutEffect(sessionId));
-  }
 
-  readonly #closeCheckoutEffect = Effect.fn("BillingService.closeCheckout")(function* (
-    this: BillingService,
-    sessionId: string,
-  ): Effect.fn.Return<"closed" | "paid", BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const session = yield* this.#stripeCall(() => dependencies.stripe.expireCheckoutSession(sessionId));
-    if (session.status !== "complete") return "closed";
-    const subscriptionId = session.subscription;
-    if (subscriptionId) {
-      // The webhook or the next close stores it. A Stripe failure is logged by `#stripeCall`.
-      yield* this.#syncSubscription(subscriptionId).pipe(
-        Effect.catch(() =>
-          Effect.sync(() => {
-            console.warn("billing: paid Checkout sync failed", { subscriptionId });
-          }),
-        ),
-      );
-    }
-    return "paid";
-  });
+  readonly closeCheckout = Effect.fn("BillingService.closeCheckout")(
+    function* (
+      this: BillingService,
+      sessionId: string,
+    ): Effect.fn.Return<"closed" | "paid", BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const session = yield* this.#stripeCall(() => dependencies.stripe.expireCheckoutSession(sessionId));
+      if (session.status !== "complete") return "closed";
+      const subscriptionId = session.subscription;
+      if (subscriptionId) {
+        // The webhook or the next close stores it. A Stripe failure is logged by `#stripeCall`.
+        yield* this.#syncSubscription(subscriptionId).pipe(
+          Effect.catch(() =>
+            Effect.sync(() => {
+              console.warn("billing: paid Checkout sync failed", { subscriptionId });
+            }),
+          ),
+        );
+      }
+      return "paid";
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Reads again each open plan whose period ended a day ago. Stripe moves the period end at each renewal,
    * so such a plan missed a webhook, for example a cancel while the webhook failed for 3 days.
    * Each plan is read at most once per hour.
    */
-  refreshLapsedPlans(now: number): Promise<void> {
-    return this.#run(this.#refreshLapsedPlansEffect(now));
-  }
 
-  readonly #refreshLapsedPlansEffect = Effect.fn("BillingService.refreshLapsedPlans")(function* (
-    this: BillingService,
-    now: number,
-  ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const rows = yield* billingCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT stripe_subscription_id FROM billing_subscriptions
+  readonly refreshLapsedPlans = Effect.fn("BillingService.refreshLapsedPlans")(
+    function* (
+      this: BillingService,
+      now: number,
+    ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const rows = yield* billingCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT stripe_subscription_id FROM billing_subscriptions
          WHERE status IN ${OPEN_STATUSES_SQL} AND current_period_end < ? AND updated_at < ?
          ORDER BY updated_at LIMIT ?`,
-        )
-        .bind(now - LAPSED_PLAN_GRACE_MS, now - LAPSED_PLAN_READ_INTERVAL_MS, LAPSED_PLAN_BATCH_SIZE)
-        .all<{ stripe_subscription_id: string }>(),
-    );
-    for (const row of rows.results) {
-      yield* this.#syncSubscription(row.stripe_subscription_id).pipe(
-        Effect.catch(() =>
-          Effect.sync(() => {
-            console.warn("billing: lapsed plan sync failed", { subscriptionId: row.stripe_subscription_id });
-          }),
-        ),
+          )
+          .bind(now - LAPSED_PLAN_GRACE_MS, now - LAPSED_PLAN_READ_INTERVAL_MS, LAPSED_PLAN_BATCH_SIZE)
+          .all<{ stripe_subscription_id: string }>(),
       );
-    }
-  });
+      for (const row of rows.results) {
+        yield* this.#syncSubscription(row.stripe_subscription_id).pipe(
+          Effect.catch(() =>
+            Effect.sync(() => {
+              console.warn("billing: lapsed plan sync failed", { subscriptionId: row.stripe_subscription_id });
+            }),
+          ),
+        );
+      }
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Cancels each open plan of one server now, with no refund. It stops at the first plan that Stripe
    * did not cancel, so the caller can keep the server.
    */
-  cancelServerPlans(userId: string, serverId: string): Promise<void> {
-    return this.#run(this.#cancelServerPlansEffect(userId, serverId));
-  }
 
-  readonly #cancelServerPlansEffect = Effect.fn("BillingService.cancelServerPlans")(function* (
-    this: BillingService,
-    userId: string,
-    serverId: string,
-  ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const rows = yield* billingCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT stripe_subscription_id FROM billing_subscriptions
+  readonly cancelServerPlans = Effect.fn("BillingService.cancelServerPlans")(
+    function* (
+      this: BillingService,
+      userId: string,
+      serverId: string,
+    ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const rows = yield* billingCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT stripe_subscription_id FROM billing_subscriptions
          WHERE user_id = ? AND server_id = ? AND status IN ${OPEN_STATUSES_SQL}`,
-        )
-        .bind(userId, serverId)
-        .all<{ stripe_subscription_id: string }>(),
-    );
-    for (const row of rows.results) yield* this.#cancelSubscriptionEffect(row.stripe_subscription_id);
-  });
+          )
+          .bind(userId, serverId)
+          .all<{ stripe_subscription_id: string }>(),
+      );
+      for (const row of rows.results) yield* this.cancelSubscription(row.stripe_subscription_id);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** Cancels one subscription now. A subscription that Stripe closed already counts as cancelled. */
-  cancelSubscription(subscriptionId: string): Promise<void> {
-    return this.#run(this.#cancelSubscriptionEffect(subscriptionId));
-  }
 
-  readonly #cancelSubscriptionEffect = Effect.fn("BillingService.cancelSubscription")(function* (
-    this: BillingService,
-    subscriptionId: string,
-  ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const stored = yield* billingCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT user_id, plan, interval, currency, amount, status FROM billing_subscriptions
+  readonly cancelSubscription = Effect.fn("BillingService.cancelSubscription")(
+    function* (
+      this: BillingService,
+      subscriptionId: string,
+    ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const stored = yield* billingCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT user_id, plan, interval, currency, amount, status FROM billing_subscriptions
          WHERE stripe_subscription_id = ?`,
-        )
-        .bind(subscriptionId)
-        .first<{
-          user_id: string;
-          plan: string;
-          interval: string;
-          currency: string;
-          amount: number | null;
-          status: string;
-        }>(),
-    );
-    yield* stripeRequest(() => dependencies.stripe.cancelSubscription(subscriptionId)).pipe(
-      Effect.catch((error) => {
-        if (!(error instanceof StripeRequestError)) return Effect.fail(error);
-        return stripeRequest(() => dependencies.stripe.getSubscription(subscriptionId)).pipe(
-          Effect.flatMap((current) =>
-            current.status === "canceled" || current.status === "incomplete_expired" ? Effect.void : Effect.fail(error),
-          ),
+          )
+          .bind(subscriptionId)
+          .first<{
+            user_id: string;
+            plan: string;
+            interval: string;
+            currency: string;
+            amount: number | null;
+            status: string;
+          }>(),
+      );
+      yield* dependencies.stripe
+        .cancelSubscription(subscriptionId)
+        .pipe(Effect.mapError((error) => (error instanceof StripeRequestError ? error : new BillingOperationError({}))))
+        .pipe(
+          Effect.catch((error) => {
+            if (!(error instanceof StripeRequestError)) return Effect.fail(error);
+            return dependencies.stripe
+              .getSubscription(subscriptionId)
+              .pipe(
+                Effect.mapError((error) =>
+                  error instanceof StripeRequestError ? error : new BillingOperationError({}),
+                ),
+              )
+              .pipe(
+                Effect.flatMap((current) =>
+                  current.status === "canceled" || current.status === "incomplete_expired"
+                    ? Effect.void
+                    : Effect.fail(error),
+                ),
+              );
+          }),
+          Effect.mapError(stripeFailure),
         );
-      }),
-      Effect.mapError(stripeFailure),
-    );
-    // The webhook stores the final state later. Until then the plan must not count as open.
-    yield* billingCall(() =>
-      dependencies.database
-        .prepare(
-          `UPDATE billing_subscriptions SET status = 'canceled', cancel_at_period_end = 0, updated_at = ?
+      // The webhook stores the final state later. Until then the plan must not count as open.
+      yield* billingCall(() =>
+        dependencies.database
+          .prepare(
+            `UPDATE billing_subscriptions SET status = 'canceled', cancel_at_period_end = 0, updated_at = ?
          WHERE stripe_subscription_id = ?`,
-        )
-        .bind(dependencies.now(), subscriptionId)
-        .run(),
-    );
-    // The webhook that follows sees the plan closed already, so the end is reported here.
-    if (stored && isOneOf(BILLING_SUBSCRIPTION_STATUSES, stored.status) && isOpenBillingStatus(stored.status)) {
-      dependencies.analytics.track(stored.user_id, {
-        name: "billing_action",
-        action: "plan_ended",
-        ...(isOneOf(BILLING_PLAN_IDS, stored.plan) ? { plan: stored.plan } : {}),
-        ...(isOneOf(BILLING_INTERVALS, stored.interval) ? { interval: stored.interval } : {}),
-        ...(isBillingCurrency(stored.currency) ? { currency: stored.currency } : {}),
-        amount: stored.amount,
-      });
-    }
-  });
+          )
+          .bind(dependencies.now(), subscriptionId)
+          .run(),
+      );
+      // The webhook that follows sees the plan closed already, so the end is reported here.
+      if (stored && isOneOf(BILLING_SUBSCRIPTION_STATUSES, stored.status) && isOpenBillingStatus(stored.status)) {
+        dependencies.analytics.track(stored.user_id, {
+          name: "billing_action",
+          action: "plan_ended",
+          ...(isOneOf(BILLING_PLAN_IDS, stored.plan) ? { plan: stored.plan } : {}),
+          ...(isOneOf(BILLING_INTERVALS, stored.interval) ? { interval: stored.interval } : {}),
+          ...(isBillingCurrency(stored.currency) ? { currency: stored.currency } : {}),
+          amount: stored.amount,
+        });
+      }
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** The open plan of each server. The server name comes only from a host that the same account owns. */
-  getState(userId: string): Promise<BillingState> {
-    return this.#run(this.#getStateEffect(userId));
-  }
 
-  readonly #getStateEffect = Effect.fn("BillingService.getState")(function* (
-    this: BillingService,
-    userId: string,
-  ): Effect.fn.Return<BillingState, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const [customer, rows] = yield* Effect.all(
-      [
-        this.#customerId(userId),
-        billingCall(() =>
-          dependencies.database
-            .prepare(
-              `SELECT s.stripe_subscription_id, s.server_id, h.name AS server_name, s.plan, s.interval, s.currency,
+  readonly getState = Effect.fn("BillingService.getState")(
+    function* (
+      this: BillingService,
+      userId: string,
+    ): Effect.fn.Return<BillingState, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const [customer, rows] = yield* Effect.all(
+        [
+          this.#customerId(userId),
+          billingCall(() =>
+            dependencies.database
+              .prepare(
+                `SELECT s.stripe_subscription_id, s.server_id, h.name AS server_name, s.plan, s.interval, s.currency,
                   s.amount, s.status, s.current_period_end, s.cancel_at_period_end
            FROM billing_subscriptions s
            LEFT JOIN remote_hosts h ON h.host_id = s.server_id AND h.owner_user_id = s.user_id
            WHERE s.user_id = ? AND s.status IN ${OPEN_STATUSES_SQL}
            ORDER BY h.name IS NULL, h.name COLLATE NOCASE, s.updated_at DESC`,
-            )
-            .bind(userId)
-            .all<ServerPlanRow>(),
-        ),
-      ],
-      { concurrency: "unbounded" },
-    );
-    const servers = rows.results.flatMap((row) => {
-      const server = serverPlan(row);
-      return server ? [server] : [];
-    });
-    return { available: true, hasCustomer: customer !== null, servers };
-  });
+              )
+              .bind(userId)
+              .all<ServerPlanRow>(),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const servers = rows.results.flatMap((row) => {
+        const server = serverPlan(row);
+        return server ? [server] : [];
+      });
+      return { available: true, hasCustomer: customer !== null, servers };
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Returns a Customer Portal page. The plan change and cancel flows open on one subscription, after
    * the service checks that the subscription belongs to the account.
    */
-  createPortal(
-    userId: string,
-    request: BillingPortalRequest,
-    target: BillingReturnTarget,
-    origin: string,
-  ): Promise<string> {
-    return this.#run(this.#createPortalEffect(userId, request, target, origin));
-  }
 
-  readonly #createPortalEffect = Effect.fn("BillingService.createPortal")(function* (
-    this: BillingService,
-    userId: string,
-    request: BillingPortalRequest,
-    target: BillingReturnTarget,
-    origin: string,
-  ): Effect.fn.Return<string, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const customerId = yield* this.#customerId(userId);
-    if (!customerId) return yield* new BillingError(404, "no_customer", "No billing account exists yet.");
-    const returnUrl = portalReturnUrl(origin, target);
-    dependencies.analytics.track(userId, { name: "billing_action", action: "portal_opened", flow: request.flow });
-    if (request.flow === "manage") {
-      return yield* this.#stripeCall(() => dependencies.stripe.createPortalSession({ customerId, returnUrl }));
-    }
-    const owned = yield* billingCall(() =>
-      dependencies.database
-        .prepare(
-          `SELECT 1 AS owned FROM billing_subscriptions
+  readonly createPortal = Effect.fn("BillingService.createPortal")(
+    function* (
+      this: BillingService,
+      userId: string,
+      request: BillingPortalRequest,
+      target: BillingReturnTarget,
+      origin: string,
+    ): Effect.fn.Return<string, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const customerId = yield* this.#customerId(userId);
+      if (!customerId) return yield* new BillingError(404, "no_customer", "No billing account exists yet.");
+      const returnUrl = portalReturnUrl(origin, target);
+      dependencies.analytics.track(userId, { name: "billing_action", action: "portal_opened", flow: request.flow });
+      if (request.flow === "manage") {
+        return yield* this.#stripeCall(() => dependencies.stripe.createPortalSession({ customerId, returnUrl }));
+      }
+      const owned = yield* billingCall(() =>
+        dependencies.database
+          .prepare(
+            `SELECT 1 AS owned FROM billing_subscriptions
          WHERE stripe_subscription_id = ? AND user_id = ? AND stripe_customer_id = ? AND status IN ${OPEN_STATUSES_SQL}`,
-        )
-        .bind(request.subscriptionId, userId, customerId)
-        .first<{ owned: number }>(),
-    );
-    if (!owned) return yield* new BillingError(404, "no_subscription", "This plan does not exist.");
-    const type = request.flow === "update" ? "subscription_update" : "subscription_cancel";
-    return yield* this.#stripeCall(() =>
-      dependencies.stripe.createPortalSession({
-        customerId,
-        returnUrl,
-        flow: { type, subscriptionId: request.subscriptionId },
-      }),
-    );
-  });
+          )
+          .bind(request.subscriptionId, userId, customerId)
+          .first<{ owned: number }>(),
+      );
+      if (!owned) return yield* new BillingError(404, "no_subscription", "This plan does not exist.");
+      const type = request.flow === "update" ? "subscription_update" : "subscription_cancel";
+      return yield* this.#stripeCall(() =>
+        dependencies.stripe.createPortalSession({
+          customerId,
+          returnUrl,
+          flow: { type, subscriptionId: request.subscriptionId },
+        }),
+      );
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /**
    * Applies one Stripe event. Each event gets the subscription from Stripe again, so a late or repeated
    * event cannot write an old state. An error makes the route answer 500, so Stripe sends the event again.
    */
-  handleWebhook(payload: string, signature: string | null): Promise<void> {
-    return this.#run(this.#handleWebhookEffect(payload, signature));
-  }
 
-  readonly #handleWebhookEffect = Effect.fn("BillingService.handleWebhook")(function* (
-    this: BillingService,
-    payload: string,
-    signature: string | null,
-  ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
-    const dependencies = yield* BillingDependencies;
-    const webhookSecret = this.#webhookSecret;
-    if (!webhookSecret) return yield* new BillingError(503, "billing_unavailable", "Billing is not available.");
-    const now = dependencies.now();
-    if (!(yield* billingCall(() => verifyStripeSignature(payload, signature, webhookSecret, now)))) {
-      return yield* new BillingError(400, "invalid_signature", "The Stripe signature is invalid.");
-    }
-    const event = parseStripeEvent(payload);
-    if (!event) return yield* new BillingError(400, "invalid_event", "The Stripe event is invalid.");
-    const seen = yield* billingCall(() =>
-      dependencies.database
-        .prepare("SELECT 1 AS seen FROM billing_webhook_events WHERE event_id = ?")
-        .bind(event.id)
-        .first<{ seen: number }>(),
-    );
-    if (seen) return;
-    const subscriptionId = eventSubscriptionId(event);
-    const synced = subscriptionId ? yield* this.#syncSubscription(subscriptionId) : null;
-    // The event is recorded only after it is applied, so a failed event is applied again on retry.
-    yield* billingCall(() =>
-      dependencies.database.batch([
+  readonly handleWebhook = Effect.fn("BillingService.handleWebhook")(
+    function* (
+      this: BillingService,
+      payload: string,
+      signature: string | null,
+    ): Effect.fn.Return<void, BillingError | BillingOperationError, BillingDependencies> {
+      const dependencies = yield* BillingDependencies;
+      const webhookSecret = this.#webhookSecret;
+      if (!webhookSecret) return yield* new BillingError(503, "billing_unavailable", "Billing is not available.");
+      const now = dependencies.now();
+      if (
+        !(yield* verifyStripeSignature(payload, signature, webhookSecret, now).pipe(
+          Effect.mapError((error) => (error instanceof BillingError ? error : new BillingOperationError({}))),
+        ))
+      ) {
+        return yield* new BillingError(400, "invalid_signature", "The Stripe signature is invalid.");
+      }
+      const event = parseStripeEvent(payload);
+      if (!event) return yield* new BillingError(400, "invalid_event", "The Stripe event is invalid.");
+      const seen = yield* billingCall(() =>
         dependencies.database
-          .prepare("INSERT OR IGNORE INTO billing_webhook_events(event_id, type, received_at) VALUES (?, ?, ?)")
-          .bind(event.id, event.type, now),
-        dependencies.database
-          .prepare("DELETE FROM billing_webhook_events WHERE received_at < ?")
-          .bind(now - WEBHOOK_EVENT_RETENTION_MS),
-      ]),
-    );
-    yield* this.#trackEvent(event, synced);
-  });
+          .prepare("SELECT 1 AS seen FROM billing_webhook_events WHERE event_id = ?")
+          .bind(event.id)
+          .first<{ seen: number }>(),
+      );
+      if (seen) return;
+      const subscriptionId = eventSubscriptionId(event);
+      const synced = subscriptionId ? yield* this.#syncSubscription(subscriptionId) : null;
+      // The event is recorded only after it is applied, so a failed event is applied again on retry.
+      yield* billingCall(() =>
+        dependencies.database.batch([
+          dependencies.database
+            .prepare("INSERT OR IGNORE INTO billing_webhook_events(event_id, type, received_at) VALUES (?, ?, ?)")
+            .bind(event.id, event.type, now),
+          dependencies.database
+            .prepare("DELETE FROM billing_webhook_events WHERE received_at < ?")
+            .bind(now - WEBHOOK_EVENT_RETENTION_MS),
+        ]),
+      );
+      yield* this.#trackEvent(event, synced);
+    },
+    (operation) => operation.pipe(Effect.provide(this.#layer)),
+  ).bind(this);
 
   /** Reports a payment or an expired Checkout. A change of the plan itself is reported by the sync. */
   readonly #trackEvent = Effect.fn("BillingService.trackEvent")(function* (
@@ -690,17 +703,15 @@ export class BillingService {
     const onSubscriptionSynced = dependencies.onSubscriptionSynced;
     const status = subscription.status;
     if (serverId && onSubscriptionSynced) {
-      yield* billingCall(() =>
-        onSubscriptionSynced({
-          subscriptionId,
-          userId: ownerId,
-          serverId,
-          status,
-          plan: key.plan,
-          interval: key.interval,
-          currency,
-        }),
-      );
+      yield* onSubscriptionSynced({
+        subscriptionId,
+        userId: ownerId,
+        serverId,
+        status,
+        plan: key.plan,
+        interval: key.interval,
+        currency,
+      }).pipe(Effect.mapError((error) => (error instanceof BillingError ? error : new BillingOperationError({}))));
     }
     return synced;
   });
@@ -807,8 +818,9 @@ export class BillingService {
     return row?.stripe_customer_id ?? null;
   });
 
-  readonly #stripeCall = Effect.fn("BillingService.stripeCall")(<T>(call: () => Promise<T>) =>
-    stripeRequest(call).pipe(Effect.mapError(stripeFailure)),
+  readonly #stripeCall = Effect.fn("BillingService.stripeCall")(
+    <T>(call: () => Effect.Effect<T, StripeRequestError | StripeTransportError>) =>
+      stripeRequest(call).pipe(Effect.mapError(stripeFailure)),
   );
 }
 
