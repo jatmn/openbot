@@ -208,8 +208,8 @@ function articleBreadcrumbData(collection: ContentCollection, article: Collectio
 }
 
 function collectionStructuredData(collection: ContentCollection, siteUrl: string) {
-  // A comparison is a reference page, not a dated post, so the index is a list of them.
-  if (collection.id === "compare") {
+  // A comparison or a provider page is a reference page, not a dated post, so the index is a list of them.
+  if (collection.id === "compare" || collection.id === "providers") {
     return {
       "@context": "https://schema.org",
       "@type": "ItemList",

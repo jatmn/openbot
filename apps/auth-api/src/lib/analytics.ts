@@ -99,6 +99,7 @@ const FIXED_SCREEN_PATHS = [
   "/news",
   "/guides",
   "/compare",
+  "/providers",
 ] as const satisfies readonly LandingScreenPath[];
 
 /**

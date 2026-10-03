@@ -12,6 +12,7 @@ import {
   TrashIcon,
 } from "@openbot/ui/features/conversation/ConversationIcons";
 import type { JSX } from "@solidjs/web";
+import { Link } from "@tanstack/solid-router";
 import { createSignal, For, lazy, onSettled, Show } from "solid-js";
 import {
   LANDING_BROWSER_FIELD,
@@ -29,6 +30,7 @@ import {
   LANDING_PERSIST_EARLIER,
   LANDING_PERSIST_REQUEST,
   LANDING_PERSIST_SWITCH,
+  LANDING_PROVIDER_COPY,
   LANDING_PROVIDERS,
   LANDING_QUEUE,
   LANDING_QUEUE_DRAFT,
@@ -326,7 +328,7 @@ export function FeaturesSection() {
                 </div>
                 <div class="landing-feature-copy">
                   <h3>{feature.title}</h3>
-                  <p>{feature.description}</p>
+                  <p>{feature.id === "providers" ? <ProviderCopy /> : feature.description}</p>
                 </div>
               </li>
             )}
@@ -334,5 +336,22 @@ export function FeaturesSection() {
         </ul>
       </div>
     </section>
+  );
+}
+
+/** The provider tile's sentence, with each name linked to its provider page. */
+function ProviderCopy() {
+  return (
+    <For each={LANDING_PROVIDER_COPY}>
+      {(part) =>
+        typeof part === "string" ? (
+          part
+        ) : (
+          <Link class="landing-feature-link" to="/providers/$slug" params={{ slug: part.slug }}>
+            {part.text}
+          </Link>
+        )
+      }
+    </For>
   );
 }

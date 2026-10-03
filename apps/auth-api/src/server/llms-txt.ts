@@ -4,9 +4,10 @@
 
 import { COMPARISONS } from "../content/compare";
 import { OPENBOT_PLANS } from "../content/compare/comparison";
+import { PROVIDER_PAGES } from "../content/providers";
 import { CHANGELOG_DESCRIPTION, changelogUrl } from "../lib/changelog";
 import { CONTENT_COLLECTIONS } from "../lib/content";
-import { articleUrl, collectionIndexUrl } from "../lib/content-collection";
+import { articleUrl, type CollectionId, collectionIndexUrl } from "../lib/content-collection";
 import {
   OPENBOT_ALTERNATE_DOWNLOAD_LINKS,
   OPENBOT_DOWNLOAD_LINKS,
@@ -16,6 +17,13 @@ import {
 import { PLUGINS_DESCRIPTION, pluginIndexUrl } from "../lib/plugins";
 import { OPENBOT_SITE_DESCRIPTION, OPENBOT_SITE_URL } from "../lib/site-metadata";
 import { FEED_CACHE_CONTROL } from "./content-feed";
+
+/** The one-sentence answer of a page drawn from data. A prose article has none, and uses its description. */
+function referenceAnswer(collection: CollectionId, slug: string): string | undefined {
+  if (collection === "compare") return COMPARISONS[slug]?.answer;
+  if (collection === "providers") return PROVIDER_PAGES[slug]?.answer;
+  return undefined;
+}
 
 function absolute(path: string): string {
   return new URL(path, OPENBOT_SITE_URL).href;
@@ -56,7 +64,7 @@ function llmsTxt(): string {
       "",
     );
     for (const article of collection.articles) {
-      const answer = collection.id === "compare" ? COMPARISONS[article.slug]?.answer : undefined;
+      const answer = referenceAnswer(collection.id, article.slug);
       lines.push(`- [${article.title}](${articleUrl(collection, article.slug)}): ${answer ?? article.description}`);
     }
     lines.push("");
