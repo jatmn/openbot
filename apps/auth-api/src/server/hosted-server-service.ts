@@ -1137,9 +1137,7 @@ export class HostedServerService {
         .run(),
     );
     if (claimed.meta.changes !== 1) return;
-    return yield* Effect.gen({ self: this }, function* () {
-      yield* boat.stopSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
-    }).pipe(
+    return yield* boat.stopSandbox(sandboxId).pipe(
       Effect.catch((error) =>
         Effect.gen({ self: this }, function* () {
           // 409: the sandbox cannot stop in its current state. The cron tries again.
@@ -1235,7 +1233,6 @@ export class HostedServerService {
           if (error instanceof BoatApiError && error.code === "network_error") return boat.createSandbox(request);
           return Effect.fail(error);
         }),
-        Effect.mapError(hostedFailure),
       );
       const stored = yield* hostedCall(() =>
         dependencies.database
@@ -1340,9 +1337,7 @@ export class HostedServerService {
           .first<{ email: string }>(),
       );
       if (!owner) return;
-      yield* boat
-        .renameSandbox(sandboxId, sandboxName(row.plan, owner.email, row.server_id))
-        .pipe(Effect.mapError(hostedFailure));
+      yield* boat.renameSandbox(sandboxId, sandboxName(row.plan, owner.email, row.server_id));
     }).pipe(
       Effect.catch((error) =>
         Effect.sync(() => {
@@ -1393,7 +1388,6 @@ export class HostedServerService {
     const state = yield* boat.getSandbox(sandboxId).pipe(
       Effect.map((sandbox) => sandbox.state),
       Effect.catch((error) => (error.status === 404 ? Effect.succeed("cancelled" as const) : Effect.fail(error))),
-      Effect.mapError(hostedFailure),
     );
     yield* this.#observe(row, state, dependencies.now());
   });
@@ -1511,11 +1505,7 @@ export class HostedServerService {
     if (!boat || !sandboxId || row.observed_state === "stopping" || row.observed_state === "stopped") {
       return;
     }
-    const operationResult1 = yield* Effect.result(
-      Effect.gen({ self: this }, function* () {
-        yield* boat.stopSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
-      }),
-    );
+    const operationResult1 = yield* Effect.result(boat.stopSandbox(sandboxId));
     if (Result.isFailure(operationResult1)) {
       const error = operationResult1.failure;
 
@@ -1587,7 +1577,7 @@ export class HostedServerService {
     const boat = dependencies.boat;
     if (!boat || !sandboxId || row.observed_state !== "running") return;
     if (row.lease_until !== null && row.lease_until - now > LEASE_EXTEND_BEFORE_MS) return;
-    yield* boat.extendSandbox(sandboxId, LEASE_TTL_SECONDS).pipe(Effect.mapError(hostedFailure));
+    yield* boat.extendSandbox(sandboxId, LEASE_TTL_SECONDS);
     yield* hostedCall(() =>
       dependencies.database
         .prepare("UPDATE hosted_servers SET lease_until = ? WHERE server_id = ?")
@@ -1737,11 +1727,7 @@ export class HostedServerService {
     const boat = dependencies.boat;
     if (!boat || !sandboxId) return;
     const size = row.pending_size;
-    const operationResult2 = yield* Effect.result(
-      Effect.gen({ self: this }, function* () {
-        yield* boat.resumeSandbox(sandboxId, LEASE_TTL_SECONDS, size ?? undefined).pipe(Effect.mapError(hostedFailure));
-      }),
-    );
+    const operationResult2 = yield* Effect.result(boat.resumeSandbox(sandboxId, LEASE_TTL_SECONDS, size ?? undefined));
     if (Result.isFailure(operationResult2)) {
       const error = operationResult2.failure;
 
@@ -1846,11 +1832,7 @@ export class HostedServerService {
       const boat = dependencies.boat;
       if (!boat)
         return yield* new HostedServerServiceError(503, "hosting_not_configured", "Hosting is not configured.");
-      const operationResult3 = yield* Effect.result(
-        Effect.gen({ self: this }, function* () {
-          yield* boat.deleteSandbox(sandboxId).pipe(Effect.mapError(hostedFailure));
-        }),
-      );
+      const operationResult3 = yield* Effect.result(boat.deleteSandbox(sandboxId));
       if (Result.isFailure(operationResult3)) {
         const error = operationResult3.failure;
 
@@ -1900,7 +1882,7 @@ export class HostedServerService {
         providerTemplate,
         yield* hostedClaim(secret, row.server_id).pipe(Effect.mapError(hostedFailure)),
       );
-      return (yield* boat.createSandbox(request).pipe(Effect.mapError(hostedFailure))).id;
+      return (yield* boat.createSandbox(request)).id;
     }).pipe(
       Effect.catch((error) =>
         Effect.gen({ self: this }, function* () {

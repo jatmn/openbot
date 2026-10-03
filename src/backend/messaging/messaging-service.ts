@@ -549,7 +549,6 @@ export class MessagingService {
       ) {
         yield* live.adapter
           .react(message.target, message.platformMessageId, "stopped", true)
-          .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
           .pipe(Effect.catch(() => Effect.void));
         return;
       }
@@ -603,14 +602,12 @@ export class MessagingService {
               .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
             yield* adapter
               .react(message.target, message.platformMessageId, "failed", true)
-              .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
               .pipe(Effect.catch(() => Effect.void));
             return;
           }
           this.#targets.set(key, message.target);
           yield* adapter
             .react(message.target, message.platformMessageId, "received", true)
-            .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
             .pipe(Effect.catch(() => Effect.void));
           // In the same order as the turn's own posts: a turn that already started has its status post.
           if (result.waiting)
@@ -693,7 +690,6 @@ export class MessagingService {
           .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
     const messages = yield* live.adapter
       .history(link.platformChannelId, link.threadKey, link.historyCursor, origin.platformMessageId)
-      .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
       .pipe(Effect.catch(() => Effect.succeed([])));
     return { workspaceName, place, messages, cursor: origin.platformMessageId, skippedFiles: [] };
   });
@@ -746,14 +742,8 @@ export class MessagingService {
             : "failed";
     // A follow-up turn answers a teammate's reply: the person's message already shows how its own turn ended.
     if (activity.type === "cancelled" || !activity.followUp) {
-      yield* adapter
-        .react(target, origin.platformMessageId, "received", false)
-        .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
-        .pipe(Effect.catch(() => Effect.void));
-      yield* adapter
-        .react(target, origin.platformMessageId, reaction, true)
-        .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
-        .pipe(Effect.catch(() => Effect.void));
+      yield* adapter.react(target, origin.platformMessageId, "received", false).pipe(Effect.catch(() => Effect.void));
+      yield* adapter.react(target, origin.platformMessageId, reaction, true).pipe(Effect.catch(() => Effect.void));
     }
     if (activity.type === "cancelled" || activity.status === "interrupted") {
       yield* this.#say(adapter, target, placeholder, sourceText("status.messaging.stopped"));
@@ -927,7 +917,6 @@ export class MessagingService {
     if (!pending || pending.connectionId !== live.record.connectionId) {
       yield* adapter
         .edit(action.target, action.platformMessageId, { text: sourceText("status.messaging.requestInactive") })
-        .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
         .pipe(Effect.catch(() => Effect.void));
       return;
     }

@@ -181,14 +181,7 @@ export class RemoteServerClient {
         ),
       );
       return addRemotePreviewUrls(value, server.id);
-    }).pipe(
-      Effect.catch(({ cause: error }) =>
-        Effect.gen({ self: this }, function* () {
-          this.#connections.reportError(server.id, error);
-          return yield* new RemoteWorkflowError({ cause: error });
-        }),
-      ),
-    );
+    }).pipe(Effect.tapError(({ cause }) => Effect.sync(() => this.#connections.reportError(server.id, cause))));
   });
 
   /**
@@ -269,10 +262,9 @@ export class RemoteServerClient {
       }
       return response;
     }).pipe(
-      Effect.catch(({ cause: error }) =>
-        Effect.gen({ self: this }, function* () {
-          if (affectsConnection) this.#connections.reportError(server.id, error);
-          return yield* new RemoteWorkflowError({ cause: error });
+      Effect.tapError(({ cause }) =>
+        Effect.sync(() => {
+          if (affectsConnection) this.#connections.reportError(server.id, cause);
         }),
       ),
     );
@@ -595,13 +587,7 @@ export class RemoteServerClient {
   ): Effect.fn.Return<unknown, RemoteWorkflowError> {
     return yield* Effect.gen({ self: this }, function* () {
       return yield* this.#requireTransport().request(serverId, path, init);
-    }).pipe(
-      Effect.catch(({ cause: error }) =>
-        Effect.gen({ self: this }, function* () {
-          return yield* remoteDecode(() => rethrowAsRemoteRequestError(error));
-        }),
-      ),
-    );
+    }).pipe(Effect.catch(({ cause }) => remoteDecode(() => rethrowAsRemoteRequestError(cause))));
   });
 
   /**

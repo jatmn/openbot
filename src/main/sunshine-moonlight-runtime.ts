@@ -20,7 +20,6 @@ import { LifecycleGate } from "./lifecycle-gate";
 import {
   desktopCall,
   desktopFailure,
-  desktopResult,
   desktopSync,
   type RemoteDesktopOperationError,
   runDesktopEffect,
@@ -550,61 +549,51 @@ export class SunshineMoonlightRuntime {
         if (this.#sunshineBasePort === null) {
           const allocateSunshine = this.#options.allocateSunshineBasePort;
           if (allocateSunshine) {
-            this.#sunshineBasePort = desktopResult(yield* Effect.result(allocateSunshine()));
+            this.#sunshineBasePort = yield* allocateSunshine();
           } else {
-            this.#sunshineBasePort = desktopResult(yield* Effect.result(allocateSunshineBasePort()));
+            this.#sunshineBasePort = yield* allocateSunshineBasePort();
             this.#ownsSunshineAllocation = true;
           }
         }
-        desktopResult(yield* Effect.result(this.#writeSunshineConfigEffect()));
-        const iceEndpoint = desktopResult(yield* Effect.result(this.#startIceServerEffect()));
-        desktopResult(yield* Effect.result(desktopSync(() => this.#throwIfStopRequested())));
+        yield* this.#writeSunshineConfigEffect();
+        const iceEndpoint = yield* this.#startIceServerEffect();
+        yield* desktopSync(() => this.#throwIfStopRequested());
         if (this.#moonlightPort === null) {
-          this.#moonlightPort = desktopResult(
-            yield* Effect.result((this.#options.allocateMoonlightPort ?? reservePort)()),
-          );
+          this.#moonlightPort = yield* (this.#options.allocateMoonlightPort ?? reservePort)();
         }
         if (this.#webRtcRange === null) {
           const allocateWebRtc = this.#options.allocateWebRtcPortRange;
           if (allocateWebRtc) {
-            this.#webRtcRange = desktopResult(yield* Effect.result(allocateWebRtc()));
+            this.#webRtcRange = yield* allocateWebRtc();
           } else {
-            this.#webRtcRange = desktopResult(yield* Effect.result(allocateWebRtcPortRange()));
+            this.#webRtcRange = yield* allocateWebRtcPortRange();
             this.#ownsWebRtcRange = true;
           }
         }
-        desktopResult(yield* Effect.result(this.#writeIceHelperEffect()));
-        desktopResult(yield* Effect.result(this.#setSunshineCredentialsEffect()));
-        desktopResult(
-          yield* Effect.result(this.#startSunshineWithRetryEffect().pipe(Effect.mapError(this.#failStart("sunshine")))),
-        );
-        desktopResult(yield* Effect.result(this.#writeMoonlightConfigEffect()));
-        const displays = desktopResult(yield* Effect.result(this.#getSunshineDisplaysEffect()));
+        yield* this.#writeIceHelperEffect();
+        yield* this.#setSunshineCredentialsEffect();
+        yield* this.#startSunshineWithRetryEffect().pipe(Effect.mapError(this.#failStart("sunshine")));
+        yield* this.#writeMoonlightConfigEffect();
+        const displays = yield* this.#getSunshineDisplaysEffect();
         if (!this.#selectedDisplayId || !displays.some((display) => display.id === this.#selectedDisplayId)) {
           this.#selectedDisplayId = displays.find((display) => display.primary)?.id ?? displays[0]?.id ?? null;
         }
         const moonlightPort = this.#moonlightPort;
         if (moonlightPort === null) throw new Error("Moonlight port has not been allocated yet.");
-        desktopResult(yield* Effect.result(desktopSync(() => this.#throwIfStopRequested())));
-        desktopResult(yield* Effect.result(desktopSync(() => this.#startMoonlight(moonlightPort, iceEndpoint))));
-        desktopResult(
-          yield* Effect.result(
-            waitForHttpEffect(
-              `http://127.0.0.1:${moonlightPort}/api/authenticate`,
-              {
-                headers: { [this.#moonlightHeader]: moonlightSlotUser(1) },
-              },
-              this.#moonlight,
-            ).pipe(Effect.mapError(this.#failStart("moonlight"))),
-          ),
-        );
+        yield* desktopSync(() => this.#throwIfStopRequested());
+        yield* desktopSync(() => this.#startMoonlight(moonlightPort, iceEndpoint));
+        yield* waitForHttpEffect(
+          `http://127.0.0.1:${moonlightPort}/api/authenticate`,
+          {
+            headers: { [this.#moonlightHeader]: moonlightSlotUser(1) },
+          },
+          this.#moonlight,
+        ).pipe(Effect.mapError(this.#failStart("moonlight")));
         this.#options.onDiagnostic?.("moonlight", "OpenBot: Moonlight Web is ready.\n");
-        const paired = desktopResult(
-          yield* Effect.result(
-            this.#bootstrapMoonlightEffect(moonlightPort).pipe(Effect.mapError(this.#failStart("pairing"))),
-          ),
+        const paired = yield* this.#bootstrapMoonlightEffect(moonlightPort).pipe(
+          Effect.mapError(this.#failStart("pairing")),
         );
-        desktopResult(yield* Effect.result(desktopSync(() => this.#throwIfStopRequested())));
+        yield* desktopSync(() => this.#throwIfStopRequested());
         // An exit during pairing precedes the exit watcher becoming active.
         if (childEnded(this.#sunshine) || childEnded(this.#moonlight)) {
           return yield* this.#failStart("pairing")(
@@ -782,23 +771,20 @@ export class SunshineMoonlightRuntime {
     let lastError: unknown;
     for (let attempt = 0; attempt < SUNSHINE_START_ATTEMPTS; attempt += 1) {
       yield* desktopSync(() => this.#throwIfStopRequested());
-      try {
-        desktopResult(yield* Effect.result(this.#startSunshineOnceEffect()));
-        return;
-      } catch (error) {
-        lastError = error;
-        const sunshine = this.#sunshine;
-        if (sunshine) {
-          yield* stopRemoteProcess(sunshine).pipe(Effect.catch(() => Effect.void));
-          this.#sunshine = null;
-        }
-        if (attempt + 1 >= SUNSHINE_START_ATTEMPTS) break;
-        if (this.#ownsSunshineAllocation && this.#sunshineBasePort !== null) {
-          releaseSunshineBasePort(this.#sunshineBasePort);
-          this.#sunshineBasePort = yield* allocateSunshineBasePort();
-        }
-        yield* this.#writeSunshineConfigEffect();
+      const result = yield* Effect.result(this.#startSunshineOnceEffect());
+      if (Result.isSuccess(result)) return;
+      lastError = result.failure.cause;
+      const sunshine = this.#sunshine;
+      if (sunshine) {
+        yield* stopRemoteProcess(sunshine).pipe(Effect.catch(() => Effect.void));
+        this.#sunshine = null;
       }
+      if (attempt + 1 >= SUNSHINE_START_ATTEMPTS) break;
+      if (this.#ownsSunshineAllocation && this.#sunshineBasePort !== null) {
+        releaseSunshineBasePort(this.#sunshineBasePort);
+        this.#sunshineBasePort = yield* allocateSunshineBasePort();
+      }
+      yield* this.#writeSunshineConfigEffect();
     }
     return yield* desktopFailure(new Error(sourceText("error.backend.sunshineNotStarted"), { cause: lastError }));
   });

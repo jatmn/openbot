@@ -109,11 +109,7 @@ export class CustomAcpAgentsClient extends EventEmitter<ClientEvents> implements
       children,
       (pending) =>
         Deferred.await(pending).pipe(
-          Effect.flatMap((client) =>
-            client
-              .stop()
-              .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause }))),
-          ),
+          Effect.flatMap((client) => client.stop()),
           Effect.catch(() => Effect.void),
         ),
       { concurrency: "unbounded", discard: true },
@@ -309,14 +305,7 @@ export class CustomAcpAgentsClient extends EventEmitter<ClientEvents> implements
       yield* child
         .request("initialize", {}, decodeRecordResponse)
         .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })))
-        .pipe(
-          Effect.onError(() =>
-            child
-              .stop()
-              .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })))
-              .pipe(Effect.catch(() => Effect.void)),
-          ),
-        );
+        .pipe(Effect.onError(() => child.stop().pipe(Effect.catch(() => Effect.void))));
       return child;
     },
     Effect.mapError((error) => new ProviderClientOperationError({ cause: this.#redactError(error.cause) })),

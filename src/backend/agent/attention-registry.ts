@@ -327,17 +327,14 @@ export class AttentionRegistry {
       secret.cancel();
     } else {
       pending.submitting = true;
-      const outcome = yield* secret
-        .submit(input.secret)
-        .pipe(Effect.mapError((failure) => new AttentionOperationFailed({ cause: failure.cause })))
-        .pipe(
-          Effect.catch(() => Effect.succeed("takeover")),
-          Effect.ensuring(
-            Effect.sync(() => {
-              pending.submitting = false;
-            }),
-          ),
-        );
+      const outcome = yield* secret.submit(input.secret).pipe(
+        Effect.catch(() => Effect.succeed("takeover")),
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.submitting = false;
+          }),
+        ),
+      );
       if (this.#takeovers.get(input.requestId) !== pending) return;
       if (outcome === "submitted") {
         this.#resolveBrowserTakeover(input.requestId, pending, "complete");

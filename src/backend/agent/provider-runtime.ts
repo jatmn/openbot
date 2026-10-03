@@ -979,9 +979,7 @@ export class ProviderRuntime implements ProviderPort {
     if (!this.#clients.has("opencode")) return "not-running";
     if (this.#hooks.isProviderBusy("opencode")) return "skipped-busy";
     const result = yield* Effect.result(
-      this.#runProviderConnectionCommand("opencode", () => this.#reprobeProvider("opencode")).pipe(
-        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
-      ),
+      this.#runProviderConnectionCommand("opencode", () => this.#reprobeProvider("opencode")),
     );
     if (Result.isFailure(result) && this.#hooks.isProviderBusy("opencode")) return "skipped-busy";
     return "restarted";
@@ -1014,9 +1012,7 @@ export class ProviderRuntime implements ProviderPort {
       return;
     }
     const result = yield* Effect.result(
-      this.#runProviderConnectionCommand(provider, () => this.#reprobeProvider(provider)).pipe(
-        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
-      ),
+      this.#runProviderConnectionCommand(provider, () => this.#reprobeProvider(provider)),
     );
     if (Result.isFailure(result) && this.#hooks.isProviderBusy(provider)) this.#environmentReloadPending.add(provider);
   }, Effect.uninterruptible);
@@ -1046,11 +1042,7 @@ export class ProviderRuntime implements ProviderPort {
       return this.#clients.has("acp") ? "restarted" : "not-running";
     }
     if (this.#hooks.isProviderBusy("acp")) return "skipped-busy";
-    const result = yield* Effect.result(
-      this.#runProviderConnectionCommand("acp", () => this.#reprobeProvider("acp")).pipe(
-        Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })),
-      ),
-    );
+    const result = yield* Effect.result(this.#runProviderConnectionCommand("acp", () => this.#reprobeProvider("acp")));
     if (Result.isFailure(result)) {
       if (this.#hooks.isProviderBusy("acp")) return "skipped-busy";
       if (savedCustomAgents(this.#credentials).length === 0) yield* this.#stopProviderClient("acp");
@@ -1072,10 +1064,7 @@ export class ProviderRuntime implements ProviderPort {
       this.#accounts.delete(provider);
       this.#conversation.unloadClientThreads(client);
     });
-    yield* client
-      .stop()
-      .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-      .pipe(Effect.catch(() => Effect.void));
+    yield* client.stop().pipe(Effect.catch(() => Effect.void));
     yield* this.#hooks.onClientStopped(client);
     yield* Effect.forEach(
       [...this.#confined].filter(([, confined]) => confined.client.provider === provider),
@@ -1294,10 +1283,7 @@ export class ProviderRuntime implements ProviderPort {
     const disposals = this.#disposals;
     const { client } = yield* this.#authenticateClient(provider, cli, { confinement });
     if (disposals !== this.#disposals || this.#hooks.isStopping()) {
-      yield* client
-        .stop()
-        .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-        .pipe(Effect.catch(() => Effect.void));
+      yield* client.stop().pipe(Effect.catch(() => Effect.void));
       return yield* new ProviderOperationFailed({
         cause: new Error(sourceText("error.provider.stoppedBeforeAgentProcess", { provider: providerLabel(provider) })),
       });
@@ -1317,10 +1303,7 @@ export class ProviderRuntime implements ProviderPort {
       if (this.#confined.get(agentId) === confined) this.#confined.delete(agentId);
       this.#conversation.unloadClientThreads(confined.client);
     });
-    yield* confined.client
-      .stop()
-      .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-      .pipe(Effect.catch(() => Effect.void));
+    yield* confined.client.stop().pipe(Effect.catch(() => Effect.void));
     yield* this.#hooks.onClientStopped(confined.client);
   }, Effect.uninterruptible);
 
@@ -1700,13 +1683,7 @@ export class ProviderRuntime implements ProviderPort {
             transferred = true;
             return { client, account };
           }),
-        (client) =>
-          transferred
-            ? Effect.void
-            : client
-                .stop()
-                .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-                .pipe(Effect.catch(() => Effect.void)),
+        (client) => (transferred ? Effect.void : client.stop().pipe(Effect.catch(() => Effect.void))),
       );
     },
     Effect.mapError((failure) => new ProviderOperationFailed({ cause: this.#withExitDetail(failure.cause) })),
@@ -1723,10 +1700,7 @@ export class ProviderRuntime implements ProviderPort {
     return yield* this.#providerActivation.withPermit(
       Effect.gen({ self: this }, function* () {
         const { isCurrent, notifyReady = true } = options;
-        const stopCandidate = client
-          .stop()
-          .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-          .pipe(Effect.catch(() => Effect.void));
+        const stopCandidate = client.stop().pipe(Effect.catch(() => Effect.void));
         if (isCurrent && !isCurrent()) {
           yield* stopCandidate;
           return;
@@ -1791,10 +1765,7 @@ export class ProviderRuntime implements ProviderPort {
           return;
         }
         if (previousClient && previousClient !== client) {
-          yield* previousClient
-            .stop()
-            .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-            .pipe(Effect.catch(() => Effect.void));
+          yield* previousClient.stop().pipe(Effect.catch(() => Effect.void));
           yield* this.#hooks.onClientStopped(previousClient);
         }
         if (provider === "codex") yield* this.#refreshUsage(client).pipe(Effect.ignore, Effect.forkIn(this.#scope));
@@ -2160,10 +2131,7 @@ export class ProviderRuntime implements ProviderPort {
           if (!account.account) {
             const message =
               this.#customProviderSignInMessage(provider) ?? agentProviderDescriptor(provider).signInMessage;
-            yield* candidate
-              .stop()
-              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-              .pipe(Effect.catch(() => Effect.void));
+            yield* candidate.stop().pipe(Effect.catch(() => Effect.void));
             this.#setStatus({
               providers: updateProviderStatus(this.#status.providers, provider, {
                 state: "sign-in-required",
@@ -2178,10 +2146,7 @@ export class ProviderRuntime implements ProviderPort {
           yield* providerStep(() => driver.validateAccount(authenticated));
           // `stop()` does not wait for a start: a client added after its `dispose()` would run on.
           if (disposed()) {
-            yield* candidate
-              .stop()
-              .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-              .pipe(Effect.catch(() => Effect.void));
+            yield* candidate.stop().pipe(Effect.catch(() => Effect.void));
             return null;
           }
           if (!this.#released.has(provider)) this.#countActivation(provider);
@@ -2202,11 +2167,7 @@ export class ProviderRuntime implements ProviderPort {
           Effect.catch((problem) =>
             Effect.gen({ self: this }, function* () {
               const failedClient = client;
-              if (failedClient)
-                yield* failedClient
-                  .stop()
-                  .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-                  .pipe(Effect.catch(() => Effect.void));
+              if (failedClient) yield* failedClient.stop().pipe(Effect.catch(() => Effect.void));
               const thrown = problem.cause;
               // Another start of this provider, such as a turn's during a refresh, finished first. Its
               // client runs and its row is current, so this failure describes nothing the app uses.
@@ -2249,10 +2210,7 @@ export class ProviderRuntime implements ProviderPort {
           Effect.onInterrupt(() => {
             const interruptedClient = client;
             return interruptedClient && this.#clients.get(provider) !== interruptedClient
-              ? interruptedClient
-                  .stop()
-                  .pipe(Effect.mapError((failure) => new ProviderOperationFailed({ cause: failure.cause })))
-                  .pipe(Effect.catch(() => Effect.void))
+              ? interruptedClient.stop().pipe(Effect.catch(() => Effect.void))
               : Effect.void;
           }),
         );

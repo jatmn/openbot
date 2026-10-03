@@ -1410,30 +1410,20 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       );
     const result = yield* Effect.result(
       Effect.gen({ self: this }, function* () {
-        yield* this.#prepareAgentWorkspace(agent).pipe(
-          Effect.mapError(
-            (failure) => new AgentLifecycleFailed({ operation: "prepare agent workspace", cause: failure.cause }),
-          ),
-        );
+        yield* this.#prepareAgentWorkspace(agent);
         const requested = yield* lifecycleStep("select requested model", () =>
           creationModel(input, this.#endpoints.available(), this.#providers.status().providers),
         );
         if (requested) {
-          agent = yield* this.#store
-            .updateAgent({
-              agentId: agent.id,
-              provider: requested.provider,
-              model: requested.model.id,
-              reasoningEffort:
-                input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
-                  ? input.reasoningEffort
-                  : requested.model.defaultReasoningEffort,
-            })
-            .pipe(
-              Effect.mapError(
-                (failure) => new AgentLifecycleFailed({ operation: "set agent model", cause: failure.cause }),
-              ),
-            );
+          agent = yield* this.#store.updateAgent({
+            agentId: agent.id,
+            provider: requested.provider,
+            model: requested.model.id,
+            reasoningEffort:
+              input.reasoningEffort && requested.model.supportedReasoningEfforts.includes(input.reasoningEffort)
+                ? input.reasoningEffort
+                : requested.model.defaultReasoningEffort,
+          });
         } else {
           const starting = yield* lifecycleStep("select starting model", () => {
             const choice = this.#startingChoice();
@@ -1445,12 +1435,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           });
           agent = yield* this.#landOnStartingChoice(agent, starting);
         }
-        if (configure)
-          agent = yield* configure(agent).pipe(
-            Effect.mapError(
-              (failure) => new AgentLifecycleFailed({ operation: "configure agent", cause: failure.cause }),
-            ),
-          );
+        if (configure) agent = yield* configure(agent);
         yield* this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
         return this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent;
       }).pipe(
@@ -1656,13 +1641,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       return { previous, requestedModel, requestedProvider };
     });
     if (requestedProvider && previous && requestedProvider !== providerForAgent(previous)) {
-      yield* this.#providers
-        .ensureProvider(requestedProvider)
-        .pipe(
-          Effect.mapError(
-            (failure) => new AgentLifecycleFailed({ operation: "ensure updated provider", cause: failure.cause }),
-          ),
-        );
+      yield* this.#providers.ensureProvider(requestedProvider);
     }
     const profileChanged =
       input.name !== undefined ||
@@ -1673,14 +1652,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       input.access !== undefined ||
       input.computerUse !== undefined ||
       input.allowAutomation !== undefined;
-    const agent = yield* this.#store
-      .updateAgent(
-        { ...input, ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}) },
-        initiatingAgentId,
-      )
-      .pipe(
-        Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "update agent", cause: failure.cause })),
-      );
+    const agent = yield* this.#store.updateAgent(
+      { ...input, ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}) },
+      initiatingAgentId,
+    );
     const activeSession = this.#store.activeProviderSession(agent.id);
     if (previous?.threadId && requestedProvider && requestedProvider !== providerForAgent(previous)) {
       this.#store.database.deactivateProviderSessions(previous.threadId);
@@ -2148,19 +2123,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     yield* this.#turn.dispose();
     this.#drain.dispose();
     this.#browser.clearControls();
-    yield* Effect.forEach(
-      clients,
-      (client) =>
-        client
-          .stop()
-          .pipe(
-            Effect.mapError(
-              (failure) => new AgentLifecycleFailed({ operation: "stop provider client", cause: failure.cause }),
-            ),
-          )
-          .pipe(Effect.catch(() => Effect.void)),
-      { concurrency: "unbounded", discard: true },
-    );
+    yield* Effect.forEach(clients, (client) => client.stop().pipe(Effect.catch(() => Effect.void)), {
+      concurrency: "unbounded",
+      discard: true,
+    });
     yield* Fiber.join(channelStop);
     yield* settleLifecycleTasks("finish drain", this.#drain.pendingTasks());
     yield* settleLifecycleTasks("finish image requests", this.#images.pendingOperations());

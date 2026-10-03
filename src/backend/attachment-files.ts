@@ -24,13 +24,7 @@ import type {
 } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect } from "effect";
-import {
-  type AttachmentOperationError,
-  attachmentCall,
-  attachmentFailure,
-  attachmentResult,
-  attachmentSync,
-} from "./attachment-effects";
+import { type AttachmentOperationError, attachmentCall, attachmentFailure, attachmentSync } from "./attachment-effects";
 import { sha256File } from "./file-hash";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
@@ -157,17 +151,18 @@ export class AttachmentFiles {
   managedTransferFile(path: string): Effect.Effect<string | null, AttachmentOperationError> {
     return Effect.gen({ self: this }, function* () {
       try {
-        const [root, candidate] = attachmentResult(
-          yield* Effect.result(attachmentCall(() => Promise.all([realpath(this.#transfersRoot), realpath(path)]))),
+        const [root, candidate] = yield* attachmentCall(() =>
+          Promise.all([realpath(this.#transfersRoot), realpath(path)]),
         );
         if (!isWithin(root, candidate)) return null;
-        return attachmentResult(yield* Effect.result(attachmentCall(() => lstat(candidate)))).isFile()
-          ? candidate
-          : null;
+        return (yield* attachmentCall(() => lstat(candidate))).isFile() ? candidate : null;
       } catch {
         return null;
       }
-    }).pipe(Effect.withSpan("AttachmentFiles.managedTransferFile"));
+    }).pipe(
+      Effect.catch(() => Effect.succeed(null)),
+      Effect.withSpan("AttachmentFiles.managedTransferFile"),
+    );
   }
 
   readonly remove = Effect.fn("AttachmentFiles.remove")(function* (
@@ -224,42 +219,28 @@ export class AttachmentFiles {
     return yield* Effect.gen({ self: this }, function* () {
       try {
         for (const sourcePath of paths) {
-          const source = attachmentResult(yield* Effect.result(inspectSourceEffect(sourcePath)));
+          const source = yield* inspectSourceEffect(sourcePath);
           const id = randomUUID();
           const targetDirectory = join(this.#draftsRoot, id);
           preparedRoots.push(targetDirectory);
           const name = sanitizeName(source.path);
           assertSupportedAttachmentName(name);
           const targetPath = join(targetDirectory, name);
-          attachmentResult(
-            yield* Effect.result(
-              attachmentCall(() => mkdir(targetDirectory, { recursive: true, mode: 0o700 })).pipe(
-                Effect.uninterruptible,
-              ),
-            ),
+          yield* attachmentCall(() => mkdir(targetDirectory, { recursive: true, mode: 0o700 })).pipe(
+            Effect.uninterruptible,
           );
-          attachmentResult(
-            yield* Effect.result(attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible)),
-          );
-          const copied = attachmentResult(yield* Effect.result(attachmentCall(() => stat(targetPath))));
+          yield* attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible);
+          const copied = yield* attachmentCall(() => stat(targetPath));
           if (copied.size > MAX_FILE_BYTES) {
-            attachmentResult(
-              yield* Effect.result(
-                attachmentCall(() => rm(targetDirectory, { recursive: true, force: true })).pipe(
-                  Effect.uninterruptible,
-                ),
-              ),
+            yield* attachmentCall(() => rm(targetDirectory, { recursive: true, force: true })).pipe(
+              Effect.uninterruptible,
             );
             throw new Error(`${name} exceeds the 100 MB limit.`);
           }
           total += copied.size;
           if (total > MAX_TOTAL_BYTES) {
-            attachmentResult(
-              yield* Effect.result(
-                attachmentCall(() => rm(targetDirectory, { recursive: true, force: true })).pipe(
-                  Effect.uninterruptible,
-                ),
-              ),
+            yield* attachmentCall(() => rm(targetDirectory, { recursive: true, force: true })).pipe(
+              Effect.uninterruptible,
             );
             throw new Error(sourceText("error.attachment.totalTooLarge"));
           }
@@ -269,11 +250,7 @@ export class AttachmentFiles {
               name,
               copied.size,
               targetPath,
-              attachmentResult(
-                yield* Effect.result(
-                  sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
-                ),
-              ),
+              yield* sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
             ),
             createdAt: new Date().toISOString(),
           });
@@ -291,18 +268,10 @@ export class AttachmentFiles {
           const name = sanitizeName(item.name || "pasted-image.png");
           assertSupportedAttachmentName(name);
           const targetPath = join(targetDirectory, name);
-          attachmentResult(
-            yield* Effect.result(
-              attachmentCall(() => mkdir(targetDirectory, { recursive: true, mode: 0o700 })).pipe(
-                Effect.uninterruptible,
-              ),
-            ),
+          yield* attachmentCall(() => mkdir(targetDirectory, { recursive: true, mode: 0o700 })).pipe(
+            Effect.uninterruptible,
           );
-          attachmentResult(
-            yield* Effect.result(
-              attachmentCall(() => writeFile(targetPath, bytes, { mode: 0o600 })).pipe(Effect.uninterruptible),
-            ),
-          );
+          yield* attachmentCall(() => writeFile(targetPath, bytes, { mode: 0o600 })).pipe(Effect.uninterruptible);
           prepared.push({
             ...attachmentRecord(
               id,
@@ -359,10 +328,8 @@ export class AttachmentFiles {
           const name = uniqueName(sanitizeName(source.path), usedNames);
           const id = randomUUID();
           const targetPath = join(temporaryRoot, name);
-          attachmentResult(
-            yield* Effect.result(attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible)),
-          );
-          const copied = attachmentResult(yield* Effect.result(attachmentCall(() => stat(targetPath))));
+          yield* attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible);
+          const copied = yield* attachmentCall(() => stat(targetPath));
           if (copied.size > MAX_FILE_BYTES) throw new Error(`${name} exceeds the 100 MB limit.`);
           total += copied.size;
           if (total > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
@@ -372,31 +339,21 @@ export class AttachmentFiles {
               name,
               copied.size,
               join(finalRoot, name),
-              attachmentResult(
-                yield* Effect.result(
-                  sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
-                ),
-              ),
+              yield* sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
             ),
           );
         }
-        attachmentResult(
-          yield* Effect.result(
-            writeTransferManifestEffect(temporaryRoot, {
-              version: 2,
-              kind: "message-transfer",
-              transferId,
-              messageId,
-              sender,
-              recipientAgentIds,
-              createdAt,
-              attachments: attachments.map(manifestAttachment),
-            }),
-          ),
-        );
-        attachmentResult(
-          yield* Effect.result(attachmentCall(() => rename(temporaryRoot, finalRoot)).pipe(Effect.uninterruptible)),
-        );
+        yield* writeTransferManifestEffect(temporaryRoot, {
+          version: 2,
+          kind: "message-transfer",
+          transferId,
+          messageId,
+          sender,
+          recipientAgentIds,
+          createdAt,
+          attachments: attachments.map(manifestAttachment),
+        });
+        yield* attachmentCall(() => rename(temporaryRoot, finalRoot)).pipe(Effect.uninterruptible);
         completed = true;
         return attachments;
       } catch (error) {
@@ -457,19 +414,11 @@ export class AttachmentFiles {
         const attachments: StoredGeneratedAttachment[] = [];
         let copiedTotal = 0;
         for (const entry of entries) {
-          attachmentResult(
-            yield* Effect.result(
-              attachmentCall(() => mkdir(entry.generatedRoot, { recursive: true, mode: 0o700 })).pipe(
-                Effect.uninterruptible,
-              ),
-            ),
+          yield* attachmentCall(() => mkdir(entry.generatedRoot, { recursive: true, mode: 0o700 })).pipe(
+            Effect.uninterruptible,
           );
-          attachmentResult(
-            yield* Effect.result(
-              copyOpenedFileEffect(entry.source.handle, entry.targetPath, entry.name, MAX_TOTAL_BYTES - copiedTotal),
-            ),
-          );
-          const copied = attachmentResult(yield* Effect.result(attachmentCall(() => stat(entry.targetPath))));
+          yield* copyOpenedFileEffect(entry.source.handle, entry.targetPath, entry.name, MAX_TOTAL_BYTES - copiedTotal);
+          const copied = yield* attachmentCall(() => stat(entry.targetPath));
           if (copied.size > MAX_FILE_BYTES) throw new Error(`${entry.name} exceeds the 100 MB limit.`);
           copiedTotal += copied.size;
           if (copiedTotal > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
@@ -479,16 +428,12 @@ export class AttachmentFiles {
               entry.name,
               copied.size,
               entry.targetPath,
-              attachmentResult(
-                yield* Effect.result(
-                  sha256File(entry.targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
-                ),
-              ),
+              yield* sha256File(entry.targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
             ),
             ...(input.ownerAgentId ? { ownerAgentId: input.ownerAgentId } : {}),
             ...(input.ownerThreadId !== undefined ? { ownerThreadId: input.ownerThreadId } : {}),
           };
-          attachmentResult(yield* Effect.result(writeGeneratedManifestEffect(attachment)));
+          yield* writeGeneratedManifestEffect(attachment);
           attachments.push(attachment);
         }
         completed = true;
@@ -541,18 +486,11 @@ export class AttachmentFiles {
           Effect.uninterruptible,
         );
 
-        if (source)
-          attachmentResult(
-            yield* Effect.result(attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible)),
-          );
+        if (source) yield* attachmentCall(() => copyFile(source.path, targetPath)).pipe(Effect.uninterruptible);
         else if (bytes)
-          attachmentResult(
-            yield* Effect.result(
-              attachmentCall(() => writeFile(targetPath, bytes, { mode: 0o600 })).pipe(Effect.uninterruptible),
-            ),
-          );
+          yield* attachmentCall(() => writeFile(targetPath, bytes, { mode: 0o600 })).pipe(Effect.uninterruptible);
         else throw new Error("Generated image bytes are missing.");
-        const stored = attachmentResult(yield* Effect.result(attachmentCall(() => stat(targetPath))));
+        const stored = yield* attachmentCall(() => stat(targetPath));
         if (stored.size > MAX_FILE_BYTES) throw new Error(sourceText("error.backend.generatedImageTooLarge"));
         const generatedAttachment: StoredGeneratedAttachment = {
           ...attachmentRecord(
@@ -560,17 +498,13 @@ export class AttachmentFiles {
             name,
             stored.size,
             targetPath,
-            attachmentResult(
-              yield* Effect.result(
-                sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
-              ),
-            ),
+            yield* sha256File(targetPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
             input.mimeType,
           ),
           ...(input.ownerAgentId ? { ownerAgentId: input.ownerAgentId } : {}),
           ...(input.ownerThreadId !== undefined ? { ownerThreadId: input.ownerThreadId } : {}),
         };
-        attachmentResult(yield* Effect.result(writeGeneratedManifestEffect(generatedAttachment)));
+        yield* writeGeneratedManifestEffect(generatedAttachment);
         completed = true;
         return generatedAttachment;
       } catch (error) {
@@ -604,30 +538,30 @@ export class AttachmentFiles {
   }).bind(this);
 }
 
-const resolveManagedAttachmentEffect = Effect.fn("Attachments.resolveManagedAttachment")(function* (
-  root: string,
-  attachment: StoredAttachment,
-): Effect.fn.Return<{ path: string; mimeType: string; name: string } | null, AttachmentOperationError> {
-  try {
-    const [canonicalRoot, canonicalPath] = attachmentResult(
-      yield* Effect.result(attachmentCall(() => Promise.all([realpath(root), realpath(attachment.path)]))),
-    );
-    if (!isWithin(canonicalRoot, canonicalPath)) return null;
-    const metadata = attachmentResult(yield* Effect.result(attachmentCall(() => stat(canonicalPath))));
-    if (!metadata.isFile() || metadata.size !== attachment.size) return null;
-    if (
-      attachmentResult(
-        yield* Effect.result(
-          sha256File(canonicalPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause))),
-        ),
-      ) !== attachment.sha256
-    )
+const resolveManagedAttachmentEffect = Effect.fn("Attachments.resolveManagedAttachment")(
+  function* (
+    root: string,
+    attachment: StoredAttachment,
+  ): Effect.fn.Return<{ path: string; mimeType: string; name: string } | null, AttachmentOperationError> {
+    try {
+      const [canonicalRoot, canonicalPath] = yield* attachmentCall(() =>
+        Promise.all([realpath(root), realpath(attachment.path)]),
+      );
+      if (!isWithin(canonicalRoot, canonicalPath)) return null;
+      const metadata = yield* attachmentCall(() => stat(canonicalPath));
+      if (!metadata.isFile() || metadata.size !== attachment.size) return null;
+      if (
+        (yield* sha256File(canonicalPath).pipe(Effect.mapError((error) => attachmentFailure(error.cause)))) !==
+        attachment.sha256
+      )
+        return null;
+      return { path: canonicalPath, mimeType: attachment.mimeType, name: attachment.name };
+    } catch {
       return null;
-    return { path: canonicalPath, mimeType: attachment.mimeType, name: attachment.name };
-  } catch {
-    return null;
-  }
-});
+    }
+  },
+  Effect.catch(() => Effect.succeed(null)),
+);
 
 const writeTransferManifestEffect = Effect.fn("Attachments.writeTransferManifest")(function* (
   directory: string,

@@ -532,9 +532,7 @@ export class ThreadLifecycle {
       client
         .request("config/read", { includeLayers: false }, decodeRecordResponse)
         .pipe(Effect.mapError((failure) => new McpShapeFailed({ cause: failure.cause }))),
-    )
-      .pipe(Effect.mapError((failure) => new ThreadOperationFailed({ cause: failure.cause })))
-      .pipe(Effect.catch(() => Effect.succeed({})));
+    ).pipe(Effect.catch(() => Effect.succeed({})));
   });
 
   /**

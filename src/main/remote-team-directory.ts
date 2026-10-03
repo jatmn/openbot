@@ -84,9 +84,7 @@ export class RemoteTeamDirectory {
     ): Effect.fn.Return<TeamMemberSummary[], RemoteWorkflowError, RemoteRequest> {
       const transport = yield* remoteDecode(() => this.#controlPlaneFor(serverId));
       if (transport) {
-        const members = yield* transport
-          .listMembers(serverId)
-          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+        const members = yield* transport.listMembers(serverId);
         return members.map((member) => ({
           id: member.membershipId,
           username: member.email,
@@ -117,15 +115,10 @@ export class RemoteTeamDirectory {
         const current = members.find((member) => member.id === input.memberId);
         if (!current || current.role === "owner")
           return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.host.memberNotFound")) });
-        if (input.disabled)
-          yield* transport
-            .removeMember(serverId, input.memberId)
-            .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+        if (input.disabled) yield* transport.removeMember(serverId, input.memberId);
         else {
           const role = input.role ?? current.role;
-          yield* transport
-            .updateMember(serverId, input.memberId, role, input.disabled === false)
-            .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+          yield* transport.updateMember(serverId, input.memberId, role, input.disabled === false);
         }
         const updatedMembers = yield* this.listMembers(serverId);
         const updated = updatedMembers.find((member) => member.id === input.memberId);
@@ -146,10 +139,7 @@ export class RemoteTeamDirectory {
   readonly removeMember = Effect.fn("RemoteTeam.removeMember")(
     function* (this: RemoteTeamDirectory, serverId: string, memberId: string) {
       const transport = yield* remoteDecode(() => this.#controlPlaneFor(serverId));
-      if (transport)
-        return yield* transport
-          .removeMember(serverId, memberId)
-          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+      if (transport) return yield* transport.removeMember(serverId, memberId);
       return yield* RemoteRequest.use((service) =>
         service.request(serverId, TEAM_API_ROUTES.team.member(memberId), decodeVoid, { method: "DELETE" }),
       );
@@ -164,9 +154,7 @@ export class RemoteTeamDirectory {
     ): Effect.fn.Return<TeamInviteSummary[], RemoteWorkflowError, RemoteRequest> {
       const transport = yield* remoteDecode(() => this.#controlPlaneFor(serverId));
       if (transport) {
-        const invites = yield* transport
-          .listInvites(serverId)
-          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+        const invites = yield* transport.listInvites(serverId);
         return invites
           .filter((invite) => invite.revokedAt === null)
           .map((invite) => ({
@@ -189,10 +177,7 @@ export class RemoteTeamDirectory {
   readonly revokeInvite = Effect.fn("RemoteTeam.revokeInvite")(
     function* (this: RemoteTeamDirectory, serverId: string, inviteId: string) {
       const transport = yield* remoteDecode(() => this.#controlPlaneFor(serverId));
-      if (transport)
-        return yield* transport
-          .revokeInvite(inviteId)
-          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+      if (transport) return yield* transport.revokeInvite(inviteId);
       return yield* RemoteRequest.use((service) =>
         service.request(serverId, TEAM_API_ROUTES.team.invite(inviteId), decodeVoid, { method: "DELETE" }),
       );
@@ -216,9 +201,7 @@ export class RemoteTeamDirectory {
           return yield* new RemoteWorkflowError({
             cause: new Error(sourceText("error.remote.selfHostedInviteNoEmail")),
           });
-        const invite = yield* transport
-          .createInvite(serverId, input)
-          .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })));
+        const invite = yield* transport.createInvite(serverId, input);
         const result: InviteSummary = yield* remoteDecode(() => ({
           id: invite.inviteId,
           role: input.role,
@@ -251,7 +234,7 @@ export class RemoteTeamDirectory {
               Effect.tapError(() =>
                 transport
                   .revokeInvite(invite.inviteId)
-                  .pipe(Effect.mapError((error) => new RemoteWorkflowError({ cause: error.cause })))
+
                   .pipe(Effect.catch(() => Effect.void)),
               ),
             );

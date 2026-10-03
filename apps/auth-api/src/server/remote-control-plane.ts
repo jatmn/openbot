@@ -1342,21 +1342,17 @@ export class RemoteControlPlane {
       if (!session || session.ended_at || session.expires_at <= now || session.status !== "active") {
         return yield* new RemoteControlPlaneError(403, "session_inactive", "The remote session is not active.");
       }
-      return yield* dependencies.signer
-        .issue({
-          sessionId,
-          hostId: session.host_id,
-          userId,
-          membershipId: session.membership_id,
-          role: session.role,
-          authEpoch: session.auth_epoch,
-          sessionExpiresAt: session.expires_at,
-          clientPublicKey: boundClientPublicKey,
-          now,
-        })
-        .pipe(
-          Effect.mapError((error) => (error instanceof RemoteControlPlaneError ? error : new RemoteOperationError({}))),
-        );
+      return yield* dependencies.signer.issue({
+        sessionId,
+        hostId: session.host_id,
+        userId,
+        membershipId: session.membership_id,
+        role: session.role,
+        authEpoch: session.auth_epoch,
+        sessionExpiresAt: session.expires_at,
+        clientPublicKey: boundClientPublicKey,
+        now,
+      });
     },
     (operation) => operation.pipe(Effect.provide(this.#layer)),
   ).bind(this);
@@ -1444,20 +1440,16 @@ export class RemoteControlPlane {
     function* (this: RemoteControlPlane, hostId: string, machineToken: string) {
       const dependencies = yield* RemoteDependencies;
       const host = yield* this.authenticateHost(hostId, machineToken);
-      return yield* dependencies.signer
-        .issue({
-          sessionId: `host-${hostId}`,
-          hostId,
-          userId: host.owner_user_id,
-          membershipId: `${hostId}:host`,
-          role: "host",
-          authEpoch: host.auth_epoch,
-          sessionExpiresAt: PERSISTENT_SESSION_EXPIRES_AT,
-          now: dependencies.now(),
-        })
-        .pipe(
-          Effect.mapError((error) => (error instanceof RemoteControlPlaneError ? error : new RemoteOperationError({}))),
-        );
+      return yield* dependencies.signer.issue({
+        sessionId: `host-${hostId}`,
+        hostId,
+        userId: host.owner_user_id,
+        membershipId: `${hostId}:host`,
+        role: "host",
+        authEpoch: host.auth_epoch,
+        sessionExpiresAt: PERSISTENT_SESSION_EXPIRES_AT,
+        now: dependencies.now(),
+      });
     },
     (operation) => operation.pipe(Effect.provide(this.#layer)),
   ).bind(this);
@@ -1489,13 +1481,7 @@ export class RemoteControlPlane {
       );
       const teams = rows.results.map((row) => ({ id: row.team_id, appId: row.app_id, linkedAt: row.connected_at }));
       return {
-        ticket: yield* signer
-          .issue({ hostId, teams, now: dependencies.now() })
-          .pipe(
-            Effect.mapError((error) =>
-              error instanceof RemoteControlPlaneError ? error : new RemoteOperationError({}),
-            ),
-          ),
+        ticket: yield* signer.issue({ hostId, teams, now: dependencies.now() }),
         teams: teams.map((team) => team.id),
       };
     },
