@@ -200,6 +200,8 @@ function connectSignal(state: PeerState): void {
 }
 
 async function handleSignal(state: PeerState, message: SignalServerMessage): Promise<void> {
+  // Signal sends Slack deliveries only to the main process's `ingress` socket, never to this peer.
+  if (message.type === "slack-delivery") return;
   if (message.type === "account-profile-changed") {
     post({ type: "account-profile-changed", peerId: state.id });
     return;
@@ -215,10 +217,14 @@ async function handleSignal(state: PeerState, message: SignalServerMessage): Pro
       code: message.code,
       message: message.message,
     });
+    // Signal sends `permission_denied` to a host for a relayed frame whose connection it already
+    // removed, such as a late ICE candidate after a phone reconnected. That connection is gone; the
+    // host registration that serves every other device is not.
+    const staleRelay = message.code === "permission_denied" && state.role === "host";
     if (
       message.code === "session_revoked" ||
       message.code === "authentication_required" ||
-      message.code === "permission_denied" ||
+      (message.code === "permission_denied" && !staleRelay) ||
       message.code === "host_busy"
     ) {
       disconnect(state.id);

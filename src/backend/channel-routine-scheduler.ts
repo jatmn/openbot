@@ -15,6 +15,7 @@ import { ChannelRoutineStore } from "./channel-routine-store";
 import type { ChannelService } from "./channel-service";
 import { recordRestartActivity } from "./restart-activity";
 import { collapseMissedOccurrences } from "./routine-schedule";
+import type { RoutineHoldWindow } from "./routine-store";
 import type { RoutineDueSource } from "./routine-timer";
 
 export interface ChannelRoutineHooks {
@@ -151,8 +152,8 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
     return run;
   }
 
-  skipMissed(now: Date): void {
-    this.#routines.skipMissed(now);
+  skipMissed(now: Date, held?: RoutineHoldWindow): void {
+    this.#routines.skipMissed(now, held);
   }
 
   /** The earliest channel routine, for the shared timer to compare against the other owners. */
@@ -160,10 +161,11 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
     return this.#routines.nextDueAt(this.#excluded());
   }
 
-  async processDue(now = new Date()): Promise<void> {
+  async processDue(now = new Date(), active: () => boolean = () => true): Promise<void> {
     const changed = new Set<string>();
     try {
       for (const due of this.#routines.due(now, this.#excluded())) {
+        if (!active()) break;
         // A previous fire can yield while the channel is archived.
         if (this.#excluded().has(due.routine.channelId)) continue;
         const { scheduledFor, nextRunAt } = collapseMissedOccurrences(

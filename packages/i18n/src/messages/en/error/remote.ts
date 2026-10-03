@@ -13,9 +13,9 @@ export const messages = defineMessages("error.remote", {
   "error.remote.controlSessionEnded": "Remote control session ended.",
   "error.remote.testPanelFailed": "The host could not open the test panel.",
   "error.remote.sessionCapacity": "The host already has four active sessions.",
-  "error.remote.linuxUnsupported": "Remote desktop hosting is not supported on Linux.",
+  "error.remote.linuxNeedsX11": "Remote desktop on Linux needs an X11 session. Wayland is not supported.",
   "error.remote.runtimeMissing":
-    "The Sunshine and Moonlight Web runtime is missing or is not supported on this host. Install the full OpenBot release on a Mac or a Windows x64 host, then restart OpenBot.",
+    "The Sunshine and Moonlight Web runtime is missing or is not supported on this host. Install the full OpenBot release on a Mac, a Windows x64 host or a Linux x64 host, then restart OpenBot.",
   "error.remote.testActive": "A remote desktop test is active. Try again when it ends.",
   "error.remote.screenRecordingDenied":
     "The host has not allowed OpenBot to record its screen. Grant screen recording on the host, then try again.",
@@ -26,6 +26,14 @@ export const messages = defineMessages("error.remote", {
   "error.remote.localTestListenerUnavailable": "The local test listener is unavailable.",
   "error.remote.localTestNotFound": "Local test session not found.",
   "error.remote.runtimeUnavailable": "Remote desktop runtime is not available.",
+  "error.remote.sunshineStartFailed":
+    "Sunshine did not start on the host. Check the remote desktop logs on the host, then try again.",
+  "error.remote.moonlightStartFailed":
+    "Moonlight Web did not start on the host. Check the remote desktop logs on the host, then try again.",
+  "error.remote.pairingFailed":
+    "Moonlight could not pair with Sunshine on the host. Try again. If the problem continues, restart OpenBot on the host.",
+  "error.remote.runtimeStartFailed":
+    "The remote desktop runtime did not start on the host. Check the remote desktop logs on the host, then try again.",
   "error.remote.hostUnreachable": "The host is not reachable.",
   "error.remote.signInToHostAgain": "Sign in to this host again.",
   "error.remote.invalidData": "The host returned invalid data.",
@@ -116,6 +124,8 @@ export const messages = defineMessages("error.remote", {
   "error.remote.pairedIdentityChanged":
     "The paired desktop identity is missing or changed. Scan a new code from that desktop.",
   "error.remote.permanentInviteNoEmail": "Permanent invitations cannot be sent by email.",
+  "error.remote.selfHostedInviteNoEmail":
+    "An invitation from a self-hosted account service cannot be sent by email. Copy the link.",
   "error.remote.inviteOtherService": "This invitation belongs to another OpenBot service.",
   "error.remote.inviteFingerprintMismatch": "The invitation host identity does not match its fingerprint.",
   "error.remote.inviteHostKeyMissing": "The invitation host key is missing.",

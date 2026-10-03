@@ -36,6 +36,8 @@ import {
   type RespondToApprovalInput,
   type RespondToBrowserTakeoverInput,
   type RespondToPromptInput,
+  type RoutineCalendarInput,
+  type SearchConversationFilesInput,
   type SearchConversationMessagesInput,
   type SendMessageInput,
   type SetAgentAvatarInput,
@@ -258,6 +260,18 @@ export function parseTestRoutine(value: unknown): TestRoutineInput {
   return parseDeleteRoutine(value);
 }
 
+/** The range is a whole number of instants the host reads in one pass, so its length is limited. */
+export function parseRoutineCalendar(value: unknown): RoutineCalendarInput {
+  if (!isObject(value)) throw new Error("Invalid routine calendar request.");
+  const from = new Date(requireString(value.from, "from"));
+  const to = new Date(requireString(value.to, "to"));
+  const length = to.getTime() - from.getTime();
+  if (Number.isNaN(length) || length <= 0 || length > INPUT_LIMITS.routineCalendarDays * 86_400_000) {
+    throw new Error("Invalid routine calendar range.");
+  }
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+
 export function parseListRoutineRuns(value: unknown): ListRoutineRunsInput {
   const input = parseDeleteRoutine(value);
   if (!isObject(value)) throw new Error("Invalid routine history request.");
@@ -381,6 +395,17 @@ export function parseSearchConversationMessages(value: unknown): SearchConversat
   };
 }
 
+/** An empty query is allowed: it lists the newest files. */
+export function parseSearchConversationFiles(value: unknown): SearchConversationFilesInput {
+  if (!isObject(value) || !isString(value.query)) throw new Error("Invalid conversation file search request.");
+  if (value.query.length > INPUT_LIMITS.attachmentName) throw new Error("query is too long.");
+  return {
+    query: value.query,
+    ...(value.cursor === undefined ? {} : { cursor: requireString(value.cursor, "cursor", 2048) }),
+    limit: parsePageLimit(value.limit),
+  };
+}
+
 function parsePageAnchor(value: unknown): ReadConversationPageInput["anchor"] {
   if (value === undefined) return { type: "latest" };
   if (!isObject(value) || !isString(value.type)) throw new Error("Invalid conversation page anchor.");
@@ -496,6 +521,10 @@ export function parseUpdateAgent(value: unknown): UpdateAgentInput {
   if (value.computerUse !== undefined) {
     if (!isBoolean(value.computerUse)) throw new Error("Invalid Computer Use value.");
     result.computerUse = value.computerUse;
+  }
+  if (value.allowAutomation !== undefined) {
+    if (!isBoolean(value.allowAutomation)) throw new Error("Invalid automation value.");
+    result.allowAutomation = value.allowAutomation;
   }
   if (value.avatarSeed !== undefined) {
     if (!isAvatarSeed(value.avatarSeed)) throw new Error("Invalid avatar seed.");

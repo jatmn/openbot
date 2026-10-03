@@ -1,57 +1,35 @@
 import type {
   AccountSession,
-  AgentProviderId,
-  AgentStatus,
   AppInfo,
   AvatarImageInput,
+  BillingDesktopApi,
   CentralAuthUser,
-  CustomProviderRestart,
-  CustomProviderSummary,
-  HostedSitesDesktopApi,
+  DynamicIslandGeometry,
+  HostedServersDesktopApi,
   MobileConnectedDevice,
   MobileConnectTicket,
-  ProviderRuntimeStatus,
-  SaveCustomProviderInput,
   UpdateStatus,
 } from "@openbot/contracts/ipc";
-import type { AppTextKey } from "@openbot/i18n";
-import {
-  CircleArrowDown,
-  Globe2,
-  MousePointer2,
-  PanelTop,
-  Settings,
-  Smartphone,
-  Sparkles,
-  Tabs,
-  UserRound,
-} from "@openbot/ui";
-import type { CustomAgentSettingsApi } from "@openbot/ui/features/custom-providers/CustomAgentSettings";
-import type { DetectedProviderApi, ProviderDetection } from "@openbot/ui/features/custom-providers/detected-providers";
-import {
-  ProviderDetectionSettings,
-  type ProviderDetectionSettingsValue,
-} from "@openbot/ui/features/custom-providers/ProviderDetectionSettings";
+import { Tabs } from "@openbot/ui";
+import { BillingPanel } from "@openbot/ui/features/billing/BillingPanel";
+import { createBillingStore } from "@openbot/ui/features/billing/billing-store";
 import type { GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
-import type { ProviderKeyApi } from "@openbot/ui/features/settings/OpenCodeKeyDialog";
 import { ProfileNameSaveBar } from "@openbot/ui/features/settings/ProfileNameSaveBar";
 import { SettingsDialogShell } from "@openbot/ui/features/settings/SettingsDialogShell";
+import { SettingsHostedServersTab } from "@openbot/ui/features/settings/SettingsHostedServersTab";
 import { SettingsMobileConnectTab } from "@openbot/ui/features/settings/SettingsMobileConnectTab";
 import { SettingsProfileTab } from "@openbot/ui/features/settings/SettingsProfileTab";
 import { SettingsUpdatesTab } from "@openbot/ui/features/settings/SettingsUpdatesTab";
+import { createSettingsHostedServersStore } from "@openbot/ui/features/settings/stores/hosted-servers-store";
 import { createSettingsMobileConnectStore } from "@openbot/ui/features/settings/stores/mobile-connect-store";
 import { createSettingsProfileStore } from "@openbot/ui/features/settings/stores/profile-store";
 import { createSettingsUpdatesStore } from "@openbot/ui/features/settings/stores/updates-store";
 import { createEffect, createSignal, Show, untrack } from "solid-js";
-import type { ProviderCodeLoginApi } from "../../components/provider-code-login-api";
 import { useI18n } from "../../i18n-context";
 import { ComputerUseSetup } from "../computer-use/ComputerUseSetup";
-import { createProviderKeyState, ProviderSettingsDialogs, ProviderSettingsSection } from "./ProviderSettingsSection";
 import { SettingsDynamicIslandTab } from "./SettingsDynamicIslandTab";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
-import { SettingsHostedSitesTab } from "./SettingsHostedSitesTab";
-import { createSettingsGeneralStore } from "./stores/general-store";
-import { createSettingsHostedSitesStore } from "./stores/hosted-sites-store";
+import { navItem, navItems, type SettingsTab } from "./settings-tabs";
 
 export interface SettingsModalProps {
   open: boolean;
@@ -59,9 +37,13 @@ export interface SettingsModalProps {
   value: GeneralSettingsValue;
   onValueChange: (value: GeneralSettingsValue) => void;
   appInfo: AppInfo | null;
+  /** The built-in display's notch, null when it has none, or undefined before main answers. */
+  builtInDisplayGeometry?: DynamicIslandGeometry | undefined;
   updateStatus: UpdateStatus;
   onUpdateAction: () => Promise<void>;
   onCancelScheduledRestart?: () => Promise<void>;
+  onRestartWhenIdle?: () => Promise<void>;
+  onCancelIdleRestart?: () => Promise<void>;
   account: CentralAuthUser;
   onUpdateAccountName: (name: string) => Promise<void>;
   onUpdateAccountAvatar: (image: AvatarImageInput | null) => Promise<void>;
@@ -71,45 +53,11 @@ export interface SettingsModalProps {
   onListAccountSessions?: () => Promise<AccountSession[]>;
   onRevokeAccountSession?: (sessionId: string) => Promise<void>;
   processAvatarFile?: (file: File) => Promise<AvatarImageInput>;
-  agentStatus?: AgentStatus;
-  providerRuntimeStatuses?: Partial<Record<AgentProviderId, ProviderRuntimeStatus>>;
-  providerAvailableVersions?: Partial<Record<AgentProviderId, string | null>>;
-  onDownloadProvider?: (provider: AgentProviderId) => void | Promise<void>;
-  onCancelProviderDownload?: (provider: AgentProviderId) => void | Promise<void>;
-  onUpdateProvider?: (provider: AgentProviderId) => void | Promise<void>;
-  onInstallProvider?: (provider: AgentProviderId) => void | Promise<void>;
-  onConnectProvider?: (provider: AgentProviderId) => void | Promise<void>;
-  /** Accepts a described endpoint from the AI providers tab. Omitted on a remote server, which hides it. */
-  onAddCustomProvider?: (value: SaveCustomProviderInput) => Promise<CustomProviderRestart>;
-  customProviders?: readonly CustomProviderSummary[];
-  onDeleteCustomProvider?: (id: string) => Promise<CustomProviderRestart>;
-  /** Local model servers and ACP agents found on this computer. Omitted on a remote server. */
-  providerDetection?: ProviderDetection;
-  detectedProviderApi?: DetectedProviderApi;
-  /** Saved custom agent IDs, so a found agent's ID is checked before the round trip. */
-  takenAgentIds?: readonly string[];
-  /** The user's own ACP agents. Only the local host passes it. */
-  customAgents?: CustomAgentSettingsApi;
-  /** Where the scan looks. Without it the tab has no detection settings. */
-  detectionSettings?: ProviderDetectionSettingsValue;
-  onDetectionSettingsChange?: (value: ProviderDetectionSettingsValue) => void;
-  /** The last detection settings save failed. The section keeps the rows the user typed. */
-  detectionSettingsError?: string | null;
-  /** Runs each time the AI providers tab is shown, so the found list is current. */
-  onProvidersShown?: () => void;
-  /**
-   * Reads and writes the optional provider keys of the computer the providers run on. Absent when
-   * this window cannot manage them, which is also what takes the row's sign-in button away.
-   */
-  providerKeys?: ProviderKeyApi;
-  /** The joined server whose host runs the listed providers. Absent when this computer runs them. */
-  providerHostName?: string | undefined;
-  /**
-   * The code sign-in, for the providers that offer one. Absent for the same reason as
-   * `providerKeys`.
-   */
-  codeLogin?: ProviderCodeLoginApi;
-  hostedSitesApi?: HostedSitesDesktopApi;
+  billingApi?: BillingDesktopApi;
+  /** The account's hosted servers. The tab is shown only when the account server offers them. */
+  hostedServersApi?: HostedServersDesktopApi;
+  /** Opens the add server dialog from the Hosted servers tab. */
+  onAddHostedServer?: () => void;
   /** The agents granted a standing approval, so the user can see and undo each one. */
   turboModePending?: boolean;
   onTestNotification?: () => void | Promise<void>;
@@ -118,85 +66,8 @@ export interface SettingsModalProps {
   restoreFocusTarget?: HTMLElement | null;
   /** The tab shown when the modal is created. Read once; the user moves between tabs after that. */
   initialTab?: SettingsTab;
-}
-
-export type SettingsTab =
-  | "general"
-  | "providers"
-  | "dynamic-island"
-  | "computer-use"
-  | "profile"
-  | "mobile-connect"
-  | "updates"
-  | "hosted-sites";
-
-/**
- * A tab holds the keys of its label and its header text, not the text itself. The list is read at
- * module level, before any component exists to translate it, and a label captured there would keep
- * the language the app started in.
- */
-type SettingsNavItem = {
-  value: SettingsTab;
-  titleKey: AppTextKey;
-  descriptionKey: AppTextKey;
-  icon: typeof Settings;
-};
-
-const navItems: ReadonlyArray<SettingsNavItem> = [
-  {
-    value: "general",
-    titleKey: "settings.tab.general.title",
-    descriptionKey: "settings.tab.general.description",
-    icon: Settings,
-  },
-  {
-    value: "providers",
-    titleKey: "settings.tab.providers.title",
-    descriptionKey: "settings.tab.providers.description",
-    icon: Sparkles,
-  },
-  {
-    value: "dynamic-island",
-    titleKey: "settings.tab.dynamicIsland.title",
-    descriptionKey: "settings.tab.dynamicIsland.description",
-    icon: PanelTop,
-  },
-  {
-    value: "computer-use",
-    titleKey: "settings.tab.computerUse.title",
-    descriptionKey: "settings.tab.computerUse.description",
-    icon: MousePointer2,
-  },
-  {
-    value: "profile",
-    titleKey: "settings.tab.profile.title",
-    descriptionKey: "settings.tab.profile.description",
-    icon: UserRound,
-  },
-  {
-    value: "mobile-connect",
-    titleKey: "settings.tab.mobileConnect.title",
-    descriptionKey: "settings.tab.mobileConnect.description",
-    icon: Smartphone,
-  },
-  {
-    value: "updates",
-    titleKey: "settings.tab.updates.title",
-    descriptionKey: "settings.tab.updates.description",
-    icon: CircleArrowDown,
-  },
-  {
-    value: "hosted-sites",
-    titleKey: "settings.tab.hostedSites.title",
-    descriptionKey: "settings.tab.hostedSites.description",
-    icon: Globe2,
-  },
-];
-
-function navItem(tab: SettingsTab): SettingsNavItem {
-  const found = navItems.find((item) => item.value === tab);
-  if (!found) throw new Error(`Unknown settings tab: ${tab}`);
-  return found;
+  /** The tab shown each time the modal opens. Without it, the modal shows the tab that was open last. */
+  openTab?: SettingsTab | undefined;
 }
 
 /**
@@ -211,37 +82,44 @@ export function SettingsModal(props: SettingsModalProps) {
   const i18n = useI18n();
   const [activeTab, setActiveTab] = createSignal<SettingsTab>(untrack(() => props.initialTab) ?? "general");
   let modalElement: HTMLElement | undefined;
-  const providerKeyState = createProviderKeyState(props);
-
-  const providers = createSettingsGeneralStore({
-    get agentStatus() {
-      return props.agentStatus;
-    },
-    get providerRuntimeStatuses() {
-      return props.providerRuntimeStatuses;
-    },
-    get providerAvailableVersions() {
-      return props.providerAvailableVersions;
-    },
-    openCodeKeyStatus: providerKeyState.openCodeKeyStatus,
-    get providerHostName() {
-      return props.providerHostName;
-    },
-  });
   const profile = createSettingsProfileStore(props, () => activeTab() === "profile");
   const mobileConnect = createSettingsMobileConnectStore(props, () => activeTab() === "mobile-connect");
   const updates = createSettingsUpdatesStore(props);
-  const hostedSites = createSettingsHostedSitesStore(props, () => activeTab() === "hosted-sites");
-  createEffect(
-    () => props.open && activeTab() === "providers",
-    (shown) => {
-      if (shown) untrack(() => props.onProvidersShown?.());
-    },
+  const billing = createBillingStore(
+    () => props.billingApi,
+    () => props.open && activeTab() === "billing",
   );
+  const hostedServers = createSettingsHostedServersStore(props, () => activeTab() === "hosted-servers");
 
   // The Dynamic Island exists only on macOS, so other platforms get no tab for it.
   const isMac = () => props.appInfo?.platform === "darwin";
-  const visibleNavItems = () => navItems.filter((item) => item.value !== "dynamic-island" || isMac());
+  // An account that lost access to hosting still sees its servers, so it can delete or start them.
+  const hostedServersShown = () => hostedServers.state.available || hostedServers.state.servers.length > 0;
+  // A deep link, or the last server's delete, can leave the Hosted servers tab open without its panel.
+  createEffect(
+    () =>
+      activeTab() === "hosted-servers" &&
+      !hostedServersShown() &&
+      (hostedServers.state.loaded || hostedServers.state.error !== null || !props.hostedServersApi),
+    (hidden) => {
+      if (hidden) setActiveTab("general");
+    },
+  );
+  // The Hosted servers tab exists only after its list loads. A tab with no trigger falls back to General.
+  createEffect(
+    () => {
+      const tab = props.open ? props.openTab : undefined;
+      return tab === "hosted-servers" && !hostedServersShown() ? undefined : tab;
+    },
+    (tab) => {
+      if (tab) setActiveTab(tab);
+    },
+  );
+  const visibleNavItems = () =>
+    navItems.filter(
+      (item) =>
+        (item.value !== "dynamic-island" || isMac()) && (item.value !== "hosted-servers" || hostedServersShown()),
+    );
 
   const title = () => i18n.t(navItem(activeTab()).titleKey);
   const description = () => i18n.t(navItem(activeTab()).descriptionKey);
@@ -253,13 +131,13 @@ export function SettingsModal(props: SettingsModalProps) {
     onChange(value: string) {
       if (
         value === "general" ||
-        value === "providers" ||
         (value === "dynamic-island" && isMac()) ||
         value === "computer-use" ||
         value === "profile" ||
+        value === "billing" ||
         value === "mobile-connect" ||
         value === "updates" ||
-        value === "hosted-sites"
+        (value === "hosted-servers" && hostedServersShown())
       ) {
         setActiveTab(value);
       }
@@ -287,14 +165,6 @@ export function SettingsModal(props: SettingsModalProps) {
         contentKey={activeTab()}
         restoreFocusTarget={props.restoreFocusTarget}
         onContentElement={(element) => (modalElement = element)}
-        floatingContent={
-          <ProviderSettingsDialogs
-            keys={providerKeyState}
-            providerKeys={props.providerKeys}
-            codeLogin={props.codeLogin}
-            onConnectProvider={props.onConnectProvider}
-          />
-        }
         footer={<ProfileNameSaveBar store={profile} />}
         sidebar={
           <Tabs.List class="settings-modal-nav" aria-label={i18n.t("settings.sections.label")}>
@@ -317,7 +187,9 @@ export function SettingsModal(props: SettingsModalProps) {
         <Tabs.Content value="general" class="settings-modal-tab-panel" data-tab="general">
           <SettingsGeneralTab
             value={props.value}
+            variant={props.appInfo?.variant ?? "production"}
             onUpdateSetting={updateSetting}
+            onUpdateSettings={updateSettings}
             selectMount={modalElement}
             turboModePending={props.turboModePending}
             onTestNotification={props.onTestNotification}
@@ -329,41 +201,12 @@ export function SettingsModal(props: SettingsModalProps) {
           />
         </Tabs.Content>
 
-        <Tabs.Content value="providers" class="settings-modal-tab-panel" data-tab="providers">
-          <ProviderSettingsSection
-            store={providers}
-            selectMount={modalElement}
-            onDownloadProvider={props.onDownloadProvider}
-            onCancelProviderDownload={props.onCancelProviderDownload}
-            onUpdateProvider={props.onUpdateProvider}
-            onConnectProvider={props.onConnectProvider}
-            onInstallProvider={props.onInstallProvider}
-            onAddCustomProvider={props.onAddCustomProvider}
-            customProviders={props.customProviders}
-            onDeleteCustomProvider={props.onDeleteCustomProvider}
-            // With detection off there is no list, not an empty one.
-            providerDetection={props.detectionSettings?.enabled === false ? undefined : props.providerDetection}
-            detectedProviderApi={props.detectedProviderApi}
-            takenAgentIds={props.takenAgentIds}
-            customAgents={props.customAgents}
-            onSignInProvider={props.providerKeys ? providerKeyState.openKeyDialog : undefined}
-            onSignInWithCodeProvider={props.codeLogin?.start}
-          />
-          <Show when={props.detectionSettings}>
-            {(value) => (
-              <ProviderDetectionSettings
-                value={value()}
-                error={props.detectionSettingsError}
-                onChange={(next) => props.onDetectionSettingsChange?.(next)}
-              />
-            )}
-          </Show>
-        </Tabs.Content>
-
         <Show when={isMac()}>
           <Tabs.Content value="dynamic-island" class="settings-modal-tab-panel" data-tab="dynamic-island">
             <SettingsDynamicIslandTab
               value={props.value}
+              variant={props.appInfo?.variant ?? "production"}
+              builtInDisplayGeometry={props.builtInDisplayGeometry}
               onUpdateSetting={updateSetting}
               onUpdateSettings={updateSettings}
             />
@@ -383,6 +226,10 @@ export function SettingsModal(props: SettingsModalProps) {
           />
         </Tabs.Content>
 
+        <Tabs.Content value="billing" class="settings-modal-tab-panel" data-tab="billing">
+          <BillingPanel store={billing} available={Boolean(props.billingApi)} />
+        </Tabs.Content>
+
         <Tabs.Content value="mobile-connect" class="settings-modal-tab-panel" data-tab="mobile-connect">
           <SettingsMobileConnectTab
             store={mobileConnect}
@@ -399,9 +246,14 @@ export function SettingsModal(props: SettingsModalProps) {
             selectMount={modalElement}
           />
         </Tabs.Content>
-        <Tabs.Content value="hosted-sites" class="settings-modal-tab-panel" data-tab="hosted-sites">
-          <SettingsHostedSitesTab store={hostedSites} available={Boolean(props.hostedSitesApi)} />
-        </Tabs.Content>
+        <Show when={hostedServersShown()}>
+          <Tabs.Content value="hosted-servers" class="settings-modal-tab-panel" data-tab="hosted-servers">
+            <SettingsHostedServersTab
+              store={hostedServers}
+              onAddServer={hostedServers.state.available ? props.onAddHostedServer : undefined}
+            />
+          </Tabs.Content>
+        </Show>
       </SettingsDialogShell>
     </Tabs.Root>
   );

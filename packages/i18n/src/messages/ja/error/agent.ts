@@ -21,6 +21,14 @@ export const messages = {
   "error.agent.initialMessageTooLong": "最初のメッセージが長すぎます。",
   "error.agent.setupCleanupFailed": "エージェントのセットアップに失敗し、不完全なエージェントを削除できませんでした。",
   "error.agent.modelUnavailable": "選択したエージェントのモデルを使用できません。",
+  "error.agent.modelProviderNotConnected":
+    "選択したエージェントのモデル「{model}」を使用できません: {provider} が接続されていません。",
+  "error.agent.modelListEmpty":
+    "選択したエージェントのモデル「{model}」を使用できません: {provider} はモデルを 1 つも返しませんでした。最後のエラー: {detail}",
+  "error.agent.modelListEmptyNoError":
+    "選択したエージェントのモデル「{model}」を使用できません: {provider} はモデルを 1 つも返しませんでした。",
+  "error.agent.modelNotInProviderList":
+    "選択したエージェントのモデル「{model}」を使用できません: {provider} のモデル一覧にありません。",
   "error.agent.modelProviderMismatch": "選択したモデルはそのプロバイダーのものではありません。",
   "error.agent.modelNotListed": "モデル「{model}」は使用できません。使用できるモデル: {models}。",
   "error.agent.providerNotListed":
@@ -76,6 +84,8 @@ export const messages = {
   "error.agent.computerUseLocalOnly": "Computer Use は、エージェントを実行しているコンピューターでのみ変更できます。",
   "error.agent.workspaceOnlyMacOnly":
     "このプロバイダーの「ワークスペースのみ」は macOS でのみ利用できます。エージェントの設定で「フルアクセス」を選んでください。",
+  "error.agent.lowMemory":
+    "このサーバーはメモリが不足しています。メッセージはキューで待機し、メモリが空くと開始します。より大きいプランにすると、サーバーのメモリが増えます。",
   "error.agent.workspaceOnlyToolMissing":
     "「ワークスペースのみ」には {tool} が必要ですが、OpenBot は見つけられませんでした。インストールするか、エージェントの設定で「フルアクセス」を選んでください。",
 } as const satisfies PartialTranslation<typeof source>;

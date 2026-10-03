@@ -12,7 +12,7 @@ export const COMPARE_COLLECTION: ContentCollection<"compare"> = {
   indexRoute: "/compare",
   articleRoute: "/compare/$slug",
   name: "Compare",
-  indexTitle: "Compare OpenBot with other AI agent apps — OpenBot",
+  indexTitle: "Compare OpenBot with other AI agent apps",
   indexDescription:
     "How OpenBot compares with other AI agent apps: where the agents run, which models they use, how teams work, and where your data stays.",
   feedTitle: "OpenBot comparisons",
@@ -21,12 +21,21 @@ export const COMPARE_COLLECTION: ContentCollection<"compare"> = {
   imageEyebrow: "OPENBOT · COMPARE",
   articles: publishedFirst([
     {
+      slug: "chatgpt-dots",
+      title: "OpenBot vs ChatGPT dots: A Local Alternative",
+      description:
+        "OpenBot is a free, local ChatGPT dots alternative: run a team of AI agents on your own computer, in any country, with the ChatGPT plan you already pay for.",
+      publishedAt: "2026-10-02",
+      updatedAt: "2026-10-02",
+      author: NEWS_AUTHOR,
+    },
+    {
       slug: "devin",
       title: "OpenBot vs Devin: A Local Devin Alternative",
       description:
-        "OpenBot is a free, local Devin alternative: run Codex, Claude Code, Gemini and Grok as a team of coding agents on your computer, with the AI plans you already pay for.",
+        "OpenBot is a free, local Devin alternative: run Codex, Claude Code, Gemini and Grok as a coding agent team on your computer, with plans you already have.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
@@ -35,25 +44,25 @@ export const COMPARE_COLLECTION: ContentCollection<"compare"> = {
       description:
         "OpenBot vs Claude Cowork: run Claude Code, Codex, Gemini and Grok as a team on your own computer, with the AI plans you already pay for. Compare the two.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
       slug: "manus",
       title: "OpenBot vs Manus: A Local Manus Alternative",
       description:
-        "OpenBot is a free, local Manus alternative: run a team of AI agents on your own computer with the ChatGPT, Claude, Gemini or Grok plan you already pay for. Compare the two.",
+        "OpenBot is a free, local Manus alternative: run a team of AI agents on your own computer with the ChatGPT, Claude, Gemini or Grok plan you already pay for.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
       slug: "openclaw",
       title: "OpenBot vs OpenClaw: An OpenClaw Alternative",
       description:
-        "OpenBot vs OpenClaw (formerly Clawdbot and Moltbot): run Codex, Claude Code, Gemini and Grok as a team on your computer, and reach them from your phone. Compare the two.",
+        "OpenBot vs OpenClaw (formerly Clawdbot and Moltbot): run Codex, Claude Code, Gemini and Grok as a team on your computer, and reach them from your phone.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
@@ -62,16 +71,16 @@ export const COMPARE_COLLECTION: ContentCollection<"compare"> = {
       description:
         "OpenBot vs Hermes Agent: run Codex, Claude Code, Gemini and Grok as a team on your computer, with the AI plans you already pay for. Compare the two.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
       slug: "muse",
       title: "OpenBot vs Muse: A Local Alternative to Meta's Muse",
       description:
-        "OpenBot is a free, local alternative to Meta's Muse: run a team of AI agents on your own computer with the ChatGPT, Claude, Gemini or Grok plan you already pay for.",
+        "OpenBot is a free, local alternative to Meta's Muse: run a team of AI agents on your computer with the ChatGPT, Claude, Gemini or Grok plan you have.",
       publishedAt: "2026-09-27",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
     {
@@ -80,9 +89,9 @@ export const COMPARE_COLLECTION: ContentCollection<"compare"> = {
       slug: "grok-bot",
       title: "OpenBot vs Grok Bot: A Local Grok Bot Alternative",
       description:
-        "OpenBot is a free, local Grok Bot alternative: run AI agents on your computer with the ChatGPT, Claude, Gemini or Grok plan you already pay for. Compare the two.",
+        "OpenBot is a free, local Grok Bot alternative: run AI agents on your computer with the ChatGPT, Claude, Gemini or Grok plan you already pay for.",
       publishedAt: "2026-09-24",
-      updatedAt: "2026-09-27",
+      updatedAt: "2026-10-02",
       author: NEWS_AUTHOR,
     },
   ]),

@@ -3,8 +3,8 @@ import { isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contrac
 import { currentText } from "@openbot/ui/text";
 
 /**
- * The desktop Settings > Profile calls for a signed-in browser. They use the `/api/browser/v1/me/...`
- * operations, which authenticate with the browser cookie instead of a bearer token.
+ * The desktop Settings > Profile calls for a signed-in browser. They use the
+ * `/api/browser/v1/...` operations, which authenticate with the browser cookie instead of a bearer token.
  */
 export interface WebAccountCalls {
   updateName: (name: string) => Promise<void>;
@@ -32,7 +32,10 @@ export function createWebAccountCalls(
       headers:
         init.method === "GET"
           ? {}
-          : { "Content-Type": init.contentType ?? "application/json", "X-OpenBot-Browser": "1" },
+          : {
+              "Content-Type": init.contentType ?? "application/json",
+              "X-OpenBot-Browser": "1",
+            },
       ...(init.body === undefined ? {} : { body: init.body }),
     }).catch(() => {
       throw new Error(errorMessage(null));

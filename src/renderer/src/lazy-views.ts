@@ -33,6 +33,9 @@ export const GlobalSearch = lazy(() =>
 export const InitialSetup = lazy(() =>
   import("./features/onboarding/InitialSetup").then((module) => ({ default: module.InitialSetup })),
 );
+export const AddServerDialog = lazy(() =>
+  import("@openbot/ui/features/servers/AddServerDialog").then((module) => ({ default: module.AddServerDialog })),
+);
 export const JoinServerDialog = lazy(() =>
   import("@openbot/ui/features/servers/JoinServerDialog").then((module) => ({ default: module.JoinServerDialog })),
 );
@@ -50,6 +53,6 @@ export const ServerSettingsModal = lazy(() =>
 export const SettingsModal = lazy(() =>
   import("./features/settings/SettingsModal").then((module) => ({ default: module.SettingsModal })),
 );
-export const SkillsMarketplaceModal = lazy(() =>
-  import("./features/settings/SkillsMarketplaceModal").then((module) => ({ default: module.SkillsMarketplaceModal })),
+export const MarketplaceModal = lazy(() =>
+  import("./features/settings/MarketplaceModal").then((module) => ({ default: module.MarketplaceModal })),
 );

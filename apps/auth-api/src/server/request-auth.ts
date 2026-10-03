@@ -1,13 +1,20 @@
 import { env, waitUntil } from "cloudflare:workers";
+import { HOSTING_DEVELOPER_KEY_HEADER } from "@openbot/contracts/hosted-servers";
 import { AgentMarketplace, AgentMarketplaceError } from "./agent-marketplace";
 import { AgentTemplates } from "./agent-templates";
 import { AuthService, AuthServiceError } from "./auth-service";
+import { BillingError, type BillingService } from "./billing-service";
 import { D1AuthRepository } from "./d1-auth-repository";
 import { createEmailCodeDelivery, createTeamInviteEmailDelivery } from "./email-delivery";
+import { GitHubInstallationTokens, GitHubInstallationTokensError } from "./github-installation-tokens";
+import { createHostedBilling } from "./hosted-billing";
+import { type HostedServerService, HostedServerServiceError } from "./hosted-server-service";
 import { HostedSiteInputError } from "./hosted-site-contract";
 import { enforceHostedSiteReportRateLimit as enforceReportRateLimit } from "./hosted-site-request-policy";
+import { type HostedSiteScope, resolveHostedSiteScope } from "./hosted-site-server";
 import { HostedSiteService } from "./hosted-site-service";
 import { JsonBodyError } from "./json-body";
+import { type ApnsLiveActivitySender, sharedApnsSender } from "./live-activity-relay";
 import { MarketplaceQueryError } from "./marketplace-pagination";
 import {
   enforceMarketplaceMutation,
@@ -22,6 +29,7 @@ import {
   verifyRemoteServiceSignature,
 } from "./remote-control-plane";
 import { SkillMarketplace, SkillMarketplaceError } from "./skill-marketplace";
+import { SlackAppError, SlackAppService } from "./slack-app";
 import { requireWorkerBindings, type TeamInviteEmailDelivery } from "./types";
 
 export function requestAuthService(): AuthService {
@@ -57,6 +65,11 @@ export function requestAgentTemplates(): AgentTemplates {
   return new AgentTemplates(requireWorkerBindings(env));
 }
 
+/** The sites that a signed-in `/v1/sites` request can see and change. See `resolveHostedSiteScope`. */
+export function requestHostedSiteScope(request: Request, userId: string): Promise<HostedSiteScope> {
+  return resolveHostedSiteScope(requireWorkerBindings(env).DB, userId, request);
+}
+
 export function requestHostedSiteService(): HostedSiteService {
   const bindings = requireWorkerBindings(env);
   return new HostedSiteService(
@@ -66,6 +79,16 @@ export function requestHostedSiteService(): HostedSiteService {
     bindings.SITE_REPORT_HASH_SECRET,
     bindings.SITE_LOCAL_ORIGIN,
   );
+}
+
+/** The billing service, or null when this deployment has no Stripe key. */
+export function requestBillingService(): BillingService | null {
+  return requestHostedBilling().billing;
+}
+
+export function billingErrorResponse(error: unknown): Response {
+  if (error instanceof BillingError) return apiError(error.status, error.code, error.message);
+  return authErrorResponse(error);
 }
 
 export function requireSitePublishingEnabled(): void {
@@ -87,12 +110,74 @@ export function hostedSiteErrorResponse(error: unknown): Response {
   return authErrorResponse(error);
 }
 
-export function requireIdempotencyKey(request: Request): string {
-  const key = request.headers.get("Idempotency-Key")?.trim() ?? "";
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u.test(key)) {
-    throw new HostedSiteInputError(400, "invalid_idempotency_key", "A valid Idempotency-Key header is required.");
+/**
+ * One service for each key, so the imported key and the app ID are read once for each isolate. Only
+ * resolved values are kept: workerd refuses a promise that another request made.
+ */
+let githubInstallationTokens: { key: string; service: GitHubInstallationTokens } | null = null;
+
+export function requestGitHubInstallationTokens(): GitHubInstallationTokens {
+  const bindings = requireWorkerBindings(env);
+  const clientId = bindings.GITHUB_APP_CLIENT_ID?.trim();
+  const privateKey = bindings.GITHUB_APP_PRIVATE_KEY?.trim();
+  if (!clientId || !privateKey) {
+    throw new GitHubInstallationTokensError(503, "github_app_unavailable", "The OpenBot GitHub App is not configured.");
   }
-  return key;
+  const key = `${clientId}\u0000${privateKey}`;
+  if (githubInstallationTokens?.key !== key) {
+    githubInstallationTokens = {
+      key,
+      service: new GitHubInstallationTokens({ clientId, privateKey, fetch: (input, init) => fetch(input, init) }),
+    };
+  }
+  return githubInstallationTokens.service;
+}
+
+export async function enforceGitHubTokenRateLimit(sourceIp: string): Promise<void> {
+  const result = await requireWorkerBindings(env).GITHUB_TOKEN_RATE_LIMITER.limit({ key: `ip:${sourceIp}` });
+  if (!result.success) {
+    throw new GitHubInstallationTokensError(429, "rate_limited", "Too many GitHub token requests. Try again later.");
+  }
+}
+
+export function githubInstallationTokensErrorResponse(error: unknown): Response {
+  if (error instanceof GitHubInstallationTokensError) {
+    const response = apiError(error.status, error.code, error.message);
+    if (error.status === 429) response.headers.set("Retry-After", "60");
+    return response;
+  }
+  return authErrorResponse(error);
+}
+
+/**
+ * The Live Activity relay: the Apple sender and the limit for each host. `null` when this Worker has
+ * no Apple key or no limiter, so the relay is off.
+ */
+export function requestLiveActivityRelay(): {
+  sender: ApnsLiveActivitySender;
+  /** A host sends a few updates a minute for each phone. More is a fault or misuse. */
+  allow(hostId: string): Promise<boolean>;
+} | null {
+  const bindings = requireWorkerBindings(env);
+  const { APNS_PRIVATE_KEY, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, APNS_ORIGIN, LIVE_ACTIVITY_RATE_LIMITER } = bindings;
+  if (!APNS_PRIVATE_KEY || !APNS_KEY_ID || !APNS_TEAM_ID || !APNS_TOPIC || !LIVE_ACTIVITY_RATE_LIMITER) return null;
+  const origin = developmentApnsOrigin(APNS_ORIGIN);
+  return {
+    sender: sharedApnsSender({
+      // A deploy passes the key as one line, with `\n` for each line break.
+      privateKey: APNS_PRIVATE_KEY.replaceAll("\\n", "\n"),
+      keyId: APNS_KEY_ID,
+      teamId: APNS_TEAM_ID,
+      topic: APNS_TOPIC,
+      ...(origin ? { origin } : {}),
+    }),
+    allow: async (hostId) => (await LIVE_ACTIVITY_RATE_LIMITER.limit({ key: `host:${hostId}` })).success,
+  };
+}
+
+/** Only a development server on this computer can stand in for Apple. */
+function developmentApnsOrigin(value: string | undefined): string | undefined {
+  return value && /^http:\/\/127\.0\.0\.1:\d+\/__dev\/apns$/u.test(value) ? value : undefined;
 }
 
 export function enforceMarketplaceMutationRateLimit(kind: MarketplaceMutationKind, principal: string): Promise<void> {
@@ -153,6 +238,29 @@ export function requestRemoteControlPlane(): RemoteControlPlane {
   return new RemoteControlPlane(requireWorkerBindings(env), { schedule: waitUntil });
 }
 
+/** Pass the request when the call checks who can create servers, so its developer key counts. */
+export function requestHostedServerService(request?: Request): HostedServerService {
+  return requestHostedBilling(request?.headers.get(HOSTING_DEVELOPER_KEY_HEADER) ?? null).hosting;
+}
+
+function requestHostedBilling(developerKey: string | null = null) {
+  const bindings = requireWorkerBindings(env);
+  const remote = new RemoteControlPlane(bindings, { schedule: waitUntil });
+  return createHostedBilling(bindings, {
+    removeHost: (ownerUserId, hostId) => remote.deleteHost(ownerUserId, hostId),
+    developerKey,
+    planChanged: (hostId) => remote.planChanged(hostId),
+    schedule: waitUntil,
+  });
+}
+
+export function hostedServerErrorResponse(error: unknown): Response {
+  if (error instanceof HostedServerServiceError) return apiError(error.status, error.code, error.message);
+  if (error instanceof BillingError) return apiError(error.status, error.code, error.message);
+  if (error instanceof HostedSiteInputError) return apiError(error.status, error.code, error.message);
+  return remoteControlPlaneErrorResponse(error);
+}
+
 export function verifyRemoteServiceRequest(request: Request, body: string): Promise<boolean> {
   const secret = requireWorkerBindings(env).REMOTE_AUTH_WEBHOOK_SECRET;
   if (!secret) return Promise.resolve(false);
@@ -166,6 +274,19 @@ export function verifyRemoteServiceRequest(request: Request, body: string): Prom
 
 export function remoteControlPlaneErrorResponse(error: unknown): Response {
   if (error instanceof RemoteControlPlaneError) return apiError(error.status, error.code, error.message);
+  return authErrorResponse(error);
+}
+
+export function requestSlackApp(): SlackAppService {
+  const bindings = requireWorkerBindings(env);
+  // The events are already in D1 and the cron redelivers them, so the answer does not wait.
+  return new SlackAppService(bindings, {
+    flushAuthEvents: async () => waitUntil(deliverPendingRemoteAuthEvents(bindings, Date.now())),
+  });
+}
+
+export function slackAppErrorResponse(error: unknown): Response {
+  if (error instanceof SlackAppError) return apiError(error.status, error.code, error.message);
   return authErrorResponse(error);
 }
 

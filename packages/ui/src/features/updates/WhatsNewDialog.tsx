@@ -116,8 +116,15 @@ export function WhatsNewDialog(props: WhatsNewDialogProps) {
   );
 }
 
-/** The scroll area. It owns the fades, so their observer stops when the dialog closes. */
-function WhatsNewBody(props: { notes: WhatsNewNotes; releases: readonly WhatsNewRelease[]; onRetry: () => void }) {
+/**
+ * The scroll area. It owns the fades, so their observer stops when the dialog closes. The
+ * full-screen update concept also shows it, to list the notes before the restart.
+ */
+export function WhatsNewBody(props: {
+  notes: WhatsNewNotes;
+  releases: readonly WhatsNewRelease[];
+  onRetry: () => void;
+}) {
   const { t } = useText();
   const summary = createMemo(() => summarizeWhatsNew(props.releases));
   const noticeTitleId = createUniqueId();
@@ -242,6 +249,7 @@ function WhatsNewGroupSection(props: { group: WhatsNewGroup; onToggle: () => voi
           aria-expanded={expanded() ? "true" : "false"}
           aria-controls={expanded() ? listId : undefined}
           data-expanded={expanded() ? "true" : undefined}
+          data-cuelume-tap={expanded() ? "close" : "open"}
           onClick={toggle}
         >
           {expanded()

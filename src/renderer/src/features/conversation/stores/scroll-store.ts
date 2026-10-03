@@ -9,6 +9,7 @@ import {
   anchorNewMessages,
   countableTimelineMessage,
   type NewMessageTally,
+  silentAgentAnswer,
   tallyNewMessages,
 } from "@openbot/ui/features/conversation/new-message-tally";
 import {
@@ -17,6 +18,7 @@ import {
 } from "@openbot/ui/features/conversation/UnreadMessages";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { groupAgentMessageMarkers } from "../agent-message-timeline";
 import type { ConversationProps, ConversationTarget } from "../conversation-types";
 import { summarizeRoutineRunMessages } from "../routine-run-timeline";
 
@@ -53,9 +55,25 @@ export function createScrollStore(deps: ScrollStoreDeps) {
   let newMessages: NewMessageTally = { count: 0, anchorId: undefined };
   let talliedConversationIdentity: string | undefined;
 
-  const timelineMessages = createMemo(() =>
-    summarizeRoutineRunMessages(deps.props.messages.filter((message) => message.kind !== "thinking")),
+  const drawnMessages = createMemo(() =>
+    summarizeRoutineRunMessages(
+      deps.props.messages.filter((message) => message.kind !== "thinking" && !silentAgentAnswer(message)),
+    ),
   );
+  /*
+   * The unread divider sits on the first unread row the timeline draws. A silent answer has no row,
+   * so the divider moves to the next row that has one; read state keeps the stored message. A
+   * message that is not loaded keeps its id, so the jump can open its page.
+   */
+  const unreadBoundaryMessageId = createMemo(() => {
+    const firstUnreadMessageId = deps.props.firstUnreadMessageId;
+    const start = deps.props.messages.findIndex((message) => message.id === firstUnreadMessageId);
+    if (start < 0) return firstUnreadMessageId;
+    const drawn = new Set(drawnMessages().map((message) => message.id));
+    return deps.props.messages.slice(start).find((message) => drawn.has(message.id))?.id ?? null;
+  });
+  /* A group of agent messages stops at the unread divider, so the divider keeps its row. */
+  const timelineMessages = createMemo(() => groupAgentMessageMarkers(drawnMessages(), unreadBoundaryMessageId()));
   /* Every row anchors the count, but only some rows add to it. */
   const timelineRows = createMemo(() =>
     deps.props.messages.map((message) => ({ id: message.id, countable: countableTimelineMessage(message) })),
@@ -183,8 +201,14 @@ export function createScrollStore(deps: ScrollStoreDeps) {
     const scrollElement = deps.elements.scrollElement();
     const unreadMessagesDivider = deps.elements.unreadMessagesDivider();
     if (!scrollElement) return;
-    if (!unreadMessagesDivider && deps.props.firstUnreadMessageId && deps.props.onOpenSearchMessage) {
-      await deps.props.onOpenSearchMessage(deps.props.firstUnreadMessageId);
+    const unreadBoundary = unreadBoundaryMessageId();
+    if (!unreadBoundary) {
+      // Every unread row is a silent answer: there is no row to scroll to, only read state to move.
+      if (deps.props.firstUnreadMessageId) await markUnreadMessages();
+      return;
+    }
+    if (!unreadMessagesDivider && deps.props.onOpenSearchMessage) {
+      await deps.props.onOpenSearchMessage(unreadBoundary);
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     }
     if (!unreadMessagesDivider) return;
@@ -226,6 +250,7 @@ export function createScrollStore(deps: ScrollStoreDeps) {
     clearNewMessages,
     messageVirtualizer,
     timelineMessages,
+    unreadBoundaryMessageId,
     updateScrollFade,
     updateVirtualScrollMargin,
     updateUnreadDividerVisibility,

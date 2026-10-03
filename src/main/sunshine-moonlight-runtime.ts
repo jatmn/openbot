@@ -26,6 +26,22 @@ export class SunshineApiError extends Error {
   }
 }
 
+export type RemoteRuntimeStartStage = "sunshine" | "moonlight" | "pairing";
+
+/**
+ * A start that failed, with the part that failed. The gateway turns the stage into the reason a
+ * member reads; the cause stays in the host's diagnostics.
+ */
+export class RemoteRuntimeStartError extends Error {
+  constructor(
+    readonly stage: RemoteRuntimeStartStage,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "RemoteRuntimeStartError";
+  }
+}
+
 const MOONLIGHT_STREAMER_SLOTS = 4;
 // First candidate for Sunshine's base port. Sunshine derives its whole port family from this one
 // `port` value, so every OpenBot instance must claim a disjoint family: two macOS users share one
@@ -271,12 +287,14 @@ export type RemoteRuntimeSpawn = (executable: string, args: string[], options: S
 interface SunshineMoonlightRuntimeOptions {
   paths: RemoteDesktopRuntimePaths;
   stateDirectory: string;
-  platform: "darwin" | "win32";
+  platform: "darwin" | "win32" | "linux";
   credentials: { username: string; password: string };
   getDisplays: () => RemoteDesktopDisplay[];
   getIceServers: () => Promise<RemoteDesktopIceServer[]>;
   spawnProcess?: RemoteRuntimeSpawn;
   onDiagnostic?: (source: "sunshine" | "moonlight", message: string) => void;
+  /** Called when Sunshine or Moonlight Web exits after the runtime started. The runtime is then stopped. */
+  onExit?: (source: "sunshine" | "moonlight") => void;
   allocateSunshineBasePort?: () => Promise<number>;
   allocateMoonlightPort?: () => Promise<number>;
   allocateWebRtcPortRange?: () => Promise<MoonlightWebRtcPortRange>;
@@ -374,8 +392,10 @@ export class SunshineMoonlightRuntime {
     this.#selectedDisplayId = displayId;
     if (!this.#state) return;
     await this.#writeSunshineConfig();
-    if (this.#sunshine) await stopRemoteProcess(this.#sunshine);
+    // Cleared before the wait, so the exit watch reads this stop as intended.
+    const sunshine = this.#sunshine;
     this.#sunshine = null;
+    if (sunshine) await stopRemoteProcess(sunshine);
     // Reuse the already allocated ports: Moonlight paired against this Sunshine HTTP port, so a
     // reallocation here would orphan every existing pairing.
     await this.#startSunshineOnce();
@@ -428,6 +448,16 @@ export class SunshineMoonlightRuntime {
     return port;
   }
 
+  // A stop that interrupts the start is not a start failure. A process that has already ended names
+  // the stage, because a pairing call to a Sunshine that has exited fails too.
+  #failStart(stage: RemoteRuntimeStartStage): (error: unknown) => never {
+    return (error) => {
+      if (this.#stopRequested) throw error;
+      const ended = childEnded(this.#sunshine) ? "sunshine" : childEnded(this.#moonlight) ? "moonlight" : null;
+      throw new RemoteRuntimeStartError(ended ?? stage, error);
+    };
+  }
+
   #throwIfStopRequested(): void {
     if (this.#stopRequested) throw new Error(sourceText("error.backend.remoteDesktopStoppedWhileStarting"));
   }
@@ -460,7 +490,7 @@ export class SunshineMoonlightRuntime {
       }
       await this.#writeIceHelper();
       await this.#setSunshineCredentials();
-      await this.#startSunshineWithRetry();
+      await this.#startSunshineWithRetry().catch(this.#failStart("sunshine"));
       await this.#writeMoonlightConfig();
       const displays = await this.#getSunshineDisplays();
       if (!this.#selectedDisplayId || !displays.some((display) => display.id === this.#selectedDisplayId)) {
@@ -476,10 +506,15 @@ export class SunshineMoonlightRuntime {
           headers: { [this.#moonlightHeader]: moonlightSlotUser(1) },
         },
         this.#moonlight,
-      );
+      ).catch(this.#failStart("moonlight"));
       this.#options.onDiagnostic?.("moonlight", "OpenBot: Moonlight Web is ready.\n");
-      const paired = await this.#bootstrapMoonlight(moonlightPort);
+      const paired = await this.#bootstrapMoonlight(moonlightPort).catch(this.#failStart("pairing"));
       this.#throwIfStopRequested();
+      // #watchExit ignores an exit while #state is null, so a process that ended during pairing is
+      // found here. Nothing is awaited between this check and #state, so a later exit is watched.
+      if (childEnded(this.#sunshine) || childEnded(this.#moonlight)) {
+        this.#failStart("pairing")(new Error("A remote desktop process exited during pairing."));
+      }
       this.#state = {
         baseUrl: `http://127.0.0.1:${moonlightPort}`,
         authHeader: this.#moonlightHeader,
@@ -529,6 +564,9 @@ export class SunshineMoonlightRuntime {
       `cert = ${join(this.#options.stateDirectory, "sunshine-cert.pem")}`,
       `log_path = ${join(this.#options.stateDirectory, "sunshine.log")}`,
       ...(this.#selectedDisplayId ? [`output_name = ${this.#selectedDisplayId}`] : []),
+      // The Linux runtime is built with X11 capture and no hardware encoder, so Sunshine does not
+      // probe the others.
+      ...(this.#options.platform === "linux" ? ["capture = x11", "encoder = software"] : []),
     ];
     await Promise.all([
       writeFile(join(this.#options.stateDirectory, "sunshine.conf"), `${values.join("\n")}\n`, { mode: 0o600 }),
@@ -652,6 +690,7 @@ export class SunshineMoonlightRuntime {
       windowsHide: true,
     });
     this.#pipeDiagnostics(this.#sunshine, "sunshine");
+    this.#watchExit(this.#sunshine, "sunshine");
     await waitForHttps(
       this.#requireSunshineHttpsPort(),
       join(this.#options.stateDirectory, "sunshine-cert.pem"),
@@ -683,6 +722,7 @@ export class SunshineMoonlightRuntime {
       },
     );
     this.#pipeDiagnostics(this.#moonlight, "moonlight");
+    this.#watchExit(this.#moonlight, "moonlight");
   }
 
   async #bootstrapMoonlight(port: number): Promise<{ hostId: number; hostIds: number[]; desktopAppId: number }> {
@@ -765,17 +805,23 @@ export class SunshineMoonlightRuntime {
       sunshineDisplaysSchema,
     );
     const local = this.#options.getDisplays();
-    if (native.displays.length === 0) return structuredClone(local);
-    return native.displays.map((display, index) => {
+    // Sunshine also lists outputs that have no monitor: an X server with a dummy driver has 16, and
+    // only one is connected. Electron lists only connected monitors, so an output with no match is
+    // not a screen to show, and its size is unknown.
+    const displays = native.displays.flatMap((display, index) => {
       const metadata = local.find((candidate) => candidate.id === display.id) ?? local[index];
-      return {
-        id: display.id,
-        label: metadata?.label ?? display.name,
-        width: metadata?.width ?? 0,
-        height: metadata?.height ?? 0,
-        primary: metadata?.primary ?? index === 0,
-      };
+      if (!metadata) return [];
+      return [
+        {
+          id: display.id,
+          label: metadata.label,
+          width: metadata.width,
+          height: metadata.height,
+          primary: metadata.primary,
+        },
+      ];
     });
+    return displays.length === 0 ? structuredClone(local) : displays;
   }
 
   async #waitForPairingRequest(): Promise<string> {
@@ -883,6 +929,18 @@ export class SunshineMoonlightRuntime {
     });
     const address = localAddressSchema.parse(this.#iceServer.address());
     return `http://127.0.0.1:${address.port}/ice`;
+  }
+
+  // After a start, nothing waits on these processes. One that exits on its own would leave a runtime
+  // that still reports itself started, and every new session would wait for a stream that never comes.
+  #watchExit(child: ChildProcess, source: "sunshine" | "moonlight"): void {
+    child.once("exit", (code, signal) => {
+      // A stop clears the field before it waits. A start in progress fails its own readiness wait.
+      if ((source === "sunshine" ? this.#sunshine : this.#moonlight) !== child || !this.#state) return;
+      this.#state = null;
+      this.#options.onDiagnostic?.(source, `OpenBot: ${source} exited unexpectedly (${signal ?? `code ${code}`}).\n`);
+      this.#options.onExit?.(source);
+    });
   }
 
   #pipeDiagnostics(process: ChildProcess, source: "sunshine" | "moonlight"): void {

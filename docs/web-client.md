@@ -44,16 +44,24 @@ mock. The separate web preview implements the browser runtime with that same moc
 - `/api/browser/*` exposes only email start/verify, session read/logout, host list, host logo read,
   session start/ticket/end, invitation preview/accept and email, host member and invite
   administration, and the account's display name, avatar, and session list/revoke
-  (`v1/me/profile`, `v1/me/avatar`, `v1/me/sessions`). It is not a general account or host proxy.
+  (`v1/me/profile`, `v1/me/avatar`, `v1/me/sessions`), and billing (`v1/me/billing`,
+  `v1/me/billing/portal`), and hosted servers (`v2/hosting/servers` list and create with
+  `{name, plan, interval, currency}`, `v2/hosting/plans`, `v2/hosting/servers/:id` delete, and
+  `v2/hosting/servers/:id/wake` and `/checkout`), and the account's hosted site list/delete
+  (`v1/sites`), which the web client no longer calls: sites are in Server settings > Sites, through
+  the host's `hosted-sites-v1`. It is not a general account or host proxy.
   Every write needs the same origin and `X-OpenBot-Browser: 1`; all send JSON except the avatar
-  upload, which sends the image bytes. A host logo is given to a member of that host, for its
-  current `logoKey` only.
-- The account dock uses the single-row layout on every browser. Its menu has usage, Profile,
-  Settings (the connected host's settings), Marketplace, Send feedback, Message, and Sign out.
-  Profile opens the desktop Settings > Profile content in the right panel of the agent on screen;
-  it is not available in a channel. A browser session is listed as Desktop, and it can disconnect
-  any other session of the account, as the desktop app can. Providers & permissions and app
-  updates stay desktop only.
+  upload, which sends the image bytes. A site delete also needs an `Idempotency-Key`. A host logo is
+  given to a member of that host, for its current `logoKey` only.
+- The account dock uses the single-row layout on every browser. Its menu has usage, Profile, Billing,
+  Account settings, Settings (the connected host's settings), Marketplace, Send feedback, Message,
+  and Sign out. Profile opens the desktop Settings > Profile content in the right panel of the agent
+  on screen; it is not available in a channel. Account settings opens a dialog with the desktop
+  Profile tab, and Preferences: the interface language and the completion sound.
+  This browser keeps both preferences, also before sign-in (`web-language-preference.ts`,
+  `completion-sound.ts`). A browser session is listed as Desktop, and it can disconnect any other
+  session of the account, as the desktop app can. Providers & permissions and app updates stay
+  desktop only.
 - Sign-in credentials are cookie-only. The browser receives a short connection ticket for the
   existing Signal handshake. Session creation, ticket issue and end are bound to its credential.
 - The production website accepts invitation links for `https://api.openbot.run`; the request still
@@ -68,8 +76,18 @@ mock. The separate web preview implements the browser runtime with that same moc
   host it has open reports that host's state. A hidden tab keeps retrying, unlike mobile, because it
   holds the lock and no other tab can take its place. Each status connection uses one Signal socket,
   and the host shows the user as present.
-- The rail order is kept in this browser, per account. The server menu has Usage and Settings.
-  Mute and notification level are desktop only, because they control desktop notifications.
+- The rail order is kept in this browser, per account. The server menu has Mute, Notification
+  settings, Usage and Settings. Mute and notification level are kept in this browser, per account
+  and host (`web-notification-preferences.ts`). They control browser notifications and the
+  completion sound, with the same rules as the desktop (`@openbot/team-client/agent-notifications`).
+  A browser notification shows only while a tab is open and no tab of the app has focus; the tabs
+  share the focused tab in local storage, because the tab that speaks for a host is often in the
+  background. The browser asks for permission on the first prompt that the user sends, or when the
+  user turns notifications on in the menu. The completion sound also stops when the user turns it
+  off in Account settings > Preferences. Status connections read the prompt, approval and
+  turn-completed events and the agent list of their host, so every connected host can notify. Each
+  click or key press starts the audio context again, because Safari plays sound only after a user
+  action and iOS can interrupt it.
 - Capability checks hide unavailable browser-view and creation-model controls. Hosts without
   pagination use their full conversation endpoint. Unsupported media and EML uploads are refused
   before transfer. Host authorization remains the final decision for every action.
@@ -80,7 +98,9 @@ mock. The separate web preview implements the browser runtime with that same moc
 - The marketplace reads the public catalog on its own origin. An owner or admin installs skills,
   plugin apps, and new agents on the connected host, and adds Try skill examples and plugin prompts
   to an agent's draft. An agent that the host added from a listing gets Update when the host serves
-  `agent-update-v1`. Publishing (submissions and package choice) is desktop only. A plugin app
+  `agent-update-v1`. Marketplace submissions and package choice are desktop only. An owner or admin
+  publishes, updates and unpublishes an agent's share link from the conversation header when the host
+  serves `agent-publish-v1`; the host publishes with its own account. A plugin app
   that needs a browser sign-in is installed on the host computer, as for a desktop remote admin.
 - Join, marketplace, shared agent, server settings, global search and channel creation use the
   shared views in `src/renderer/src/WorkspaceOverlayViews.tsx`, as desktop does. An open overlay or
@@ -89,9 +109,13 @@ mock. The separate web preview implements the browser runtime with that same moc
   the `/join` page, and `?plugin=<slug>` from a plugin page. The client removes the fields after it
   reads them, so the invitation secret does not stay in the address bar or history. A link opens the
   preview, the join dialog or the listing; it never installs or joins without a press.
-- The application Settings dialog, permissions review, and hosted sites are desktop only. Hosted
-  sites publish a folder of this computer through a folder picker and local file reads in the main
-  process.
+- Billing opens a dialog with the same content as desktop Settings > Billing: the plan of each
+  server that the account pays for. Its actions open the Stripe Customer Portal in the same tab, only
+  at a `billing.stripe.com` URL. Stripe returns to `/app?billing=portal`. The client removes the field
+  and opens the dialog. The webhook can be later than the return, so the dialog loads again on focus.
+- The application Settings dialog, permissions review, and hosted site publishing are desktop only.
+  Publishing sends a folder of this computer through a folder picker and local file reads in the main
+  process. The browser can list, open, and delete the account's sites.
 - Uploads and downloads retain the shared client's 10 MB limit. Message attachment count uses the
   shared contract limit. Cancelling a transfer sends the existing file-cancel frame. If the host
   has already committed an attachment, cancellation removes that draft after the response.
@@ -121,9 +145,8 @@ mock. The separate web preview implements the browser runtime with that same moc
   with the shape of the host frame.
 - No full remote desktop, push notifications, or offline operation is included. See
   [Remote desktop](#remote-desktop) for the reason.
-- These stay desktop only: the application Settings dialog (Providers & permissions, app
-  updates), permissions review, hosted sites, marketplace publishing, server mute and notification
-  level, Picture in Picture, the Memories, Routines and Files sections of agent settings, the
+- These stay desktop only: the application Settings dialog (permissions, app updates),
+  permissions review, hosted site publishing, marketplace publishing, Picture in Picture, the Memories, Routines and Files sections of agent settings, the
   conversation Files panel, and file reveal. The browser shows host files in Server settings >
   Storage.
 

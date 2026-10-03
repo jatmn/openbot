@@ -16,6 +16,15 @@
 
 import type { ManagedProviderId } from "./agent-providers";
 import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
+import type { AppLogoColorPreference, SetAppLogoColorPreferenceInput } from "./app-logo-color";
+import type { BillingPortalRequest, BillingState } from "./billing";
+import type {
+  CreateHostedServerInput,
+  DeleteHostedServerInput,
+  HostedServerCatalog,
+  HostedServerList,
+  HostedServerSummary,
+} from "./hosted-servers";
 import type { AddedAgent, AgentAdminSettings, UpdateAgentAdminSettingsInput } from "./ipc-agent-admin";
 import type { AgentAnalytics, AgentAnalyticsInput } from "./ipc-agent-analytics";
 import type { AgentIpcRequest, ScopedAgentEvent } from "./ipc-agent-events";
@@ -40,6 +49,7 @@ import type {
   ProviderApiKeyState,
   ProviderCodeLoginStart,
   SetProviderApiKeyInput,
+  SubmitProviderCodeLoginInput,
 } from "./ipc-agent-status";
 import type {
   AgentTemplateDetail,
@@ -69,6 +79,7 @@ import type {
   ExternalDestination,
   HostUpdateSettingsChange,
   HostUpdateStatus,
+  IdleRestartTarget,
   MacPermissionId,
   ProviderRuntimeSnapshot,
   SaveSetupInput,
@@ -125,6 +136,7 @@ import type {
 } from "./ipc-channel-routines";
 import type { Channel, ChannelCommand, ChannelPage, ChannelReadInput, ChannelSummary } from "./ipc-chat-channels";
 import type {
+  ConversationFileSearchPage,
   ConversationPage,
   ConversationReadState,
   ConversationSearchPage,
@@ -132,6 +144,7 @@ import type {
   MarkConversationReadInput,
   ReadConversationPageInput,
   RespondToPromptInput,
+  SearchConversationFilesInput,
   SearchConversationMessagesInput,
   SendMessageInput,
   SetMessageReactionInput,
@@ -160,9 +173,11 @@ import type {
   SetDynamicIslandInteractiveInput,
   SetDynamicIslandPreferenceInput,
 } from "./ipc-dynamic-island";
+import type { GitHubConnectorRepositories, GitHubConnectorStatus } from "./ipc-github-connector";
 import type { HostAnalytics, HostAnalyticsInput } from "./ipc-host-analytics";
 import type {
   DeleteHostedSiteInput,
+  HostedSiteList,
   HostedSiteSummary,
   PublishHostedSiteInput,
   ReplaceHostedSiteInput,
@@ -185,6 +200,13 @@ import type {
   SetMcpServerEnabledInput,
   TestMcpServerInput,
 } from "./ipc-mcp-servers";
+import type {
+  AddSlackOrchestratorInput,
+  AddSlackOrchestratorResult,
+  SetSlackEnabledInput,
+  SlackOverview,
+  SlackWorkspaceInput,
+} from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type {
   DetectedModelServer,
@@ -214,6 +236,8 @@ import type {
   DeleteRoutineInput,
   ListRoutineRunsInput,
   Routine,
+  RoutineCalendar,
+  RoutineCalendarInput,
   RoutineRun,
   TestRoutineInput,
   UpdateRoutineInput,
@@ -387,6 +411,13 @@ export const IPC_ENDPOINTS = {
     // Dynamic Island overlay has no Settings of its own and would otherwise stay in the old
     // language until it was next recreated.
     appLanguagePreference: event<AppLanguagePreference>()("app:language-preference"),
+    getAppLogoColorPreference: request<undefined, AppLogoColorPreference>()("app:get-logo-color-preference"),
+    setAppLogoColorPreference: request<SetAppLogoColorPreferenceInput, AppLogoColorPreference>()(
+      "app:set-logo-color-preference",
+    ),
+    // Every window draws the logo, and the Dynamic Island has no Settings of its own, so the choice
+    // is broadcast in the same way as the language.
+    appLogoColorPreference: event<AppLogoColorPreference>()("app:logo-color-preference"),
     // The native Preferences menu item and its shortcut live in main, while the dialog lives in
     // the renderer, so the menu click is broadcast rather than handled: every window opens its
     // own Settings.
@@ -401,6 +432,13 @@ export const IPC_ENDPOINTS = {
   providers: {
     connectProvider: request<AgentProviderId, AgentStatus>()("app:connect-provider"),
     refreshAgentProviders: request<undefined, AgentStatus>()("app:refresh-agent-providers"),
+    /**
+     * Restarts one provider's process after the turns that run on it end, and reads its version,
+     * account and models again. It answers when the restart is scheduled; the provider's status has
+     * `restartPending` until it is done. `cancelProviderRestart` removes one that still waits.
+     */
+    restartProvider: request<AgentProviderId, AgentStatus>()("app:restart-provider"),
+    cancelProviderRestart: request<AgentProviderId, AgentStatus>()("app:cancel-provider-restart"),
     /**
      * Runs the provider CLI's own updater, for a CLI the user installed themselves. It is their copy,
      * so the version they end on is whatever that updater fetches, which owes nothing to the version
@@ -448,6 +486,10 @@ export const IPC_ENDPOINTS = {
     presentation: event<DynamicIslandPresentation>()("dynamic-island:presentation"),
     preference: event<DynamicIslandPreference>()("dynamic-island:preference"),
     geometry: event<DynamicIslandGeometry>()("dynamic-island:geometry"),
+    /** The notch of the built-in display, or null when it has none. The Settings preview draws it. */
+    getBuiltInDisplayGeometry: request<undefined, DynamicIslandGeometry>()(
+      "dynamic-island:get-built-in-display-geometry",
+    ),
     performAction: request<DynamicIslandAction, void>()("dynamic-island:perform-action"),
     performHaptic: request<undefined, void>()("dynamic-island:perform-haptic"),
     action: event<DynamicIslandAction>()("dynamic-island:action"),
@@ -514,6 +556,10 @@ export const IPC_ENDPOINTS = {
     startCodeLogin: scopedRequest<AgentProviderId, ProviderCodeLoginStart, "required">()(
       "provider-admin:start-code-login",
     ),
+    // The code of a `paste` sign-in. The result is the status; how the sign-in ends arrives as one.
+    submitCodeLogin: scopedRequest<SubmitProviderCodeLoginInput, AgentStatus, "required">()(
+      "provider-admin:submit-code-login",
+    ),
     cancelCodeLogin: scopedRequest<AgentProviderId, AgentStatus, "required">()("provider-admin:cancel-code-login"),
     getApiKeyState: scopedRequest<AgentProviderId, ProviderApiKeyState, "required">()(
       "provider-admin:get-api-key-state",
@@ -536,6 +582,19 @@ export const IPC_ENDPOINTS = {
       "provider-admin:delete-custom-provider",
     ),
   },
+  // The Slack workspaces where this computer's agents answer. Only the host's own desktop can use
+  // these: a connect opens a Slack page in this computer's browser, and the page returns to this
+  // computer's `openbot://` link. A token only travels towards the host; no result carries one.
+  messaging: {
+    getSlackOverview: request<undefined, SlackOverview>()("messaging:get-slack-overview"),
+    connectSlackWorkspace: request<undefined, void>()("messaging:connect-slack-workspace"),
+    disconnectSlackWorkspace: request<SlackWorkspaceInput, void>()("messaging:disconnect-slack-workspace"),
+    reconnectSlackWorkspace: request<SlackWorkspaceInput, void>()("messaging:reconnect-slack-workspace"),
+    setSlackEnabled: request<SetSlackEnabledInput, void>()("messaging:set-slack-enabled"),
+    addSlackOrchestrator: request<AddSlackOrchestratorInput, AddSlackOrchestratorResult>()(
+      "messaging:add-slack-orchestrator",
+    ),
+  },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
   // reach this computer only; these take the server, so a remote admin reaches the host. The
   // identity result is the server as the list shows it after the change.
@@ -549,12 +608,42 @@ export const IPC_ENDPOINTS = {
       "host-admin:set-update-settings",
     ),
   },
+  // The built-in GitHub connection of this computer. Local only: a remote client connects GitHub on
+  // the computer that runs OpenBot. The token stays in main; every answer is the status only.
+  githubConnector: {
+    status: request<undefined, GitHubConnectorStatus>()("github-connector:status"),
+    connect: request<undefined, GitHubConnectorStatus>()("github-connector:connect"),
+    cancel: request<undefined, GitHubConnectorStatus>()("github-connector:cancel"),
+    disconnect: request<undefined, GitHubConnectorStatus>()("github-connector:disconnect"),
+    repositories: request<undefined, GitHubConnectorRepositories>()("github-connector:repositories"),
+    openVerification: request<undefined, void>()("github-connector:open-verification"),
+    openInstall: request<undefined, void>()("github-connector:open-install"),
+    changed: event<GitHubConnectorStatus>()("github-connector:changed"),
+  },
   hostedSites: {
-    list: request<undefined, HostedSiteSummary[]>()("hosted-sites:list"),
+    // The sites of one server. A joined server answers through `hosted-sites-v1`.
+    list: scopedQuery<HostedSiteList, "required">()("hosted-sites:list"),
     chooseDirectory: request<undefined, string | null>()("hosted-sites:choose-directory"),
     publish: request<PublishHostedSiteInput, HostedSiteSummary>()("hosted-sites:publish"),
     replace: request<ReplaceHostedSiteInput, HostedSiteSummary>()("hosted-sites:replace"),
-    delete: request<DeleteHostedSiteInput, void>()("hosted-sites:delete"),
+    delete: scopedRequest<DeleteHostedSiteInput, void, "required">()("hosted-sites:delete"),
+  },
+  // The account's Stripe subscription. The main process gets the Checkout or Portal URL from the
+  // account server and opens it in the browser, so the renderer never sends a URL.
+  billing: {
+    getState: request<undefined, BillingState>()("billing:get-state"),
+    openPortal: request<BillingPortalRequest, void>()("billing:open-portal"),
+  },
+  // OpenBot servers that the account server runs for this account. `wake` also works for a server
+  // that the account is a member of; it answers 404 for a host that is not a hosted server.
+  hostedServers: {
+    list: request<undefined, HostedServerList>()("hosted-servers:list"),
+    plans: request<undefined, HostedServerCatalog>()("hosted-servers:plans"),
+    // Main opens the Stripe Checkout page and returns only the server, which waits for the payment.
+    create: request<CreateHostedServerInput, HostedServerSummary>()("hosted-servers:create"),
+    openCheckout: request<string, HostedServerSummary>()("hosted-servers:open-checkout"),
+    delete: request<DeleteHostedServerInput, void>()("hosted-servers:delete"),
+    wake: request<string, HostedServerSummary>()("hosted-servers:wake"),
   },
   marketplaceAgents: {
     list: request<MarketplaceAgentQuery | undefined, MarketplaceAgentPage>()("marketplace-agents:list"),
@@ -598,6 +687,9 @@ export const IPC_ENDPOINTS = {
     getPreference: request<undefined, UpdatePreference>()("update:get-preference"),
     setPreference: request<UpdatePreferenceChange, UpdatePreference>()("update:set-preference"),
     cancelScheduledRestart: request<undefined, UpdateStatus>()("update:cancel-scheduled-restart"),
+    // The user of this computer restarts OpenBot, or installs the update, when no work runs.
+    restartWhenIdle: request<IdleRestartTarget, UpdateStatus>()("update:restart-when-idle"),
+    cancelIdleRestart: request<undefined, UpdateStatus>()("update:cancel-idle-restart"),
     event: event<UpdateStatus>()("update:event"),
     // A preference that an admin of a joined server changed on this computer.
     preference: event<UpdatePreference>()("update:preference-event"),
@@ -638,6 +730,10 @@ export const IPC_ENDPOINTS = {
     readConversationPage: scopedRequest<ReadConversationPageInput, ConversationPage>()("agent:read-conversation-page"),
     searchConversationMessages: scopedRequest<SearchConversationMessagesInput, ConversationSearchPage>()(
       "agent:search-conversation-messages",
+    ),
+    // Local only: a joined server has no file search route, so the renderer asks only this computer.
+    searchConversationFiles: request<SearchConversationFilesInput, ConversationFileSearchPage>()(
+      "agent:search-conversation-files",
     ),
     listConversationReads: scopedQuery<Record<string, ConversationReadState>>()("agent:list-conversation-reads"),
     markConversationRead: scopedRequest<MarkConversationReadInput, ConversationReadState>()(
@@ -680,6 +776,10 @@ export const IPC_ENDPOINTS = {
     deleteRoutine: scopedRequest<DeleteRoutineInput, void>()("agent:delete-routine"),
     testRoutine: scopedRequest<TestRoutineInput, RoutineRun>()("agent:test-routine"),
     listRoutineRuns: scopedRequest<ListRoutineRunsInput, RoutineRun[]>()("agent:list-routine-runs"),
+    /** The shell command a local script uses to run the routine. It names the token file, not the token. */
+    automationRunCommand: scopedRequest<TestRoutineInput, string>()("agent:automation-run-command"),
+    // Every routine of the host, of agents and channels, with its runs in a range.
+    routineCalendar: scopedRequest<RoutineCalendarInput, RoutineCalendar>()("agent:routine-calendar"),
   },
   channelMemories: {
     listChannelMemories: scopedRequest<string, ChannelMemory[]>()("agent:channel-memories:list"),
@@ -822,11 +922,12 @@ export const IPC_ENDPOINTS = {
     openFile: scopedRequest<OpenStoredFileInput, void, "required">()("storage:open-file"),
     openLocation: request<OpenStorageLocationInput, void>()("storage:open-location"),
   },
-  // Bound against the agent import service, which holds the staged archives.
+  // Bound against the agent import service, which holds the staged archives. A remote server is
+  // reached with `agent-import-v1`; main still opens the file dialog and sends the file.
   agentImport: {
-    choose: request<undefined, AgentImportPreview | null>()("agent-import:choose"),
-    apply: request<ApplyAgentImportInput, AgentImportResult>()("agent-import:apply"),
-    discard: request<string, void>()("agent-import:discard"),
+    choose: scopedQuery<AgentImportPreview | null, "required">()("agent-import:choose"),
+    apply: scopedRequest<ApplyAgentImportInput, AgentImportResult, "required">()("agent-import:apply"),
+    discard: scopedRequest<string, void, "required">()("agent-import:discard"),
     // The export skill for a user who sets up the export agent in Grok Bot by hand. Main reads it
     // from the app's resources, and `saveSkill` asks where to write it.
     readSkill: request<undefined, string>()("agent-import:read-skill"),

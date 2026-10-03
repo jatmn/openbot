@@ -3,11 +3,13 @@ import {
   CONVERSATION_PLAN_ITEM_TYPE,
   hostedSiteConversationEvent,
   isContextResetMarker,
+  marketplaceSuggestionEvent,
   parseConversationPlanText,
   routineConversationEvent,
   routineRunConversationEvent,
   skillConversationEvent,
 } from "@openbot/contracts/ipc";
+import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
 import type {
   AgentDeliveryMarkerStatus,
   AgentMessage,
@@ -18,7 +20,6 @@ import type {
 import { formatChatTimestamp } from "@openbot/ui/features/conversation/chat-timestamp";
 import type { TaskListItem } from "@openbot/ui/features/conversation/TaskList";
 import { currentText } from "@openbot/ui/text";
-import { cleanAgentMessageText } from "./features/agents/agent-message-text";
 import { isRoutineEventItem } from "./features/conversation/conversation-read-state";
 
 export function toAgentProfile(stored: AgentSummary): AgentProfile {
@@ -33,6 +34,7 @@ export function toAgentProfile(stored: AgentSummary): AgentProfile {
     reasoningEffort: stored.reasoningEffort,
     access: stored.access,
     computerUse: stored.computerUse,
+    allowAutomation: stored.allowAutomation,
     threadId: stored.threadId,
     workspacePath: stored.workspacePath,
     avatarSeed: stored.avatarSeed,
@@ -63,6 +65,7 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
     itemType: message.itemType,
     kind: message.questionPrompt ? "question" : actionMarker ? "action-marker" : plan ? "plan" : "text",
     senderAgentId: exchangeSenderId,
+    senderMember: message.author === "user" ? message.senderMember : undefined,
     replyToMessageId: message.replyToMessageId,
     attachments: message.attachments,
     imageGeneration: message.imageGeneration,
@@ -217,6 +220,8 @@ export function agentMessagesEqual(left: AgentMessage, right: AgentMessage): boo
     left.itemType === right.itemType &&
     left.status === right.status &&
     left.senderAgentId === right.senderAgentId &&
+    left.senderMember?.id === right.senderMember?.id &&
+    left.senderMember?.name === right.senderMember?.name &&
     left.replyToMessageId === right.replyToMessageId &&
     left.reaction === right.reaction &&
     JSON.stringify(left.reactions) === JSON.stringify(right.reactions) &&
@@ -263,6 +268,8 @@ function chatActionMarker(
   if (isContextResetMarker(message)) return { kind: "context-reset", timestamp: message.createdAt };
   const skillEvent = skillConversationEvent(message);
   if (skillEvent) return { ...skillEvent, kind: "skill-lifecycle", timestamp: message.createdAt };
+  const suggestion = marketplaceSuggestionEvent(message);
+  if (suggestion) return { kind: "marketplace-suggestion", appId: suggestion.appId, timestamp: message.createdAt };
   if (routineEvent) {
     return {
       kind: "routine-lifecycle",

@@ -35,7 +35,8 @@ import {
   claudeWorkspaceSkillPlugin,
   claudeWriteOutsideRoots,
 } from "./claude-workspace-sandbox";
-import { type ClaudeCliInfo, claudeTakesPromptSnapshotFlag } from "./cli";
+import { type ClaudeCliInfo, claudeTakesPromptSnapshotFlag, cliSpawnTarget } from "./cli";
+import { isClaudeTaskNotification } from "./conversation-snapshots";
 import { IdleThreadPool } from "./idle-thread-pool";
 import {
   agentMcpServers,
@@ -185,6 +186,8 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
   readonly #mcpAuthorization: McpAuthorizationSource | undefined;
   /** Where a Workspace only query keeps its skill plugin. Without it, such a query has no workspace skills. */
   readonly #stateDirectory: string | undefined;
+  /** Read at each session start, so a GitHub connection made while OpenBot runs reaches the next session. */
+  readonly #agentEnvironment: ((inherited?: NodeJS.ProcessEnv) => Readonly<Record<string, string>>) | undefined;
   /** Threads whose process was closed for being idle keep the config that resumes them. */
   readonly #threads = new IdleThreadPool<ThreadRuntime, ThreadConfig>({
     releaseAfterMs: CLAUDE_THREAD_IDLE_RELEASE_MS,
@@ -212,6 +215,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     mcpToolRuntimes?: McpToolRuntimeSource,
     mcpAuthorization?: McpAuthorizationSource,
     stateDirectory?: string,
+    agentEnvironment?: (inherited?: NodeJS.ProcessEnv) => Readonly<Record<string, string>>,
   ) {
     super();
     this.#cli = cli;
@@ -223,6 +227,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     this.#mcpToolRuntimes = mcpToolRuntimes;
     this.#mcpAuthorization = mcpAuthorization;
     this.#stateDirectory = stateDirectory;
+    this.#agentEnvironment = agentEnvironment;
   }
 
   get running(): boolean {
@@ -242,6 +247,10 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     }
     await Promise.allSettled(runtimes.map((runtime) => runtime.consume));
     this.#serverRequests.rejectAll("Claude session stopped.");
+  }
+
+  releaseIdleThreads(): void {
+    this.#threads.releaseIdle();
   }
 
   /**
@@ -462,11 +471,12 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
   async #readAuthStatus(): Promise<DynamicRecord> {
     let stdout: unknown;
     let failure: unknown = null;
+    const target = cliSpawnTarget(this.#cli.executable, ["auth", "status", "--json"]);
     try {
-      ({ stdout } = await execFileAsync(this.#cli.executable, ["auth", "status", "--json"], {
+      ({ stdout } = await execFileAsync(target.command, target.args, {
         timeout: 5_000,
         maxBuffer: 64 * 1024,
-        shell: process.platform === "win32",
+        windowsVerbatimArguments: target.windowsVerbatimArguments,
         env: claudeEnvironment(this.#cli),
       }));
     } catch (error) {
@@ -475,6 +485,8 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     }
     const status = parseAuthStatus(stdout);
     if (status && (failure === null || status.loggedIn === false)) return status;
+    // `execFile` marks a child it stopped at its timeout: a busy computer, not a failed check.
+    if (isDynamicRecord(failure) && failure.killed === true) throw new RequestTimeoutError("Claude", "account/read");
     throw failure ?? new Error("Claude returned an unreadable sign-in status.");
   }
 
@@ -572,6 +584,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         mcpServers,
         env: {
           ...claudeEnvironment(this.#cli),
+          ...this.#agentEnvironment?.(),
           CLAUDE_AGENT_SDK_CLIENT_APP: "openbot/0.1.0",
           // Without a terminal, the CLI gives the newer models no TodoWrite or task tools, so the
           // agent has no plan for OpenBot to show as a task list.
@@ -1003,17 +1016,20 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       const text = messageText(message.message);
       if (message.type === "user") {
         if (!text) continue;
+        // A task notification still opens the turn that answers it, but the user did not write it.
         current = {
           id: message.uuid,
           status: "completed",
-          items: [
-            {
-              id: message.uuid,
-              type: "userMessage",
-              clientId: message.uuid,
-              content: [{ type: "text", text }],
-            },
-          ],
+          items: isClaudeTaskNotification(text)
+            ? []
+            : [
+                {
+                  id: message.uuid,
+                  type: "userMessage",
+                  clientId: message.uuid,
+                  content: [{ type: "text", text }],
+                },
+              ],
         };
         turns.push(current);
         currentThinking = null;

@@ -20,11 +20,11 @@ import { hiddenProviderAgentIds, isPeerHiddenProvider } from "./provider-visibil
 // 400 on a malformed identifier into a 404 for some methods and not others.
 
 import { readFile } from "node:fs/promises";
-import type { AgentProviderId } from "@openbot/contracts/agent-providers";
 import { isAvatarMimeType } from "@openbot/contracts/avatar-images";
 import { AVATAR_IMAGE_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import type { DuplicateAgentResult } from "@openbot/contracts/ipc";
+import type { CreateAgentInput, DuplicateAgentResult } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { V5_AGENT_MODEL } from "@openbot/contracts/team-protocol/v5-adapter";
 import { sourceText } from "@openbot/i18n/source";
 import { parseSidebarLayoutAction } from "../ipc/agent-inputs";
 import type { TeamApiAgents, TeamApiOptions, TeamApiSidebarLayout } from "./dependencies";
@@ -36,6 +36,7 @@ import {
   approvalDecision,
   browserTakeoverDecision,
   markerExclusionsForCapabilities,
+  memberSender,
   pageLimit,
   pathIdentifier,
   promptAnswers,
@@ -71,13 +72,17 @@ export async function routeAgents(
   }
   /**
    * A peer cannot start an agent on a provider that its protocol does not show: the agent would be
-   * hidden from the peer that made it. With no named provider, the host default applies.
+   * hidden from the peer that made it. A named model decides the provider too; with neither named,
+   * the provider is the one the host starts a new agent on.
    */
-  function requireVisibleProvider(named: AgentProviderId | undefined): void {
-    if (named !== undefined) {
-      if (isPeerHiddenProvider(named, context.protocol)) throw new HttpError(400, "provider is invalid.");
-    } else if (isPeerHiddenProvider(agents.preferredProvider(), context.protocol)) {
-      throw new HttpError(400, sourceText("error.team.providersUnsupported"));
+  function requireVisibleProvider(input: Pick<CreateAgentInput, "provider" | "model"> = {}): void {
+    if (input.provider !== undefined) {
+      if (isPeerHiddenProvider(input.provider, context.protocol)) throw new HttpError(400, "provider is invalid.");
+      return;
+    }
+    const provider = agents.newAgentProvider(input);
+    if (provider && isPeerHiddenProvider(provider, context.protocol)) {
+      throw new HttpError(400, sourceText("error.team.newAgentProviderLocalOnly"));
     }
   }
   function requireVisible(id: string | undefined | null): void {
@@ -107,7 +112,7 @@ export async function routeAgents(
     if (typeof body.agentId === "string") requireVisible(body.agentId);
     else {
       requireCompatibleDefault();
-      requireVisibleProvider(undefined);
+      requireVisibleProvider();
     }
     if (url.pathname === TEAM_API_ROUTES.agents.generateProfile) {
       return json(
@@ -115,7 +120,7 @@ export async function routeAgents(
         await agents.generateProfile(parseGenerateAgentProfile(body), sidebarLayout.getSnapshot().sections),
       );
     }
-    return json(200, await agents.saveProfile(parseSaveAgentProfile(body), sidebarLayout));
+    return json(200, await agents.saveProfile(parseSaveAgentProfile(body), sidebarLayout, memberSender(member)));
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.messages.search) {
     const query = url.searchParams.get("q") ?? "";
@@ -151,7 +156,12 @@ export async function routeAgents(
     return json(200, await agents.getUsage());
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.models) {
-    return json(200, await agents.listModels());
+    // Only ids the shipped peers accept: their model list decoders fail closed on the whole array, and
+    // `isAgentModel` now also accepts `=` and `,`, which no released protocol knows.
+    return json(
+      200,
+      (await agents.listModels()).filter((model) => V5_AGENT_MODEL.test(model.id)),
+    );
   }
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.all) {
     return json(200, agents.listAgents());
@@ -162,8 +172,8 @@ export async function routeAgents(
   if (method === "POST" && url.pathname === TEAM_API_ROUTES.agents.all) {
     requireCompatibleDefault();
     const input = agentCreate(await readJson(request));
-    requireVisibleProvider(input.provider);
-    return json(201, await agents.createAgent(input));
+    requireVisibleProvider(input);
+    return json(201, await agents.createAgent(input, undefined, undefined, memberSender(member)));
   }
 
   const agentMatch = url.pathname.match(/^\/v1\/agents\/([^/]+)(?:\/(.*))?$/);
@@ -191,7 +201,7 @@ export async function routeAgents(
     }
     if (method === "PATCH" && !action) {
       const input = agentUpdate(await readJson(request), agentId);
-      if (input.provider !== undefined) requireVisibleProvider(input.provider);
+      if (input.provider !== undefined) requireVisibleProvider({ provider: input.provider });
       return json(200, await agents.updateAgent(input));
     }
     if (method === "POST" && action === "duplicate") {

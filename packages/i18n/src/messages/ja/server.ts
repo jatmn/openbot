@@ -64,6 +64,7 @@ export const messages = {
   "server.rail.moved": "サーバーを {total} 件中 {position} 番目に移動しました。",
   "server.rail.label": "サーバー",
   "server.rail.addRemote": "リモートサーバーを追加",
+  "server.rail.add": "サーバーを追加",
   "server.rail.buttonLabel": "{name} サーバー",
   "server.rail.notificationsMuted": "通知はミュート中",
   "server.rail.actions": "サーバーの操作",
@@ -86,6 +87,10 @@ export const messages = {
   "server.compatibility.versionMismatchTitle": "{name} の OpenBot のバージョンが異なります",
   "server.compatibility.versionMismatchDescription":
     "この接続はプロトコル {protocol} を使用しています。一部の新しい機能は使用できない場合があります。クライアント {clientVersion}、ホスト {hostVersion}。",
+  "server.compatibility.versionMismatchUpdateHostDescription":
+    "すべての機能を使うには、{name} の OpenBot を更新してください。この接続はプロトコル {protocol} を使用しています。クライアント {clientVersion}、ホスト {hostVersion}。",
+  "server.compatibility.versionMismatchUpdateClientDescription":
+    "すべての機能を使うには、この OpenBot アプリを更新してください。この接続はプロトコル {protocol} を使用しています。クライアント {clientVersion}、ホスト {hostVersion}。",
   "server.connection.failedTitle": "接続に失敗しました",
   "server.connection.failedDescription":
     "このサーバーに接続できませんでした。ホストがオンラインであることを確認して、もう一度お試しください。",
@@ -107,8 +112,10 @@ export const messages = {
   "server.settings.storageTitle": "ストレージ",
   "server.settings.storageDescription":
     "OpenBot がこのサーバーのディスクに保存しているものを確認し、空き容量を増やします。",
+  "server.settings.hostedSitesTitle": "サイト",
+  "server.settings.hostedSitesDescription": "このサーバーのエージェントが openbot.site に公開した静的サイト。",
   "server.settings.importTitle": "インポート",
-  "server.settings.importDescription": "Grok Bot からこのコンピューターにエージェントを移動します。",
+  "server.settings.importDescription": "Grok Bot からこのサーバーにエージェントを移動します。",
   "server.settings.nameTooShort": "{limit} 文字以上で入力してください。",
   "server.settings.nameTooLong": "{limit} 文字以内で入力してください。",
   "server.settings.actionFailedTitle": "サーバーの操作に失敗しました",
@@ -245,4 +252,6 @@ export const messages = {
   "server.desktop.startHint": "サーバーのヘッダーにあるモニターボタンからリモート操作を開始してください。",
   "server.settings.providersTitle": "プロバイダー",
   "server.settings.providersDescription": "このサーバーを実行するコンピューターの AI プロバイダーを管理します。",
+  "server.settings.providersSwitchNote": "AI プロバイダーを管理するには {name} に切り替えてください。",
+  "server.settings.providersSwitch": "このサーバーに切り替える",
 } as const satisfies PartialTranslation<typeof source>;

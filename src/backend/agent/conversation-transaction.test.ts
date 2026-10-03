@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ConversationMessage } from "@openbot/contracts/ipc";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentStore } from "../agent-store";
-import { ConversationRuntime, withDatabaseTransaction } from "./conversation-runtime";
+import { CONVERSATION_SNAPSHOT_IDLE_MS, ConversationRuntime, withDatabaseTransaction } from "./conversation-runtime";
 
 let root: string;
 let store: AgentStore;
@@ -116,6 +116,62 @@ describe("conversation transactions", () => {
     expect(runtime.snapshot(AGENT_ID)?.messages).toEqual([message]);
   });
 
+  it("runs every post-commit effect after one of them throws", () => {
+    const ran: string[] = [];
+    const queueEffect =
+      (name: string, fail = false) =>
+      () => {
+        ran.push(name);
+        if (fail) throw new Error(`${name} failed`);
+      };
+
+    expect(() =>
+      withDatabaseTransaction(
+        store.database,
+        () => {
+          withDatabaseTransaction(store.database, () => undefined, undefined, queueEffect("first", true));
+          withDatabaseTransaction(store.database, () => undefined, undefined, queueEffect("second"));
+          return undefined;
+        },
+        undefined,
+        queueEffect("owner"),
+      ),
+    ).toThrow("first failed");
+
+    // The rows are durable, so a failure in one effect must not skip the effects queued after it.
+    expect(ran).toEqual(["first", "second", "owner"]);
+  });
+
+  it("reports every post-commit failure when more than one effect throws", () => {
+    const queueEffect = (message: string) => () => {
+      throw new Error(message);
+    };
+
+    let thrown: unknown;
+    try {
+      withDatabaseTransaction(
+        store.database,
+        () => {
+          withDatabaseTransaction(store.database, () => undefined, undefined, queueEffect("first failed"));
+          withDatabaseTransaction(store.database, () => undefined, undefined, queueEffect("second failed"));
+          return undefined;
+        },
+        undefined,
+        queueEffect("owner failed"),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    const errors = thrown instanceof AggregateError ? thrown.errors : [];
+    expect(errors.map((error) => (error instanceof Error ? error.message : String(error)))).toEqual([
+      "first failed",
+      "second failed",
+      "owner failed",
+    ]);
+  });
+
   it("restores the snapshot and the thread identity when the body throws", () => {
     const before = structuredClone(runtime.ensureSnapshot(AGENT_ID, null));
     expect(before.threadId).toBeNull();
@@ -139,6 +195,39 @@ describe("conversation transactions", () => {
     expect(runtime.snapshot(AGENT_ID)).toEqual(before);
     expect(store.list().find((candidate) => candidate.id === AGENT_ID)?.threadId).toBeNull();
     expect(threadRowCount()).toBe(threadRowsBefore);
+  });
+
+  it("rebuilds an evicted snapshot equal to SQLite, and keeps a snapshot that SQLite does not hold", () => {
+    runtime.withConversationTransaction(AGENT_ID, ({ threadId, snapshot }) => {
+      const message = systemMessage("persisted");
+      snapshot.messages.push(message);
+      snapshot.revision = store.database.appendConversationMessage({
+        agentId: AGENT_ID,
+        threadId,
+        activeTurnId: snapshot.activeTurnId,
+        message,
+        eventType: "test.persisted-append",
+      });
+      return { result: undefined, snapshot };
+    });
+    const original = structuredClone(runtime.snapshot(AGENT_ID));
+    const idle = Date.now() + 2 * CONVERSATION_SNAPSHOT_IDLE_MS;
+
+    runtime.evictIdleSnapshots(idle);
+
+    expect(runtime.loadedSnapshot(AGENT_ID)).toBeUndefined();
+    // When no caller holds the evicted object any more, `snapshot` rebuilds it with this read.
+    expect(store.database.readConversation(AGENT_ID, original?.threadId ?? null)).toEqual(original);
+    expect(runtime.snapshot(AGENT_ID)).toEqual(original);
+
+    // Streamed text before its flush is in memory only: evicting it would lose that text.
+    runtime.snapshot(AGENT_ID)?.messages.push(systemMessage("not flushed"));
+    runtime.evictIdleSnapshots(idle);
+
+    expect(runtime.loadedSnapshot(AGENT_ID)?.messages.map((message) => message.text)).toEqual([
+      "persisted",
+      "not flushed",
+    ]);
   });
 
   it("ignores a late provider snapshot after an execution thread is forgotten", () => {

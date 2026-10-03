@@ -1,16 +1,26 @@
 // What main answers for the app shell, the account, the updater, notifications, voice, exports,
-// hosted sites, custom providers and remote desktop.
+// hosted sites, hosted servers, custom providers and remote desktop.
 //
 // Each decoder checks every field the contract type requires and keeps each optional field it
 // carries, so a value the renderer reads always has the shape its type says.
 
 import { isAgentTemplateId } from "@openbot/contracts/agent-template-links";
-import { parseHostedSiteSummary } from "@openbot/contracts/hosted-sites";
+import { type BillingState, parseBillingState } from "@openbot/contracts/billing";
+import {
+  type HostedServerCatalog,
+  type HostedServerList,
+  type HostedServerSummary,
+  parseHostedServerCatalog,
+  parseHostedServerList,
+  parseHostedServerSummary,
+} from "@openbot/contracts/hosted-servers";
+import { parseHostedSiteList, parseHostedSiteSummary } from "@openbot/contracts/hosted-sites";
 import {
   type AccountSession,
   type AnalyticsPreference,
   type AppInfo,
   type AppLanguagePreference,
+  type AppLogoColorPreference,
   type ApprovalAutomationPreference,
   type AppSetupState,
   type CentralAuthIssue,
@@ -26,10 +36,16 @@ import {
   type DiscoverModelsResult,
   decodeScheduledUpdateRestart,
   type ExportResult,
+  type GitHubConnectorRepositories,
+  type GitHubConnectorStatus,
+  type HostedSiteList,
   type HostedSiteSummary,
+  IDLE_RESTART_TARGETS,
+  type IdleRestart,
   isAgentModel,
   isAgentProvider,
   isAppLanguage,
+  isAppLogoColor,
   isApprovalAutomationPreference,
   isCustomAgentCheckResult,
   isCustomAgentResult,
@@ -47,6 +63,8 @@ import {
   type NotificationOpenedEvent,
   type NotificationPreference,
   type ProviderDetectionSettings,
+  parseGitHubConnectorRepositories,
+  parseGitHubConnectorStatus,
   type RemoteDesktopSetupStatus,
   type RemoteDesktopTestStatus,
   UPDATE_PHASES,
@@ -98,6 +116,12 @@ export function decodeAppLanguagePreference(value: unknown): AppLanguagePreferen
   const preference = decodeRecord(value, "language preference");
   if (!isAppLanguage(preference.language)) throw new Error("Invalid language.");
   return { language: preference.language };
+}
+
+export function decodeAppLogoColorPreference(value: unknown): AppLogoColorPreference {
+  const preference = decodeRecord(value, "logo color preference");
+  if (!isAppLogoColor(preference.color)) throw new Error("Invalid logo color.");
+  return { color: preference.color };
 }
 
 export function decodeCentralAuthState(value: unknown): CentralAuthState {
@@ -186,7 +210,7 @@ export function decodeAccountSessions(value: unknown): AccountSession[] {
 
 export function decodeUpdateStatus(value: unknown): UpdateStatus {
   const status = decodeRecord(value, "update status");
-  const { phase, errorCode, managedByHost, scheduledRestart } = status;
+  const { phase, errorCode, managedByHost, scheduledRestart, idleRestart } = status;
   if (!isOneOf(UPDATE_PHASES, phase)) throw new Error("Invalid phase.");
   if (errorCode !== null && !isOneOf(["check_failed", "download_failed", "install_failed"] as const, errorCode)) {
     throw new Error("Invalid errorCode.");
@@ -202,7 +226,17 @@ export function decodeUpdateStatus(value: unknown): UpdateStatus {
     errorCode,
     ...(managedByHost === undefined ? {} : { managedByHost }),
     ...(scheduledRestart === undefined ? {} : { scheduledRestart: decodeScheduledUpdateRestart(scheduledRestart) }),
+    ...(idleRestart === undefined ? {} : { idleRestart: decodeIdleRestart(idleRestart) }),
   };
+}
+
+function decodeIdleRestart(value: unknown): IdleRestart {
+  const restart = decodeRecord(value, "idle restart");
+  const { target, waitingFor, error } = restart;
+  if (!isOneOf(IDLE_RESTART_TARGETS, target)) throw new Error("Invalid target.");
+  if (!Array.isArray(waitingFor) || !waitingFor.every(isString)) throw new Error("Invalid waitingFor.");
+  if (error !== undefined && !isString(error)) throw new Error("Invalid error.");
+  return { target, waitingFor: [...waitingFor], ...(error === undefined ? {} : { error }) };
 }
 
 export function decodeUpdatePreference(value: unknown): UpdatePreference {
@@ -273,9 +307,46 @@ export function decodeHostedSite(value: unknown): HostedSiteSummary {
   return site;
 }
 
-export function decodeHostedSites(value: unknown): HostedSiteSummary[] {
-  if (!Array.isArray(value)) throw new Error("Invalid hosted site list response.");
-  return value.map(decodeHostedSite);
+export function decodeHostedSiteList(value: unknown): HostedSiteList {
+  const list = parseHostedSiteList(value);
+  if (!list) throw new Error("Invalid hosted site list response.");
+  return list;
+}
+
+export function decodeGitHubConnectorStatus(value: unknown): GitHubConnectorStatus {
+  const status = parseGitHubConnectorStatus(value);
+  if (!status) throw new Error("Invalid GitHub connector response.");
+  return status;
+}
+
+export function decodeGitHubConnectorRepositories(value: unknown): GitHubConnectorRepositories {
+  const repositories = parseGitHubConnectorRepositories(value);
+  if (!repositories) throw new Error("Invalid GitHub repository list response.");
+  return repositories;
+}
+
+export function decodeBillingState(value: unknown): BillingState {
+  const state = parseBillingState(value);
+  if (!state) throw new Error("Invalid billing state response.");
+  return state;
+}
+
+export function decodeHostedServer(value: unknown): HostedServerSummary {
+  const server = parseHostedServerSummary(value);
+  if (!server) throw new Error("Invalid hosted server response.");
+  return server;
+}
+
+export function decodeHostedServerCatalog(value: unknown): HostedServerCatalog {
+  const catalog = parseHostedServerCatalog(value);
+  if (!catalog) throw new Error("Invalid hosted server plans response.");
+  return catalog;
+}
+
+export function decodeHostedServerList(value: unknown): HostedServerList {
+  const list = parseHostedServerList(value);
+  if (!list) throw new Error("Invalid hosted server list response.");
+  return list;
 }
 
 /**

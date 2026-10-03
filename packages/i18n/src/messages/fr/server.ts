@@ -20,6 +20,10 @@ export const messages = {
   "server.compatibility.versionMismatchTitle": "Versions d’OpenBot différentes sur {name}",
   "server.compatibility.versionMismatchDescription":
     "La connexion utilise le protocole {protocol}. Certaines fonctions récentes peuvent être indisponibles. Client {clientVersion} ; hôte {hostVersion}.",
+  "server.compatibility.versionMismatchUpdateHostDescription":
+    "Mettez à jour OpenBot sur {name} pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
+  "server.compatibility.versionMismatchUpdateClientDescription":
+    "Mettez à jour cette application OpenBot pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
   "server.join.title": "Rejoindre un serveur",
   "server.join.verifiedFrom": "Invitation vérifiée de {hostname}.",
   "server.join.pasteToContinue": "Collez un lien d’invitation pour continuer.",
@@ -68,6 +72,7 @@ export const messages = {
   "server.rail.moved": "Serveur déplacé en position {position} sur {total}.",
   "server.rail.label": "Serveurs",
   "server.rail.addRemote": "Ajouter un serveur distant",
+  "server.rail.add": "Ajouter un serveur",
   "server.rail.buttonLabel": "Serveur {name}",
   "server.rail.notificationsMuted": "notifications en sourdine",
   "server.rail.actions": "Actions du serveur",
@@ -107,8 +112,11 @@ export const messages = {
   "server.settings.storageTitle": "Stockage",
   "server.settings.storageDescription":
     "Voyez ce qu’OpenBot conserve sur le disque de ce serveur et libérez de l’espace.",
+  "server.settings.hostedSitesTitle": "Sites",
+  "server.settings.hostedSitesDescription":
+    "Les sites statiques que les agents de ce serveur ont publiés sur openbot.site.",
   "server.settings.importTitle": "Importer",
-  "server.settings.importDescription": "Déplacez vos agents de Grok Bot vers cet ordinateur.",
+  "server.settings.importDescription": "Déplacez vos agents de Grok Bot vers ce serveur.",
   "server.settings.nameTooShort": "Saisissez au moins {limit} caractères.",
   "server.settings.nameTooLong": "N’utilisez pas plus de {limit} caractères.",
   "server.settings.actionFailedTitle": "L’action sur le serveur a échoué",
@@ -249,4 +257,6 @@ export const messages = {
   "server.desktop.startHint": "Démarrez le contrôle à distance depuis le bouton moniteur dans l’en-tête du serveur.",
   "server.settings.providersTitle": "Fournisseurs",
   "server.settings.providersDescription": "Gérez les fournisseurs d’IA de l’ordinateur qui exécute ce serveur.",
+  "server.settings.providersSwitchNote": "Passez à {name} pour gérer ses fournisseurs d’IA.",
+  "server.settings.providersSwitch": "Passer à ce serveur",
 } as const satisfies PartialTranslation<typeof source>;

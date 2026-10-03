@@ -388,6 +388,46 @@ export const STORY_QUEUES: Record<string, QueueDelivery[]> = {
   ],
 };
 
+/** A chat where several team members write to one agent. Each human message names its sender. */
+const STORY_TEAM_CONVERSATION_MESSAGES: ConversationMessage[] = [
+  {
+    id: "team-message-self",
+    author: "user",
+    source: "user",
+    text: "Can you check the sources for the launch notes?",
+    createdAt: "2026-08-19T10:00:00.000Z",
+    status: "completed",
+    senderMember: { id: "member-self", name: "Norbert" },
+  },
+  {
+    id: "team-message-alice",
+    author: "user",
+    source: "user",
+    text: "Please start with the pricing claims.",
+    createdAt: "2026-08-19T10:01:00.000Z",
+    status: "completed",
+    senderMember: { id: "member-alice", name: "Alice Chen" },
+  },
+  {
+    id: "team-message-jon",
+    author: "user",
+    source: "user",
+    text: "And the benchmark table.",
+    createdAt: "2026-08-19T10:02:00.000Z",
+    status: "completed",
+    senderMember: { id: "member-jon", name: "Jon Bell" },
+  },
+  {
+    id: "team-message-agent",
+    author: "assistant",
+    source: "assistant",
+    text: "I will check the pricing claims first, then the benchmark table.",
+    createdAt: "2026-08-19T10:03:00.000Z",
+    status: "completed",
+    replyToMessageId: "team-message-alice",
+  },
+];
+
 export const STORY_SNAPSHOTS: Record<string, ConversationSnapshot> = Object.fromEntries(
   STORY_AGENT_SUMMARIES.map((agent) => [
     agent.id,
@@ -396,7 +436,12 @@ export const STORY_SNAPSHOTS: Record<string, ConversationSnapshot> = Object.from
       threadId: agent.threadId,
       activeTurnId: null,
       revision: 1,
-      messages: agent.id === "chief" ? STORY_CONVERSATION_MESSAGES : [],
+      messages:
+        agent.id === "chief"
+          ? STORY_CONVERSATION_MESSAGES
+          : agent.id === "research"
+            ? STORY_TEAM_CONVERSATION_MESSAGES
+            : [],
     },
   ]),
 );
@@ -523,6 +568,22 @@ export const STORY_SERVERS: ServerSummary[] = [
     remoteDesktopAvailable: true,
     role: "owner",
     active: false,
+  },
+  // The stopped hosted server in `mock-hosted-servers.ts`, so the rail shows the sleep indicator.
+  {
+    id: "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f",
+    name: "Research server",
+    logoUrl: null,
+    notificationsMuted: false,
+    notificationsMutedUntil: null,
+    notificationLevel: "all",
+    kind: "remote",
+    state: "offline",
+    apiUrl: null,
+    remoteDesktopAvailable: false,
+    role: "owner",
+    active: false,
+    hostedSleep: "sleeping",
   },
 ];
 
@@ -1381,7 +1442,7 @@ export const STORY_MARKETPLACE_AGENT_DETAILS: Record<string, MarketplaceAgentDet
  * real server (`mcp.aave.com`) so the page is reviewed against the lengths a published listing
  * really has, rather than against text written to fit the layout.
  */
-export const STORY_MARKETPLACE_PLUGIN_AAVE: MarketplacePluginDetail = {
+const STORY_MARKETPLACE_PLUGIN_AAVE: MarketplacePluginDetail = {
   id: "plugin-aave",
   slug: "aave",
   name: "Aave",
@@ -1691,6 +1752,7 @@ export const STORY_HOSTED_SITES: HostedSiteSummary[] = [
     size: 3_145_728,
     expiresAt: null,
     updatedAt: "2026-08-18T18:30:00.000Z",
+    serverId: "host-preview",
   },
   {
     id: "site-design-review",
@@ -1704,5 +1766,7 @@ export const STORY_HOSTED_SITES: HostedSiteSummary[] = [
     size: 512_000,
     expiresAt: "2026-09-18T18:30:00.000Z",
     updatedAt: "2026-08-14T12:00:00.000Z",
+    // Published before this computer was a registered server.
+    serverId: null,
   },
 ];

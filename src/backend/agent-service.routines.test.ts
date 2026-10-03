@@ -10,6 +10,7 @@ import {
   createTestService,
   expectOpenBotToolError,
   FakeAgentClient,
+  firstInputText,
   inputRecords,
   notification,
   openBotToolPayload,
@@ -83,6 +84,39 @@ describe.sequential("AgentService: routines", () => {
     expect(service.listChannelRoutineRuns({ channelId: channel.id, routineId: routine.id, limit: 10 })).toEqual([
       expect.objectContaining({ kind: "scheduled", status: expect.any(String) }),
     ]);
+  });
+
+  it("does not add a scheduled run while the routine's previous run is unfinished", async () => {
+    const { store, mailbox } = stores(root);
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      // Keep the first run's turn open, as a run that stalls during a sleep does.
+      clientFactory: (provider) => new FakeAgentClient(provider, "", false),
+    });
+    await service.initialize();
+    const agent = await store.getOrCreate("hourly");
+    vi.useFakeTimers({ now: new Date("2026-08-25T10:00:00.000Z") });
+    try {
+      const routine = service.createRoutine({
+        agentId: agent.id,
+        name: "Check for updates",
+        instruction: "Check for updates.",
+        active: true,
+        timezone: "UTC",
+        schedule: { kind: "interval", amount: 15, unit: "minutes", anchorAt: "2026-08-25T10:00:00.000Z" },
+      });
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      expect(service.listRoutineRuns({ agentId: agent.id, routineId: routine.id })).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(45 * 60_000);
+      expect(service.listRoutineRuns({ agentId: agent.id, routineId: routine.id })).toEqual([
+        expect.objectContaining({ kind: "scheduled", scheduledFor: "2026-08-25T10:15:00.000Z" }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("persists routine lifecycle markers without adding unread or search results", async () => {
@@ -376,6 +410,48 @@ describe.sequential("AgentService: routines", () => {
         (message) => routineRunConversationEvent(message)?.status ?? [],
       ),
     ).toContain("succeeded");
+  });
+
+  it("sends a local script's payload with the routine and keeps it in the run for recovery", async () => {
+    const clients = new Map<AgentProvider, FakeAgentClient>();
+    const { store, mailbox } = stores(root);
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider);
+        clients.set(provider, client);
+        return client;
+      },
+    });
+    await service.initialize();
+    const agent = await store.getOrCreate("chief");
+    const routine = service.createRoutine({
+      agentId: agent.id,
+      name: "Build watcher",
+      instruction: "Read the build result and tell me what failed.",
+      active: false,
+      timezone: "Europe/Warsaw",
+      schedule: { kind: "daily", time: "09:00" },
+    });
+    const input = { agentId: agent.id, routineId: routine.id, payload: "build 42 failed: 3 tests" };
+
+    await expect(service.runRoutineFromAutomation(input)).rejects.toThrow();
+    await service.updateAgent({ agentId: agent.id, allowAutomation: true });
+    const run = await service.runRoutineFromAutomation(input);
+
+    // `resumePendingRuns` sends the stored instruction again, so the payload survives a restart.
+    expect(service.listRoutineRuns({ agentId: agent.id, routineId: routine.id, limit: 1 })[0]?.instruction).toContain(
+      "build 42 failed: 3 tests",
+    );
+    await waitFor(() => clients.get("codex")?.requests.some((request) => request.method === "turn/start") === true);
+    const prompt = firstInputText(
+      clients.get("codex")?.requests.find((request) => request.method === "turn/start")?.params,
+    );
+    expect(prompt).toContain("Read the build result and tell me what failed.");
+    expect(prompt).toContain("build 42 failed: 3 tests");
+    expect(run.deliveryId).not.toBeNull();
   });
 
   it("lets an agent react to the current user message without replacing the user's reaction", async () => {

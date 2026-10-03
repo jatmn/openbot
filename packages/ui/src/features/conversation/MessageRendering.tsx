@@ -215,7 +215,10 @@ export function MessageBody(props: {
   animate?: boolean;
   message: AgentMessage;
   referencedMessage?: AgentMessage;
-  /** Who wrote the quoted message. A chat with several authors has to name the one it quotes. */
+  /**
+   * Who wrote the quoted message. A chat with several authors has to name the one it quotes, and
+   * an agent chat names another person the reader quotes. Absent, the quote says "You" or "Agent".
+   */
   referencedAuthorName?: string;
   agents: AgentProfile[];
   skills?: InstalledSkill[];
@@ -347,9 +350,8 @@ export function MessageBody(props: {
         {(referenced) => (
           <div class="message-reply-context">
             <span>
-              {referenced().author === "you"
-                ? t("chat.message.you")
-                : (props.referencedAuthorName ?? t("chat.message.agentFallback"))}
+              {props.referencedAuthorName ??
+                (referenced().author === "you" ? t("chat.message.you") : t("chat.message.agentFallback"))}
             </span>
             <p>
               <RichMessageText
@@ -392,53 +394,28 @@ export function MessageBody(props: {
                       )}
                     </Match>
                     <Match when={textContent(block())}>
-                      {(text) => {
-                        if (untrack(() => props.message.author) === "agent") {
-                          return (
-                            <div
-                              class={`message-copy message-markdown${streamingBody.animateTail() ? " t-stream" : ""}`}
-                              data-selection-message-id={
-                                props.message.streaming !== true ? props.message.id : undefined
-                              }
-                            >
-                              <MarkdownMessageText
-                                body={text().text}
-                                agents={props.agents}
-                                skills={props.skills}
-                                attachments={props.message.attachments}
-                                citations={props.message.citations}
-                                onSelectAgent={props.onSelectAgent}
-                                onOpenLink={props.onOpenLink}
-                                onOpenAttachment={openAttachment}
-                                onOpenSharedFile={props.onOpenSharedFile}
-                                onOpenWorkspaceFile={props.onOpenWorkspaceFile}
-                                showCitationFooter={index === lastTextBlockIndex()}
-                                streaming={streamingBody.revealing() && index === contentBlocks().length - 1}
-                                streamingTailAfter={textTailAfter()[index]}
-                              />
-                            </div>
-                          );
-                        }
-                        return (
-                          <p
-                            class="message-copy"
-                            data-selection-message-id={props.message.streaming !== true ? props.message.id : undefined}
-                          >
-                            <RichMessageText
-                              body={text().text}
-                              agents={props.agents}
-                              skills={props.skills}
-                              attachments={props.message.attachments}
-                              citations={props.message.citations}
-                              onSelectAgent={props.onSelectAgent}
-                              onOpenLink={props.onOpenLink}
-                              onOpenAttachment={openAttachment}
-                              onOpenSharedFile={props.onOpenSharedFile}
-                              onOpenWorkspaceFile={props.onOpenWorkspaceFile}
-                            />
-                          </p>
-                        );
-                      }}
+                      {(text) => (
+                        <div
+                          class={`message-copy message-markdown${streamingBody.animateTail() ? " t-stream" : ""}`}
+                          data-selection-message-id={props.message.streaming !== true ? props.message.id : undefined}
+                        >
+                          <MarkdownMessageText
+                            body={text().text}
+                            agents={props.agents}
+                            skills={props.skills}
+                            attachments={props.message.attachments}
+                            citations={props.message.citations}
+                            onSelectAgent={props.onSelectAgent}
+                            onOpenLink={props.onOpenLink}
+                            onOpenAttachment={openAttachment}
+                            onOpenSharedFile={props.onOpenSharedFile}
+                            onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+                            showCitationFooter={index === lastTextBlockIndex()}
+                            streaming={streamingBody.revealing() && index === contentBlocks().length - 1}
+                            streamingTailAfter={textTailAfter()[index]}
+                          />
+                        </div>
+                      )}
                     </Match>
                   </Switch>
                 )}

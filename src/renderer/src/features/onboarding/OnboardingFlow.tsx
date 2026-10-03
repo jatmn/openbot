@@ -1,10 +1,14 @@
 import type { AgentModelId, AgentProviderId, AppSetupState, AvatarHue, DesktopPlatform } from "@openbot/contracts/ipc";
-import { ArrowUp, Button, Plus, toast } from "@openbot/ui";
+import { ArrowUp, Button, Plus } from "@openbot/ui";
 import { AgentAvatar } from "@openbot/ui/features/agents/AgentAvatar";
+import { SoundThemePicker } from "@openbot/ui/features/settings/SoundThemePicker";
 import { useText } from "@openbot/ui/text";
-import { createEffect, createMemo, createSignal, createUniqueId, For, Match, Show, Switch, untrack } from "solid-js";
+import { createEffect, createSignal, createUniqueId, For, Match, Show, Switch, untrack } from "solid-js";
+import { replayActionSoundChoice } from "../../action-sounds";
 import { ComputerUseSetup } from "../computer-use/ComputerUseSetup";
+import type { SoundFeedbackChoice } from "../settings/sound-feedback";
 import { createSetupProviders, SetupProviderPicker, type SetupProviderProps } from "./SetupProviderPicker";
+import { createSetupNext } from "./setup-next";
 
 export interface OnboardingFlowProps extends SetupProviderProps {
   state: AppSetupState;
@@ -16,9 +20,11 @@ export interface OnboardingFlowProps extends SetupProviderProps {
   onSave: (provider: AgentProviderId, model: AgentModelId | null) => Promise<void>;
   /** Runs when the provider step is shown. First run scans once, so the host ignores a repeat. */
   onProviderStepShown?: () => void;
+  /** Adds a step that turns sound feedback on or off. */
+  soundFeedback?: SoundFeedbackChoice;
 }
 
-type OnboardingStep = "meet" | "computer" | "jobs";
+type OnboardingStep = "meet" | "computer" | "sounds" | "jobs";
 type StepDirection = "forward" | "back";
 
 const ONBOARDING_AVATAR_HUES: readonly AvatarHue[] = [0, 30, 55, 100, 150, 185, 215, 245, 280, 320];
@@ -68,33 +74,11 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
     );
   const lazyProviderMode = () => Boolean(props.providerRuntimeStatuses || props.onDownloadProvider);
   const nextReasonId = createUniqueId();
-  /**
-   * Why `Next` refuses, in the step the user is actually in, or an empty string when it does not.
-   *
-   * The button is disabled, so a press says nothing and the sentence is the only account the screen
-   * gives. A first run whose providers are all still being checked otherwise shows a list of rows
-   * and a dead button, which reads as a broken application rather than as work left to do.
-   */
-  const nextBlockedReason = createMemo(() => {
-    if (providers.selectedProviderConnected()) return "";
-    const option = providers.options().find((candidate) => candidate.id === providers.selectedProvider());
-    if (!option) return t("onboarding.next.selectProvider");
-    const provider = option.name;
-    switch (option.runtimeStatus?.phase) {
-      case "downloading":
-        return t("onboarding.next.downloading", { provider });
-      case "finishing":
-        return t("onboarding.next.finishing", { provider });
-      case "download-error":
-        return t("onboarding.next.downloadError", { provider });
-      case "not-downloaded":
-        return t("onboarding.next.notDownloaded", { provider });
-      default:
-        break;
-    }
-    if (option.connectionState === "connecting") return t("onboarding.next.connecting", { provider });
-    return t("onboarding.next.connect", { provider });
-  });
+  const next = createSetupNext(providers);
+  const nextBlockedReason = next.blockedReason;
+  const steps = (): OnboardingStep[] =>
+    props.soundFeedback ? ["meet", "computer", "sounds", "jobs"] : ["meet", "computer", "jobs"];
+  const stepNumber = () => steps().indexOf(step()) + 1;
 
   function moveTo(nextStep: OnboardingStep, nextDirection: StepDirection): void {
     providers.clearErrors();
@@ -102,43 +86,18 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
     setStep(nextStep);
   }
 
-  /**
-   * The main button while the selected provider is not connected. It stays pressable: a disabled
-   * `Next` beside rows of "Ready" badges read as a broken screen (issue #643). It connects the
-   * provider when a connection can start now, and the toast says what happens or what is missing.
-   */
-  function connectSelectedProvider(): void {
-    const option = providers.options().find((candidate) => candidate.id === providers.selectedProvider());
-    const runtimePhase = option?.runtimeStatus?.phase ?? "ready";
-    const canConnect =
-      option &&
-      props.onConnectProvider &&
-      !props.refreshingProviders &&
-      runtimePhase === "ready" &&
-      option.connectionState !== "connecting";
-    if (!canConnect) {
-      toast.info(nextBlockedReason());
-      return;
-    }
-    toast.info(t("onboarding.toast.connecting", { provider: option.name }));
-    void providers.connectProvider(option.id);
-  }
-
   function nextStep(): void {
     if (!providers.selectedProviderConnected()) {
-      connectSelectedProvider();
+      next.connectSelected();
       return;
     }
-    if (step() === "meet") {
-      startFreeProvider();
-      moveTo("computer", "forward");
+    const following = steps()[stepNumber()];
+    if (!following) {
+      void finish();
       return;
     }
-    if (step() === "computer") {
-      moveTo("jobs", "forward");
-      return;
-    }
-    void finish();
+    if (step() === "meet") startFreeProvider();
+    moveTo(following, "forward");
   }
 
   /**
@@ -153,8 +112,8 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
   }
 
   function previousStep(): void {
-    if (step() === "computer") moveTo("meet", "back");
-    else if (step() === "jobs") moveTo("computer", "back");
+    const previous = steps()[stepNumber() - 2];
+    if (previous) moveTo(previous, "back");
   }
 
   async function finish(): Promise<void> {
@@ -171,8 +130,6 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
     }
   }
 
-  const stepNumber = () => (step() === "meet" ? 1 : step() === "computer" ? 2 : 3);
-
   return (
     <main
       class="onboarding-screen"
@@ -181,9 +138,16 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
       ref={(element) => setScreenElement(element)}
     >
       <div class="onboarding-shell">
-        <nav class="onboarding-progress" aria-label={t("onboarding.progress", { step: stepNumber(), total: 3 })}>
-          <For each={[1, 2, 3]}>
-            {(item) => <span class={item === stepNumber() ? "is-active" : item < stepNumber() ? "is-complete" : ""} />}
+        <nav
+          class="onboarding-progress"
+          aria-label={t("onboarding.progress", { step: stepNumber(), total: steps().length })}
+        >
+          <For each={steps()}>
+            {(_item, index) => (
+              <span
+                class={index() + 1 === stepNumber() ? "is-active" : index() + 1 < stepNumber() ? "is-complete" : ""}
+              />
+            )}
           </For>
         </nav>
 
@@ -329,6 +293,21 @@ export function OnboardingFlow(props: OnboardingFlowProps) {
 
                 <ComputerUseSetup variant="compact" />
               </section>
+            </Match>
+
+            <Match when={step() === "sounds" && props.soundFeedback}>
+              {(soundFeedback) => (
+                <section class="onboarding-panel onboarding-panel-sounds" aria-labelledby="onboarding-title">
+                  <h1 id="onboarding-title">{t("onboarding.sounds.title")}</h1>
+                  <p class="onboarding-description">{t("onboarding.sounds.description")}</p>
+                  <SoundThemePicker
+                    class="onboarding-sound-picker"
+                    value={soundFeedback().value}
+                    onChange={(value) => soundFeedback().onChange(value)}
+                    onReplay={replayActionSoundChoice}
+                  />
+                </section>
+              )}
             </Match>
 
             <Match when={step() === "jobs"}>

@@ -711,16 +711,18 @@ describe("OpenBot connected desktop shell", () => {
 
     await fireEvent.click(screen.getByRole("tab", { name: "Messages" }));
     await fireEvent.input(input, { target: { value: "sources-hidden-id" } });
-    await screen.findByText("No matching messages or agents");
+    await screen.findByText("No results");
     await fireEvent.input(input, { target: { value: "research" } });
+    await vi.waitFor(() =>
+      expect(window.openbot.agent.searchConversationMessages).toHaveBeenCalledWith({
+        query: "research",
+        limit: 100,
+      }),
+    );
     const messageResult = await screen.findByRole("option", { name: /Ask @Research to use Sources \(skill\)\./ });
     expect(messageResult).not.toHaveTextContent("research-hidden-id");
     await fireEvent.click(messageResult);
     await screen.findByRole("heading", { name: "Sales Outbound" });
-    expect(window.openbot.agent.searchConversationMessages).toHaveBeenCalledWith({
-      query: "research",
-      limit: 100,
-    });
     expect(window.openbot.agent.readConversationPage).toHaveBeenCalledWith({
       agentId: "sales-outbound",
       anchor: { type: "around", messageId: "sales-search-result" },
@@ -733,6 +735,24 @@ describe("OpenBot connected desktop shell", () => {
     await fireEvent.input(agentSearch, { target: { value: "chief" } });
     await fireEvent.click(await screen.findByRole("option", { name: /Chief/ }));
     await screen.findByRole("heading", { name: "Chief" });
+  });
+
+  it("closes global search with Escape and a backdrop press", async () => {
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+
+    await fireEvent.keyDown(window, { key: "k", metaKey: true });
+    await screen.findByRole("dialog", { name: "Search OpenBot" });
+    await fireEvent.keyDown(screen.getByRole("combobox", { name: "Search OpenBot" }), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Search OpenBot" })).not.toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "k", metaKey: true });
+    await screen.findByRole("dialog", { name: "Search OpenBot" });
+    // Kobalte attaches its outside-press listener on a later task, so press until it reacts.
+    await waitFor(() => {
+      fireEvent.pointerDown(document.body);
+      expect(screen.queryByRole("dialog", { name: "Search OpenBot" })).not.toBeInTheDocument();
+    });
   });
 
   it("removes a completed Dynamic Island answer without sending it twice", async () => {

@@ -11,11 +11,18 @@
  * this app. So does a server this app configured - the user asked for it here, and the reason it
  * does not start is something only they can fix. `configuredNames` is what separates the two: a
  * server the user configured in their own provider files is still nobody's failure but theirs.
+ *
+ * Grok's CLI also loads the servers in `~/.claude.json`, `~/.cursor/mcp.json` and `.mcp.json`. One
+ * there that asks for OAuth ends its transport with the `rmcp` worker's own sentence,
+ * `worker quit with fatal: Transport channel closed, when AuthRequired(…)`, which names neither MCP
+ * nor the server. The session opens without that server, and the user read the line as a "Provider
+ * error" toast (#1199). The worker's sentence is matched as it stands, because no other part of a
+ * provider writes it.
  */
 export function isMcpSubsystemDiagnostic(message: string, configuredNames: readonly string[] = []): boolean {
   if (/openbot/i.test(message)) return false;
   if (configuredNames.some((name) => name && message.includes(name))) return false;
-  return /\b(mcp|rmcp)\b/i.test(message);
+  return /\b(mcp|rmcp)\b|\bworker quit with (?:fatal|join error|reason):/i.test(message);
 }
 
 /**
@@ -37,6 +44,73 @@ export function isTelemetryExportDiagnostic(message: string): boolean {
   return /\b(?:batch(?:span|log|logrecord)processor|(?:span|log|logrecord|metric)exporter|opentelemetry|otlp|otel)\b/i.test(
     message,
   );
+}
+
+/** What OpenBot keeps of one echo: the method and the error text, never the request body. */
+export interface AcpRequestEcho {
+  method: string | null;
+  error: string | null;
+}
+
+/**
+ * Reads the ACP SDK's copy of an error that the agent also sent back, one stderr record at a time.
+ *
+ * An agent built on the TypeScript ACP SDK, such as Cline's CLI, writes `Error handling request`
+ * with the request and its error to stderr each time it answers a request with an error. The same
+ * error reaches OpenBot as the reply, and the call that waits for it reports it. A signed-out Cline
+ * answers the model-list session with "Authentication required", and the user met the copy as a
+ * "Provider error" toast just after the download. It belongs in the log.
+ *
+ * The SDK prints both objects over several lines, which reach OpenBot as one record each, so the
+ * reader follows the brackets to the end of the error object. Call it with every record, before any
+ * other filter: a line inside the echo, such as `message: "Internal error",`, reads as an error of
+ * its own. It returns the echo when its last line arrives, `null` while one is still open, and
+ * `undefined` for a record that is not part of one. The request body holds the MCP servers with
+ * their headers and environment, redacted one line at a time without the key above each line, so
+ * only the method and the error text are kept. A request with many MCP servers takes many lines, so
+ * the echo has no line limit: it ends when its brackets close, or when the next echo starts. Only a
+ * request counts: a notification has no reply, so `Error handling notification` stays visible.
+ */
+export function createAcpRequestEchoReader(): (record: string) => AcpRequestEcho | null | undefined {
+  let open = false;
+  let depth = 0;
+  let method: string | null = null;
+  let error: string | null = null;
+  return (record) => {
+    const start = /^Error handling request\b/.test(record);
+    if (!open && !start) return undefined;
+    if (start) {
+      open = true;
+      depth = 0;
+      method = null;
+      error = null;
+    }
+    // The request object comes first and holds the method; the error object follows it.
+    const field = /^(method|message):\s*"(.*)",?$/.exec(record);
+    if (field?.[1] === "method" && method === null) method = field[2] ?? null;
+    if (field?.[1] === "message" && method !== null) error = field[2] ?? null;
+    depth += bracketBalance(record);
+    if (depth > 0) return null;
+    open = false;
+    return { method, error };
+  };
+}
+
+/** Opening minus closing brackets in one line, outside double-quoted strings. */
+function bracketBalance(line: string) {
+  let balance = 0;
+  let inString = false;
+  let escaped = false;
+  for (const char of line) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") balance += 1;
+    else if (char === "}" || char === "]") balance -= 1;
+  }
+  return balance;
 }
 
 /**
@@ -66,6 +140,20 @@ export function isToolCallDiagnostic(message: string): boolean {
 export function isBackgroundRefreshDiagnostic(message: string): boolean {
   if (/openbot/i.test(message)) return false;
   return /\bcodex_models_manager\b.*\bfailed to refresh available models\b|\bSettings fetch failed\b/.test(message);
+}
+
+/**
+ * Whether a provider diagnostic is the ACP SDK's own copy of an error that the agent also answered.
+ *
+ * The TypeScript ACP SDK that a Node agent is built on writes `Error handling request`, the whole
+ * request and the error to stderr each time a handler fails, and then sends the same error as the
+ * JSON-RPC answer. OpenBot reports that answer where the request was made: a failed prompt in the
+ * chat. The stderr copy reached the user as an `Error handling request {` toast, with nothing to act
+ * on and the request's own fields in it (#1193). Newer SDKs write `Error handling notification` for a
+ * notification, which has no answer and no action for the user either.
+ */
+export function isAcpHandlerDiagnostic(message: string): boolean {
+  return /^Error handling (?:request|notification)\b/.test(message);
 }
 
 const IGNORED_CONFIG_SUMMARY = /\bCodex is ignoring (\d+) unrecognized configuration settings?\b/;

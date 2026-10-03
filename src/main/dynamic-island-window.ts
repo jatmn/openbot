@@ -83,6 +83,12 @@ export class DynamicIslandWindowController {
     return this.#presentation;
   }
 
+  /** The notch of the built-in display, or null when there is no built-in display or it has no notch. */
+  get builtInDisplayGeometry(): DynamicIslandNotchSize | null {
+    const builtIn = this.#options.getDisplays().find((display) => display.internal);
+    return (builtIn && dynamicIslandNotchSizeForDisplay(builtIn)) ?? null;
+  }
+
   get mainRendererIds(): ReadonlySet<number> {
     const window = this.#options.getMainWindow();
     return new Set(window && !window.isDestroyed() ? [window.webContents.id] : []);

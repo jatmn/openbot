@@ -100,37 +100,66 @@
 .global-search-dialog {
   position: fixed;
   z-index: calc(var(--openbot-layer-dialog) + 1);
-  top: 50%;
+  /* A fixed top keeps the input and filters still when the result list changes height, and clears toasts. */
+  top: 112px;
   left: 50%;
-  width: min(560px, calc(100vw - 48px));
-  max-height: calc(100vh - 68px);
+  display: flex;
+  width: min(640px, calc(100vw - 48px));
+  max-height: calc(100dvh - 136px);
+  flex-direction: column;
   overflow: hidden;
   outline: 0;
   background: var(--openbot-bg-control);
+  box-shadow:
+    0 0 0 1px var(--openbot-dialog-ring),
+    var(--openbot-shadow-dialog);
   color: var(--openbot-text-primary);
-  transform: translate(-50%, -50%);
+  transform: translateX(-50%);
+  transform-origin: 50% 0;
+  animation: global-search-in var(--openbot-duration-normal) var(--openbot-ease-out);
+}
+
+/* The inert copy that global-search-motion.ts leaves when the search closes. */
+.global-search-dialog[data-closing] {
+  animation: global-search-out var(--openbot-duration-fast) var(--openbot-ease-out) both;
+}
+
+@keyframes global-search-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px) scale(0.98);
+  }
+}
+
+@keyframes global-search-out {
+  to {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.98);
+  }
 }
 
 .global-search-control {
   display: flex;
-  height: 54px;
+  height: 48px;
+  flex: 0 0 auto;
   align-items: center;
-  gap: var(--openbot-space-3);
+  gap: var(--openbot-space-2);
   border-bottom: 1px solid var(--openbot-border);
-  padding: 0 var(--openbot-space-4);
+  padding: 0 var(--openbot-space-2) 0 var(--openbot-space-4);
   color: var(--openbot-text-muted);
 }
 
 .global-search-control > svg {
-  width: var(--openbot-icon-lg);
-  height: var(--openbot-icon-lg);
+  width: var(--openbot-icon-md);
+  height: var(--openbot-icon-md);
   flex: 0 0 auto;
   stroke-width: var(--openbot-icon-stroke);
 }
 
 .global-search-control .global-search-input {
-  width: 100%;
+  min-width: 0;
   height: 100%;
+  flex: 1;
   border: 0;
   border-radius: 0;
   outline: 0;
@@ -138,8 +167,8 @@
   padding: 0;
   box-shadow: none;
   color: var(--openbot-text-primary);
-  font-size: var(--openbot-text-xl);
-  line-height: var(--openbot-leading-xl);
+  font-size: var(--openbot-text-lg);
+  line-height: var(--openbot-leading-lg);
 }
 
 .global-search-control .global-search-input:focus {
@@ -152,57 +181,84 @@
   color: var(--openbot-text-muted);
 }
 
-.global-search-tabs {
-  border-bottom: 1px solid var(--openbot-border);
-  padding: var(--openbot-space-2) var(--openbot-space-3);
+.global-search-filters {
+  flex: 0 0 auto;
 }
 
-.global-search-tabs [role="tablist"] {
+.global-search-filters [role="tablist"] {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: var(--openbot-space-1);
+  gap: var(--openbot-space-0-5);
 }
 
-.global-search-tabs [role="tab"] {
-  height: var(--openbot-control-md);
+.global-search-filters [role="tab"] {
+  position: relative;
+  z-index: 1;
+  height: var(--openbot-control-xs);
   border: 0;
-  border-radius: var(--openbot-radius-md);
+  border-radius: var(--openbot-radius-sm);
   background: transparent;
-  padding: 0 var(--openbot-space-3);
+  padding: 0 var(--openbot-space-2);
   color: var(--openbot-text-muted);
   font-family: inherit;
-  font-size: var(--openbot-text-lg);
-  line-height: var(--openbot-leading-lg);
-  transition:
-    background-color var(--openbot-duration-hover) ease,
-    color var(--openbot-duration-hover) ease,
-    transform var(--openbot-duration-fast) var(--openbot-ease-out);
+  font-size: var(--openbot-text-sm);
+  font-weight: var(--openbot-weight-medium);
+  line-height: var(--openbot-leading-sm);
+  transition: color var(--openbot-duration-normal) var(--openbot-ease-out);
 }
 
-.global-search-tabs [role="tab"][data-selected] {
-  background: var(--openbot-bg-surface);
+@media (hover: hover) and (pointer: fine) {
+  .global-search-filters [role="tab"]:hover {
+    color: var(--openbot-text-secondary);
+  }
+}
+
+.global-search-filters [role="tab"][data-selected] {
   color: var(--openbot-text-primary);
 }
 
-.global-search-tabs [role="tab"]:focus-visible {
-  outline: 0;
-  box-shadow: var(--openbot-focus-ring);
+/* Kobalte places the pill under the selected filter; it slides when the filter changes. */
+.global-search-filter-pill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: var(--openbot-control-xs);
+  border-radius: var(--openbot-radius-sm);
+  background: var(--openbot-bg-control-active);
+  pointer-events: none;
+  transition:
+    transform var(--openbot-duration-normal) var(--openbot-ease-out),
+    width var(--openbot-duration-normal) var(--openbot-ease-out);
 }
 
-.global-search-tabs [role="tab"]:active {
-  transform: scale(0.97);
+.global-search-filter-pill:is([data-initializing], [data-resizing]) {
+  transition: none;
+}
+
+.global-search-filters [role="tab"]:focus-visible {
+  outline: 0;
+  box-shadow: var(--openbot-focus-ring);
 }
 
 .global-search-results {
   position: relative;
   inset: auto;
   width: 100%;
-  max-height: min(430px, calc(100vh - 190px));
+  max-height: min(400px, calc(100dvh - 240px));
   overflow-y: auto;
   background: transparent;
-  padding: var(--openbot-space-2);
+  padding: var(--openbot-space-1-5);
   transform: none;
   scrollbar-width: none;
+  /* A key press scrolls the active row clear of the scroll fade. */
+  scroll-padding-block: var(--openbot-space-4);
+  /* global-search-motion.ts sets the height from the content, so the dialog resizes smoothly. */
+  transition: height var(--openbot-duration-normal) var(--openbot-ease-out);
+}
+
+.global-search-results[data-instant] {
+  transition: none;
 }
 
 .global-search-dialog [data-popper-positioner] {
@@ -222,105 +278,275 @@
   display: none;
 }
 
+/* A virtual list: a spacer gives the listbox its full height, and each rendered row has its place. */
 .global-search-results [role="listbox"] {
-  display: grid;
-  gap: var(--openbot-space-0-5);
+  position: relative;
   outline: 0;
+}
+
+.global-search-results [role="listbox"] > [data-index] {
+  position: absolute;
+  right: 0;
+  left: 0;
+}
+
+.global-search-section {
+  display: flex;
+  height: var(--openbot-control-sm);
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 0 var(--openbot-space-2) var(--openbot-space-1);
+  color: var(--openbot-text-muted);
+  font-size: var(--openbot-text-sm);
+  font-weight: var(--openbot-weight-medium);
+  line-height: var(--openbot-leading-sm);
+}
+
+/* Height, not a margin: the virtual list measures the row box. */
+.global-search-section[data-spaced] {
+  height: calc(var(--openbot-control-sm) + var(--openbot-space-1-5));
+}
+
+.global-search-section-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* One highlight slides under the active row. global-search-motion.ts gives its place and height. */
+.global-search-highlight {
+  position: absolute;
+  top: 0;
+  right: var(--openbot-space-1-5);
+  left: var(--openbot-space-1-5);
+  border-radius: var(--openbot-radius-sm);
+  background: var(--openbot-bg-control-active);
+  pointer-events: none;
+  transition:
+    transform var(--openbot-duration-fast) var(--openbot-ease-out),
+    height var(--openbot-duration-fast) var(--openbot-ease-out);
+}
+
+.global-search-highlight[data-instant] {
+  transition: none;
 }
 
 .global-search-result {
   display: flex;
-  width: 100%;
-  min-height: 50px;
+  min-height: var(--openbot-control-lg);
   align-items: center;
-  gap: var(--openbot-space-3);
-  border-radius: var(--openbot-radius-md);
-  padding: var(--openbot-space-2) var(--openbot-space-3);
+  gap: var(--openbot-space-2);
+  border-radius: var(--openbot-radius-sm);
+  padding: 0 var(--openbot-space-2);
   color: var(--openbot-text-primary);
+  font-size: var(--openbot-text-md);
+  line-height: var(--openbot-leading-md);
   cursor: default;
   outline: 0;
 }
 
-.global-search-result[data-highlighted],
-.global-search-result[data-selected],
-.global-search-results
-  [role="listbox"]:not(:has(.global-search-result[data-highlighted]))
-  .global-search-result:first-child {
-  background: var(--openbot-bg-control-active);
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .global-search-result:hover {
-    background: var(--openbot-bg-control-hover);
-  }
-}
-
 .global-search-avatar.agent-avatar {
-  --agent-avatar-optical-offset: -2px;
+  --agent-avatar-optical-offset: -1px;
 
-  width: 28px;
-  height: 28px;
+  width: var(--openbot-icon-lg);
+  height: var(--openbot-icon-lg);
   flex: 0 0 auto;
 }
 
-.global-search-result-copy {
-  min-width: 0;
+/* Rows with no agent (channels, files, commands) show an icon in the same slot as the avatar. */
+.global-search-icon {
   display: grid;
-  flex: 1;
-  gap: var(--openbot-space-0-5);
+  width: var(--openbot-icon-lg);
+  height: var(--openbot-icon-lg);
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--openbot-text-muted);
+}
+
+.global-search-icon > svg {
+  width: var(--openbot-icon-md);
+  height: var(--openbot-icon-md);
+  stroke-width: var(--openbot-icon-stroke);
 }
 
 .global-search-result-title,
-.global-search-result-description {
-  display: block;
+.global-search-result-detail {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .global-search-result-title {
+  max-width: 40%;
+  flex: 0 1 auto;
   color: var(--openbot-text-primary);
-  font-size: var(--openbot-text-lg);
   font-weight: var(--openbot-weight-medium);
-  line-height: var(--openbot-leading-lg);
 }
 
-.global-search-result-description {
+.global-search-result-detail {
+  flex: 1;
+  color: var(--openbot-text-muted);
+}
+
+.global-search-result-author {
+  flex: 0 0 auto;
   color: var(--openbot-text-secondary);
+}
+
+.global-search-result-time {
+  flex: 0 0 auto;
+  color: var(--openbot-text-muted);
+  font-size: var(--openbot-text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.global-search-match {
+  background: transparent;
+  color: var(--openbot-text-primary);
+  font-weight: var(--openbot-weight-medium);
+}
+
+/* Every row keeps the space of the hint, so the time does not move when the highlight moves. */
+.global-search-result .global-search-result-enter {
+  flex: 0 0 auto;
+  border: 0;
+  background: var(--openbot-bg-control-hover);
+  opacity: 0;
+  transition: opacity var(--openbot-duration-fast) var(--openbot-ease-out);
+}
+
+.global-search-result[data-highlighted] .global-search-result-enter,
+.global-search-results
+  [role="listbox"]:not(:has(.global-search-result[data-highlighted]))
+  .global-search-result[data-first]
+  .global-search-result-enter {
+  opacity: 1;
+}
+
+.global-search-status,
+.global-search-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--openbot-space-2);
+  color: var(--openbot-text-muted);
   font-size: var(--openbot-text-md);
   line-height: var(--openbot-leading-md);
 }
 
-.global-search-result-shortcut {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: var(--openbot-space-1);
-  color: var(--openbot-text-muted);
-  font-size: var(--openbot-text-sm);
+/* A fast search ends before the delay, so the spinner does not flash. */
+.global-search-status {
+  min-height: var(--openbot-control-lg);
+  animation: global-search-fade-in var(--openbot-duration-normal) var(--openbot-ease-out) var(--openbot-duration-fast)
+    both;
 }
 
-.global-search-result-shortcut .ui-kbd {
-  border: 0;
-  background: var(--openbot-bg-surface);
+.global-search-empty,
+.global-search-results:not(:has(.global-search-result)) .global-search-status {
+  /* With no rows, "Searching…" and "No results" have one height, so the dialog does not jump. */
+  min-height: 96px;
 }
 
 .global-search-empty {
-  display: grid;
-  min-height: 124px;
-  place-items: center;
+  animation: global-search-fade-in var(--openbot-duration-normal) var(--openbot-ease-out) both;
+}
+
+@keyframes global-search-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.global-search-footer {
+  display: flex;
+  height: var(--openbot-control-lg);
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--openbot-space-4);
+  border-top: 1px solid var(--openbot-border);
+  padding: 0 var(--openbot-space-4);
   color: var(--openbot-text-muted);
-  font-size: var(--openbot-text-md);
+  font-size: var(--openbot-text-sm);
+  line-height: var(--openbot-leading-sm);
+}
+
+.global-search-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--openbot-space-1);
+  white-space: nowrap;
+}
+
+.global-search-hint .ui-kbd {
+  border: 0;
+  background: var(--openbot-bg-control-active);
+}
+
+/* Key glyphs such as ↑ and ⌘ render small in most fonts, so keys show icons and the text keys use
+   the interface font. Both then have the same visual size. */
+.global-search-footer .ui-kbd,
+.global-search-result .global-search-result-enter {
+  font-family: var(--openbot-font-sans);
+  font-weight: var(--openbot-weight-medium);
+}
+
+.global-search-footer .ui-kbd > svg,
+.global-search-result .global-search-result-enter > svg {
+  width: var(--openbot-icon-xs);
+  height: var(--openbot-icon-xs);
+  /* At 12px the usual stroke draws under 1px, which is fainter than the key text beside it. */
+  stroke-width: calc(var(--openbot-icon-stroke) * 4 / 3);
+}
+
+.global-search-hint .ui-kbd + .ui-kbd {
+  margin-left: calc(var(--openbot-space-0-5) * -1);
 }
 
 @media (max-width: 640px) {
   .global-search-dialog {
     width: calc(100vw - 24px);
-    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 124px);
   }
 
-  .global-search-result-shortcut {
+  /* The filters go to their own row, so the input keeps the full width. */
+  .global-search-control {
+    height: auto;
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+
+  .global-search-control .global-search-input {
+    height: 48px;
+  }
+
+  .global-search-filters {
+    min-width: 0;
+    flex-basis: 100%;
+    overflow-x: auto;
+    padding-block: var(--openbot-space-1) var(--openbot-space-2);
+    scrollbar-width: none;
+  }
+
+  .global-search-footer,
+  .global-search-result .global-search-result-enter {
     display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .global-search-dialog,
+  .global-search-empty {
+    animation: none;
+  }
+
+  /* Keep the delay: a fast search still shows no status. */
+  .global-search-status {
+    animation-duration: 0s;
+  }
+
+  .global-search-filter-pill,
+  .global-search-highlight,
+  .global-search-results {
+    transition: none;
   }
 }
 
@@ -897,6 +1123,19 @@ textarea {
   color: var(--openbot-text-muted);
 }
 
+/* A hosted server that sleeps because nobody used it, or that wakes. The view stays usable. */
+.sidebar-server-name > .sidebar-server-name-sleep {
+  width: var(--openbot-icon-sm);
+  height: var(--openbot-icon-sm);
+  flex: 0 0 auto;
+  color: var(--openbot-text-muted);
+}
+
+.sidebar-server-name > .sidebar-server-name-sleep[data-state="waking"] {
+  color: var(--openbot-accent);
+  animation: server-sleep-waking 1200ms ease-in-out infinite;
+}
+
 @keyframes sidebar-server-mark-in {
   from {
     opacity: 0;
@@ -988,6 +1227,19 @@ textarea {
 .server-menu-muted {
   flex: 0 0 auto;
   color: var(--openbot-text-secondary);
+}
+
+.server-menu-sleep {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-text-muted);
+}
+
+.server-menu-sleep[data-state="waking"] {
+  background: var(--openbot-accent);
+  animation: server-sleep-waking 1200ms ease-in-out infinite;
 }
 
 .server-menu .server-menu-layout-chevron {
@@ -1440,6 +1692,39 @@ textarea {
 .sidebar-section-editor-wrap {
   position: relative;
   width: 100%;
+}
+
+/* "Needs you" is not a section, so its heading is plain text with a count, and a rule ends it. */
+.sidebar-waiting-group {
+  border-bottom: 1px solid var(--openbot-border);
+  padding-bottom: var(--openbot-space-2);
+}
+
+.sidebar-waiting-group-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--openbot-space-2);
+  margin: 0;
+  padding: 0 7px;
+  color: var(--openbot-text-readable);
+  font-size: var(--openbot-text-sm);
+  font-weight: 400;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.sidebar-waiting-group-count {
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-warning);
+  padding: 0 4px;
+  color: var(--openbot-bg-sidebar);
+  font-size: var(--openbot-text-sm);
+  font-weight: 650;
 }
 
 .sidebar-chat-group > .sidebar-section-editor-wrap {
@@ -1967,12 +2252,91 @@ textarea {
   height: 10px;
 }
 
-.agent-row-agent-status-routine-needs-attention {
-  color: var(--openbot-warning);
-}
-
 .agent-row-agent-status-routine-failed {
   color: var(--openbot-danger);
+}
+
+/* An agent that waits for the user: amber, and a little larger than the routine marks, so it is
+   the first badge the eye finds in a busy list. */
+.agent-row-agent-status-waiting {
+  width: 18px;
+  height: 18px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-warning);
+  color: var(--openbot-bg-sidebar);
+}
+
+.agent-row-agent-status-waiting svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* The action chip takes the time slot: the time does not matter while the agent waits. */
+.agent-row-wait-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-warning-soft);
+  padding: 1px 7px 1px 5px;
+  color: var(--openbot-warning-text);
+  font-size: var(--openbot-text-sm);
+  font-weight: var(--openbot-weight-semibold);
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.agent-row-wait-chip svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* The tooltip anchors to this wrapper, so it needs a box of its own. */
+.sidebar-agent-tooltip-trigger {
+  display: block;
+}
+
+.sidebar-wait-tooltip {
+  z-index: var(--openbot-layer-popover);
+  display: grid;
+  max-width: min(260px, calc(100vw - 16px));
+  gap: 2px;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-sm);
+  background: var(--openbot-bg-surface-raised);
+  box-shadow: var(--openbot-shadow-raised);
+  padding: var(--openbot-space-2) var(--openbot-space-3);
+  color: var(--openbot-text-primary);
+  font-size: var(--openbot-text-md);
+  line-height: var(--openbot-leading-md);
+  pointer-events: none;
+}
+
+.sidebar-wait-tooltip-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--openbot-space-1);
+  color: var(--openbot-warning-text);
+  font-weight: var(--openbot-weight-semibold);
+}
+
+.sidebar-wait-tooltip-title svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sidebar-wait-tooltip-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  overflow-wrap: anywhere;
+}
+
+.sidebar-wait-tooltip-hint {
+  color: var(--openbot-text-muted);
+  font-size: var(--openbot-text-sm);
 }
 
 .agent-row-agent-status-entering {
@@ -2174,6 +2538,10 @@ textarea {
   text-transform: uppercase;
 }
 
+.avatar-editor-heading > span {
+  white-space: nowrap;
+}
+
 .avatar-editor-actions {
   display: flex;
   align-items: center;
@@ -2192,6 +2560,11 @@ textarea {
   transition-property: scale, background-color, color;
   transition-duration: var(--openbot-duration-normal), var(--openbot-duration-hover), var(--openbot-duration-hover);
   transition-timing-function: ease-out;
+}
+
+.avatar-editor-actions .ui-icon-button {
+  width: var(--openbot-control-xl);
+  padding: 0;
 }
 
 .avatar-editor-actions button:hover {
@@ -2509,6 +2882,16 @@ textarea {
 .sidebar:not(.sidebar-compact) .sidebar-section-body .agent-row {
   width: 100%;
   margin-inline: 0;
+}
+
+.sidebar:not(.sidebar-compact) .sidebar-waiting-group .agent-row {
+  width: 100%;
+  margin-inline: 0;
+}
+
+/* A waiting row does not drag, so it does not show the grab cursor. */
+.sidebar-waiting-group .sidebar-agent-item .agent-row {
+  cursor: default;
 }
 
 .sidebar:not(.sidebar-compact) .sidebar-pinned-row.agent-row {
@@ -3520,6 +3903,25 @@ textarea {
   color: var(--openbot-text-secondary);
   background: var(--openbot-bg-sidebar);
   border-radius: var(--openbot-radius-sm);
+}
+
+/* A hosted server that sleeps for no use: muted. One that wakes after the user's input: a pulsing accent. */
+@keyframes server-sleep-waking {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .server-menu-sleep[data-state="waking"],
+  .sidebar-server-name > .sidebar-server-name-sleep[data-state="waking"] {
+    animation: none;
+  }
 }
 
 /* A server menu item with a second line, such as "Muted until 14:30", like Discord's. */

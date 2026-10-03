@@ -10,6 +10,7 @@ import type {
   BrowserTab,
   BrowserTakeoverRequest,
   ConversationPage,
+  HostedServerSleep,
   QueueSnapshot,
   RespondToApprovalInput,
   RespondToPromptInput,
@@ -18,17 +19,20 @@ import type {
   TeamPresenceSnapshot,
   TeamRealtimeEvent,
 } from "@openbot/contracts/ipc";
+import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
+import { WAKE_RECONNECT_DELAY_MS } from "@openbot/team-client/hosted-server-wake";
 import type { RemoteTeamHost } from "@openbot/team-client/remote-directory";
 import { reconcilePendingRequests } from "@openbot/team-client/runtime-attention";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, createStore, onSettled } from "solid-js";
 import { toAgentProfile } from "../../app-message-projection";
-import { cleanAgentMessageText } from "../agents/agent-message-text";
 import { mergeConversationPage } from "../conversation/conversation-merge";
 import { createSidebarPreferences } from "../sidebar/sidebar-preferences";
 import { defaultSidebarLayout } from "../sidebar/sidebar-sections";
 import { createHostRestartToasts } from "../updates/host-restart-toast";
+import type { WebHostNotice } from "./web-host-connections";
 import type { WebHostState } from "./web-host-lock";
+import { createWebHostedServerWake } from "./web-hosted-server-wake";
 import {
   createWebWorkspaceRuntime,
   WebHostIncompatibleError,
@@ -69,6 +73,11 @@ interface WebWorkspaceState {
   presence: TeamPresenceSnapshot | null;
   capabilities: string[];
   status: "connecting" | "online" | "offline";
+  /**
+   * The opened host is a hosted server that the account service stopped for no use (`sleeping`), or that
+   * starts after the user's input (`waking`). Cleared when it is online again.
+   */
+  hostedSleep: HostedServerSleep | null;
   /** The opened host said it restarts into an update (`host-update-v1`). Cleared when it is online again. */
   hostRestart: { state: "waiting" | "restarting"; version: string | null } | null;
   /** The state of each host that this tab has not opened, from its status connection. */
@@ -97,6 +106,8 @@ interface WebWorkspaceState {
 /** A host restarts in under a minute; the retries stop after three. */
 const HOST_RESTART_RETRY_MS = 5_000;
 const HOST_RESTART_RETRY_LIMIT = 36;
+/** A sleeping server can start for a routine. The tab asks the account service again after this long. */
+const SLEEP_RECHECK_MS = 5 * 60_000;
 
 export type WebRuntimeFactory = (
   accountId: string,
@@ -136,6 +147,7 @@ export function createWebWorkspace(
     presence: null,
     capabilities: [],
     status: "offline",
+    hostedSleep: null,
     hostRestart: null,
     hostStates: {},
     incompatibility: null,
@@ -173,10 +185,20 @@ export function createWebWorkspace(
   const conversationReads = new Map<string, number>();
   const heldDeltas = new Map<string, Array<Extract<AgentEvent, { type: "conversation-delta" }>>>();
   const hostEventListeners = new Set<(event: AgentEvent | TeamRealtimeEvent) => void>();
+  const hostedServer = createWebHostedServerWake(props.accountFetch);
+  let wakeReconnectTimer: number | undefined;
+  let sleepRecheckTimer: number | undefined;
+  /** Removes the listeners that wait for the user's input while the opened server sleeps. */
+  let stopWaitingForInput: (() => void) | null = null;
+  const hostNoticeListeners = new Set<(hostId: string, event: WebHostNotice, agents: AgentSummary[]) => void>();
   const runtime = (props.createRuntime ?? createWebWorkspaceRuntime)(
     props.accountId,
     {
       accountChanged: props.onSessionCheck,
+      hostNotice(id, event, agents) {
+        if (disposed) return;
+        for (const listener of hostNoticeListeners) listener(id, event, agents);
+      },
       hostState(id, hostState) {
         if (!disposed)
           setState((draft) => {
@@ -245,8 +267,12 @@ export function createWebWorkspace(
             .catch(report);
           return;
         }
-        if (update.state === "online") revokedReconnect = false;
-        else if (state.hostRestart) retryAfterRestart();
+        // A host that announced a restart comes back by itself; a wake is only for a stopped server.
+        if (update.state === "offline" && !update.code && !state.hostRestart) hostUnavailable(update.hostId);
+        if (update.state === "online") {
+          revokedReconnect = false;
+          endSleep();
+        } else if (state.hostRestart) retryAfterRestart();
         if (update.state === "online" && update.resync) {
           // A host that still waits to restart says so again when the connection declares capabilities.
           setState((draft) => {
@@ -544,6 +570,66 @@ export function createWebWorkspace(
   function retryHosts(): Promise<void> {
     return refreshHosts().catch(() => undefined);
   }
+  /**
+   * The opened host is offline. A hosted server that the account service stopped for no use waits for the
+   * user's input. Another stopped hosted server starts, and the tab connects again. A server that starts
+   * already is asked to start again, with no status read in between.
+   */
+  function hostUnavailable(id: string): void {
+    const starting = state.hostedSleep === "waking";
+    void (starting ? hostedServer.wake(id) : Promise.resolve(false)).then(async (waking) => {
+      const availability = waking ? "waking" : await hostedServer.unavailable(id);
+      if (disposed || hostId !== id || state.status === "online") return;
+      // The 5-minute recheck can find that the server does not sleep now, so input does not wake it.
+      if (availability !== "sleeping") stopWaitingForInput?.();
+      setHostedSleep(availability === "sleeping" ? "sleeping" : availability === "waking" ? "waking" : null);
+      if (availability === "waking") reconnectAfterWake(id);
+      else if (availability === "sleeping") waitForInput(id);
+    });
+  }
+  function reconnectAfterWake(id: string): void {
+    window.clearTimeout(wakeReconnectTimer);
+    wakeReconnectTimer = window.setTimeout(() => {
+      if (!disposed && hostId === id && state.status === "offline") void reconnect().catch(report);
+    }, WAKE_RECONNECT_DELAY_MS);
+  }
+  /** The next key or pointer press in the tab starts the sleeping server. */
+  function waitForInput(id: string): void {
+    stopWaitingForInput?.();
+    const onInput = () => {
+      stopWaitingForInput?.();
+      if (disposed || hostId !== id || state.status === "online") return;
+      setHostedSleep("waking");
+      void hostedServer.wakeForInput(id).then((waking) => {
+        if (disposed || hostId !== id || state.status === "online") return;
+        if (waking) reconnectAfterWake(id);
+        else {
+          setHostedSleep(null);
+          hostUnavailable(id);
+        }
+      });
+    };
+    window.addEventListener("pointerdown", onInput, true);
+    window.addEventListener("keydown", onInput, true);
+    sleepRecheckTimer = window.setTimeout(() => hostUnavailable(id), SLEEP_RECHECK_MS);
+    stopWaitingForInput = () => {
+      window.removeEventListener("pointerdown", onInput, true);
+      window.removeEventListener("keydown", onInput, true);
+      window.clearTimeout(sleepRecheckTimer);
+      stopWaitingForInput = null;
+    };
+  }
+  function setHostedSleep(hostedSleep: HostedServerSleep | null): void {
+    if (state.hostedSleep !== hostedSleep)
+      setState((draft) => {
+        draft.hostedSleep = hostedSleep;
+      });
+  }
+  function endSleep(): void {
+    stopWaitingForInput?.();
+    setHostedSleep(null);
+  }
+
   /** `connect` clears `hostRestart`, so the retries count down instead of reading it again. */
   function retryAfterRestart(retries = HOST_RESTART_RETRY_LIMIT): void {
     if (restartRetry || disposed || retries <= 0) return;
@@ -580,17 +666,22 @@ export function createWebWorkspace(
     if (state.status === "connecting") return;
     const current = ++generation;
     const sameHost = hostId === host.hostId;
+    // A hosted server that sleeps or wakes keeps the workspace visible, so each retry keeps its agents and the selection.
+    const keepWorkspace = sameHost && state.hostedSleep !== null;
     const previousSelected = sameHost ? selectedId : null;
     hostId = host.hostId;
-    selectedId = null;
+    if (!keepWorkspace) selectedId = null;
+    if (!sameHost) endSleep();
     setState((draft) => {
       draft.host = host;
       draft.status = "connecting";
       draft.hostRestart = null;
       draft.memberId = sameHost ? draft.memberId : null;
-      draft.agents = [];
-      draft.agentsLoaded = false;
-      draft.selectedId = null;
+      if (!keepWorkspace) {
+        draft.agents = [];
+        draft.agentsLoaded = false;
+        draft.selectedId = null;
+      }
       if (!sameHost) {
         draft.conversations = {};
         draft.queues = {};
@@ -629,6 +720,7 @@ export function createWebWorkspace(
       ]);
       if (disposed || current !== generation) return;
       revokedReconnect = false;
+      endSleep();
       setState((draft) => {
         draft.capabilities = capabilities;
         draft.agents = agents;
@@ -675,7 +767,10 @@ export function createWebWorkspace(
             hostProtocol: { ...error.hostProtocol },
           };
       });
-      if (!(error instanceof WebHostIncompatibleError)) report(error);
+      if (!(error instanceof WebHostIncompatibleError)) {
+        report(error);
+        hostUnavailable(host.hostId);
+      }
     }
   }
   async function load(id: string, older = false) {
@@ -959,6 +1054,35 @@ export function createWebWorkspace(
     readWrites.set(id, write);
     return write;
   }
+  /** Marks every agent with unread messages read through its newest one, loaded or not. */
+  async function markAllRead() {
+    if (state.status !== "online") return;
+    const current = generation;
+    const reads = await runtime.conversationReads();
+    if (disposed || current !== generation) return;
+    const unread = Object.entries(reads)
+      .filter(([, read]) => read.unreadCount > 0)
+      .map(([id]) => id);
+    const writes = unread.map((id) => {
+      const write = (readWrites.get(id) ?? Promise.resolve())
+        .catch(() => undefined)
+        .then(async () => {
+          if (disposed || current !== generation) return;
+          const page = await runtime.conversation(id);
+          const latestMessageId = page.messages.at(-1)?.id;
+          if (!latestMessageId || disposed || current !== generation) return;
+          const readState = await runtime.markRead(id, latestMessageId);
+          if (disposed || current !== generation) return;
+          setState((draft) => {
+            const value = draft.conversations[id]?.page;
+            if (value?.threadId === page.threadId) value.readState = readState;
+          });
+        });
+      readWrites.set(id, write);
+      return write;
+    });
+    await Promise.all(writes);
+  }
   createHostRestartToasts(() =>
     state.host
       ? [
@@ -986,6 +1110,8 @@ export function createWebWorkspace(
     return () => {
       disposed = true;
       generation += 1;
+      window.clearTimeout(wakeReconnectTimer);
+      stopWaitingForInput?.();
       acceptedInvite = null;
       if (restartRetry) clearTimeout(restartRetry);
       window.removeEventListener("focus", focus);
@@ -1009,6 +1135,13 @@ export function createWebWorkspace(
       hostEventListeners.add(listener);
       return () => {
         hostEventListeners.delete(listener);
+      };
+    },
+    /** The events of the hosts this tab has not opened that a notification can show. Returns the unsubscribe function. */
+    onHostNotice(listener: (hostId: string, event: WebHostNotice, agents: AgentSummary[]) => void) {
+      hostNoticeListeners.add(listener);
+      return () => {
+        hostNoticeListeners.delete(listener);
       };
     },
     run,
@@ -1050,6 +1183,7 @@ export function createWebWorkspace(
       }
     },
     markRead,
+    markAllRead,
     async mutateSidebarLayout(action: SidebarLayoutAction) {
       if (state.status !== "online" || !state.capabilities.includes("sidebar-layout")) {
         throw new Error(currentText().t("webClient.error.sidebarLayout"));

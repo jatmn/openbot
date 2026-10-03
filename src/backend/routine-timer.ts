@@ -9,7 +9,8 @@
  */
 export interface RoutineDueSource {
   nextDueAt(): string | null;
-  processDue(now: Date): Promise<void>;
+  /** `active` turns false when the system suspends during the pass; stop before the next routine. */
+  processDue(now: Date, active: () => boolean): Promise<void>;
 }
 
 /** `setTimeout` rejects a delay above this and fires at once instead, which would spin. */
@@ -18,6 +19,9 @@ const MAX_DELAY = 2_147_000_000;
 export class RoutineTimer {
   #timer: NodeJS.Timeout | null = null;
   #firing = false;
+  #suspended = false;
+  /** A restart of the app waits for the agents to be idle, so no routine may start new work. */
+  #held = false;
 
   constructor(
     private readonly sources: () => Iterable<RoutineDueSource>,
@@ -33,12 +37,8 @@ export class RoutineTimer {
     if (this.#firing) return;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
-    if (!this.isRunning()) return;
-    let earliest: string | null = null;
-    for (const source of this.sources()) {
-      const dueAt = source.nextDueAt();
-      if (dueAt && (!earliest || dueAt < earliest)) earliest = dueAt;
-    }
+    if (this.#paused() || !this.isRunning()) return;
+    const earliest = this.nextDueAt();
     if (!earliest) return;
     const delay = Math.max(0, Math.min(new Date(earliest).getTime() - Date.now(), MAX_DELAY));
     this.#timer = setTimeout(() => {
@@ -46,6 +46,51 @@ export class RoutineTimer {
       void this.#fire();
     }, delay);
     this.#timer.unref?.();
+  }
+
+  /** The earliest due time of all sources, or null when no routine is scheduled. */
+  nextDueAt(): string | null {
+    let earliest: string | null = null;
+    for (const source of this.sources()) {
+      const dueAt = source.nextDueAt();
+      if (dueAt && (!earliest || dueAt < earliest)) earliest = dueAt;
+    }
+    return earliest;
+  }
+
+  /**
+   * The system is going to sleep. A timer left armed can still fire in a dark wake, where the
+   * network is down and the run waits until the full wake, so each one becomes a queued duplicate.
+   */
+  suspend(): void {
+    this.#suspended = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = null;
+  }
+
+  /** Every occurrence missed while suspended collapses into one run in the next pass. */
+  resume(): void {
+    this.#suspended = false;
+    this.arm();
+  }
+
+  /**
+   * Holds routine firing apart from a system sleep, so a resume from sleep does not release it.
+   * A routine that comes due meanwhile runs when `release` is called, or when the app starts again.
+   */
+  hold(): void {
+    this.#held = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = null;
+  }
+
+  release(): void {
+    this.#held = false;
+    this.arm();
+  }
+
+  #paused(): boolean {
+    return this.#suspended || this.#held;
   }
 
   dispose(): void {
@@ -62,8 +107,10 @@ export class RoutineTimer {
     this.#firing = true;
     try {
       for (const source of this.sources()) {
+        // A suspend or a hold can arrive while an enqueue awaits. The rest stays due and fires later.
+        if (this.#paused()) break;
         try {
-          await source.processDue(now);
+          await source.processDue(now, () => !this.#paused());
         } catch (error) {
           this.onError("routine_scheduler_failed", error);
         }

@@ -1,4 +1,17 @@
-import { access, chmod, copyFile, link, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  cp,
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import type { ManagedRuntimeId } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
@@ -7,15 +20,24 @@ import type { AgentRuntimeLock } from "../../scripts/agent-runtime-lock";
 import {
   ANTIGRAVITY_MANIFEST,
   antigravityHarnessName,
+  CURSOR_MANIFEST,
   parseAntigravityVersion,
   parseBunVersion,
   parseClaudeVersion,
+  parseClineVersion,
   parseCodexVersion,
+  parseCursorManifestVersion,
   parseGrokVersion,
   parseOpencodeVersion,
 } from "../backend/cli";
 import { sha256File } from "../backend/file-hash";
-import { assertSafeArchive, extractArchive, extractZipFiles, rejectNonRegularFiles } from "./provider-runtime-archive";
+import {
+  assertSafeArchive,
+  extractArchive,
+  extractZipFiles,
+  extractZipTree,
+  rejectNonRegularFiles,
+} from "./provider-runtime-archive";
 
 export type RuntimeTarget = "darwin-arm64" | "darwin-x64" | "linux-x64" | "linux-arm64" | "win32-x64";
 
@@ -96,6 +118,23 @@ export interface ProviderRuntimeDescriptor {
 }
 
 const CODEX_ARCHIVE_ROOTS = ["bin", "codex-package.json", "codex-path", "codex-resources"];
+
+/** The one folder of a Cursor archive, which the install renames to `bin`. */
+const CURSOR_ARCHIVE_ROOT = "dist-package";
+
+/** Where Cursor publishes one build for one target. The build names the folder. */
+export function cursorPackageUrl(
+  distribution: string,
+  version: string,
+  artifact: AgentRuntimeLock["cursor"]["artifacts"][RuntimeTarget],
+): string {
+  return `${distribution}/${version}/${artifact.platformDirectory}/${artifact.architecture}/${artifact.asset}`;
+}
+
+/** Cline tags each CLI release `cli-v<version>`, apart from the tags of its editor extension. */
+function clineTag(version: string): string {
+  return `cli-v${version}`;
+}
 
 /** The lock's hash for a file of a pinned version; an upstream release's file has none to compare. */
 function pinnedHash(spec: RuntimeSpec, sha256: string): string | null {
@@ -434,6 +473,124 @@ const PROVIDER_RUNTIME_DESCRIPTORS: Record<ManagedRuntimeId, ProviderRuntimeDesc
     // manifest with the version that OpenBot wrote, not with the programs.
     versionFile: ANTIGRAVITY_MANIFEST,
     parseVersion: parseAntigravityVersion,
+  },
+  cursor: {
+    runtime: "cursor",
+    spec: (target, lock) => {
+      const artifact = lock.cursor.artifacts[target];
+      return {
+        runtime: "cursor",
+        target,
+        version: lock.cursor.version,
+        packageVersion: lock.cursor.version,
+        source: "lock",
+        url: cursorPackageUrl(lock.cursor.distribution, lock.cursor.version, artifact),
+        archiveDigest: { algorithm: "sha256", hex: artifact.assetSha256 },
+        downloadBytes: artifact.downloadBytes,
+        installedBytes: artifact.installedBytes,
+        executableName: artifact.executable,
+      };
+    },
+    // The launcher starts the Node.js runtime and the script beside it, so the whole folder goes to
+    // `bin/`. The archive has no licence file; the manifest names the terms Cursor publishes instead.
+    // GNU tar on Linux reads no zip, so the Windows zip is read by OpenBot.
+    stage: async ({ spec, downloadedPath, staging, lock }) => {
+      const message = sourceText("error.provider.cursorArchivePath");
+      if (spec.target === "win32-x64") {
+        await extractZipTree(downloadedPath, staging, CURSOR_ARCHIVE_ROOT, message);
+      } else {
+        await assertSafeArchive(downloadedPath, [CURSOR_ARCHIVE_ROOT], message);
+        await extractArchive(downloadedPath, staging);
+      }
+      await rejectNonRegularFiles(staging);
+      await rename(join(staging, CURSOR_ARCHIVE_ROOT), join(staging, "bin"));
+      await access(join(staging, "bin", spec.executableName));
+      await writeFile(
+        join(staging, CURSOR_MANIFEST),
+        layoutManifest({
+          version: spec.version,
+          target: spec.target,
+          executable: `bin/${spec.executableName}`,
+          licenseUrl: lock.cursor.licenseUrl,
+        }),
+      );
+    },
+    verify: async (root, spec, lock) => {
+      const files = Object.entries(lock.cursor.artifacts[spec.target].files);
+      const hashes = await Promise.all(files.map(([name]) => sha256File(join(root, "bin", name))));
+      if (files.some(([, sha256], index) => hashes[index] !== sha256)) {
+        throw new Error(sourceText("error.provider.cursorChecksum"));
+      }
+    },
+    // The Windows launcher is a `.cmd` file, which `execFile` cannot start, so the version comes from
+    // the manifest that OpenBot wrote, as for Antigravity.
+    versionFile: CURSOR_MANIFEST,
+    parseVersion: parseCursorManifestVersion,
+  },
+  cline: {
+    runtime: "cline",
+    spec: (target, lock) => {
+      const artifact = lock.cline.artifacts[target];
+      return {
+        runtime: "cline",
+        target,
+        version: lock.cline.version,
+        packageVersion: lock.cline.version,
+        source: "lock",
+        url: `${lock.cline.registry}/${artifact.package}/-/${artifact.asset}`,
+        archiveDigest: { algorithm: "sha256", hex: artifact.assetSha256 },
+        downloadBytes: artifact.downloadBytes,
+        installedBytes: artifact.installedBytes,
+        executableName: artifact.executable,
+      };
+    },
+    stage: async ({ spec, downloadedPath, staging, lock, downloadSmallFile }) => {
+      const artifact = lock.cline.artifacts[spec.target];
+      await withNpmPackage(
+        downloadedPath,
+        staging,
+        {
+          name: artifact.package,
+          version: spec.packageVersion,
+          archivePathError: sourceText("error.provider.clineArchivePath"),
+          mismatchError: sourceText("error.provider.clinePackageMismatch"),
+        },
+        async (packageRoot) => {
+          // The platform tarball carries no licence, so it comes from the tagged source like OpenCode's.
+          const license = await downloadSmallFile(
+            `${lock.cline.repository}/raw/${encodeURIComponent(clineTag(spec.version))}/LICENSE`,
+            pinnedHash(spec, lock.cline.licenseSha256),
+          );
+          // The CLI finds its plugin bootstrap and hub webview from the folder of its executable, so
+          // the whole package keeps its layout. Only the npm manifest stays out.
+          const entries = (await readdir(packageRoot)).filter((entry) => entry !== "package.json");
+          await Promise.all(
+            entries.map((entry) => cp(join(packageRoot, entry), join(staging, entry), { recursive: true })),
+          );
+          await Promise.all([
+            writeFile(join(staging, "LICENSE"), license),
+            writeFile(
+              join(staging, "cline-package.json"),
+              layoutManifest({ version: spec.version, target: spec.target, executable: `bin/${spec.executableName}` }),
+            ),
+          ]);
+          if (spec.target !== "win32-x64") await chmod(join(staging, "bin", spec.executableName), 0o755);
+        },
+      );
+    },
+    verify: async (root, spec, lock) => {
+      const artifact = lock.cline.artifacts[spec.target];
+      const [executable, bootstrap, license] = await Promise.all([
+        sha256File(join(root, "bin", spec.executableName)),
+        sha256File(join(root, "extensions", "plugin-sandbox-bootstrap.js")),
+        sha256File(join(root, "LICENSE")),
+      ]);
+      if (executable !== artifact.binarySha256 || bootstrap !== artifact.bootstrapSha256) {
+        throw new Error(sourceText("error.provider.clineChecksum"));
+      }
+      if (license !== lock.cline.licenseSha256) throw new Error(sourceText("error.provider.clineLicenseChecksum"));
+    },
+    parseVersion: parseClineVersion,
   },
   bun: {
     runtime: "bun",

@@ -1,5 +1,6 @@
 import type {
   AvatarImageInput,
+  HostedSitesDesktopApi,
   HostStatus,
   InviteSummary,
   ServerNotificationLevel,
@@ -20,20 +21,31 @@ import {
   Button,
   ChevronRight,
   Download,
+  Globe2,
   HardDrive,
   Monitor,
+  Plug,
   RefreshCw,
   Settings,
   ShieldCheck,
   Sparkles,
   Tabs,
   Text,
-  toast,
   UsersRound,
 } from "@openbot/ui";
+import type { AgentProfile } from "@openbot/ui/data";
 import { SaveBarDock, SettingsDialogShell } from "@openbot/ui/features/settings/SettingsDialogShell";
+import { SettingsHostedSitesTab } from "@openbot/ui/features/settings/SettingsHostedSitesTab";
+import {
+  createSettingsHostedSitesStore,
+  type HostedSiteDeleteResult,
+} from "@openbot/ui/features/settings/stores/hosted-sites-store";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
+import { actionToast } from "../../action-toast";
+import { ConnectorsPanel } from "../connectors/ConnectorsPanel";
+import type { GitHubConnectorController } from "../connectors/github-connector";
+import type { SlackConnectorController } from "../connectors/slack-connector";
 import { type ServerStorageOptions, ServerStoragePanel } from "../files/ServerStoragePanel";
 import { type HostProviderSettings, HostProviderSettingsPanel } from "../settings/ProviderSettingsSection";
 import type { McpServerConfig, McpTestResult } from "./mcp-servers";
@@ -107,12 +119,34 @@ export interface ServerSettingsModalProps {
    */
   storage?: ServerStorageOptions | undefined;
   /**
-   * The Providers section appears only when a caller supplies this. The desktop app passes nothing:
-   * its own Settings holds the providers of every host it administers.
+   * The Sites section appears only when a caller supplies this: this computer, or a remote host with
+   * `hosted-sites-v1`. Every member reads the list; an owner or admin can delete.
+   */
+  hostedSites?: ServerHostedSitesOptions | undefined;
+  /**
+   * The Providers section: this computer, or a remote host with `providers-v1` that this account
+   * administers. A member gets no section.
    */
   providers?: HostProviderSettings | undefined;
-  /** The Import section appears only when a caller supplies this: agents import into the local server. */
-  agentImport?: ServerImportOptions;
+  /**
+   * For a server that the window has not selected. The provider state belongs to the selected server,
+   * so the Providers section shows a note and this action in place of the list.
+   */
+  onSwitchToManageProviders?: (() => void) | undefined;
+  /**
+   * The Import section appears only when a caller supplies this: the local server, or a remote host
+   * with `agent-import-v1`. Any member can import.
+   */
+  agentImport?: ServerImportOptions | undefined;
+  /**
+   * The Connectors section appears only when a caller supplies one of these: the GitHub connection
+   * and the Slack apps belong to this computer, so a remote server passes neither, and a build
+   * without a GitHub App passes no GitHub.
+   */
+  githubConnector?: GitHubConnectorController | undefined;
+  slackConnector?: SlackConnectorController | undefined;
+  /** This computer's agents, for the Slack page. */
+  connectorAgents?: AgentProfile[] | undefined;
   /**
    * The Updates section appears only when a caller supplies this: a remote host with
    * `host-update-v1` that this member administers.
@@ -122,15 +156,25 @@ export interface ServerSettingsModalProps {
   initialSection?: ServerSettingsSection | null;
 }
 
+export interface ServerHostedSitesOptions {
+  /** Called with this dialog's server. */
+  api: Pick<HostedSitesDesktopApi, "list" | "delete">;
+  onOpenSite: (url: string) => void;
+  /** Called as a deletion starts. It returns the call that records the result. */
+  trackDelete?: () => (result: HostedSiteDeleteResult) => void;
+}
+
 export type ServerSettingsSection =
   | "general"
   | "members"
   | "desktop"
   | "mcp"
   | "storage"
+  | "sites"
   | "providers"
   | "updates"
-  | "import";
+  | "import"
+  | "connectors";
 type Section = ServerSettingsSection;
 
 const sections = {
@@ -139,9 +183,11 @@ const sections = {
   desktop: { title: "server.settings.desktopTitle", description: "server.settings.desktopDescription" },
   mcp: { title: "server.settings.mcpTitle", description: "server.settings.mcpDescription" },
   storage: { title: "server.settings.storageTitle", description: "server.settings.storageDescription" },
+  sites: { title: "server.settings.hostedSitesTitle", description: "server.settings.hostedSitesDescription" },
   providers: { title: "server.settings.providersTitle", description: "server.settings.providersDescription" },
   updates: { title: "server.settings.updatesTitle", description: "server.settings.updatesDescription" },
   import: { title: "server.settings.importTitle", description: "server.settings.importDescription" },
+  connectors: { title: "server.settings.connectorsTitle", description: "server.settings.connectorsDescription" },
 } as const satisfies Record<Section, { title: AppTextKey; description: AppTextKey }>;
 
 export function ServerSettingsModal(props: ServerSettingsModalProps) {
@@ -180,7 +226,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
       await action();
       return true;
     } catch (error) {
-      toast.error(t("server.settings.actionFailedTitle"), {
+      actionToast.error(t("server.settings.actionFailedTitle"), {
         description: errorMessage(error, t("server.settings.actionFailed")),
       });
       return false;
@@ -199,11 +245,28 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
     busy,
     run,
     showCopyError() {
-      toast.error(t("server.settings.copyFailedTitle"), { description: t("server.settings.copyFailed") });
+      actionToast.error(t("server.settings.copyFailedTitle"), { description: t("server.settings.copyFailed") });
     },
   };
   const general = createServerGeneralSection(host, { onSetUpDesktop: () => setSection("desktop") });
   const members = createServerMembersSection(host);
+  const hostedSites = createSettingsHostedSitesStore(
+    {
+      get open() {
+        return props.open;
+      },
+      get serverId() {
+        return props.server.id;
+      },
+      get hostedSitesApi() {
+        return props.hostedSites?.api;
+      },
+      get trackDelete() {
+        return props.hostedSites?.trackDelete;
+      },
+    },
+    () => section() === "sites",
+  );
 
   /** Publishes the reserve to the shell stylesheet, which spends it as the panel's end padding. */
   createEffect(
@@ -255,6 +318,13 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
     },
   );
 
+  createEffect(
+    () => props.open && section() === "providers" && props.providers !== undefined,
+    (visible) => {
+      if (visible) untrack(() => props.providers?.onShown?.());
+    },
+  );
+
   /** The latch keeps a section the user is already in from being reported again on every change. */
   let mcpSectionVisible = false;
   createEffect(
@@ -279,9 +349,11 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
         value === "desktop" ||
         value === "mcp" ||
         value === "storage" ||
+        value === "sites" ||
         value === "providers" ||
         value === "updates" ||
-        value === "import"
+        value === "import" ||
+        value === "connectors"
       )
         setSection(value);
     },
@@ -454,7 +526,13 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 <span>{t(sections.storage.title)}</span>
               </Tabs.Trigger>
             </Show>
-            <Show when={props.providers}>
+            <Show when={props.hostedSites}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="sites">
+                <Globe2 aria-hidden="true" />
+                <span>{t(sections.sites.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.providers || props.onSwitchToManageProviders}>
               <Tabs.Trigger class="settings-modal-nav-item" value="providers">
                 <Sparkles aria-hidden="true" />
                 <span>{t(sections.providers.title)}</span>
@@ -470,6 +548,12 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
               <Tabs.Trigger class="settings-modal-nav-item" value="import">
                 <Download aria-hidden="true" />
                 <span>{t(sections.import.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.githubConnector || props.slackConnector}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="connectors">
+                <Plug aria-hidden="true" />
+                <span>{t(sections.connectors.title)}</span>
               </Tabs.Trigger>
             </Show>
           </Tabs.List>
@@ -516,12 +600,49 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
             </Tabs.Content>
           )}
         </Show>
-        <Show when={props.providers}>
-          {(providers) => (
-            <Tabs.Content value="providers" class="settings-modal-tab-panel server-settings-panel" data-tab="providers">
-              <HostProviderSettingsPanel {...providers()} hostName={props.server.name} selectMount={modalElement()} />
+        <Show when={props.hostedSites}>
+          {(sites) => (
+            <Tabs.Content value="sites" class="settings-modal-tab-panel server-settings-panel" data-tab="sites">
+              <SettingsHostedSitesTab
+                store={hostedSites}
+                available
+                canDelete={serverRoleCanAdminister(props.server)}
+                onOpenSite={sites().onOpenSite}
+              />
             </Tabs.Content>
           )}
+        </Show>
+        <Show when={props.providers || props.onSwitchToManageProviders}>
+          <Tabs.Content value="providers" class="settings-modal-tab-panel server-settings-panel" data-tab="providers">
+            <Show
+              when={props.providers}
+              fallback={
+                <Alert>
+                  <AlertIcon>
+                    <Sparkles />
+                  </AlertIcon>
+                  <AlertContent>
+                    <AlertDescription>
+                      {t("server.settings.providersSwitchNote", { name: props.server.name })}
+                    </AlertDescription>
+                  </AlertContent>
+                  <AlertActions>
+                    <Button type="button" size="sm" onClick={() => props.onSwitchToManageProviders?.()}>
+                      {t("server.settings.providersSwitch")}
+                    </Button>
+                  </AlertActions>
+                </Alert>
+              }
+            >
+              {(providers) => (
+                <HostProviderSettingsPanel
+                  {...providers()}
+                  hostName={local() ? undefined : props.server.name}
+                  selectMount={modalElement()}
+                />
+              )}
+            </Show>
+          </Tabs.Content>
         </Show>
         <Show when={props.hostUpdate}>
           {(hostUpdate) => (
@@ -538,9 +659,21 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
         <Show when={props.agentImport}>
           {(agentImport) => (
             <Tabs.Content value="import" class="settings-modal-tab-panel server-settings-panel" data-tab="import">
-              <ServerImportPanel {...agentImport()} />
+              {/* Keyed: an open export belongs to one server, so another server starts a new panel. */}
+              <Show when={props.server.id} keyed>
+                {(serverId) => <ServerImportPanel serverId={serverId} {...agentImport()} />}
+              </Show>
             </Tabs.Content>
           )}
+        </Show>
+        <Show when={props.githubConnector || props.slackConnector}>
+          <Tabs.Content value="connectors" class="settings-modal-tab-panel server-settings-panel" data-tab="connectors">
+            <ConnectorsPanel
+              github={props.githubConnector}
+              slack={props.slackConnector}
+              agents={props.connectorAgents ?? []}
+            />
+          </Tabs.Content>
         </Show>
       </SettingsDialogShell>
 

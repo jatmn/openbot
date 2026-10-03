@@ -6,11 +6,13 @@ import { messages as agentSettings } from "./agentSettings";
 import { messages as agentTemplate } from "./agentTemplate";
 import { messages as app } from "./app";
 import { messages as attachment } from "./attachment";
+import { messages as billing } from "./billing";
 import { messages as browser } from "./browser";
 import { messages as channel } from "./channel";
 import { messages as chat } from "./chat";
 import { messages as composer } from "./composer";
 import { messages as computerUse } from "./computerUse";
+import { messages as connector } from "./connector";
 import { messages as conversation } from "./conversation";
 import { messages as customProvider } from "./customProvider";
 import { messages as dialog } from "./dialog";
@@ -21,6 +23,7 @@ import { messages as marketplace } from "./marketplace";
 import { messages as mcp } from "./mcp";
 import { messages as memory } from "./memory";
 import { messages as menu } from "./menu";
+import { messages as messaging } from "./messaging";
 import { messages as notification } from "./notification";
 import { messages as onboarding } from "./onboarding";
 import { messages as plugin } from "./plugin";
@@ -64,6 +67,7 @@ export const ja = {
   ...startup,
   ...window,
   ...settings,
+  ...billing,
   ...provider,
   ...app,
   ...composer,
@@ -87,6 +91,7 @@ export const ja = {
   ...team,
   ...remoteDesktop,
   ...mcp,
+  ...messaging,
   ...webClient,
   ...account,
   ...onboarding,
@@ -99,4 +104,5 @@ export const ja = {
   ...files,
   ...island,
   ...computerUse,
+  ...connector,
 } as const satisfies PartialTranslation<AppMessages>;

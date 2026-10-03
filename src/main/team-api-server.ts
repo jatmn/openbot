@@ -26,15 +26,20 @@ import { isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import {
   AGENT_ADMIN_CAPABILITY,
+  AGENT_IMPORT_CAPABILITY,
   AGENT_INSTALL_CAPABILITY,
+  AGENT_PUBLISH_CAPABILITY,
   AGENT_UPDATE_CAPABILITY,
   CHANNEL_DELETE_CAPABILITY,
   HOST_ADMIN_CAPABILITY,
   HOST_UPDATE_CAPABILITY,
+  HOSTED_SITES_CAPABILITY,
   isTeamCurrentCapability,
+  LIVE_ACTIVITY_PUSH_CAPABILITY,
   MCP_SERVERS_CAPABILITY,
   PROVIDERS_ADMIN_CAPABILITY,
   PROVIDERS_RUNTIMES_V2_CAPABILITY,
+  PROVIDERS_SIGN_IN_V3_CAPABILITY,
   SHARED_TABLES_CAPABILITY,
   SKILLS_ADMIN_CAPABILITY,
   SKILLS_EVENTS_CAPABILITY,
@@ -75,9 +80,15 @@ import { McpServerError } from "../backend/mcp-server-store";
 import type { TeamChatStore } from "../backend/team-chat-store";
 import { LifecycleGate } from "./lifecycle-gate";
 import { RemoteScreenError } from "./remote-screen-gateway";
+import { isClientUse } from "./team-api/client-use";
 import type { TeamApiOptions, TeamApiSidebarLayout } from "./team-api/dependencies";
 import { HttpError } from "./team-api/http-error";
-import { hiddenAgentView, hiddenProviderAgentIds, legacyProviderView } from "./team-api/provider-visibility";
+import {
+  hiddenAgentView,
+  hiddenProviderAgentIds,
+  isPeerHiddenProvider,
+  legacyProviderView,
+} from "./team-api/provider-visibility";
 import type { RouteOutcome, TeamApiRequestContext } from "./team-api/request-context";
 import {
   bearerToken,
@@ -91,7 +102,9 @@ import {
   stringField,
 } from "./team-api/request-helpers";
 import { routeAgentAdmin } from "./team-api/route-agent-admin";
+import { routeAgentImport } from "./team-api/route-agent-import";
 import { routeAgentInstall } from "./team-api/route-agent-install";
+import { routeAgentPublish } from "./team-api/route-agent-publish";
 import { routeAgents } from "./team-api/route-agents";
 import { routeBrowser } from "./team-api/route-browser";
 import { routeChannels } from "./team-api/route-channels";
@@ -100,6 +113,8 @@ import { routeDirect } from "./team-api/route-direct";
 import { routeFiles } from "./team-api/route-files";
 import { routeHostAdmin } from "./team-api/route-host-admin";
 import { routeHostUpdate } from "./team-api/route-host-update";
+import { routeHostedSites } from "./team-api/route-hosted-sites";
+import { routeLiveActivityPush } from "./team-api/route-live-activity-push";
 import { routeMcpServers } from "./team-api/route-mcp";
 import { routeProviders } from "./team-api/route-providers";
 import { routeRemoteScreen } from "./team-api/route-remote-screen";
@@ -180,6 +195,7 @@ export class TeamApiServer {
   readonly #lifecycle = new LifecycleGate<number>();
   #port: number | null = null;
   #heartbeat: ReturnType<typeof setInterval> | null = null;
+  #lastClientUseAt: number | null = null;
   #agentListener: ((event: AgentEvent) => void) | null = null;
   #sidebarLayoutListener: ((layout: SidebarLayoutSnapshot) => void) | null = null;
   #localTypingAgentId: string | null = null;
@@ -338,6 +354,19 @@ export class TeamApiServer {
       }),
       updatedAt: new Date().toISOString(),
     };
+  }
+
+  /** Remote clients with an open event stream. Each WebRTC client opens one after it signs in. */
+  connectedClientCount(): number {
+    return this.#eventClients.size;
+  }
+
+  /**
+   * The last user action from a client - a send, a change, or a typing event - or null for none. Reads,
+   * polls and mark-read do not count: a client that is only open does not keep a hosted server running.
+   */
+  lastClientUseAt(): number | null {
+    return this.#lastClientUseAt;
   }
 
   setLocalTyping(agentId: string | null, typing: boolean): void {
@@ -559,15 +588,9 @@ export class TeamApiServer {
       if (!authenticated || !token) {
         return this.#json(response, 401, { error: sourceText("error.team.authenticationRequired") });
       }
+      if (isClientUse(method, url.pathname)) this.#lastClientUseAt = Date.now();
       const context = this.#requestContext(request, response, url, token, authenticated);
-      const agents = this.#options.agents.listAgents();
-      const hidden = hiddenProviderAgentIds(agents, context.protocol);
-      for (const id of this.#unrepresentableAgentIds(
-        agents.filter((agent) => !hidden.has(agent.id)),
-        context.protocol,
-        context.capabilities,
-      ))
-        hidden.add(id);
+      const hidden = this.#hiddenAgentIds(context.protocol, context.capabilities);
       // Every protocol gets the projection, also with no hidden agent: a provider status row, a
       // model or an auth state of a local-only provider can be in the response.
       const responseRoute = this.#responseRoutes.get(response);
@@ -579,6 +602,11 @@ export class TeamApiServer {
       ) {
         throw new HttpError(404, sourceText("error.team.agentNotFound"));
       }
+      // A template, a marketplace agent and an imported one start where a new agent does.
+      const newAgentHidden = () => {
+        const provider = this.#options.agents.newAgentProvider();
+        return provider !== null && isPeerHiddenProvider(provider, context.protocol);
+      };
 
       // First module that does not say "unmatched" wins, and the dispatcher then does nothing at
       // all - work after a `writeHead` is an `ERR_HTTP_HEADERS_SENT` thrown into the catch below,
@@ -601,14 +629,23 @@ export class TeamApiServer {
       )
         return;
       if ((await routeStorage(context, this.#options.storage)) === "handled") return;
-      if ((await routeAgentAdmin(context, this.#options.admin)) === "handled") return;
-      if ((await routeSkillsAdmin(context, this.#options.admin)) === "handled") return;
+      if ((await routeHostedSites(context, this.#options.hostedSites)) === "handled") return;
+      if ((await routeAgentAdmin(context, this.#options.admin, hidden)) === "handled") return;
+      if ((await routeSkillsAdmin(context, this.#options.admin, hidden)) === "handled") return;
       if ((await routeSharedTables(context, this.#options.admin)) === "handled") return;
-      if ((await routeAgentInstall(context, this.#options.admin)) === "handled") return;
+      if ((await routeAgentInstall(context, this.#options.admin, hidden, newAgentHidden)) === "handled") return;
+      if ((await routeAgentPublish(context, this.#options.admin, hidden)) === "handled") return;
       if ((await routeProviders(context, this.#options.admin)) === "handled") return;
       if ((await routeHostAdmin(context, this.#options.admin)) === "handled") return;
       if ((await routeHostUpdate(context, this.#options.admin)) === "handled") return;
       if ((await routeContextReset(context, this.#options.agents, hidden)) === "handled") return;
+      if ((await routeAgentImport(context, this.#options.agentImport, newAgentHidden)) === "handled") return;
+      if (
+        (await routeLiveActivityPush(context, this.#options.liveActivityPush, () =>
+          this.#hiddenAgentIds(context.protocol, context.capabilities),
+        )) === "handled"
+      )
+        return;
       if ((await this.#routeAgents(context)) === "handled") return;
 
       // The only 404 in the Team API.
@@ -627,6 +664,12 @@ export class TeamApiServer {
       const message = expected ? error.message : sourceText("error.team.requestFailed");
       const code = error instanceof RemoteScreenError ? error.code : undefined;
       if (!expected) (this.#options.logger ?? logger).error("Team API request failed:", toLogValue(error));
+      // A streamed file can fail after its head is on the wire. A second head is not possible, so
+      // the socket closes and the client sees an incomplete download.
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
       return this.#json(response, status, { error: message, ...(code ? { code } : {}) });
     }
   }
@@ -711,7 +754,7 @@ export class TeamApiServer {
     capabilities: ReadonlySet<string>,
     options: { preserveSemanticTags?: boolean } = {},
   ): string | null {
-    const protocol = capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
+    const protocol = eventProtocol(capabilities);
     const hidden = hiddenProviderAgentIds(this.#options.agents.listAgents(), protocol);
     const visible = protocol === 1 ? legacyProviderView(event, hidden) : hiddenAgentView(event, hidden, protocol);
     if (!isAgentEvent(visible) && !isTeamRealtimeEvent(visible)) return null;
@@ -751,6 +794,14 @@ export class TeamApiServer {
       // `eventCapability` above has already kept an optional event from a client without its capability.
       const optional = optionalTeamEvent(event);
       if (optional) {
+        // The base events go through the provider view; an optional event that names a hidden agent is left out.
+        if (
+          "agentId" in optional &&
+          hiddenProviderAgentIds(this.#options.agents.listAgents(), eventProtocol(connection.capabilities)).has(
+            optional.agentId,
+          )
+        )
+          continue;
         outgoing = JSON.stringify(optional);
       } else if (event.type === "conversation" && supportsRuntimeSnapshots) {
         conversationInvalidation ??=
@@ -807,7 +858,9 @@ export class TeamApiServer {
           encodingOptions,
         ) ?? undefined;
       if (!completionSnapshot) continue;
-      if (Buffer.byteLength(completionSnapshot) > AGENT_RUNTIME_SNAPSHOT_BYTES_LIMIT) return;
+      // The snapshot is this client's own. It does not fit, so this client loses the snapshot and
+      // keeps the turn, and the clients after it in the loop still get the turn.
+      if (Buffer.byteLength(completionSnapshot) > AGENT_RUNTIME_SNAPSHOT_BYTES_LIMIT) continue;
       client.send(completionSnapshot);
     }
   }
@@ -906,7 +959,10 @@ export class TeamApiServer {
         client.close(1003, "Invalid team event payload");
       }
     });
+    // iOS can suspend a phone before it says that it goes away. Its closed connection says so.
+    const sessionId = this.#options.store.authenticateSession(token)?.sessionId;
     client.once("close", () => {
+      if (sessionId) this.#options.liveActivityPush?.disconnected(sessionId);
       if (connection.typingTimer) clearTimeout(connection.typingTimer);
       if (connection.directTypingTimer) clearTimeout(connection.directTypingTimer);
       const directTypingRecipientId = connection.directTypingRecipientId;
@@ -965,6 +1021,7 @@ export class TeamApiServer {
   }
 
   #setClientTyping(connection: EventClientState, agentId: string | null): void {
+    this.#lastClientUseAt = Date.now();
     const changed = connection.typingAgentId !== agentId;
     connection.typingAgentId = agentId;
     if (connection.typingTimer) clearTimeout(connection.typingTimer);
@@ -981,6 +1038,7 @@ export class TeamApiServer {
   }
 
   #setClientDirectTyping(connection: EventClientState, recipientMemberId: string | null): void {
+    this.#lastClientUseAt = Date.now();
     const previousRecipientId = connection.directTypingRecipientId;
     const changed = previousRecipientId !== recipientMemberId;
     const recipientAlreadyActive = recipientMemberId
@@ -1158,6 +1216,19 @@ export class TeamApiServer {
     return hidden;
   }
 
+  /** The agents this client cannot see: a provider its protocol does not know, or one it cannot describe. */
+  #hiddenAgentIds(protocol: number, capabilities: ReadonlySet<string>): Set<string> {
+    const agents = this.#options.agents.listAgents();
+    const hidden = hiddenProviderAgentIds(agents, protocol);
+    for (const id of this.#unrepresentableAgentIds(
+      agents.filter((agent) => !hidden.has(agent.id)),
+      protocol,
+      capabilities,
+    ))
+      hidden.add(id);
+    return hidden;
+  }
+
   #protocolSupport(): TeamProtocolSupportV1 {
     return {
       appVersion: this.#options.appVersion ?? "0.0.0",
@@ -1171,6 +1242,7 @@ export class TeamApiServer {
           return this.#options.remoteScreen?.checkSetup !== undefined && this.#options.remoteScreen?.test !== undefined;
         if (capability === MCP_SERVERS_CAPABILITY) return this.#options.mcpServers !== undefined;
         if (capability === STORAGE_CAPABILITY) return this.#options.storage !== undefined;
+        if (capability === HOSTED_SITES_CAPABILITY) return this.#options.hostedSites !== undefined;
         if (capability === AGENT_ADMIN_CAPABILITY) return this.#options.admin?.agents !== undefined;
         if (capability === SKILLS_ADMIN_CAPABILITY) return this.#options.admin?.skills !== undefined;
         if (capability === SKILLS_EVENTS_CAPABILITY) return this.#options.skills !== undefined;
@@ -1180,10 +1252,14 @@ export class TeamApiServer {
             this.#options.admin?.marketplaceAgents !== undefined && this.#options.admin?.agentTemplates !== undefined
           );
         if (capability === AGENT_UPDATE_CAPABILITY) return this.#options.admin?.marketplaceAgents !== undefined;
+        if (capability === AGENT_PUBLISH_CAPABILITY) return this.#options.admin?.agentTemplates !== undefined;
         if (capability === PROVIDERS_ADMIN_CAPABILITY || capability === PROVIDERS_RUNTIMES_V2_CAPABILITY)
           return this.#options.admin?.providers !== undefined;
+        if (capability === PROVIDERS_SIGN_IN_V3_CAPABILITY) return this.#options.admin?.providers?.pasteSignIn === true;
         if (capability === HOST_ADMIN_CAPABILITY) return this.#options.admin?.identity !== undefined;
         if (capability === HOST_UPDATE_CAPABILITY) return this.#options.admin?.update !== undefined;
+        if (capability === AGENT_IMPORT_CAPABILITY) return this.#options.agentImport !== undefined;
+        if (capability === LIVE_ACTIVITY_PUSH_CAPABILITY) return this.#options.liveActivityPush !== undefined;
         return true;
       }),
     };
@@ -1292,6 +1368,11 @@ function unavailableSidebarLayout(): TeamApiSidebarLayout {
     on: () => undefined,
     off: () => undefined,
   };
+}
+
+/** The protocol that an event connection's capabilities describe, as `#encodeProviderEvent` encodes it. */
+function eventProtocol(capabilities: ReadonlySet<string>): 1 | 4 | 5 {
+  return capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
 }
 
 function eventCapability(event: AgentEvent): TeamCurrentCapability | null {

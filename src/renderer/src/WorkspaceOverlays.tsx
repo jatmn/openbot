@@ -1,10 +1,17 @@
 import type { CentralAuthUser, ServerSummary } from "@openbot/contracts/ipc";
 import type { CustomAgentSettingsApi } from "@openbot/ui/features/custom-providers/CustomAgentSettings";
+import { providerDiagnosticsText } from "@openbot/ui/features/provider-diagnostics/provider-diagnostics";
+import type { HostedSiteDeleteResult } from "@openbot/ui/features/settings/stores/hosted-sites-store";
 import { currentText } from "@openbot/ui/text";
-import { createMemo, Loading, Show } from "solid-js";
+import { createEffect, Loading, Show } from "solid-js";
+import { actionToast } from "./action-toast";
+import { desktopAnalytics } from "./analytics";
 import { appPort } from "./app-port";
 import { useAuth } from "./features/account/account-context";
+import { resolveCreationModel } from "./features/agents/agent-creation-model";
 import { useAgents } from "./features/agents/agents-context";
+import { createGitHubConnector, type GitHubConnectorController } from "./features/connectors/github-connector";
+import { createSlackConnector } from "./features/connectors/slack-connector";
 import { useCustomAgents } from "./features/custom-agents/custom-agents-context";
 import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
 import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
@@ -12,13 +19,19 @@ import type { ServerStorageOptions } from "./features/files/ServerStoragePanel";
 import { useSetup } from "./features/onboarding/onboarding-context";
 import { useSetupProviderProps } from "./features/onboarding/setup-provider-props";
 import { useRemoteDesktop } from "./features/remote-desktop/remote-desktop-context";
+import { AddServerOverlay } from "./features/servers/AddServerOverlay";
 import { mcpToolRuntimeNote } from "./features/servers/mcp-servers";
+import { useServerActions } from "./features/servers/server-actions";
+import { serverCanAdminister, serverSupportsCapability } from "./features/servers/server-capabilities";
 import { useServerSelection } from "./features/servers/server-selection";
 import { useServerSettings } from "./features/servers/server-settings";
 import { useServerSwitch } from "./features/servers/server-switch";
 import { useServers } from "./features/servers/servers-context";
+import type { HostProviderSettings } from "./features/settings/ProviderSettingsSection";
 import { useSettings } from "./features/settings/settings-context";
+import { useSidebar } from "./features/sidebar/sidebar-context";
 import { useUpdates } from "./features/updates/updates-context";
+import { useGlobalSearchSources } from "./global-search-sources";
 import { InitialSetup, RemoteDesktopWorkspace, SettingsModal } from "./lazy-views";
 import { useNavigation } from "./navigation";
 import { usePlatform } from "./platform";
@@ -53,13 +66,30 @@ interface AccountProps {
  * the components here read the desktop contexts and pass them on.
  */
 export function WorkspaceOverlays(props: AccountProps) {
+  const { activeServer } = useServers();
+  const { skillsMarketplaceOpen } = useSettings();
+  const { serverSettingsOpen, serverSettingsTarget } = useServerSettings();
+  /* One GitHub connection of this computer, which Server settings and the Marketplace both show.
+     A build with no GitHub App has none. */
+  const github = createGitHubConnector();
+  const githubFor = (server: ServerSummary | undefined) =>
+    server?.kind === "local" && github.status().available ? github : undefined;
+  /* The overlays mount with the app. A first read that failed then must not hide GitHub for good, and
+     the sign-in can change outside this window, so each window reads the status again when it opens. */
+  createEffect(
+    () => skillsMarketplaceOpen() || serverSettingsOpen(),
+    (open) => {
+      if (open) github.reload();
+    },
+  );
   return (
     <>
       <PermissionsReview account={props.account} />
-      <SkillsMarketplace />
+      <SkillsMarketplace githubConnector={githubFor(activeServer())} />
       <SharedAgentInstall />
       <JoinServer account={props.account} />
-      <ServerSettings />
+      <AddServer />
+      <ServerSettings githubConnector={githubFor(serverSettingsTarget())} />
       <AppSettings account={props.account} />
       <GlobalMessageSearch />
       <RemoteDesktop />
@@ -104,8 +134,15 @@ function PermissionsReview(props: AccountProps) {
  * serves `agent-install-v1`, otherwise to this computer. An agent of a joined server is updated from
  * its listing only when its host serves `agent-update-v1`.
  */
-function SkillsMarketplace() {
-  const { skillsMarketplaceOpen, setSkillsMarketplaceOpen, pendingPluginSlug, setPendingPluginSlug } = useSettings();
+function SkillsMarketplace(props: { githubConnector: GitHubConnectorController | undefined }) {
+  const {
+    skillsMarketplaceOpen,
+    setSkillsMarketplaceOpen,
+    pendingPluginSlug,
+    setPendingPluginSlug,
+    pendingPluginConnect,
+    setPendingPluginConnect,
+  } = useSettings();
   const { agentList, activeAgent, agentStatus, agentSetupOpen, creatingAgent } = useAgents();
   const { selectAgent } = useNavigation();
   const { activeServer } = useServers();
@@ -122,7 +159,12 @@ function SkillsMarketplace() {
       onOpenAgent={selectAgent}
       onAgentInstalled={openInstalledMarketplaceAgent}
       pluginSlug={pendingPluginSlug()}
-      onPluginSlugConsumed={() => setPendingPluginSlug(null)}
+      pluginConnect={pendingPluginConnect()}
+      onPluginSlugConsumed={() => {
+        setPendingPluginSlug(null);
+        setPendingPluginConnect(false);
+      }}
+      githubConnector={props.githubConnector}
     />
   );
 }
@@ -167,17 +209,86 @@ function JoinServer(props: AccountProps) {
   );
 }
 
+/** A hosted server: the plans, the payment, then the setup. */
+function AddServer() {
+  const { servers, addServerOpen, setAddServerOpen, setJoinServerOpen } = useServers();
+  const { select } = useServerActions();
+  const { openAppSettings } = useSettings();
+
+  return (
+    <AddServerOverlay
+      open={addServerOpen()}
+      calls={appPort().hostedServers}
+      servers={servers()}
+      onClose={() => setAddServerOpen(false)}
+      onOpenServer={(serverId) => {
+        setAddServerOpen(false);
+        void select(serverId);
+      }}
+      onContactUs={() => void appPort().openExternal("hosted-server-contact")}
+      onJoinWithInvite={() => {
+        setAddServerOpen(false);
+        setJoinServerOpen(true);
+      }}
+      onManageServers={() => openAppSettings(null, "hosted-servers")}
+    />
+  );
+}
+
 /**
  * Settings for one server, which is any server on the rail rather than the
  * active one - hence the target held by the domain instead of `activeServer()`.
  */
-function ServerSettings() {
+function ServerSettings(props: { githubConnector: GitHubConnectorController | undefined }) {
   const platform = usePlatform();
-  const { hostStatus, setServerMuted, setServerNotificationLevel } = useServers();
+  const { hostStatus, setServerMuted, setServerNotificationLevel, activeServer } = useServers();
   const { selectAgent, selectGlobalSearchMessage } = useNavigation();
   const { selectServer } = useServerSelection();
   const { setPendingAgentSelection } = useServerSwitch();
-  const { toolRuntimeStatuses, providerAdminServerId } = useProviders();
+  const { agentList, agentStatus, modelOptions, serverSetupChoice } = useAgents();
+  const { setupState } = useSetup();
+  const {
+    toolRuntimeStatuses,
+    providerAdminServerId,
+    providerRuntimeStatuses,
+    providerAvailableVersions,
+    providerRuntimeDownloadsAvailable,
+    downloadProviderRuntime,
+    startProviderUpdate,
+    cancelProviderRuntimeDownload,
+    connectProvider,
+    openProviderInstallGuide,
+    restartProvider,
+    cancelProviderRestart,
+    codeLogin,
+    providerKeys,
+    hostCustomProviders,
+  } = useProviders();
+  const localEndpoints = useCustomProviders();
+  const localAgents = useCustomAgents();
+  const detection = useProviderDetection();
+  /** A custom agent is a command on this computer, so only the local server lists or runs one. */
+  const customAgents: CustomAgentSettingsApi = {
+    get agents() {
+      return localAgents.customAgents();
+    },
+    save: localAgents.saveCustomAgent,
+    remove: localAgents.deleteCustomAgent,
+    check: localAgents.checkCustomAgent,
+    // One process group runs every custom agent, so its restart is the restart of all of them.
+    get restartPending() {
+      return agentStatus().providers?.some((provider) => provider.id === "acp" && provider.restartPending) === true;
+    },
+    get lastError() {
+      return agentStatus().providers?.find((provider) => provider.id === "acp")?.lastError;
+    },
+    get diagnostics() {
+      const status = agentStatus().providers?.find((provider) => provider.id === "acp");
+      return status ? providerDiagnosticsText(status) : undefined;
+    },
+    restart: () => restartProvider("acp"),
+    cancelRestart: () => cancelProviderRestart("acp"),
+  };
   /**
    * Whether the tool runtimes the providers context holds are this server's: this computer's, or,
    * over `providers-v1`, those of the host of the joined server on screen.
@@ -185,6 +296,7 @@ function ServerSettings() {
   const holdsToolRuntimes = (server: ServerSummary) =>
     server.kind === "local" ? providerAdminServerId() === undefined : server.id === providerAdminServerId();
   const {
+    openServerSettings,
     serverSettingsTarget,
     serverSettingsSection,
     serverSettingsOpen,
@@ -211,7 +323,28 @@ function ServerSettings() {
     setMcpServerEnabled,
     testMcpServer,
   } = useServerSettings();
-
+  // The Slack Orchestrator runs on this computer, so its picker lists this computer's models: none
+  // while a joined server is on screen, and then it starts on a new agent's default.
+  const { collapseSidebarSection } = useSidebar();
+  const slack = createSlackConnector(
+    undefined,
+    () => {
+      const options = modelOptions();
+      if (activeServer()?.kind !== "local" || options.length === 0) return undefined;
+      return {
+        modelOptions: options,
+        agentStatus: agentStatus(),
+        initial: resolveCreationModel(serverSetupChoice() ?? setupState(), options),
+        customProviders: localEndpoints.customProviders(),
+        customAgents: localAgents.customAgents(),
+      };
+    },
+    // The Integrations section starts collapsed: the orchestrator is not an agent people chat with
+    // every day. The collapse belongs to the local server, the one on screen when Slack connects.
+    (sectionId) => {
+      if (activeServer()?.kind === "local") collapseSidebarSection(sectionId);
+    },
+  );
   // The workspace belongs to the selected server. For another server, the switch comes first and
   // the agent is published for the scope it lands in; a message there opens as its agent's chat.
   const openOnServer = (server: ServerSummary, agentId: string, open: () => void) => {
@@ -220,6 +353,97 @@ function ServerSettings() {
     void selectServer(server.id).then((selected) => {
       if (selected) setPendingAgentSelection(agentId);
     });
+  };
+
+  /**
+   * The providers of the computer the agents of `server` run on: this one, or the host of a joined
+   * server that the account administers over `providers-v1`. The provider state belongs to the
+   * selected server only, so it is read only while `server` is the selected one.
+   */
+  const providerSettings = (server: ServerSummary): HostProviderSettings | undefined => {
+    const local = server.kind === "local";
+    if (!server.active || (!local && server.id !== providerAdminServerId())) return undefined;
+    /**
+     * A named endpoint merges into the `opencode acp` process of that computer. This does not need
+     * `providerRuntimeDownloadsAvailable()`: a build without managed runtime downloads still has custom endpoints.
+     */
+    const endpoints = local ? localEndpoints : hostCustomProviders;
+    return {
+      get agentStatus() {
+        return agentStatus();
+      },
+      get providerRuntimeStatuses() {
+        return providerRuntimeDownloadsAvailable() ? providerRuntimeStatuses() : undefined;
+      },
+      get providerAvailableVersions() {
+        return providerRuntimeDownloadsAvailable() ? providerAvailableVersions() : undefined;
+      },
+      get onUpdateProvider() {
+        return providerRuntimeDownloadsAvailable() ? startProviderUpdate : undefined;
+      },
+      get onDownloadProvider() {
+        return providerRuntimeDownloadsAvailable() ? downloadProviderRuntime : undefined;
+      },
+      get onCancelProviderDownload() {
+        return providerRuntimeDownloadsAvailable() ? cancelProviderRuntimeDownload : undefined;
+      },
+      get customProviders() {
+        return endpoints.customProviders();
+      },
+      onAddCustomProvider: endpoints.saveCustomProvider,
+      onDeleteCustomProvider: endpoints.deleteCustomProvider,
+      get providerKeys() {
+        return providerRuntimeDownloadsAvailable() ? providerKeys() : undefined;
+      },
+      get codeLogin() {
+        return providerRuntimeDownloadsAvailable() ? codeLogin : undefined;
+      },
+      // The browser sign-in, the install guide, the scan and custom agents are of this computer.
+      get onConnectProvider() {
+        return local && providerRuntimeDownloadsAvailable() ? connectProvider : undefined;
+      },
+      get onInstallProvider() {
+        return local && providerRuntimeDownloadsAvailable() ? openProviderInstallGuide : undefined;
+      },
+      onRestartProvider: local ? restartProvider : undefined,
+      onCancelProviderRestart: local ? cancelProviderRestart : undefined,
+      get providerDetection() {
+        return local ? detection.detection() : undefined;
+      },
+      detectedProviderApi: local ? detection.api : undefined,
+      get takenAgentIds() {
+        return detection.takenAgentIds();
+      },
+      customAgents: local ? customAgents : undefined,
+      get detectionSettings() {
+        return local ? (detection.settingsValue() ?? undefined) : undefined;
+      },
+      onDetectionSettingsChange: detection.setSettings,
+      get detectionSettingsError() {
+        return detection.settingsError();
+      },
+      onShown: local ? () => void detection.scan() : undefined,
+    };
+  };
+
+  /**
+   * Another server's providers are managed after a switch to it, in its own Providers section. A
+   * failed switch shows the error and opens the section again, with its switch button.
+   */
+  const switchToManageProviders = (server: ServerSummary) => {
+    setServerSettingsOpen(false);
+    void selectServer(server.id).then(
+      (selected) => {
+        if (selected) openServerSettings(server.id, null, "providers");
+      },
+      (error: unknown) => {
+        const text = currentText();
+        actionToast.error(text.t("server.select.failedTitle"), {
+          description: text.errorMessage(error, text.t("server.select.failedDescription")),
+        });
+        openServerSettings(server.id, null, "providers");
+      },
+    );
   };
 
   const storageOptions = (server: ServerSummary): Omit<ServerStorageOptions, "canManage"> => ({
@@ -272,21 +496,55 @@ function ServerSettings() {
           onSetMcpServerEnabled={setMcpServerEnabled}
           onTestMcpServer={testMcpServer}
           storage={storageOptions(server())}
+          providers={providerSettings(server())}
+          onSwitchToManageProviders={
+            !server().active && serverCanAdminister(server(), "providers-v1")
+              ? () => switchToManageProviders(server())
+              : undefined
+          }
+          // This computer, or a remote host with `hosted-sites-v1`. Every member lists; the host deletes
+          // only for an owner or admin.
+          hostedSites={
+            serverSupportsCapability(server(), "hosted-sites-v1")
+              ? {
+                  api: appPort().hostedSites,
+                  onOpenSite: (url) => void appPort().openUrl(url),
+                  trackDelete: trackHostedSiteDelete,
+                }
+              : undefined
+          }
           hostUpdate={{}}
           initialSection={serverSettingsSection()}
-          // Agents import into this computer only; a remote host has no Import section.
+          // Any member imports into this computer or a remote host with `agent-import-v1`.
           agentImport={
-            server().kind === "local"
+            serverSupportsCapability(server(), "agent-import-v1")
               ? {
                   onOpenAgent: (agentId) => openOnServer(server(), agentId, () => selectAgent(agentId)),
                   onClose: () => setServerSettingsOpen(false),
                 }
               : undefined
           }
+          githubConnector={props.githubConnector}
+          // Slack is connected on the computer that runs the agents: Slack opens this computer's browser
+          // and returns to its `openbot://` link.
+          slackConnector={server().kind === "local" ? slack : undefined}
+          connectorAgents={agentList()}
         />
       )}
     </Show>
   );
+}
+
+/** The account that starts a deletion gets its result event, as the scope is taken at the start. */
+function trackHostedSiteDelete(): (result: HostedSiteDeleteResult) => void {
+  const analytics = desktopAnalytics.scope();
+  return (result) =>
+    analytics.track("hosted_site_action", {
+      action: "delete",
+      entry_point: "settings",
+      result,
+      ...(result === "failed" ? { failure_code: "delete_failed" } : {}),
+    });
 }
 
 /**
@@ -298,64 +556,19 @@ function AppSettings(props: AccountProps) {
   const platform = usePlatform();
   const auth = useAuth();
   const updates = useUpdates();
-  const { agentStatus } = useAgents();
-  const { activeServer } = useServers();
+  const { setAddServerOpen } = useServers();
   const {
     appSettingsOpen,
     setAppSettingsOpen,
+    appSettingsTab,
     generalSettings,
+    builtInDisplayGeometry,
     updateGeneralSettings,
     appSettingsRestoreTarget,
     turboModePending,
     sendTestNotification,
     openNotificationSettings,
   } = useSettings();
-  const {
-    providerRuntimeStatuses,
-    providerAvailableVersions,
-    providerRuntimeDownloadsAvailable,
-    downloadProviderRuntime,
-    startProviderUpdate,
-    cancelProviderRuntimeDownload,
-    connectProvider,
-    openProviderInstallGuide,
-    codeLogin,
-    providerAdminServerId,
-    providerKeys,
-    hostCustomProviders,
-  } = useProviders();
-  const localEndpoints = useCustomProviders();
-  const localAgents = useCustomAgents();
-  const detection = useProviderDetection();
-  /** A custom agent is a command on this computer, so only the local host lists or runs one. */
-  const customAgents: CustomAgentSettingsApi = {
-    get agents() {
-      return localAgents.customAgents();
-    },
-    save: localAgents.saveCustomAgent,
-    remove: localAgents.deleteCustomAgent,
-    check: localAgents.checkCustomAgent,
-  };
-  const local = () => activeServer()?.kind === "local";
-  /**
-   * The providers of the computer the agents run on: this one, or the host of a joined server the
-   * account administers over `providers-v1`. Any other server shows none of these controls.
-   */
-  const providerDownloads = createMemo(
-    () => (local() || providerAdminServerId() !== undefined) && providerRuntimeDownloadsAvailable(),
-  );
-  /** The browser sign-in and the install guide open on this computer, so they stay local. */
-  const localProviderDownloads = createMemo(() => local() && providerRuntimeDownloadsAvailable());
-  /**
-   * A named endpoint merges into the `opencode acp` process of the computer the agents run on, so a
-   * server this window cannot manage shows no custom row, no list and no Add. This is not
-   * `providerDownloads()`: that one also needs `providerRuntimeDownloadsAvailable()`, which is about
-   * managed runtime downloads and would hide this feature on a build without them.
-   */
-  const endpoints = createMemo(() =>
-    local() ? localEndpoints : providerAdminServerId() !== undefined ? hostCustomProviders : undefined,
-  );
-
   return (
     <Loading>
       <SettingsModal
@@ -364,9 +577,12 @@ function AppSettings(props: AccountProps) {
         value={generalSettings()}
         onValueChange={updateGeneralSettings}
         appInfo={platform.appInfo()}
+        builtInDisplayGeometry={builtInDisplayGeometry()}
         updateStatus={updates.status()}
         onUpdateAction={updates.runAction}
         onCancelScheduledRestart={updates.cancelScheduledRestart}
+        onRestartWhenIdle={updates.restartWhenIdle}
+        onCancelIdleRestart={updates.cancelIdleRestart}
         account={props.account()}
         onUpdateAccountName={auth.updateAccountName}
         onUpdateAccountAvatar={auth.updateAccountAvatar}
@@ -375,55 +591,44 @@ function AppSettings(props: AccountProps) {
         onRevokeMobileConnectedDevice={auth.revokeMobileConnectedDevice}
         onListAccountSessions={auth.listAccountSessions}
         onRevokeAccountSession={auth.revokeAccountSession}
-        agentStatus={agentStatus()}
-        providerRuntimeStatuses={providerDownloads() ? providerRuntimeStatuses() : undefined}
-        providerAvailableVersions={providerDownloads() ? providerAvailableVersions() : undefined}
-        onUpdateProvider={providerDownloads() ? startProviderUpdate : undefined}
-        onDownloadProvider={providerDownloads() ? downloadProviderRuntime : undefined}
-        onCancelProviderDownload={providerDownloads() ? cancelProviderRuntimeDownload : undefined}
-        onConnectProvider={localProviderDownloads() ? connectProvider : undefined}
-        onInstallProvider={localProviderDownloads() ? openProviderInstallGuide : undefined}
-        customProviders={endpoints()?.customProviders()}
-        onAddCustomProvider={endpoints()?.saveCustomProvider}
-        onDeleteCustomProvider={endpoints()?.deleteCustomProvider}
-        customAgents={local() ? customAgents : undefined}
-        // The scan is of this computer, so a joined server's tab shows no found list and no Edit.
-        providerDetection={local() ? detection.detection() : undefined}
-        detectedProviderApi={local() ? detection.api : undefined}
-        takenAgentIds={detection.takenAgentIds()}
-        detectionSettings={local() ? (detection.settingsValue() ?? undefined) : undefined}
-        onDetectionSettingsChange={detection.setSettings}
-        detectionSettingsError={detection.settingsError()}
-        onProvidersShown={() => {
-          if (local()) void detection.scan();
+        billingApi={appPort().billing}
+        hostedServersApi={appPort().hostedServers}
+        onAddHostedServer={() => {
+          setAppSettingsOpen(false);
+          setAddServerOpen(true);
         }}
-        providerKeys={providerDownloads() ? providerKeys() : undefined}
-        providerHostName={providerAdminServerId() === undefined ? undefined : activeServer()?.name}
-        codeLogin={providerDownloads() ? codeLogin : undefined}
-        hostedSitesApi={appPort().hostedSites}
         turboModePending={turboModePending()}
         onTestNotification={sendTestNotification}
         onOpenNotificationSettings={openNotificationSettings}
         restoreFocusTarget={appSettingsRestoreTarget()}
+        openTab={appSettingsTab()}
       />
     </Loading>
   );
 }
 
-/** Search across every conversation on the active server. */
+/** Search across the agents, channels, conversations, routines and commands of the active server. */
 function GlobalMessageSearch() {
   const { agentList } = useAgents();
   const { globalSearchOpen, searchGlobalMessages, setGlobalSearchVisibility, selectAgent, selectGlobalSearchMessage } =
     useNavigation();
+  const sources = useGlobalSearchSources(globalSearchOpen);
 
   return (
     <GlobalSearchOverlay
       open={globalSearchOpen()}
       agents={agentList()}
+      channels={sources.channels()}
+      routines={sources.routines()}
+      routinesLoading={sources.routinesLoading()}
+      actions={sources.actions()}
       onSearchMessages={searchGlobalMessages}
+      onSearchFiles={sources.searchFiles()}
       onOpenChange={setGlobalSearchVisibility}
       onSelectAgent={selectAgent}
+      onSelectChannel={sources.openChannel}
       onSelectMessage={selectGlobalSearchMessage}
+      onSelectRoutine={sources.selectRoutine}
     />
   );
 }

@@ -3,6 +3,11 @@ import type { AppServerNotification, AppServerRequest, RequestId, ResponseDecode
 
 export type AgentProvider = AgentProviderId;
 
+/** Where a diagnostic came from. See `AgentClient.on("diagnostic")`. */
+export interface DiagnosticOrigin {
+  readonly duringStop: boolean;
+}
+
 export interface AgentClient {
   readonly provider: AgentProvider;
   readonly running: boolean;
@@ -17,13 +22,23 @@ export interface AgentClient {
    * user turned off. Optional, because a client that keeps no per-thread state has nothing to close.
    */
   releaseThread?(externalThreadId: string): Promise<void>;
+  /**
+   * Closes each thread that has no turn and can open again from its session, to free its processes
+   * and MCP servers when the machine is low on memory. Optional, because a client that runs all its
+   * threads in one process frees nothing this way.
+   */
+  releaseIdleThreads?(): void;
   request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T>;
   notify(method: string, params?: unknown): void;
   respond(id: RequestId, result: unknown): void;
   respondError(id: RequestId, error: RpcError): void;
   on(event: "notification", listener: (notification: AppServerNotification) => void): this;
   on(event: "request", listener: (request: AppServerRequest) => void): this;
-  on(event: "diagnostic", listener: (message: string) => void): this;
+  /**
+   * `origin.duringStop` marks a stderr line of a process that `stop()` ended while it still ran: the
+   * shutdown that OpenBot started, not an error for the user. A line with no `origin` is reported.
+   */
+  on(event: "diagnostic", listener: (message: string, origin?: DiagnosticOrigin) => void): this;
   once(event: "exit", listener: (error: Error) => void): this;
 }
 

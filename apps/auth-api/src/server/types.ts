@@ -10,6 +10,9 @@ export interface WorkerBindings {
   MARKETPLACE_MUTATION_RATE_LIMITER: RateLimit;
   MARKETPLACE_UPLOAD_RATE_LIMITER: RateLimit;
   SITE_REPORT_RATE_LIMITER: RateLimit;
+  GITHUB_TOKEN_RATE_LIMITER: RateLimit;
+  /** Checked by the Live Activity relay only, so a Worker without it keeps its other routes. */
+  LIVE_ACTIVITY_RATE_LIMITER?: RateLimit;
   AUTH_EXPOSE_DEVELOPMENT_CODE?: string;
   EMAIL_SMTP_HOST?: string;
   EMAIL_SMTP_PORT?: string;
@@ -30,6 +33,43 @@ export interface WorkerBindings {
   REMOTE_SIGNAL_URL?: string;
   REMOTE_AUTH_WEBHOOK_URL?: string;
   REMOTE_AUTH_WEBHOOK_SECRET?: string;
+  /** Signs Slack route tickets. Its public key must also be in `REMOTE_TICKET_PUBLIC_JWKS`. */
+  SLACK_ROUTE_PRIVATE_JWK?: string;
+  SLACK_ROUTE_KEY_ID?: string;
+  /** The OpenBot Slack app, which every workspace installs. */
+  SLACK_CLIENT_ID?: string;
+  SLACK_CLIENT_SECRET?: string;
+  /** Signs the OAuth `state` of the Slack install. At least 32 bytes. */
+  SLACK_STATE_SECRET?: string;
+  /** Development only: the public HTTPS tunnel of a local API, which Slack can send the browser back to. */
+  SLACK_DEV_PUBLIC_ORIGIN?: string;
+  /** A Stripe sandbox (`sk_test_`) key in development and test. */
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  HOSTED_SERVERS_ENABLED?: string;
+  /** Comma-separated account IDs or emails that can create hosted servers. `*` allows each account. */
+  HOSTED_SERVERS_ALLOWED_USER_IDS?: string;
+  /** A request with this key in `OpenBot-Hosting-Developer-Key` can create hosted servers. Test Worker only. */
+  HOSTED_SERVERS_DEVELOPER_KEY?: string;
+  /** The boat named snapshot that new hosted servers start from. */
+  HOSTED_SERVER_TEMPLATE?: string;
+  BOAT_API_KEY?: string;
+  BOAT_WEBHOOK_SECRET?: string;
+  /** An OpenPanel server client and its write-only secret, for account events. Set only in production. */
+  OPENPANEL_CLIENT_ID?: string;
+  OPENPANEL_CLIENT_SECRET?: string;
+  /** The public Client ID of the OpenBot GitHub App. */
+  GITHUB_APP_CLIENT_ID?: string;
+  /** The private key of the OpenBot GitHub App as a PKCS #8 PEM. Without it, no installation token is issued. */
+  GITHUB_APP_PRIVATE_KEY?: string;
+  /** The Apple Push Notification service key (`.p8`, PEM text). The Live Activity relay is off without it. */
+  APNS_PRIVATE_KEY?: string;
+  APNS_KEY_ID?: string;
+  APNS_TEAM_ID?: string;
+  /** The iOS app bundle ID. */
+  APNS_TOPIC?: string;
+  /** Local development only: the development server that forwards to Apple over HTTP/2. */
+  APNS_ORIGIN?: string;
 }
 
 function isWorkerBindings(value: unknown): value is WorkerBindings {
@@ -42,6 +82,7 @@ function isWorkerBindings(value: unknown): value is WorkerBindings {
   const marketplaceMutationRateLimiter = value.MARKETPLACE_MUTATION_RATE_LIMITER;
   const marketplaceUploadRateLimiter = value.MARKETPLACE_UPLOAD_RATE_LIMITER;
   const siteReportRateLimiter = value.SITE_REPORT_RATE_LIMITER;
+  const githubTokenRateLimiter = value.GITHUB_TOKEN_RATE_LIMITER;
   if (
     !isDynamicRecord(database) ||
     !isFunction(database.prepare) ||
@@ -64,7 +105,9 @@ function isWorkerBindings(value: unknown): value is WorkerBindings {
     !isDynamicRecord(marketplaceUploadRateLimiter) ||
     !isFunction(marketplaceUploadRateLimiter.limit) ||
     !isDynamicRecord(siteReportRateLimiter) ||
-    !isFunction(siteReportRateLimiter.limit)
+    !isFunction(siteReportRateLimiter.limit) ||
+    !isDynamicRecord(githubTokenRateLimiter) ||
+    !isFunction(githubTokenRateLimiter.limit)
   ) {
     return false;
   }

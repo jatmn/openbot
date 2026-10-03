@@ -7,13 +7,21 @@ import type { OpenBotDesktopApi } from "@openbot/contracts/ipc";
 export interface AppPort {
   getAppInfo: OpenBotDesktopApi["getAppInfo"];
   getAppLanguagePreference: OpenBotDesktopApi["getAppLanguagePreference"];
+  getAppLogoColorPreference: OpenBotDesktopApi["getAppLogoColorPreference"];
   onAppLanguagePreference: OpenBotDesktopApi["onAppLanguagePreference"];
+  onAppLogoColorPreference: OpenBotDesktopApi["onAppLogoColorPreference"];
   openExternal: OpenBotDesktopApi["openExternal"];
   openUrl: OpenBotDesktopApi["openUrl"];
   setAppLanguagePreference: OpenBotDesktopApi["setAppLanguagePreference"];
-  agent: Pick<OpenBotDesktopApi["agent"], "readConversationPage" | "searchConversationMessages">;
+  setAppLogoColorPreference: OpenBotDesktopApi["setAppLogoColorPreference"];
+  agent: Pick<
+    OpenBotDesktopApi["agent"],
+    "readConversationPage" | "searchConversationMessages" | "searchConversationFiles" | "listRoutines"
+  >;
   agentTemplates: Pick<OpenBotDesktopApi["agentTemplates"], "onOpenLink" | "takePendingLink">;
   hostedSites: OpenBotDesktopApi["hostedSites"];
+  billing: OpenBotDesktopApi["billing"];
+  hostedServers: OpenBotDesktopApi["hostedServers"];
   plugins: Pick<OpenBotDesktopApi["plugins"], "onOpenListing" | "takePendingListing">;
   servers: Pick<OpenBotDesktopApi["servers"], "onInvite" | "takePendingInvite">;
 }

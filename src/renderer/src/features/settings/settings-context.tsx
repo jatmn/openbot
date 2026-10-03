@@ -1,15 +1,22 @@
-import { type ApprovalAutomationPreference, agentAutoApprovalEnabled } from "@openbot/contracts/ipc";
-import { toast } from "@openbot/ui";
+import {
+  type ApprovalAutomationPreference,
+  agentAutoApprovalEnabled,
+  type DynamicIslandGeometry,
+} from "@openbot/contracts/ipc";
 import { DEFAULT_GENERAL_SETTINGS, type GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createSignal, onSettled } from "solid-js";
+import { isActionSoundEnabled, readActionSoundTheme, setActionSoundChoice } from "../../action-sounds";
+import { actionToast } from "../../action-toast";
 import { desktopAnalytics } from "../../analytics";
+import { isCompletionSoundEnabled, setCompletionSoundEnabled } from "../../completion-sound";
 import { usePlatform } from "../../platform";
 import { createSimpleContext } from "../../simple-context";
 import { useAuth } from "../account/account-context";
 import { useSetup } from "../onboarding/onboarding-context";
 import { settingsPort } from "./settings-port";
 import { isOpenSettingsShortcut } from "./settings-shortcut";
+import type { SettingsTab } from "./settings-tabs";
 
 const ANALYTICS_APP_VERSION_STORAGE_KEY = "openbot:analytics-app-version";
 
@@ -38,6 +45,8 @@ const Settings = createSimpleContext({
 
     const [analyticsPreferenceLoaded, setAnalyticsPreferenceLoaded] = createSignal<boolean | null>(null);
     const [skillsMarketplaceOpen, setSkillsMarketplaceOpen] = createSignal(false);
+    // Undefined until main answers. The Settings preview then draws the notch it had before.
+    const [builtInDisplayGeometry, setBuiltInDisplayGeometry] = createSignal<DynamicIslandGeometry | undefined>();
     /**
      * The plugin an `openbot://plugins/<slug>` link asked for, held beside the open flag because the
      * marketplace is loaded lazily: the slug has to outlive the chunk load that shows it. It is a
@@ -45,12 +54,24 @@ const Settings = createSimpleContext({
      */
     const [pendingPluginSlug, setPendingPluginSlug] = createSignal<string | null>(null);
     /**
+     * Set with the slug when the person pressed Connect on a suggestion card in the chat, so the
+     * page starts the connect step. A link never sets it.
+     */
+    const [pendingPluginConnect, setPendingPluginConnect] = createSignal(false);
+    /**
      * The template an `openbot://agents/<id>` link named. The install dialog reads the template by
      * this id and installs only after the user presses Add agent.
      */
     const [pendingAgentTemplateId, setPendingAgentTemplateId] = createSignal<string | null>(null);
     const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
-    const [generalSettings, setGeneralSettings] = createSignal<GeneralSettingsValue>(DEFAULT_GENERAL_SETTINGS);
+    /** The tab that the next opening shows. Undefined keeps the tab that was open last. */
+    const [appSettingsTab, setAppSettingsTab] = createSignal<SettingsTab | undefined>();
+    const [generalSettings, setGeneralSettings] = createSignal<GeneralSettingsValue>({
+      ...DEFAULT_GENERAL_SETTINGS,
+      taskCompletionSound: isCompletionSoundEnabled(),
+      soundFeedback: isActionSoundEnabled(),
+      soundTheme: readActionSoundTheme(),
+    });
     const [approvalAutomation, setApprovalAutomation] = createSignal<ApprovalAutomationPreference>({
       turbo: false,
       defaultAutoApprove: false,
@@ -107,6 +128,12 @@ const Settings = createSimpleContext({
       const previous = generalSettings();
       const turboMode = turboModePending() ? previous.turboMode : value.turboMode;
       setGeneralSettings({ ...value, turboMode });
+      if (previous.taskCompletionSound !== value.taskCompletionSound) {
+        setCompletionSoundEnabled(value.taskCompletionSound);
+      }
+      if (previous.soundFeedback !== value.soundFeedback || previous.soundTheme !== value.soundTheme) {
+        setActionSoundChoice(value.soundFeedback ? value.soundTheme : "off");
+      }
       if (previous.productAnalytics !== value.productAnalytics) {
         desktopAnalytics.setTrackingEnabled(value.productAnalytics);
         setAnalyticsPreferenceLoaded(value.productAnalytics);
@@ -135,7 +162,9 @@ const Settings = createSimpleContext({
           .catch(() => {
             setGeneralSettings((current) => ({ ...current, turboMode: previous.turboMode }));
             const { t } = currentText();
-            toast.error(previous.turboMode ? t("settings.turbo.turnOffFailed") : t("settings.turbo.turnOnFailed"));
+            actionToast.error(
+              previous.turboMode ? t("settings.turbo.turnOffFailed") : t("settings.turbo.turnOnFailed"),
+            );
           })
           .finally(() => setTurboModePending(false));
       }
@@ -250,9 +279,10 @@ const Settings = createSimpleContext({
     }
 
     /** Remembers what to focus when the dialog closes; the dialog itself restores it. */
-    function openAppSettings(trigger?: HTMLElement | null): void {
+    function openAppSettings(trigger?: HTMLElement | null, tab?: SettingsTab): void {
       const target = trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
       appSettingsRestoreTarget = target;
+      setAppSettingsTab(tab);
       setAppSettingsOpen(true);
     }
 
@@ -341,6 +371,10 @@ const Settings = createSimpleContext({
           })),
         )
         .catch(() => undefined);
+      void settingsPort()
+        .dynamicIsland.getBuiltInDisplayGeometry()
+        .then((geometry) => setBuiltInDisplayGeometry(geometry))
+        .catch(() => undefined);
     });
 
     const sendTestNotification = () => settingsPort().notifications.test();
@@ -349,6 +383,7 @@ const Settings = createSimpleContext({
     return {
       analyticsPreferenceLoaded,
       generalSettings,
+      builtInDisplayGeometry,
       turboModePending,
       updateGeneralSettings,
       sendTestNotification,
@@ -358,11 +393,14 @@ const Settings = createSimpleContext({
       appSettingsOpen,
       setAppSettingsOpen,
       appSettingsRestoreTarget: () => appSettingsRestoreTarget,
+      appSettingsTab,
       openAppSettings,
       skillsMarketplaceOpen,
       setSkillsMarketplaceOpen,
       pendingPluginSlug,
       setPendingPluginSlug,
+      pendingPluginConnect,
+      setPendingPluginConnect,
       pendingAgentTemplateId,
       setPendingAgentTemplateId,
     };

@@ -10,8 +10,11 @@ import {
   type CreateElicitationResponse,
   type ElicitationContentValue,
   type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   ndJsonStream,
   type PermissionOption,
+  RequestError,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionConfigOption,
@@ -19,13 +22,15 @@ import {
 } from "@agentclientprotocol/sdk";
 import { agentProviderName } from "@openbot/contracts/agent-providers";
 import { type DynamicRecord, isBoolean, isString } from "@openbot/contracts/runtime-values";
-import { sourceText } from "@openbot/i18n/source";
+import { type SourceMessages, sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
 import { acpPlanSteps, PLAN_UPDATED_METHOD } from "./agent/plan-updates";
 import { elicitationOptions, elicitationValue, secretElicitationField } from "./agent/prompts";
-import { AgentProcessExitError, type AgentProvider } from "./agent-client";
+import { isUsageLimitDiagnostic } from "./agent/provider-diagnostics";
+import { AgentProcessExitError, type AgentProvider, type DiagnosticOrigin } from "./agent-client";
 import { type AgentCliInfo, cliSpawnTarget } from "./cli";
 import { IdleThreadPool } from "./idle-thread-pool";
+import { LineTooLongError, limitLineLength } from "./jsonl";
 import { type DynamicToolNamespace, LocalMcpBridge, type LocalMcpSession } from "./local-mcp-bridge";
 import {
   acpMcpServers,
@@ -72,9 +77,9 @@ const MODEL_REASONING_PROBE_BUDGET_MS = 5_000;
 const MODEL_REASONING_PROBE_TIMEOUT_MS = 1_000;
 
 /**
- * What the sweep leaves of the discovery deadline for the two requests that follow it: the restore of
- * the model the session opened on, and the close of the probe session. Both are one round trip, and
- * the catalog the caller waits for is already built when they run.
+ * What the sweep leaves of the discovery deadline for the request that follows it: the restore of the
+ * model the session opened on. It is one round trip, and the catalog the caller waits for is already
+ * built when it runs. The close of the probe session is not awaited and uses none of it.
  */
 const MODEL_REASONING_CLEANUP_MS = 1_000;
 
@@ -91,11 +96,17 @@ const MODEL_DISCOVERY_RETURN_MS = 250;
  */
 const EXIT_REPORT_WAIT_MS = 2_000;
 
+/** How long OpenCode's second `session/load` waits after an internal service failure. */
+const OPENCODE_LOAD_RETRY_MS = 500;
+
+/** How many `session/list` pages OpenBot reads to find a session before it stops looking. */
+const OPENCODE_SESSION_LIST_PAGES = 50;
+
 interface ClientEvents {
   notification: [notification: AppServerNotification];
   request: [request: AppServerRequest];
   exit: [error: Error];
-  diagnostic: [message: string];
+  diagnostic: [message: string, origin?: DiagnosticOrigin];
 }
 
 interface ProcessEnd {
@@ -116,6 +127,8 @@ interface AcpTurn {
   answerOptional: boolean;
   messages: ThreadItem[];
   toolNames: Map<string, string>;
+  /** The ACP `kind` of each tool call; a later update can omit it. */
+  toolKinds: Map<string, string>;
   task: Promise<void>;
 }
 
@@ -290,6 +303,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   #models: AcpModel[] = [];
   #signedIn = false;
   #stopping = false;
+  /**
+   * Each process that `stop()` ended while it still ran. Its stderr is the shutdown that OpenBot
+   * started. Held per process, not read from `#stopping`: a crash also calls `stop()`, and `start()`
+   * clears `#stopping` before the last stderr of the previous process is read.
+   */
+  readonly #stoppedProcesses = new WeakSet<ChildProcessWithoutNullStreams>();
 
   constructor(
     cli: AgentCliInfo,
@@ -331,11 +350,21 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       windowsHide: true,
     });
     this.#process = child;
+    // The SDK holds a line until its newline with no limit. At the limit the connection closes with
+    // the error, so each open request fails with it, and the process ends.
+    const stdout = child.stdout.pipe(
+      limitLineLength(() => {
+        const error = new LineTooLongError(this.#label);
+        this.#fail(error, child);
+        void endProcess(child);
+        return error;
+      }),
+    );
     const stream = ndJsonStream(
       // biome-ignore lint/nursery/noUnsafeTypeAssertion: Node and DOM declare the same Web Stream ABI with incompatible generic variance.
       Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
       // biome-ignore lint/nursery/noUnsafeTypeAssertion: Node and DOM declare the same Web Stream ABI with incompatible generic variance.
-      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
+      Readable.toWeb(stdout) as unknown as ReadableStream<Uint8Array>,
     );
     this.#connection = new ClientSideConnection(
       () => ({
@@ -353,7 +382,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       redact: (text) => this.#redact(text),
       emit: (message) => {
         lastDiagnostic = message;
-        this.emit("diagnostic", message);
+        this.emit("diagnostic", message, { duringStop: this.#stoppedProcesses.has(child) });
       },
     });
     child.stderr.on("data", (chunk: Buffer) => diagnostics.push(chunk.toString("utf8")));
@@ -376,6 +405,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   async stop(): Promise<void> {
     this.#stopping = true;
     const child = this.#process;
+    // After a crash `#process` is already null, so the crash reason stays an error for the user.
+    if (child && child.exitCode === null) this.#stoppedProcesses.add(child);
     this.#process = null;
     this.#connection = null;
     this.#initialized = null;
@@ -384,19 +415,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#serverRequests.rejectAll("ACP session stopped.");
     await this.#bridge.close();
     if (!child || child.exitCode !== null) return;
-    child.stdin.end();
-    // A `.cmd` agent runs under `cmd.exe`; a kill of the wrapper alone leaves the agent running.
-    if (process.platform === "win32") return stopWindowsProcessTree(child);
-    await new Promise<void>((resolve) => {
-      const forceKill = setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-      }, 2_000);
-      child.once("exit", () => {
-        clearTimeout(forceKill);
-        resolve();
-      });
-      child.kill("SIGTERM");
-    });
+    await endProcess(child);
+  }
+
+  releaseIdleThreads(): void {
+    this.#threads.releaseIdle();
   }
 
   /**
@@ -453,7 +476,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     if (!this.running) throw new Error("ACP client is not running.");
     switch (method) {
       case "initialize":
-        await this.#ensureInitialized();
+        // The caller's timeout covers the first model discovery too: a CLI that was just installed
+        // can take minutes to answer both.
+        await this.#ensureInitialized(timeoutMs);
         return decoder({});
       case "account/read": {
         if (!this.#signedIn) return decoder({ account: null, requiresOpenaiAuth: false });
@@ -477,7 +502,16 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         );
       case "model/list":
         await this.#ensureInitialized();
-        if (this.#signedIn) this.#models = await this.#discoverModels(timeoutMs);
+        if (this.#signedIn) {
+          try {
+            this.#models = await this.#discoverModels(timeoutMs);
+          } catch (error) {
+            // Initialization already proved that OpenCode's catalogue works. A later refresh can
+            // time out while probing model options; keep the last successful list instead of making
+            // a connected provider appear to have no models. Other providers report the failure.
+            if (this.provider !== "opencode" || this.#models.length === 0) throw error;
+          }
+        }
         return decoder({
           data: this.#models.map((model) => ({
             model: model.id,
@@ -532,9 +566,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#serverRequests.reject(id, error);
   }
 
-  async #ensureInitialized(): Promise<void> {
+  async #ensureInitialized(timeoutMs = this.#requestTimeoutMs): Promise<void> {
     if (this.#initialized) return this.#initialized;
-    this.#initialized = this.#initialize();
+    this.#initialized = this.#initialize(timeoutMs);
     return this.#initialized;
   }
 
@@ -552,7 +586,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
   }
 
-  async #initialize(): Promise<void> {
+  async #initialize(timeoutMs: number): Promise<void> {
     const connection = this.#requireConnection();
     this.#initialization = await withTimeout(
       connection.initialize({
@@ -560,12 +594,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
         clientInfo: OPENBOT_ACP_CLIENT_INFO,
       }),
-      this.#requestTimeoutMs,
+      timeoutMs,
       "ACP initialization timed out.",
     );
     try {
       await this.options.authenticate?.(connection, this.#initialization);
-      this.#models = await this.#discoverModels();
+      this.#models = await this.#discoverModels(timeoutMs);
       if (this.#models.length === 0 && !this.options.allowNoModels) {
         throw new Error(sourceText("error.provider.acpNoModels"));
       }
@@ -592,13 +626,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         try {
           return await this.#modelReasoningEfforts(connection, probe, modelsFromSessionSetup(probe), deadline);
         } finally {
-          // Bounded like the probes, and for the same reason: the catalog is complete by now, and an
-          // agent that is slow to close a session it is about to lose anyway must not take it away.
-          await this.#requestBefore(
-            () => connection.closeSession({ sessionId: probe.sessionId }),
-            deadline,
-            "session/close",
-          );
+          // Sent always, and not awaited. An agent can run one process per session, so a probe left
+          // open after a slow `session/new` used the deadline, or after `model/list` timed out, is one
+          // idle process until the app quits. Not awaited, because the catalog is complete by now, and
+          // an agent that is slow to close a session must not take it away.
+          void connection.closeSession({ sessionId: probe.sessionId }).catch(() => undefined);
         }
       })(),
       timeoutMs,
@@ -665,8 +697,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
     // Back to the model the session opened on. The session is closed next, but an agent that keeps a
     // "last used model" outside the session would otherwise remember the end of this sweep, and the
-    // user's own next CLI session would start on a model they never chose. Half of the cleanup
-    // reserve, so the close that follows keeps the other half.
+    // user's own next CLI session would start on a model they never chose.
     if (selected !== option.currentValue) {
       await this.#requestBefore(
         () =>
@@ -675,7 +706,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
             configId: option.id,
             value: option.currentValue,
           }),
-        Math.min(Date.now() + MODEL_REASONING_CLEANUP_MS / 2, deadline),
+        Math.min(Date.now() + MODEL_REASONING_CLEANUP_MS, deadline),
         "session/set_config_option",
       );
     }
@@ -703,7 +734,10 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       if (!this.#loadsSessions) return null;
       await this.#startThread(params, true);
     } catch (error) {
-      this.emit("diagnostic", this.#redact(`ACP session load for a read failed: ${String(error)}`));
+      // The next turn replaces the missing session, so the user has nothing to act on.
+      if (!(error instanceof MissingAcpSessionError)) {
+        this.emit("diagnostic", this.#redact(`ACP session load for a read failed: ${String(error)}`));
+      }
       return null;
     }
     const thread = this.#threads.get(id) ?? null;
@@ -792,7 +826,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       this.options.reportMcpDrops?.(this.provider, handoff.dropped);
       const mcpServers = [...handoff.servers, ...mcp.servers];
       if (resume && requestedThreadId) {
-        const response = await connection.loadSession({
+        const response = await this.#loadSession(connection, {
           sessionId: requestedThreadId,
           cwd,
           additionalDirectories,
@@ -831,6 +865,64 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       mcp.close();
       throw error;
     }
+  }
+
+  /**
+   * An agent that follows the protocol answers a session missing from its store with `-32002`, the
+   * resource-not-found error, naming the session. Cline does.
+   *
+   * OpenCode answers a session missing from its store with the same `-32603` "OpenCode service
+   * failure" as a fault of its internal server. Only a `session/list` that answers in full without
+   * the session shows it is missing: the caller then replaces it and hands it the transcript. A
+   * session that is listed, a list that fails, or an OpenCode without `session/list` leaves the
+   * session kept: one more attempt, then the fault is reported.
+   */
+  async #loadSession(connection: ClientSideConnection, request: LoadSessionRequest): Promise<LoadSessionResponse> {
+    let failure: unknown;
+    try {
+      return await connection.loadSession(request);
+    } catch (error) {
+      if (isSessionNotFound(error, request.sessionId)) {
+        throw new MissingAcpSessionError(`ACP session not found: ${request.sessionId}`, error);
+      }
+      if (this.provider !== "opencode" || !isOpenCodeServiceFailure(error)) throw error;
+      failure = error;
+    }
+    const listing = await this.#sessionListing(connection, request);
+    if (listing === "absent") {
+      throw new MissingAcpSessionError(
+        `OpenCode session not found: ${request.sessionId} (OpenCode service failure)`,
+        failure,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, OPENCODE_LOAD_RETRY_MS));
+    try {
+      // The process can have stopped during the wait; this reports that instead of a closed stream.
+      return await this.#requireConnection().loadSession(request);
+    } catch (error) {
+      if (!isOpenCodeServiceFailure(error)) throw error;
+      throw new Error(sourceText("error.provider.opencodeServiceFailure"), { cause: error });
+    }
+  }
+
+  /** Whether the agent's `session/list` for the session's directory holds the session. */
+  async #sessionListing(
+    connection: ClientSideConnection,
+    request: LoadSessionRequest,
+  ): Promise<"listed" | "absent" | "unknown"> {
+    if (!this.#initialization?.agentCapabilities?.sessionCapabilities?.list) return "unknown";
+    let cursor: string | undefined;
+    try {
+      for (let page = 0; page < OPENCODE_SESSION_LIST_PAGES; page += 1) {
+        const response = await connection.listSessions({ cwd: request.cwd, ...(cursor ? { cursor } : {}) });
+        if (response.sessions.some((session) => session.sessionId === request.sessionId)) return "listed";
+        cursor = response.nextCursor ?? undefined;
+        if (!cursor) return "absent";
+      }
+    } catch {
+      return "unknown";
+    }
+    return "unknown";
   }
 
   async #applyConfig(thread: AcpThread, model: string | null, effort: string | null): Promise<void> {
@@ -932,6 +1024,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       answerOptional: isRecord(params) && params.answerOptional === true,
       messages: [],
       toolNames: new Map(),
+      toolKinds: new Map(),
       task: Promise.resolve(),
     };
     thread.activeTurn = turn;
@@ -1030,6 +1123,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       // ACP updates are partial; OpenCode omits the name when a tool finishes.
       const name = update.name ?? update.title ?? turn.toolNames.get(update.toolCallId) ?? "tool";
       turn.toolNames.set(update.toolCallId, name);
+      const toolKind = update.kind ?? turn.toolKinds.get(update.toolCallId) ?? "other";
+      turn.toolKinds.set(update.toolCallId, toolKind);
       this.emit("notification", {
         method: update.status === "completed" || update.status === "failed" ? "item/completed" : "item/started",
         params: {
@@ -1039,6 +1134,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
             id: update.toolCallId,
             type: "toolCall",
             name,
+            toolKind,
             status: update.status,
             arguments: update.rawInput,
             result: update.rawOutput,
@@ -1086,12 +1182,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#completeThought(thread, turn);
     this.#completeMessage(thread, turn, "final_answer");
     if (status === "failed" && error) {
-      const detail = this.#redact(String(error));
+      const detail = this.#redact(failureText(error));
       const message =
         this.provider === "opencode" &&
         /invalid api key|unauthori[sz]ed|token refresh failed|authentication failed/i.test(detail)
           ? `OpenCode rejected the selected model's credentials. Update or remove the OpenCode Go key in Settings. If you signed in through the OpenCode CLI, reconnect that provider there. Then retry or choose another model.\n${detail}`
-          : detail;
+          : this.provider === "opencode" && isOpenCodeServiceFailure(error)
+            ? sourceText("error.provider.opencodeServiceFailure")
+            : this.#openCodeRequestFailure(error, detail);
       this.emit("notification", {
         method: "error",
         params: { threadId: thread.id, turnId: turn.id, message },
@@ -1104,6 +1202,28 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     thread.turns.push({ id: turn.id, status, items: turn.messages });
     thread.activeTurn = null;
     this.#threads.markIdle(thread);
+  }
+
+  /**
+   * OpenCode retries a rate limit or a provider failure by itself. When it stops, it fails the prompt
+   * with the provider's text behind `Internal error:`, so a billing refusal, a rate limit and an
+   * offline computer all read as one failure of OpenBot, and the user could not tell whether
+   * waiting helps (#1163). The kind comes first; the provider's own text follows it.
+   */
+  #openCodeRequestFailure(error: unknown, detail: string): string {
+    if (this.provider !== "opencode" || !(error instanceof RequestError) || error.code !== -32603) return detail;
+    const reason = error.message.replace(/^Internal error:\s*/u, "");
+    // The usage notice reports an exhausted usage limit, and it reads the whole text to find one.
+    if (isUsageLimitDiagnostic(reason)) return detail;
+    const key = OPENCODE_REQUEST_FAILURES.find(([, pattern]) => pattern.test(reason))?.[0];
+    if (!key) return detail;
+    // The renderer shows its generic sentence for text over 400 characters.
+    const characters = Array.from(this.#redact(reason));
+    const shown =
+      characters.length > OPENCODE_FAILURE_DETAIL_LIMIT
+        ? `${characters.slice(0, OPENCODE_FAILURE_DETAIL_LIMIT - 1).join("")}…`
+        : characters.join("");
+    return sourceText(key, { detail: shown });
   }
 
   async #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -1220,6 +1340,23 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#process = null;
     if (!this.#stopping) this.emit("exit", error);
   }
+}
+
+/** Ends the agent process with SIGTERM, and with SIGKILL when it is still running after 2 seconds. */
+async function endProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+  child.stdin.end();
+  // A `.cmd` agent runs under `cmd.exe`; a kill of the wrapper alone leaves the agent running.
+  if (process.platform === "win32") return stopWindowsProcessTree(child);
+  await new Promise<void>((resolve) => {
+    const forceKill = setTimeout(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }, 2_000);
+    child.once("exit", () => {
+      clearTimeout(forceKill);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
 }
 
 function isDynamicToolNamespace(value: unknown): value is DynamicToolNamespace {
@@ -1451,6 +1588,67 @@ function isDynamicToolResult(value: unknown): value is DynamicToolResult {
     )
   );
 }
+
+/** A session that the agent does not have, so the caller opens a new one. */
+class MissingAcpSessionError extends Error {
+  constructor(message: string, cause: unknown) {
+    // The wording is what `isMissingProviderSessionError` recognizes.
+    super(message, { cause });
+    this.name = "MissingAcpSessionError";
+  }
+}
+
+/** The protocol's resource-not-found error, for this session. */
+function isSessionNotFound(error: unknown, sessionId: string): boolean {
+  if (!(error instanceof RequestError) || error.code !== -32002) return false;
+  const uri = isRecord(error.data) ? error.data.uri : undefined;
+  return uri === sessionId || error.message.includes(sessionId);
+}
+
+/**
+ * The text of a failed turn. When a handler in an ACP agent throws, the SDK answers `Internal error`
+ * and puts the thrown message in `data.details`, which `String(error)` leaves out (#1193).
+ */
+function failureText(error: unknown): string {
+  if (!(error instanceof RequestError) || !isRecord(error.data)) return String(error);
+  const details = error.data.details;
+  return typeof details === "string" && details && !error.message.includes(details)
+    ? `${String(error)}: ${details}`
+    : String(error);
+}
+
+/**
+ * OpenCode's wrapper error for a failed call to its internal server. It carries no cause: OpenCode
+ * maps each such failure that is not an authentication error to this one.
+ */
+function isOpenCodeServiceFailure(error: unknown): boolean {
+  return error instanceof RequestError && error.code === -32603 && /\bOpenCode service failure\b/.test(error.message);
+}
+
+const OPENCODE_FAILURE_DETAIL_LIMIT = 200;
+
+/**
+ * The kind of a model request that OpenCode gave up on, first match wins. A provider gateway
+ * reports each kind as `Upstream request failed: <reason>`, so billing and the rate limit come
+ * first. The provider's own failure comes before the network: a gateway that could not reach its
+ * model was reached by this computer. Text that names no kind, such as OpenCode's own "Free usage
+ * exceeded, subscribe to Go", is shown as it is.
+ */
+const OPENCODE_REQUEST_FAILURES = [
+  [
+    "error.provider.opencodeBilling",
+    /\bno payment method\b|\binsufficient (?:account )?(?:funds|balance)\b|\bpayment required\b/iu,
+  ],
+  ["error.provider.opencodeRateLimited", /\brate[ _-]?limit|\btoo many requests\b/iu],
+  [
+    "error.provider.opencodeProviderFailed",
+    /\binternal server error\b|\bservice unavailable\b|\bendpoint is unavailable\b|\bbad gateway\b|\bgateway time-?out\b|\boverloaded\b|\bupstream request failed\b/iu,
+  ],
+  [
+    "error.provider.opencodeNetwork",
+    /\b(?:cannot|unable to|could not) connect\b|\bfetch failed\b|\bfailed to fetch\b|\bgetaddrinfo\b|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b|\bsocket hang up\b/iu,
+  ],
+] as const satisfies readonly (readonly [keyof SourceMessages, RegExp])[];
 
 function isAuthenticationError(error: unknown): boolean {
   return /auth|login|credential|token|unauthori[sz]ed|api key/i.test(

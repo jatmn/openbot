@@ -31,6 +31,7 @@ import { existsSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { selfHostedApiOrigin } from "@openbot/contracts/invite-links";
 import type {
   AgentStatus,
   AppVariant,
@@ -42,15 +43,19 @@ import type {
   VoiceModelStatus,
 } from "@openbot/contracts/ipc";
 import { IPC_ENDPOINTS, isManagedToolRuntime, isUpdateBusyPhase } from "@openbot/contracts/ipc";
+import { decodeRecord, requiredString } from "@openbot/contracts/ipc-decoding";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { REMOTE_ACCOUNT_CHECK_INTERVAL_MS } from "@openbot/team-client";
 import { app, type BrowserWindow, nativeImage, safeStorage, screen, shell } from "electron";
+import { pasteCodeLoginSupported } from "../backend/agent/cli-code-login";
 import { AgentService } from "../backend/agent-service";
 import { AgentStore } from "../backend/agent-store";
 import { BrowserHost } from "../backend/browser-host";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
+import { MessagingService } from "../backend/messaging/messaging-service";
+import { slackDriver } from "../backend/messaging/slack/slack-driver";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
 import { TeamChatStore } from "../backend/team-chat-store";
@@ -59,8 +64,17 @@ import { AgentInitializationGate } from "./agent-initialization";
 import { AgentMarketplaceService } from "./agent-marketplace-service";
 import { AgentTemplateService } from "./agent-template-service";
 import { HostAnalytics } from "./analytics";
+import { analyticsInventoryDayStore, collectAnalyticsInventory } from "./analytics-inventory";
+import {
+  type CatalogPluginServer,
+  catalogPluginSlug,
+  isReportedMcpServerName,
+  loadCatalogPluginServers,
+} from "./analytics-plugin-catalog";
 import { readAnalyticsPreference } from "./analytics-preference-store";
 import { ApprovalAutomation, readApprovalAutomation } from "./approval-automation-store";
+import { AutomationServer } from "./automation-server";
+import { BillingDesktopService } from "./billing-service";
 import { BrowserPictureInPicture } from "./browser-picture-in-picture";
 import { BrowserViewClient } from "./browser-view-client";
 import { CentralAuthManager, readCentralAuthApiUrl, readMobileConnectApiUrl } from "./central-auth-manager";
@@ -88,12 +102,24 @@ import {
 } from "./development-remote-bootstrap";
 import { performDynamicIslandCriticalAction } from "./dynamic-island-actions";
 import { DynamicIslandWindowController } from "./dynamic-island-window";
+import { githubAppConfig } from "./github-connector-config";
+import { GitHubConnectorService } from "./github-connector-service";
+import { GitHubConnectorStore } from "./github-connector-store";
 import { HostService } from "./host-service";
 import { HostUpdateCoordinator } from "./host-update-coordinator";
+import { CLIENT_USE_WINDOW_MS, HostedServerActivity } from "./hosted-server-activity";
+import { applyHostedServerAccount, type HostedServerEnvironment } from "./hosted-server-bootstrap";
+import { HostedServerMemory } from "./hosted-server-memory";
+import { HostedServerDesktopService, withHostingDeveloperKey } from "./hosted-server-service";
+import { HostedServerStartRetry } from "./hosted-server-start-retry";
 import { HostedSiteDesktopService } from "./hosted-site-service";
+import { IdleRestart } from "./idle-restart";
 import { LanguageService } from "./language-service";
+import { LogoColorService } from "./logo-color-service";
 import type { MacHapticFeedback } from "./mac-haptic-feedback";
 import {
+  computerUseDesktopPoint,
+  computerUseDesktopRect,
   computerUseDisplays,
   createComputerUseHighlightWindow,
   createComputerUsePermissionHelpWindow,
@@ -108,11 +134,13 @@ import {
 import { ManagedSkillService } from "./managed-skill-service";
 import { startMcpOAuthRedirectServer } from "./mcp-oauth-redirect-server";
 import { McpOAuthStore } from "./mcp-oauth-store";
+import { MessagingCredentialStore } from "./messaging-credential-store";
 import { probeModels } from "./model-server-probe";
 import { NotificationPreferenceStore } from "./notification-preference-store";
 import { ProviderCredentialStore } from "./provider-credential-store";
 import { createProviderDetection, type ProviderDetection } from "./provider-detection";
 import { PROVIDER_DETECTION_SETTINGS_FILE, ProviderDetectionSettingsStore } from "./provider-detection-settings-store";
+import { startProviderLog } from "./provider-log";
 import { ProviderRuntimeManager, providerRuntimeRoot } from "./provider-runtime-manager";
 import { RemoteDesktopManager } from "./remote-desktop-manager";
 import { resolveRemoteDesktopRuntime } from "./remote-desktop-runtime-artifact";
@@ -122,6 +150,8 @@ import { decodeVoid } from "./remote-host-decoding";
 import { RemoteServerManager } from "./remote-server-manager";
 import { sendToRenderer } from "./renderer-ipc";
 import { RequestedUpdate, RequestedUpdateRefusal } from "./requested-update";
+import { clearRoutineHold, ROUTINE_HOLD_FILE, takeRoutineHold, writeRoutineHold } from "./routine-hold-file";
+import { ServerMode, type ServerModeEnvironment } from "./server-mode";
 import {
   configureApplicationProtocol,
   configureAttachmentProtocol,
@@ -129,6 +159,8 @@ import {
 } from "./session-configuration";
 import { readSetupState } from "./setup-store";
 import { SkillMarketplaceService } from "./skill-marketplace-service";
+import { SLACK_DEV_CALLBACK_PATH, startSlackDevCallbackServer } from "./slack-dev-callback-server";
+import { SlackIngress } from "./slack-ingress";
 import { TeamStore } from "./team-store";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcClientTransport } from "./team-webrtc-client-transport";
@@ -150,9 +182,11 @@ import { VoiceTranscriptionService } from "./voice-transcription-service";
 const logger = createOpenBotLogger("application-services");
 const SETUP_FILE = "openbot-setup-v2.json";
 const ANALYTICS_PREFERENCE_FILE = "openbot-analytics-preference-v1.json";
+const ANALYTICS_INVENTORY_FILE = "openbot-analytics-inventory-v1.json";
 const APPROVAL_AUTOMATION_FILE = "openbot-approval-automation-v2.json";
 const LEGACY_APPROVAL_AUTOMATION_FILE = "openbot-approval-automation-v1.json";
 const LANGUAGE_PREFERENCE_FILE = "openbot-language-preference-v1.json";
+const LOGO_COLOR_PREFERENCE_FILE = "openbot-logo-color-preference-v1.json";
 const UPDATE_PREFERENCE_FILE = "openbot-update-preference-v1.json";
 const NOTIFICATION_PREFERENCE_FILE = "openbot-notification-preference-v1.json";
 const DYNAMIC_ISLAND_PREFERENCE_FILE = "openbot-dynamic-island-preference-v1.json";
@@ -167,8 +201,11 @@ const LEGACY_REMOTE_DESKTOP_CREDENTIAL_FILE = "openbot-remote-desktop-credential
 const REMOTE_DESKTOP_RUNTIME_SECRET_FILE = "openbot-remote-desktop-runtime-v1.json";
 const CUSTOM_PROVIDERS_FILE = "openbot-custom-providers-v1.json";
 const PROVIDER_CREDENTIAL_FILE = "openbot-provider-credentials-v1.json";
+const MESSAGING_CREDENTIAL_FILE = "openbot-messaging-credentials-v1.json";
 /** The MCP sign-ins. Separate from the keys above: a key is typed by the user, a token is not. */
 const MCP_OAUTH_FILE = "openbot-mcp-oauth-v1.json";
+/** The one GitHub sign-in of this computer, with the same cipher as the MCP sign-ins. */
+const GITHUB_CONNECTOR_FILE = "openbot-github-connector-v1.json";
 
 /**
  * Where each service stops, as a position in the shutdown sequence rather than a position in the
@@ -187,8 +224,13 @@ const DEVELOPMENT_BUNDLE_IDENTIFIER = "com.github.Electron";
 
 const TEARDOWN_ORDER = {
   updater: 10,
+  idleRestart: 11,
   hostUpdateCoordinator: 12,
   requestedUpdate: 13,
+  hostedServerStartRetry: 14,
+  hostedServerActivity: 15,
+  hostedServerMemory: 16,
+  serverMode: 17,
   computerUseHighlight: 18,
   computerUsePermissionHelp: 19,
   dynamicIsland: 20,
@@ -200,12 +242,22 @@ const TEARDOWN_ORDER = {
   remoteServers: 60,
   voice: 70,
   remoteDesktop: 80,
+  // Before the host and the service: no new external message arrives while they stop.
+  messaging: 85,
+  // After the connections that hold it.
+  slackIngress: 86,
   host: 90,
   teamWebRtcBridge: 100,
   mcpOAuthRedirect: 105,
+  // Before the agent service, so no agent is handed a token file that is being removed.
+  githubConnector: 107,
+  // Before the agent service, so no script starts a run while the service stops.
+  automation: 108,
   service: 110,
   // Last, so the turns that end while the services stop are still written.
   trace: 120,
+  // After the service, so the lines its providers write while they stop are kept.
+  providerLog: 121,
 } as const;
 
 export interface ApplicationServiceContext {
@@ -220,6 +272,12 @@ export interface ApplicationServiceContext {
   appVariant: AppVariant;
   developmentRemoteRole: DevelopmentRemoteRole | null;
   developmentTestClientEnabled: boolean;
+  /** Set only in a hosted server VM. */
+  hostedServer: HostedServerEnvironment | null;
+  /** Set only in a self-hosted server that `install-server.sh` installed. */
+  serverMode: ServerModeEnvironment | null;
+  /** Set only by `bun run dev --hosting=test`. */
+  hostingDeveloperKey: string | null;
   macHapticFeedback: MacHapticFeedback;
   teardown: TeardownRegistry;
   forwardCentralAuth: (state: CentralAuthState) => void;
@@ -234,8 +292,11 @@ export interface ApplicationServices {
   service: AgentService;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
+  /** The Slack connections of the agents on this host. */
+  messaging: MessagingService;
   /** Reached by the entry point for one thing only: handing a returning grant to its sign-in. */
   mcpOAuth: McpOAuth;
+  githubConnector: GitHubConnectorService;
   mailbox: MailboxStore;
   storageUsage: StorageUsageService;
   browser: BrowserHost;
@@ -247,12 +308,15 @@ export interface ApplicationServices {
   hostUpdateCoordinator: HostUpdateCoordinator;
   /** The update restart that an admin of a joined server asked for (`host-update-v1`). */
   requestedUpdate: RequestedUpdate;
+  /** The restart that the user of this computer asked for, when no work runs. */
+  idleRestart: IdleRestart;
   setupFile: string;
   analyticsPreferenceFile: string;
   updatePreferenceFile: string;
   approvalAutomation: ApprovalAutomation;
   agentAdminSettings: AgentAdminSettingsService;
   language: LanguageService;
+  logoColor: LogoColorService;
   notificationPreference: NotificationPreferenceStore;
   agentInitialization: AgentInitializationGate;
   sidebarLayout: SidebarLayoutStore;
@@ -262,6 +326,10 @@ export interface ApplicationServices {
   centralAuth: CentralAuthManager;
   skills: SkillMarketplaceService;
   hostedSites: HostedSiteDesktopService;
+  billing: BillingDesktopService;
+  hostedServers: HostedServerDesktopService;
+  /** The terminal control of a self-hosted server. Null in every other build. */
+  serverMode: ServerMode | null;
   customProviders: CustomProviderStore;
   customProviderChanges: CustomProviderChanges;
   customAgentChanges: CustomAgentChanges;
@@ -316,6 +384,9 @@ export async function createApplicationServices({
   appVariant,
   developmentRemoteRole,
   developmentTestClientEnabled,
+  hostedServer,
+  serverMode: serverModeEnvironment,
+  hostingDeveloperKey,
   macHapticFeedback,
   teardown,
   forwardCentralAuth,
@@ -324,6 +395,12 @@ export async function createApplicationServices({
   forwardVoiceModelStatus,
   prepareForUpdateInstall,
 }: ApplicationServiceContext): Promise<ApplicationServices> {
+  // First, so the provider lines of the whole startup reach the file.
+  teardown.push(
+    TEARDOWN_ORDER.providerLog,
+    "the provider log",
+    startProviderLog(join(app.getPath("userData"), "logs")),
+  );
   // The one forward reference left in this function: the controller is built at the top of
   // startup because its window must be able to appear immediately, but the two services its
   // critical actions drive are built hundreds of lines below. A single named local rather than
@@ -333,7 +410,7 @@ export async function createApplicationServices({
     platform: process.platform,
     preferencePath: join(app.getPath("userData"), DYNAMIC_ISLAND_PREFERENCE_FILE),
     createWindow: createDynamicIslandWindow,
-    loadWindow: loadDynamicIslandRenderer,
+    loadWindow: (window, display) => loadDynamicIslandRenderer(window, display, appVariant),
     getDisplays: () => screen.getAllDisplays(),
     getMainWindow: windows.getMainWindow,
     ensureMainWindow: windows.ensureMainWindow,
@@ -425,7 +502,22 @@ export async function createApplicationServices({
   await managedSkills.syncAll(store.list());
   await skillCreator.syncAll(store.list());
   await dataSkill.syncAll(store.list());
-  const hostedSites = new HostedSiteDesktopService(centralAuth);
+  const hostedSites = new HostedSiteDesktopService(centralAuth, () => {
+    // Read at request time: the team store is created later, and the server can register after launch.
+    const hostId = teamStore.getIdentity()?.serverId;
+    return hostId ? centralAuth.hostSiteCredential(hostId) : null;
+  });
+  const billing = new BillingDesktopService(centralAuth, (url) => shell.openExternal(url));
+  const hostedServers = new HostedServerDesktopService(
+    withHostingDeveloperKey(centralAuth, hostingDeveloperKey),
+    (url) => shell.openExternal(url),
+    Date.now,
+    // A new server is running, but the joined list has no entry for it yet: read the list again.
+    (serverId) => {
+      if (!remoteServers.list().some((server) => server.id === serverId)) remoteServers.invalidateDirectory();
+    },
+    (serverId) => remoteServers.hostedServerStarting(serverId),
+  );
   const sidebarLayout = new SidebarLayoutStore(join(app.getPath("userData"), SIDEBAR_LAYOUT_FILE));
   await sidebarLayout.initialize();
   const mailbox = new MailboxStore(app.getPath("userData"), store.sharedRoot, store.database);
@@ -438,7 +530,19 @@ export async function createApplicationServices({
   });
   teamWebRtcBridge.on("accountProfileChanged", refreshAccountProfile);
   teardown.push(TEARDOWN_ORDER.teamWebRtcBridge, "the team WebRTC bridge", () => teamWebRtcBridge.stop());
-  const browser = new BrowserHost(mainWindow, store.downloadsRoot, join(app.getPath("userData"), BROWSER_STATE_FILE));
+  // Only a hosted server: its machine is small, and one unit holds OpenBot and every agent process.
+  const hostMemory = hostedServer
+    ? new HostedServerMemory({
+        onError: (message, error) => logger.warn(message, toLogValue(error)),
+      })
+    : null;
+  if (hostMemory) {
+    hostMemory.start();
+    teardown.push(TEARDOWN_ORDER.hostedServerMemory, "the hosted server memory reading", () => hostMemory.stop());
+  }
+  const browser = new BrowserHost(mainWindow, store.downloadsRoot, join(app.getPath("userData"), BROWSER_STATE_FILE), {
+    memoryLow: () => (hostMemory?.level() ?? "ok") !== "ok",
+  });
   teardown.push(TEARDOWN_ORDER.browser, "the browser", () => browser.destroy());
   await browser.restore(store.list().map((agent) => ({ id: agent.id, threadId: agent.threadId })));
   const browserPictureInPicture = new BrowserPictureInPicture({
@@ -461,6 +565,7 @@ export async function createApplicationServices({
   const setupFile = join(app.getPath("userData"), SETUP_FILE);
   const analyticsPreferenceFile = join(app.getPath("userData"), ANALYTICS_PREFERENCE_FILE);
   const updatePreferenceFile = join(app.getPath("userData"), UPDATE_PREFERENCE_FILE);
+  const routineHoldFile = join(app.getPath("userData"), ROUTINE_HOLD_FILE);
   const setupState = await readSetupState(setupFile);
   const analyticsPreference = await readAnalyticsPreference(analyticsPreferenceFile);
   // Loaded before the first window and before the application menu is built, so every native
@@ -470,6 +575,8 @@ export async function createApplicationServices({
     systemLocale: app.getLocale(),
   });
   await language.load();
+  const logoColor = new LogoColorService({ path: join(app.getPath("userData"), LOGO_COLOR_PREFERENCE_FILE) });
+  await logoColor.load();
   const notificationPreference = new NotificationPreferenceStore(
     join(app.getPath("userData"), NOTIFICATION_PREFERENCE_FILE),
   );
@@ -605,6 +712,20 @@ export async function createApplicationServices({
     redirectUrl: mcpOAuthRedirect?.redirectUrl ?? MCP_OAUTH_REDIRECT_URL,
   });
   mcpOAuthAuthority = mcpOAuth;
+  /*
+   * The built-in GitHub connection. Loaded before the agent service, because the first spawn reads
+   * its MCP server and its `gh` and `git` files. An unreadable file is logged by the service and
+   * treated as no sign-in.
+   */
+  const githubConnector = new GitHubConnectorService({
+    app: githubAppConfig(),
+    store: new GitHubConnectorStore(join(app.getPath("userData"), GITHUB_CONNECTOR_FILE), secretCipher),
+    toolDirectory: join(app.getPath("userData"), "provider-state", "github"),
+    apiUrl: centralAuthApiUrl,
+    openExternal: (url) => shell.openExternal(url),
+  });
+  await githubConnector.load();
+  teardown.push(TEARDOWN_ORDER.githubConnector, "the GitHub connection", () => githubConnector.dispose());
   const tables = new AgentTables({
     sharedRoot: store.sharedRoot,
     supervisor: new AgentDatabaseSupervisor({ spawnHost: spawnAgentDatabaseHost }),
@@ -670,14 +791,32 @@ export async function createApplicationServices({
     displays: computerUseDisplays,
     // The driver's own cursor on one screen, OpenBot's inside this overlay on more than one. The
     // runtime answers `null` for the screen it draws itself, so only one cursor is ever drawn.
-    readPointer: () => cuaDriver.lastPointer(COMPUTER_USE_CURSOR_MAX_AGE_MS),
+    readPointer: () => {
+      const pointer = cuaDriver.lastPointer(COMPUTER_USE_CURSOR_MAX_AGE_MS);
+      return pointer ? computerUseDesktopPoint(pointer) : null;
+    },
     readTarget: async (previous) => {
       if (!cuaDriver.mcpServerForProviders()) return null;
-      const session = liveSession(await computerUseReads.sessions());
+      // The rim marks work in progress, so it goes down with the last turn: completed, failed or
+      // cancelled. The driver's lease outlives the turn, so only an action made while a turn that
+      // still runs was running counts: a lease left by the turn before would put the rim over a
+      // turn that does not touch the desktop. Neither a lease nor an action names its agent, so the
+      // oldest running turn is the bound: a newer turn of another agent does not hide this one's
+      // rim. `service` is built below; the controller starts only after it.
+      const turnStartedAt = service.earliestRunningTurnStartedAt();
+      if (turnStartedAt === null) return null;
+      const session = liveSession(await computerUseReads.sessions(), (Date.now() - turnStartedAt) / 1000);
       if (!session) return null;
       const windows = await computerUseReads.listWindows();
       const action = cuaDriver.lastAction(COMPUTER_USE_ACTION_MAX_AGE_MS);
-      return chooseTarget({ windows, session, action, ownPid: process.pid, previous });
+      return chooseTarget({
+        windows,
+        session,
+        action,
+        ownPid: process.pid,
+        previous,
+        toDesktop: computerUseDesktopRect,
+      });
     },
   });
   // Before the daemon stops, so the rim is gone rather than left over a window nothing drives, and
@@ -715,6 +854,7 @@ export async function createApplicationServices({
     store,
     mailbox,
     browser,
+    hostMemory,
     requestTimeoutMs: 30_000,
     preferredProvider: setupState.preferredProvider ?? "codex",
     bundledExecutables: providerRuntimes.bundledExecutables(),
@@ -747,17 +887,123 @@ export async function createApplicationServices({
       // service asks for one at each hand-off; only a test the user pressed may open a browser.
       mcpOAuth,
       providerStateDirectory: join(app.getPath("userData"), "provider-state"),
+      // Paths only: `gh` and `git` read the token from the files the connection keeps current.
+      agentEnvironment: (inherited) => githubConnector.agentEnvironment(inherited),
     },
     // Appended to the stored servers at each spawn, so the same tools reach Codex, Claude and the
     // ACP providers. Null until the daemon runs, which is what keeps a machine with no driver from
     // handing every provider a command it cannot start.
     computerUseMcpServer: () => cuaDriver.mcpServerForProviders(),
+    githubConnector,
     localSkillTools: () => localSkillTools(skills),
     approvalAutomation,
     deleteWithRevokedApproval: (agentId, remove) => approvalAutomation.deleteAgent(agentId, remove),
     tables,
   });
   teardown.push(TEARDOWN_ORDER.service, "the agent service", () => service.stop());
+  // Listens only while an agent allows local scripts; see `AutomationServer`.
+  const automation = new AutomationServer({
+    root: store.automationRoot,
+    listAgents: () => service.listAgents(),
+    listRoutines: (agentId) => service.listRoutines(agentId),
+    runRoutine: (input) => service.runRoutineFromAutomation(input),
+  });
+  service.on("event", (event) => {
+    if (event.type === "agents-changed") void automation.sync();
+  });
+  teardown.push(TEARDOWN_ORDER.automation, "the automation server", () => automation.stop());
+  /*
+   * The Slack workspaces where the agents answer. The tokens use the same cipher as every other
+   * secret; an unreadable file is reported, not fatal, and each workspace then connects again.
+   */
+  const messagingCredentials = new MessagingCredentialStore(
+    join(app.getPath("userData"), MESSAGING_CREDENTIAL_FILE),
+    secretCipher,
+  );
+  const messagingCredentialLoadError = await messagingCredentials.load();
+  if (messagingCredentialLoadError)
+    logger.warn(
+      `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
+    );
+  // The Signal socket that brings the events of the Slack workspaces linked to this host. The host
+  // id is read when the socket opens, and the team store is built further down, so it starts as "no
+  // name yet".
+  let slackIngressHostId: () => string | null = () => null;
+  const slackIngress = new SlackIngress({
+    hostId: () => slackIngressHostId(),
+    signedIn: () => {
+      try {
+        centralAuth.getSignedInUser();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    issueTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId),
+    issueSlackRoute: (hostId) => centralAuth.issueSlackRoute(hostId),
+  });
+  teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack ingress socket", () => slackIngress.dispose());
+  // Development only: `bun run dev:slack` names this loopback port, so a Slack install returns to this
+  // dev app and not to an installed OpenBot that owns `openbot://`.
+  const developmentSlackCallbackPort = app.isPackaged ? 0 : Number(process.env.OPENBOT_DEV_SLACK_CALLBACK_PORT ?? 0);
+  const messaging = new MessagingService({
+    threads: service.messaging,
+    agents: {
+      listAgents: () => service.listAgents(),
+      respondToApproval: (input) => service.respondToApproval(input),
+      onEvent: (listener) => {
+        service.on("event", listener);
+        return () => service.off("event", listener);
+      },
+      createAgentProfile: (input) => service.createAgentProfile(input),
+      createMemory: (input) => service.createMemory(input),
+    },
+    credentials: messagingCredentials,
+    drivers: [slackDriver({ ingress: slackIngress })],
+    downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
+    ingress: slackIngress,
+    sidebar: sidebarLayout,
+    slackApp: {
+      authorize: (input) => {
+        const hostId = slackIngressHostId();
+        if (!hostId) throw new Error(sourceText("error.messaging.relayUnavailable"));
+        return centralAuth.requestAuthorized(
+          "/v2/slack/authorize",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hostId,
+              ...input,
+              ...(developmentSlackCallbackPort > 0
+                ? { returnUrl: `http://127.0.0.1:${developmentSlackCallbackPort}${SLACK_DEV_CALLBACK_PATH}` }
+                : {}),
+            }),
+          },
+          (value) => requiredString(decodeRecord(value, "Slack sign-in"), "authorizeUrl"),
+        );
+      },
+      unlink: async (workspaceId) => {
+        const hostId = slackIngressHostId();
+        if (hostId) await centralAuth.unlinkSlackWorkspace(hostId, workspaceId);
+      },
+      openExternal: (url) => shell.openExternal(url),
+    },
+  });
+  // Not awaited: a connection waits for Slack, and the app does not wait for it.
+  void messaging.start().catch((error) => logger.warn("Messaging connections did not start.", toLogValue(error)));
+  teardown.push(TEARDOWN_ORDER.messaging, "the messaging connections", () => messaging.stop());
+  if (developmentSlackCallbackPort > 0) {
+    // As `openbot://` does for a packaged build, a finished install brings OpenBot to the front.
+    const callback = await startSlackDevCallbackServer(developmentSlackCallbackPort, async (nonce, grant) => {
+      const received = await messaging.completeSlackWorkspace(nonce, grant);
+      if (received) app.focus({ steal: true });
+      return received;
+    });
+    teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack development callback", () => callback.close());
+  }
+  // A connect, a disconnect or an expiry changes the tools and the `gh` sign-in of every agent.
+  githubConnector.onAgentAccessChanged(() => service.notifyGitHubConnectorChanged());
   // The capability and the tool list both follow the daemon, and nothing else can tell them: no
   // provider probe reaches the driver, because the driver is this process's child.
   // The held state first: the providers start at `unavailable`, and a listener hears only what
@@ -840,7 +1086,7 @@ export async function createApplicationServices({
       caches: ["remote-attachments", "remote-shared-files", "remote-workspace-files"].map((name) =>
         join(userData, name),
       ),
-      logs: [join(userData, "logs", "remote"), join(userData, "logs", "update")],
+      logs: [join(userData, "logs", "remote"), join(userData, "logs", "update"), join(userData, "logs", "providers")],
       runtimes: providerRuntimeRoot({
         appData: app.getPath("appData"),
         userDataOverride: app.commandLine.getSwitchValue("user-data-dir"),
@@ -884,6 +1130,8 @@ export async function createApplicationServices({
     join(app.getPath("userData"), TEAM_FILE),
   );
   await teamStore.initialize();
+  slackIngressHostId = () => teamStore.getIdentity()?.serverId ?? null;
+  slackIngress.reconnect();
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await applyDevelopmentRemoteAccount({
@@ -894,6 +1142,21 @@ export async function createApplicationServices({
       setupFile,
       setupCompleted: setupState.completed,
     });
+  }
+  // At the same position. A failure leaves the host unconfigured and the app running, so the log
+  // shows why; a throw here would make systemd restart the app with a claim that may be spent.
+  let hostedServerSignedIn = false;
+  const signInHostedServer = async (
+    environment: HostedServerEnvironment,
+    initialization: Promise<CentralAuthState>,
+  ): Promise<void> => {
+    await applyHostedServerAccount({ environment, centralAuth, centralAuthInitialization: initialization, teamStore });
+    hostedServerSignedIn = true;
+  };
+  if (hostedServer) {
+    await signInHostedServer(hostedServer, centralAuthInitialization).catch((error) =>
+      logger.error("The hosted server could not sign in:", toLogValue(error)),
+    );
   }
   const teamChatStore = new TeamChatStore(store.database);
   const remoteDesktopRuntime = await resolveRemoteDesktopRuntime({
@@ -914,6 +1177,18 @@ export async function createApplicationServices({
     if (!requestedUpdate) throw new RequestedUpdateRefusal("unsupported");
     return requestedUpdate;
   };
+  // Imported channels are created by the local user, as when they create one by hand. A member who
+  // imports from a joined client is named by the route instead. The host is read only on apply.
+  const agentImport = new AgentImportService(
+    service,
+    {
+      library: () => skills.requireLocalLibrary(),
+      installLocal: (input) => skills.installLocal(input),
+    },
+    () => host.channelActor(),
+    undefined,
+    join(app.getPath("userData"), "agent-import-uploads"),
+  );
   const host = new HostService({
     appVersion: app.getVersion(),
     store: teamStore,
@@ -928,6 +1203,10 @@ export async function createApplicationServices({
     mcpServers: service,
     // Present, so the host advertises `storage-v1`. Members read; only admins delete or clear.
     storage: storageUsage,
+    // Present, so the host advertises `hosted-sites-v1`. Members list; only admins delete.
+    hostedSites,
+    // Present, so the host advertises `agent-import-v1`. Any member can import.
+    agentImport,
     // Each member present advertises its admin capability. Every admin route requires an owner or admin.
     admin: {
       agents: agentAdminSettings,
@@ -940,6 +1219,7 @@ export async function createApplicationServices({
         credentials: providerCredentials,
         runtimes: providerRuntimes,
         customProviders: customProviderChanges,
+        pasteSignIn: pasteCodeLoginSupported(),
       },
       update: {
         snapshot: () => scheduledUpdate().snapshot(),
@@ -959,6 +1239,7 @@ export async function createApplicationServices({
     teamWebRtcBridge,
     registerRemoteHost: (input) => centralAuth.registerRemoteHost(input),
     issueRemoteHostTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId),
+    sendLiveActivityPush: (hostId, push) => centralAuth.sendLiveActivityPush(hostId, push),
     verifyRemoteSessionTicket: (ticket) => centralAuth.verifyRemoteSessionTicket(ticket),
     endRemoteSession: (sessionId) => centralAuth.endRemoteSession(sessionId),
     remoteControlPlaneUrl: centralAuth.resolveApiUrl("/"),
@@ -1018,15 +1299,6 @@ export async function createApplicationServices({
       return Promise.resolve(iceServers);
     },
   });
-  // Imported channels are created by the local user, as when they create one by hand.
-  const agentImport = new AgentImportService(
-    service,
-    {
-      library: () => skills.requireLocalLibrary(),
-      installLocal: (input) => skills.installLocal(input),
-    },
-    () => host.channelActor(),
-  );
   teardown.push(TEARDOWN_ORDER.host, "the local host", () => host.shutdown());
   const signedInState = centralAuth.getState();
   if (signedInState.status === "signed_in") {
@@ -1043,6 +1315,16 @@ export async function createApplicationServices({
   if (analyticsPlatform !== "darwin" && analyticsPlatform !== "win32" && analyticsPlatform !== "linux") {
     throw new Error(`Unsupported analytics platform: ${analyticsPlatform}`);
   }
+  // The catalog is read in the background. Until it is ready, a tool step reports its server as
+  // custom; the inventory waits for it, because it is sent only once a day.
+  let catalogPluginServers: CatalogPluginServer[] = [];
+  const catalogPluginServersLoaded = loadCatalogPluginServers(
+    app.isPackaged
+      ? join(process.resourcesPath, "plugin-catalog")
+      : resolve(__dirname, "../../resources/plugin-catalog"),
+  ).then((servers) => {
+    catalogPluginServers = servers;
+  });
   const analytics = new HostAnalytics({
     enabled: app.isPackaged && appVariant === "production",
     trackingEnabled: analyticsPreference.enabled,
@@ -1061,6 +1343,31 @@ export async function createApplicationServices({
         : null;
     },
     resolveAgent: (agentId) => service.listAgents().find((agent) => agent.id === agentId) ?? null,
+    resolveMcpServer: (name) => {
+      const configs = service.listMcpServers().filter((server) => isReportedMcpServerName(server.name, name));
+      if (configs.length === 0) return null;
+      const slugs = new Set(configs.map((config) => catalogPluginSlug(config, catalogPluginServers, homedir())));
+      const [slug] = slugs;
+      return { slug: slugs.size === 1 && slug ? slug : null };
+    },
+    resolveRoutineRun: (agentId, routineId, runId) => {
+      const run = service.listRoutineRuns({ agentId, routineId }).find((item) => item.id === runId);
+      const routine = service.listRoutines(agentId).find((item) => item.id === routineId);
+      return run && routine ? { runKind: run.kind, triggerType: routine.trigger.schedule.kind } : null;
+    },
+    resolveInventory: async () => {
+      await catalogPluginServersLoaded;
+      return collectAnalyticsInventory({
+        agents: () => service.listAgents(),
+        routines: (agentId) => service.listRoutines(agentId),
+        // The local read: `listInstalled` asks the marketplace for each skill's latest version.
+        skills: (agentId) => skills.listInstalledForChatTags(agentId),
+        mcpServers: () => service.listMcpServers(),
+        pluginSlug: (config) => catalogPluginSlug(config, catalogPluginServers, homedir()),
+        computerUseEnabled: () => cuaDriver.mcpServerForProviders() !== null,
+      });
+    },
+    inventoryDay: analyticsInventoryDayStore(join(app.getPath("userData"), ANALYTICS_INVENTORY_FILE)),
   });
   // Immediately after construction: this attributes buffered events to the current owner rather
   // than flushing a queue, so a later call would attribute them to nobody.
@@ -1077,8 +1384,13 @@ export async function createApplicationServices({
     },
     {
       allowLocalDevelopmentInvites: developmentRemoteRole !== null,
+      selfHostedApiOrigin: selfHostedApiOrigin(centralAuthApiUrl),
       appVersion: app.getVersion(),
       getLocalHostId: () => teamStore.getIdentity()?.serverId ?? null,
+      hostedServers: {
+        unavailable: (serverId, wake) => hostedServers.unavailableHost(serverId, wake),
+        wake: (serverId) => hostedServers.wake(serverId),
+      },
       webrtcTransport: new TeamWebRtcClientTransport({
         bridge: teamWebRtcBridge,
         listHosts: () => centralAuth.listRemoteHosts(),
@@ -1193,13 +1505,20 @@ export async function createApplicationServices({
     // the service refuses the install until every sibling session stopped. Unpackaged runs never
     // enable updates, so there is nothing to guard there.
     checkSiblingInstances: app.isPackaged
-      ? () =>
-          listSiblingOpenBotInstances({
+      ? async () => {
+          const siblings = await listSiblingOpenBotInstances({
             executablePath: app.getPath("exe"),
             currentPid: process.pid,
             platform: process.platform,
-          })
+          });
+          if (siblings.length > 0) {
+            const list = siblings.map(({ pid, uid }) => `pid ${pid} (uid ${uid})`).join(", ");
+            logger.warn(`OpenBot update install refused: other OpenBot processes run from this application: ${list}`);
+          }
+          return siblings;
+        }
       : undefined,
+    currentUid: typeof process.getuid === "function" ? process.getuid() : undefined,
     platform: process.platform,
     logDirectory: join(app.getPath("userData"), "logs", "update"),
     // Squirrel.Mac only. The path is meaningless under a Linux or Windows home directory.
@@ -1213,7 +1532,8 @@ export async function createApplicationServices({
     // from the moment the runtime exists, so this waits only for what is left of it, and a
     // failure here must not keep the agents down.
     await computerUseWarmUp.catch(() => undefined);
-    await service.initialize();
+    await service.initialize({ heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)) });
+    await automation.sync();
   });
   const describeRestartReadiness = (): RestartReadiness =>
     checkRestartReadiness({
@@ -1252,6 +1572,101 @@ export async function createApplicationServices({
   });
   const remoteUpdate = requestedUpdate;
   teardown.push(TEARDOWN_ORDER.requestedUpdate, "the requested update", () => remoteUpdate.dispose());
+  const idleRestart = new IdleRestart({
+    updater,
+    describeReadiness: describeRestartReadiness,
+    holdRoutines: () => service.holdRoutines(),
+    releaseRoutines: () => service.releaseRoutines(),
+    recordHold: (window) => {
+      try {
+        if (window) writeRoutineHold(routineHoldFile, window);
+        else clearRoutineHold(routineHoldFile);
+      } catch (error) {
+        // The restart goes on: the next start then skips the held routines as missed.
+        logger.warn("The routine hold could not be saved.", toLogValue(error));
+      }
+    },
+    relaunch: () => {
+      // A development build only quits: its supervisor stops the stack, and a relaunched Electron
+      // would run outside it with no renderer server.
+      if (app.isPackaged) app.relaunch();
+      app.quit();
+    },
+    log: (message) => logger.info(message),
+  });
+  teardown.push(TEARDOWN_ORDER.idleRestart, "the restart when idle", () => idleRestart.dispose());
+  if (hostedServer) {
+    const hostedServerStartRetry = new HostedServerStartRetry({
+      hostPhase: () => host.getStatus().phase,
+      startHost: async () => {
+        // A start with no answer from the account server ends in the auth error state, and only a
+        // retry reads the stored session again.
+        if (centralAuth.getState().status !== "signed_in") await centralAuth.retry();
+        if (!hostedServerSignedIn) await signInHostedServer(hostedServer, Promise.resolve(centralAuth.getState()));
+        return host.start();
+      },
+      onError: (message, error) => logger.warn(message, toLogValue(error)),
+    });
+    hostedServerStartRetry.start();
+    teardown.push(TEARDOWN_ORDER.hostedServerStartRetry, "the hosted server start retry", () =>
+      hostedServerStartRetry.stop(),
+    );
+    const hostedServerActivity = new HostedServerActivity({
+      hostId: hostedServer.hostId,
+      // A live Slack connection counts: stopped, the server could not hear the next message. An open
+      // browser view does not: a view that the user forgot would keep the server running. Input in
+      // the view counts as client use.
+      inUse: () =>
+        service.hasActiveWork().length > 0 ||
+        messaging.hasLiveConnection() ||
+        host.describeRestartBlockers().some((reason) => reason !== "browser-view") ||
+        (host.connectedClientCount() > 0 && Date.now() - (host.lastClientUseAt() ?? 0) < CLIENT_USE_WINDOW_MS),
+      nextRunAt: () => {
+        const dueAt = service.nextRoutineDueAt();
+        return dueAt ? Date.parse(dueAt) : null;
+      },
+      report: async (path, report) =>
+        centralAuth.requestAuthorized(
+          path,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) },
+          () => undefined,
+        ),
+      onError: (message, error) => logger.warn(message, toLogValue(error)),
+    });
+    hostedServerActivity.start();
+    teardown.push(TEARDOWN_ORDER.hostedServerActivity, "the hosted server activity report", () =>
+      hostedServerActivity.stop(),
+    );
+  }
+  const serverMode = serverModeEnvironment
+    ? new ServerMode({
+        environment: serverModeEnvironment,
+        version: app.getVersion(),
+        centralAuth,
+        host,
+        onError: (message, error) => logger.warn(message, toLogValue(error)),
+      })
+    : null;
+  if (serverMode) {
+    // Without the socket the server still runs, and the log says why nobody can sign it in.
+    await serverMode
+      .listen()
+      .catch((error) => logger.error("The server control socket did not start:", toLogValue(error)));
+    // Nobody presses Retry on a server either. A server that is signed out has nothing to publish.
+    const serverStartRetry = new HostedServerStartRetry({
+      hostPhase: () => host.getStatus().phase,
+      startHost: async () => {
+        if (centralAuth.getState().status === "error") await centralAuth.retry();
+        await serverMode.publish();
+      },
+      onError: (message, error) => logger.warn(message, toLogValue(error)),
+    });
+    serverStartRetry.start();
+    teardown.push(TEARDOWN_ORDER.serverMode, "the server control socket", async () => {
+      serverStartRetry.stop();
+      await serverMode.close();
+    });
+  }
   await hostUpdateCoordinator.tick();
   hostUpdateCoordinator.start();
   teardown.push(TEARDOWN_ORDER.hostUpdateCoordinator, "the host update coordinator", () =>
@@ -1262,7 +1677,9 @@ export async function createApplicationServices({
     service,
     providerRuntimes,
     providerCredentials,
+    messaging,
     mcpOAuth,
+    githubConnector,
     mailbox,
     storageUsage,
     browser,
@@ -1275,10 +1692,12 @@ export async function createApplicationServices({
     approvalAutomation,
     agentAdminSettings,
     language,
+    logoColor,
     notificationPreference,
     agentInitialization,
     hostUpdateCoordinator,
     requestedUpdate: remoteUpdate,
+    idleRestart,
     describeRestartReadiness,
     sidebarLayout,
     host,
@@ -1287,6 +1706,9 @@ export async function createApplicationServices({
     centralAuth,
     skills,
     hostedSites,
+    billing,
+    hostedServers,
+    serverMode,
     customProviders,
     customProviderChanges,
     customAgentChanges,

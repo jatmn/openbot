@@ -1,3 +1,5 @@
+import type { AppLanguage } from "@openbot/contracts/app-language";
+import { HOSTED_SERVER_CONTACT_URL } from "@openbot/contracts/hosted-servers";
 import {
   type AccountUsage,
   type AddedAgent,
@@ -5,23 +7,29 @@ import {
   type AgentEvent,
   type AgentModelOption,
   type AgentStatus,
+  type AgentSummary,
   type AppInfo,
   type BrowserTakeoverRequest,
   CHANNEL_CHATS_CAPABILITY,
   type ServerConnectionState,
+  type ServerNotificationLevel,
   type ServerSummary,
 } from "@openbot/contracts/ipc";
+import { AGENT_IMPORT_CAPABILITY } from "@openbot/contracts/team-protocol/agent-import-v1";
 import { CONTEXT_RESET_CAPABILITY } from "@openbot/contracts/team-protocol/context-reset-v1";
 import { HOST_UPDATE_CAPABILITY } from "@openbot/contracts/team-protocol/host-update-v1";
+import { HOSTED_SITES_CAPABILITY } from "@openbot/contracts/team-protocol/hosted-sites-v1";
 import { readHostAnalytics } from "@openbot/team-client";
 import {
   cancelHostUpdate,
   checkHostForUpdate,
   clearStorage,
+  deleteHostedSite,
   deleteStoredFile,
   getAgentAdminSettings,
   getHostUpdateStatus,
   getStorageUsage,
+  listHostedSites,
   setHostUpdateSettings,
   startHostUpdate,
   updateAgentAdminSettings,
@@ -41,13 +49,18 @@ import type { AgentMessage } from "@openbot/ui/data";
 import { AccountDock } from "@openbot/ui/features/account/AccountDock";
 import { computeAgentAvatarMoods } from "@openbot/ui/features/agents/agent-avatar-mood";
 import { createFirstAgentDraft, type FirstAgentDraft } from "@openbot/ui/features/agents/FirstAgentSetup";
+import { BillingDialog } from "@openbot/ui/features/billing/BillingDialog";
+import { createBillingStore } from "@openbot/ui/features/billing/billing-store";
 import { ServerRail } from "@openbot/ui/features/servers/ServerRail";
+import { createSettingsHostedServersStore } from "@openbot/ui/features/settings/stores/hosted-servers-store";
 import { Sidebar } from "@openbot/ui/features/sidebar/Sidebar";
 import { computeSidebarAgentStates } from "@openbot/ui/features/sidebar/sidebar-agent-states";
 import { useText } from "@openbot/ui/text";
-import { createEffect, createMemo, createSignal, onCleanup, onSettled, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, Loading, lazy, onCleanup, onSettled, Show, untrack } from "solid-js";
+import { startActionSounds } from "../../action-sounds";
+import { actionToast } from "../../action-toast";
 import { toAgentMessage, toAgentMessages } from "../../app-message-projection";
-import { playCompletionSoundForAgentEvent } from "../../completion-sound";
+import { playCompletionSoundForAgentEvent, unlockCompletionSound } from "../../completion-sound";
 import { isGlobalSearchShortcut } from "../../global-search-shortcut";
 import { LayoutProvider, useLayout } from "../../layout";
 import { PlatformProvider } from "../../platform";
@@ -60,22 +73,28 @@ import {
   ServerSettingsOverlay,
   SharedAgentInstallOverlay,
 } from "../../WorkspaceOverlayViews";
+import type { CreationPreference } from "../agents/agent-creation-model";
 import { claimErrorToast, readableAgentError } from "../agents/agent-error-text";
+import { createAgentEventSounds } from "../agents/agent-event-sounds";
 import { createRemoteAgentAdmin, updateRemoteAgent } from "../agents/remote-agent-admin";
 import { ChannelConversation } from "../channels/ChannelConversation";
 import { readChannelSelection, writeChannelSelection } from "../channels/channel-selection";
-import { isOwnChannelAuthor } from "../channels/channel-timeline";
 import { ChannelsControllerProvider } from "../channels/channels-context";
 import { createChannelsController } from "../channels/channels-controller";
+import { globalSearchChannels } from "../channels/global-search-channels";
 import { Conversation, createConversationController } from "../conversation/Conversation";
 import { clearStoredQueueEdit } from "../conversation/composer-draft";
 import { ConversationControllerProvider } from "../conversation/conversation-controller-context";
 import { composerDraftKey } from "../conversation/conversation-keys";
 import type { FilesPort } from "../files/files-port";
+import { hostSetupProviderProps } from "../onboarding/host-setup-provider-props";
+import { ServerOnboarding } from "../onboarding/ServerOnboarding";
+import { AddServerOverlay, type AddServerResume } from "../servers/AddServerOverlay";
 import { watchHostUpdate } from "../servers/host-update-toast";
-import type { ServerSettingsSection } from "../servers/ServerSettingsModal";
+import type { ServerHostedSitesOptions, ServerSettingsSection } from "../servers/ServerSettingsModal";
 import type { HostUpdateCalls } from "../servers/ServerUpdatePanel";
 import { remoteAdminServer } from "../servers/server-capabilities";
+import { isReaderAuthor } from "../team/reader-identity";
 import { AgentUsagePanel } from "../usage/AgentUsagePanel";
 import type { UsagePort } from "../usage/usage-port";
 import { WebAgentSettings } from "./WebAgentSettings";
@@ -83,11 +102,17 @@ import { WebConnectComputer } from "./WebConnectComputer";
 import { WebHostOffline } from "./WebHostOffline";
 import { WebMobileNavigation, type WebMobilePane } from "./WebMobileNavigation";
 import { createWebAccountCalls } from "./web-account";
+import { createWebAgentImportCalls } from "./web-agent-import";
+import { openWebLink } from "./web-attachments";
+import { createWebBillingCalls } from "./web-billing";
 import { createWebChannelsPort } from "./web-channels-runtime";
 import { createWebWorkspace, type WebRuntimeFactory } from "./web-client-context";
 import { createWebConversationRuntime } from "./web-conversation-runtime";
 import { createWebFileSaver } from "./web-file-download";
+import { createWebHostedServerCalls } from "./web-hosted-servers";
 import { createWebAgentTemplateCalls, createWebMarketplaceCalls } from "./web-marketplace";
+import { createWebServerNotifications } from "./web-notification-preferences";
+import { requestWebNotificationPermission, showWebAgentNotification, watchWebTabFocus } from "./web-notifications";
 import { createWebProviderSettings, openWebDestination } from "./web-provider-admin";
 import { createWebServerSettings } from "./web-server-settings";
 
@@ -140,7 +165,18 @@ type WebWorkspaceProps = {
   /** A plugin listing that a `/app?plugin=<slug>` link named. The marketplace opens on it. */
   pluginSlug?: string | null;
   onPluginSlugConsumed?: () => void;
+  /** True on a return from the Stripe Customer Portal. The Billing dialog opens on it. */
+  billingReturn?: boolean;
+  onBillingReturnConsumed?: () => void;
+  /** The server of a return from Stripe Checkout. The add server dialog opens on its progress. */
+  hostingReturn?: AddServerResume | null;
+  onHostingReturnConsumed?: () => void;
+  /** The interface language this browser keeps. Account settings change it. */
+  language: AppLanguage;
+  onChangeLanguage: (language: AppLanguage) => void;
 };
+
+const WebAccountSettings = lazy(() => import("./WebAccountSettings"));
 
 export function WebWorkspace(props: WebWorkspaceProps) {
   return (
@@ -182,6 +218,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       );
     },
   });
+  const notifications = createWebServerNotifications(props.accountId);
   // A stored queue edit holds message text of the account that opened it. Another account must not restore it.
   try {
     if (window.localStorage.getItem(QUEUE_EDIT_ACCOUNT_KEY) !== props.accountId) clearStoredQueueEdit();
@@ -222,7 +259,8 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   }
   /** The host list was read and holds no computer to connect to. */
   const noHost = () => !workspace.state.host && (workspace.state.hostsLoaded || Boolean(workspace.state.hostsError));
-  const hostOffline = () => !noHost() && workspace.state.status !== "online";
+  // A hosted server that sleeps or wakes keeps the workspace on screen; the server name shows why it does not answer.
+  const hostOffline = () => !noHost() && workspace.state.status !== "online" && !workspace.state.hostedSleep;
   let resetRevocation = workspace.state.revocationRevision;
   createEffect(
     () => ({ host: workspace.state.host?.hostId, revocation: workspace.state.revocationRevision }),
@@ -254,6 +292,38 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   const [accountUsage, setAccountUsage] = createSignal<AccountUsage | null>(null);
   let usageGeneration = 0;
   const [joinOpen, setJoinOpen] = createSignal(false);
+  const hostedServerCalls = createWebHostedServerCalls(props.accountFetch);
+  const [addServer, setAddServer] = createSignal<{ resume: AddServerResume | null } | null>(null);
+  // True when the account can create hosted servers. The plus button then opens the plans.
+  const [hostedServersAvailable, setHostedServersAvailable] = createSignal(false);
+  async function refreshHostedServersAvailable(): Promise<boolean> {
+    // A failed read keeps the last answer: a network error does not turn the plans off.
+    const available = await hostedServerCalls.list().then(
+      (list) => list.available,
+      () => hostedServersAvailable(),
+    );
+    setHostedServersAvailable(available);
+    return available;
+  }
+  void refreshHostedServersAvailable();
+  /**
+   * The plus button opens the add server dialog when the account can create hosted servers, else the
+   * join dialog. It uses the last answer, so the click does not wait for the network; the read after it
+   * is for the next click.
+   */
+  function openAddServer(): void {
+    if (hostedServersAvailable()) setAddServer({ resume: null });
+    else setJoinOpen(true);
+    void refreshHostedServersAvailable();
+  }
+  createEffect(
+    () => props.hostingReturn,
+    (resume) => {
+      if (!resume) return;
+      setAddServer({ resume });
+      props.onHostingReturnConsumed?.();
+    },
+  );
   const [creating, setCreating] = createSignal(false);
   /** The new agent form's avatar. The first-agent row in an empty sidebar shows it. */
   const [agentAvatar, setAgentAvatar] = createSignal(newAgentAvatar());
@@ -267,6 +337,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     avatarUrl: props.accountAvatarUrl ?? null,
   }));
   const accountCalls = createWebAccountCalls(props.accountFetch, props.onSessionCheck);
+  const [accountSettingsOpen, setAccountSettingsOpen] = createSignal(false);
   /* As in the desktop dock: the reading is taken again when a provider connects or disconnects. */
   const usageTargetKey = createMemo(() => {
     const hostId = workspace.state.host?.hostId;
@@ -310,6 +381,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       const active = host.hostId === workspace.state.host?.hostId;
       const incompatibility =
         active && workspace.state.incompatibility?.hostId === host.hostId ? workspace.state.incompatibility : null;
+      const notice = notifications.state(host.hostId);
       return {
         id: host.hostId,
         name: host.name,
@@ -321,10 +393,13 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
           : null,
         active,
         state: incompatibility ? "incompatible" : hostState(host.hostId),
-        notificationsMuted: false,
-        notificationsMutedUntil: null,
-        notificationLevel: "all",
+        // Only the opened host has a known sleep state.
+        hostedSleep: active ? workspace.state.hostedSleep : null,
+        notificationsMuted: notice.muted,
+        notificationsMutedUntil: notice.mutedUntil,
+        notificationLevel: notice.level,
         remoteDesktopAvailable: false,
+        ...(host.memberLimit === undefined ? {} : { memberLimit: host.memberLimit }),
         compatibility: {
           localAppVersion: "web",
           hostAppVersion: incompatibility?.hostAppVersion ?? null,
@@ -399,9 +474,64 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       },
     },
   };
+  /** As on desktop, mute and the notification level decide what a host's event says; the sound follows them too. */
+  function notify(hostId: string, event: AgentEvent, agents: AgentSummary[]): void {
+    const { muted, level } = untrack(() => notifications.state(hostId));
+    if (muted || level === "nothing") return;
+    if (event.type === "turn-completed" && level === "all") playCompletionSoundForAgentEvent(event, agents);
+    showWebAgentNotification({
+      event,
+      agents,
+      level,
+      translate: t,
+      onOpen: (agentId) => void openNotified(hostId, agentId),
+    });
+  }
+  async function openNotified(hostId: string, agentId: string) {
+    setMobilePane("conversation");
+    if (hostId !== workspace.state.host?.hostId) {
+      const host = workspace.state.hosts.find((item) => item.hostId === hostId);
+      if (!host) return;
+      await workspace.connect(host);
+    }
+    if (workspace.state.host?.hostId === hostId && workspace.state.agents.some((agent) => agent.id === agentId))
+      await select(agentId);
+  }
+  function setMuted(hostId: string, muted: boolean, durationMs?: number) {
+    if (!muted) requestWebNotificationPermission(true);
+    notifications.setMuted(hostId, muted, durationMs);
+  }
+  function setNotificationLevel(hostId: string, level: ServerNotificationLevel) {
+    if (level !== "nothing") requestWebNotificationPermission(true);
+    notifications.setLevel(hostId, level);
+  }
+  // Safari starts audio only from a user action, and can stop it again, so each action starts it.
+  window.addEventListener("pointerdown", unlockCompletionSound, true);
+  window.addEventListener("keydown", unlockCompletionSound, true);
+  onCleanup(() => {
+    window.removeEventListener("pointerdown", unlockCompletionSound, true);
+    window.removeEventListener("keydown", unlockCompletionSound, true);
+  });
+  startActionSounds();
+  // As with `notify`: a muted server, a server set to nothing, or a muted agent plays no cue.
+  const playAgentEventSound = createAgentEventSounds((agentId) => {
+    const hostId = workspace.state.host?.hostId;
+    if (!hostId) return false;
+    const { muted, level } = untrack(() => notifications.state(hostId));
+    return (
+      !muted &&
+      level !== "nothing" &&
+      untrack(() => workspace.state.agents).some((agent) => agent.id === agentId && agent.notifications)
+    );
+  });
+  onCleanup(watchWebTabFocus());
+  onCleanup(workspace.onHostNotice(notify));
   onCleanup(
     workspace.onHostEvent((event) => {
-      if (event.type === "turn-completed") playCompletionSoundForAgentEvent(event, workspace.state.agents);
+      const hostId = workspace.state.host?.hostId;
+      if (hostId && (event.type === "turn-completed" || event.type === "prompt" || event.type === "approval"))
+        notify(hostId, event, workspace.state.agents);
+      playAgentEventSound(event);
       // As on desktop: the host sends a new reading when a provider reports usage.
       if (event.type === "usage-changed" && untrack(usageTargetKey)) {
         usageGeneration += 1;
@@ -425,13 +555,17 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     window.addEventListener("keydown", toggleSearch);
     return () => window.removeEventListener("keydown", toggleSearch);
   });
-  async function searchAllMessages(query: string) {
-    if (workspace.state.status !== "online") return [];
-    const page = await workspace.runtime.search(undefined, query);
-    return page.results.map((result) => ({
-      agentId: result.agentId,
-      message: toAgentMessage(result.message, result.agentId),
-    }));
+  async function searchAllMessages(query: string, cursor?: string) {
+    if (workspace.state.status !== "online") return { results: [], nextCursor: null };
+    const page = await workspace.runtime.search(undefined, query, cursor);
+    return {
+      results: page.results.map((result) => ({
+        agentId: result.agentId,
+        message: toAgentMessage(result.message, result.agentId),
+      })),
+      total: page.total,
+      nextCursor: page.nextCursor,
+    };
   }
   /** Opens an agent at one message, for a global search result and a stored file's message. */
   async function openMessage(agentId: string, messageId: string) {
@@ -503,6 +637,27 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       if (slug) setMarketplaceOpen(true);
     },
   );
+  const [billingOpen, setBillingOpen] = createSignal(false);
+  const billingCalls = createWebBillingCalls(props.accountFetch);
+  const billing = createBillingStore(() => billingCalls, billingOpen);
+  // The web client has no Settings dialog, so a server whose plan ended is renewed or deleted in Billing.
+  const hostedServers = createSettingsHostedServersStore(
+    {
+      get open() {
+        return billingOpen();
+      },
+      hostedServersApi: hostedServerCalls,
+    },
+    billingOpen,
+  );
+  createEffect(
+    () => props.billingReturn,
+    (billingReturn) => {
+      if (!billingReturn) return;
+      setBillingOpen(true);
+      props.onBillingReturnConsumed?.();
+    },
+  );
   const saveFile = createWebFileSaver();
   const storageCalls: FilesPort = {
     agent: { listAgents: () => workspace.runtime.listAgents() },
@@ -521,6 +676,15 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       },
     },
   };
+  const hostedSiteCalls: ServerHostedSitesOptions["api"] = {
+    list: async (serverId) => listHostedSites(hostRequest(serverId)),
+    delete: async ({ siteId }, serverId) => deleteHostedSite(hostRequest(serverId), siteId),
+  };
+  const agentImportCalls = createWebAgentImportCalls({
+    request: hostRequest,
+    listAgents: () => workspace.runtime.listAgents(),
+    saveFile,
+  });
   const hostUpdateCalls: HostUpdateCalls = {
     getUpdateStatus: async (serverId) => getHostUpdateStatus(hostRequest(serverId)),
     checkForUpdate: async (serverId) => checkHostForUpdate(hostRequest(serverId)),
@@ -630,6 +794,22 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   const firstAgent = () => workspace.state.agentsLoaded && workspace.profiles().length === 0 && createSupported();
   /** An open channel still takes the pane, as a channel closes the desktop form. */
   const agentFormOpen = () => creating() || (firstAgent() && !channelOpen());
+  /**
+   * The provider that a server's provider step chose, by server. In memory only, as on desktop: the
+   * saved setup choice is of the desktop computer, not of the server.
+   */
+  const [serverSetupChoices, setServerSetupChoices] = createSignal<Record<string, CreationPreference>>({});
+  const serverSetupChoice = () => {
+    const id = server()?.id;
+    return id ? (serverSetupChoices()[id] ?? null) : null;
+  };
+  /**
+   * A server with no agents shows the provider step before the first-agent form, for an account that
+   * can sign its host in. OpenBot includes no AI subscription, so an agent made first could not
+   * answer. A member and an older host open the form as before.
+   */
+  const serverOnboarding = () =>
+    agentFormOpen() && firstAgent() && serverSetupChoice() === null ? providerSettings() : undefined;
   // The host reports the new agent before the create call returns. Hold the form open until the
   // save is done, so the new-agent avatar still changes after it.
   createEffect(firstAgent, (first) => {
@@ -658,21 +838,36 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     for (const request of workspace.state.takeovers) takeovers[request.agentId] = request;
     return takeovers;
   });
-  const sidebarActivity = createMemo(() => ({
-    agentIds: workspace.state.agents.map((agent) => agent.id),
-    activeTurns: Object.fromEntries(
-      Object.entries(workspace.state.conversations).map(([id, conversation]) => [
-        id,
-        workspace.state.status === "online" ? (conversation.page?.activeTurnId ?? null) : null,
+  const sidebarActivity = createMemo(() => {
+    // The agent conversation shows only the waits of the agent's own thread. A wait in a channel
+    // thread stays out of "Needs you", because selecting the row cannot answer it.
+    const agentThreads = new Map(workspace.state.agents.map((agent) => [agent.id, agent.threadId]));
+    const inAgentThread = (item: { agentId: string; threadId?: string }) =>
+      item.threadId !== undefined && agentThreads.get(item.agentId) === item.threadId;
+    return {
+      agentIds: workspace.state.agents.map((agent) => agent.id),
+      activeTurns: Object.fromEntries(
+        Object.entries(workspace.state.conversations).map(([id, conversation]) => [
+          id,
+          workspace.state.status === "online" ? (conversation.page?.activeTurnId ?? null) : null,
+        ]),
+      ),
+      queues: workspace.state.queues,
+      unreadReplies: {},
+      recentReplies: {},
+      failedTurns: {},
+      // One wait per agent: a question replaces a browser takeover for the same agent.
+      pendingPrompts: Object.fromEntries([
+        ...workspace.state.takeovers
+          .filter(inAgentThread)
+          .map((request) => [request.agentId, { type: "browser-takeover-requested", request } as const] as const),
+        ...workspace.state.prompts.filter(inAgentThread).map((prompt) => [prompt.agentId, prompt] as const),
       ]),
-    ),
-    queues: workspace.state.queues,
-    unreadReplies: {},
-    recentReplies: {},
-    failedTurns: {},
-    pendingPrompts: Object.fromEntries(workspace.state.prompts.map((prompt) => [prompt.agentId, prompt])),
-    pendingApprovals: Object.fromEntries(workspace.state.approvals.map((approval) => [approval.agentId, approval])),
-  }));
+      pendingApprovals: Object.fromEntries(
+        workspace.state.approvals.filter(inAgentThread).map((approval) => [approval.agentId, approval]),
+      ),
+    };
+  });
   const sidebarAgentStates = createMemo(() => computeSidebarAgentStates(sidebarActivity()));
   const sidebarAgentMoods = createMemo(() => computeAgentAvatarMoods(sidebarActivity()));
   const browserEnabled = createMemo(
@@ -845,10 +1040,21 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       await select(agent.id);
     });
   }
+  /** The host a switch left, so the provider step of a new server can go back to it. */
+  const [previousHostId, setPreviousHostId] = createSignal<string | null>(null);
   function selectServer(id: string) {
     const host = workspace.state.hosts.find((item) => item.hostId === id);
-    if (host) void workspace.connect(host);
+    if (!host) return;
+    const current = workspace.state.host?.hostId;
+    if (current && current !== id) setPreviousHostId(current);
+    void workspace.connect(host);
   }
+  /** The server the provider step goes back to: the one open before, else any other on the rail. */
+  const returnHostId = () => {
+    const current = workspace.state.host?.hostId;
+    const others = workspace.state.hosts.filter((item) => item.hostId !== current);
+    return others.find((item) => item.hostId === previousHostId())?.hostId ?? others[0]?.hostId;
+  };
   function startCreate() {
     setMobilePane("conversation");
     channels.close();
@@ -901,9 +1107,12 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                   servers={servers()}
                   onSelect={selectServer}
                   onReorder={workspace.reorderHosts}
-                  onAdd={() => setJoinOpen(true)}
+                  onAdd={openAddServer}
+                  addCreatesServer={hostedServersAvailable()}
                   onOpenSettings={(id, trigger) => void openServerSettings(id, trigger)}
                   onOpenUsage={(id, trigger) => void openUsage(id, trigger)}
+                  onSetMuted={setMuted}
+                  onSetNotificationLevel={setNotificationLevel}
                 />
               </Show>
               <Sidebar
@@ -924,15 +1133,28 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 showingArchivedChannels={channels.state.archived}
                 onToggleArchivedChannels={channelsSupported() ? channels.toggleArchived : undefined}
                 onCreateChannel={channelsSupported() ? channels.create : undefined}
+                onMarkAllRead={
+                  workspace.state.status === "online"
+                    ? () => {
+                        void workspace.markAllRead().catch(() => actionToast.error(t("chat.unread.markReadFailed")));
+                        if (channelsSupported()) void channels.markAllRead();
+                      }
+                    : undefined
+                }
+                // The browser client does not know the unread counts of agent chats it has not opened.
+                hasUnread
                 serverName={workspace.state.host?.name ?? "OpenBot"}
                 serverMenu={{
                   servers: servers(),
                   view: layout.serverView(),
                   onViewChange: layout.setServerView,
                   onSelect: selectServer,
-                  onAdd: () => setJoinOpen(true),
+                  onAdd: openAddServer,
+                  addCreatesServer: hostedServersAvailable(),
                   onOpenSettings: (id, trigger) => void openServerSettings(id, trigger),
                   onOpenUsage: (id, trigger) => void openUsage(id, trigger),
+                  onSetMuted: setMuted,
+                  onSetNotificationLevel: setNotificationLevel,
                 }}
                 agents={workspace.profiles()}
                 activeAgentId={channelOpen() ? "" : (workspace.state.selectedId ?? "")}
@@ -994,8 +1216,9 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
               />
               <AccountDock
                 account={account()}
-                // No platform: the macOS dock shelf is for the desktop app, so every browser gets the one-row dock.
+                // A browser has no app platform, but it draws the same shelf as the desktop app.
                 appInfo={null}
+                shelf
                 agentStatus={status()}
                 accountUsage={accountUsage()}
                 usageProvider={workspace.selected()?.provider ?? null}
@@ -1019,6 +1242,8 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 onLogout={signOut}
                 onOpenExternal={openWebDestination}
                 onOpenProfile={profileAgentId() ? openProfile : undefined}
+                onOpenBilling={() => setBillingOpen(true)}
+                onOpenAccountSettings={() => setAccountSettingsOpen(true)}
                 onOpenSettings={
                   workspace.state.host
                     ? (trigger) => {
@@ -1034,6 +1259,24 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
           }
           after={
             <>
+              <AddServerOverlay
+                open={addServer() !== null}
+                calls={hostedServerCalls}
+                servers={servers()}
+                onRefreshServers={workspace.retryHosts}
+                resume={addServer()?.resume}
+                onClose={() => setAddServer(null)}
+                onOpenServer={(serverId) => {
+                  setAddServer(null);
+                  selectServer(serverId);
+                }}
+                onContactUs={() => window.location.assign(HOSTED_SERVER_CONTACT_URL)}
+                onJoinWithInvite={() => {
+                  setAddServer(null);
+                  setJoinOpen(true);
+                }}
+                onManageServers={() => setBillingOpen(true)}
+              />
               <JoinServerOverlay
                 open={joinOpen()}
                 inviteUrl={props.inviteUrl ?? ""}
@@ -1070,6 +1313,18 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 pluginSlug={props.pluginSlug}
                 onPluginSlugConsumed={() => props.onPluginSlugConsumed?.()}
               />
+              <Show when={accountSettingsOpen()}>
+                <Loading>
+                  <WebAccountSettings
+                    open={accountSettingsOpen()}
+                    onOpenChange={setAccountSettingsOpen}
+                    account={account()}
+                    calls={accountCalls}
+                    language={props.language}
+                    onChangeLanguage={props.onChangeLanguage}
+                  />
+                </Loading>
+              </Show>
               <SharedAgentInstallOverlay
                 templateId={props.agentTemplateId}
                 server={server()}
@@ -1094,6 +1349,8 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                     loadError={serverSettings.state.error}
                     onRetry={serverSettings.refresh}
                     onSaveIdentity={serverSettings.saveIdentity}
+                    onSetMuted={async (muted) => setMuted(target().id, muted)}
+                    onSetNotificationLevel={async (level) => setNotificationLevel(target().id, level)}
                     // Publication and screen recording belong to the computer that runs the server.
                     onSetPublished={unavailable}
                     onCreateInvite={serverSettings.createInvite}
@@ -1123,31 +1380,87 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                         void openMessage(agentId, messageId);
                       },
                     }}
+                    // Every member lists; the host deletes only for an owner or admin.
+                    hostedSites={
+                      workspace.state.capabilities.includes(HOSTED_SITES_CAPABILITY)
+                        ? { api: hostedSiteCalls, onOpenSite: (url) => void openWebLink(url) }
+                        : undefined
+                    }
                     providers={providerSettings()}
                     hostUpdate={{ calls: hostUpdateCalls }}
+                    // Any member imports into a host with `agent-import-v1`.
+                    agentImport={
+                      workspace.state.capabilities.includes(AGENT_IMPORT_CAPABILITY)
+                        ? {
+                            calls: agentImportCalls,
+                            onOpenAgent: (agentId) => {
+                              serverSettings.setOpen(false);
+                              setMobilePane("conversation");
+                              void select(agentId);
+                            },
+                            onClose: () => serverSettings.setOpen(false),
+                          }
+                        : undefined
+                    }
                   />
                 )}
               </Show>
+              <BillingDialog
+                open={billingOpen()}
+                onOpenChange={setBillingOpen}
+                store={billing}
+                hostedServers={hostedServers}
+              />
               <ChannelCreateOverlay />
               <GlobalSearchOverlay
                 open={searchOpen()}
                 agents={workspace.profiles()}
+                channels={channels.supported() ? globalSearchChannels(channels.state.channels) : undefined}
                 onSearchMessages={searchAllMessages}
                 onOpenChange={setSearchOpen}
                 onSelectAgent={(id) => {
                   setMobilePane("conversation");
                   void select(id);
                 }}
+                onSelectChannel={(id) => {
+                  setMobilePane("conversation");
+                  void channels.open(id);
+                }}
                 onSelectMessage={(agentId, messageId) => void openMessage(agentId, messageId)}
               />
             </>
           }
         >
-          <Show when={agentFormOpen()}>
+          <Show when={serverOnboarding()}>
+            {(settings) => (
+              <ServerOnboarding
+                serverName={server()?.name ?? ""}
+                setup={hostSetupProviderProps(settings())}
+                onContinue={(provider, model) => {
+                  const id = server()?.id;
+                  if (id)
+                    setServerSetupChoices((current) => ({
+                      ...current,
+                      [id]: { preferredProvider: provider, preferredModel: model },
+                    }));
+                }}
+                onClose={
+                  returnHostId()
+                    ? () => {
+                        const id = returnHostId();
+                        if (id) selectServer(id);
+                      }
+                    : undefined
+                }
+              />
+            )}
+          </Show>
+          <Show when={agentFormOpen() && !serverOnboarding()}>
             <WebAgentSettings
               runtime={workspace.runtime}
               capabilities={workspace.state.capabilities}
               first={firstAgent()}
+              preference={serverSetupChoice()}
               customProviders={providerSettings()?.customProviders}
               // A new form starts empty, with the avatar that the first-agent row showed.
               initialDraft={{ ...createFirstAgentDraft(), ...untrack(agentAvatar) }}
@@ -1163,7 +1476,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
           <Show when={!agentFormOpen() && channelOpen()}>
             <ChannelConversation
               isOwnMessage={(authorId) =>
-                isOwnChannelAuthor(authorId, {
+                isReaderAuthor(authorId, {
                   memberId: workspace.state.memberId,
                   accountUserId: props.accountId,
                   onOwnComputer: false,
@@ -1299,6 +1612,13 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
               server={server()}
               presence={workspace.state.presence ?? { serverId: server()?.id ?? null, members: [], updatedAt: "" }}
               currentUserEmail={props.accountEmail ?? ""}
+              isOwnSender={(senderId) =>
+                isReaderAuthor(senderId, {
+                  memberId: workspace.state.memberId,
+                  accountUserId: props.accountId,
+                  onOwnComputer: false,
+                })
+              }
               browserEnabled={browserEnabled()}
               remoteDesktopEnabled={false}
               remoteDesktopSessionActive={false}
@@ -1319,6 +1639,8 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 await workspace.refresh();
               }}
               onSendMessage={async (text, attachments, replyTo, target) => {
+                // A sent prompt is what a notification later reports, so the browser asks here, from the user's action.
+                requestWebNotificationPermission();
                 const id = target?.agentId ?? workspace.state.selectedId;
                 if (!id || (target && target.serverId !== server()?.id) || id !== workspace.state.selectedId)
                   return false;

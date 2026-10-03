@@ -63,7 +63,12 @@ describe("TeamApiServer agents", () => {
     expect(editQueuedMessage).not.toHaveBeenCalled();
     const accepted = await fetch(path, { method: "POST", body: JSON.stringify(input), headers });
     expect(accepted.status).toBe(200);
-    expect(editQueuedMessage).toHaveBeenCalledExactlyOnceWith("chief", input);
+    // The member who saves the edit becomes the sender of the new text.
+    expect(editQueuedMessage).toHaveBeenCalledExactlyOnceWith(
+      "chief",
+      input,
+      expect.objectContaining({ name: "owner" }),
+    );
     editQueuedMessage.mockRejectedValueOnce(new QueueEditRejectedError("Held by another device"));
     const rejected = await fetch(path, { method: "POST", body: JSON.stringify(input), headers });
     expect(rejected.status).toBe(409);
@@ -353,8 +358,46 @@ describe("TeamApiServer agents", () => {
       }),
     });
     expect(create.status).toBe(201);
-    expect(createAgent).toHaveBeenCalledWith(expect.objectContaining({ provider: "antigravity" }));
+    expect(createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "antigravity" }),
+      undefined,
+      undefined,
+      expect.objectContaining({ id: expect.any(String) }),
+    );
     expect(updateAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not create an agent that would start on a provider only the host can use", async () => {
+    const createAgent = vi.fn();
+    const newAgentProvider = vi.fn(() => "cursor" as const);
+    const { start, signIn } = await createTeamApiFixture("local-only-new-agent", { configure: true });
+    const { base } = await start({ appVersion: "1.0.0", agents: createAgents({ createAgent, newAgentProvider }) });
+    const token = await signIn({ protocol: 4, appVersion: "1.0.0" });
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      [TEAM_PROTOCOL_VERSION_HEADER]: "5",
+      [TEAM_APP_VERSION_HEADER]: "1.0.0",
+      [TEAM_CAPABILITIES_HEADER]: "opencode,local-providers,agent-create-model",
+      "Content-Type": "application/json",
+    };
+    // A model ID alone, or no model at all, is a Cursor agent when the host resolves it so.
+    for (const choice of [{ model: "composer-2" }, {}]) {
+      const create = await fetch(`${base}/v1/agents`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          name: "Explorer",
+          description: "",
+          initialMessage: "Hello.",
+          avatarSeed: "mobile:newagentseed",
+          avatarHue: null,
+          ...choice,
+        }),
+      });
+      expect(create.status).toBe(400);
+    }
+    expect(newAgentProvider).toHaveBeenCalledWith(expect.objectContaining({ model: "composer-2" }));
+    expect(createAgent).not.toHaveBeenCalled();
   });
 
   it("keeps agent access on the computer that runs the agent", async () => {
@@ -413,6 +456,45 @@ describe("TeamApiServer agents", () => {
       if (protocol < 4) expect((await fetch(`${base}/v1/agents/suffixed/memories`, { headers })).status).toBe(404);
     }
     expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  // A shipped peer's list decoders fail closed on the whole array, and no released protocol knows
+  // `=` or `,` in a model id, so neither such a model nor an agent on one may reach a peer.
+  it("keeps a model id no released protocol knows off the model and agent lists", async () => {
+    const source = opencodeFixture[0];
+    if (!isAgentSummary(source)) throw new Error("Invalid agent fixture.");
+    const plain: AgentSummary = { ...source, id: "plain", provider: "claude", model: "claude-fable-5-1[1m]" };
+    const settings: AgentSummary = { ...plain, id: "settings", model: "claude-opus-5[effort=high,fast=false]" };
+    const option = { name: "Model", description: "", defaultReasoningEffort: "medium" as const };
+    const { start, signIn } = await createTeamApiFixture("unrepresentable-model", { configure: true });
+    const { base } = await start({
+      appVersion: "1.0.0",
+      logger: { trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: createAgents({
+        listAgents: () => [plain, settings],
+        listModels: () => [
+          {
+            ...option,
+            provider: "claude",
+            id: "claude-opus-5[effort=high,fast=false]",
+            supportedReasoningEfforts: ["medium"],
+          },
+          { ...option, provider: "claude", id: "claude-fable-5-1[1m]", supportedReasoningEfforts: ["medium"] },
+        ],
+      }),
+    });
+    const token = await signIn({ protocol: 5, appVersion: "1.0.0" });
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      [TEAM_PROTOCOL_VERSION_HEADER]: "5",
+      [TEAM_APP_VERSION_HEADER]: "1.0.0",
+    };
+    const models = await fetch(`${base}/v1/agents/models`, { headers });
+    expect(models.status).toBe(200);
+    expect((await models.json()).map((model: { id: string }) => model.id)).toEqual(["claude-fable-5-1[1m]"]);
+    const agents = await fetch(`${base}/v1/agents`, { headers });
+    expect(agents.status).toBe(200);
+    expect((await agents.json()).map((agent: AgentSummary) => agent.id)).toEqual(["plain"]);
   });
 
   it("duplicates an agent through protocol v3 and places it after the source", async () => {

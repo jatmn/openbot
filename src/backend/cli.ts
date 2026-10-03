@@ -4,7 +4,7 @@ import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, join, posix, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
-import type { AgentProviderId } from "@openbot/contracts/ipc";
+import { type AgentProviderId, agentProviderName } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 
@@ -12,6 +12,9 @@ const execFileAsync = promisify(execFile);
 const MINIMUM_CODEX_VERSION = [0, 144, 1] as const;
 const MINIMUM_CLAUDE_VERSION = [2, 1, 232] as const;
 const MINIMUM_GROK_VERSION = [1, 0, 5] as const;
+// The first Cline CLI that OpenBot was checked with: its sessions run in-process and it answers a lost
+// session with the ACP resource-not-found error.
+const MINIMUM_CLINE_VERSION = [3, 0, 68] as const;
 
 export interface CodexCliInfo {
   executable: string;
@@ -43,12 +46,31 @@ export interface AntigravityCliInfo {
   source?: "system" | "managed";
 }
 
-export type AgentCliInfo = CodexCliInfo | ClaudeCliInfo | GrokCliInfo | OpencodeCliInfo | AntigravityCliInfo;
+export interface CursorCliInfo {
+  executable: string;
+  version: string;
+  source?: "system" | "managed";
+}
+
+export interface ClineCliInfo {
+  executable: string;
+  version: string;
+  source?: "system" | "managed";
+}
+
+export type AgentCliInfo =
+  | CodexCliInfo
+  | ClaudeCliInfo
+  | GrokCliInfo
+  | OpencodeCliInfo
+  | AntigravityCliInfo
+  | CursorCliInfo
+  | ClineCliInfo;
 
 export class CodexCliError extends Error {
   constructor(
     message: string,
-    readonly code: "missing" | "invalid" | "outdated",
+    readonly code: "missing" | "invalid" | "outdated" | "timeout",
   ) {
     super(message);
     this.name = "CodexCliError";
@@ -73,7 +95,7 @@ export async function resolveCodexCli(
     if (!(await isExecutable(candidate.executable))) continue;
 
     try {
-      const stdout = await readCliVersion(candidate.executable);
+      const stdout = await readCliVersion(candidate.executable, "codex");
       const version = parseCodexVersion(stdout);
       if (!isMinimumVersion(version, MINIMUM_CODEX_VERSION)) {
         throw new CodexCliError(sourceText("error.provider.codexOutdated", { version }), "outdated");
@@ -81,6 +103,7 @@ export async function resolveCodexCli(
 
       return { executable: candidate.executable, version, source: candidate.source };
     } catch (error) {
+      if (isCliTimeout(error)) throw error;
       failures.push(
         error instanceof CodexCliError
           ? error
@@ -117,13 +140,14 @@ export async function resolveClaudeCli(
     if (!(await isExecutable(candidate.executable))) continue;
 
     try {
-      const stdout = await readCliVersion(candidate.executable);
+      const stdout = await readCliVersion(candidate.executable, "claude");
       const version = parseClaudeVersion(stdout);
       if (!isMinimumVersion(version, MINIMUM_CLAUDE_VERSION)) {
         throw new CodexCliError(sourceText("error.provider.claudeOutdated", { version }), "outdated");
       }
       return { executable: candidate.executable, version, source: candidate.source };
     } catch (error) {
+      if (isCliTimeout(error)) throw error;
       failures.push(
         error instanceof CodexCliError
           ? error
@@ -160,13 +184,14 @@ export async function resolveGrokCli(
     if (!(await isExecutable(candidate.executable))) continue;
 
     try {
-      const stdout = await readCliVersion(candidate.executable);
+      const stdout = await readCliVersion(candidate.executable, "grok");
       const version = parseGrokVersion(stdout);
       if (!isMinimumVersion(version, MINIMUM_GROK_VERSION)) {
         throw new CodexCliError(sourceText("error.provider.grokOutdated", { version }), "outdated");
       }
       return { executable: candidate.executable, version, source: candidate.source };
     } catch (error) {
+      if (isCliTimeout(error)) throw error;
       failures.push(
         error instanceof CodexCliError
           ? error
@@ -199,12 +224,13 @@ export async function resolveOpencodeCli(
     if (!(await isExecutable(candidate.executable))) continue;
     found = true;
     try {
-      const version = parseOpencodeVersion(await readCliVersion(candidate.executable));
+      const version = parseOpencodeVersion(await readCliVersion(candidate.executable, "opencode"));
       // `source` has to be the candidate's own: hardcoding "system" made `updateProviderCli` refuse
       // to activate the managed copy, and made `trackSystemCliVersions` report the managed version
       // as the user's, which suppressed every later update offer.
       return { executable: candidate.executable, version, source: candidate.source };
-    } catch {
+    } catch (error) {
+      if (isCliTimeout(error)) throw error;
       /* Try the remaining installed candidates. */
     }
   }
@@ -270,6 +296,97 @@ export function parseAntigravityVersion(manifest: string): string {
     throw new CodexCliError(sourceText("error.provider.antigravityVersionUnreadable"), "invalid");
   }
   return version;
+}
+
+/** The file beside `bin/` that names the version of a Cursor install. */
+export const CURSOR_MANIFEST = "cursor-package.json";
+
+/**
+ * The Cursor CLI is `cursor-agent` on `PATH`. The `cursor` command is the Cursor editor, not this
+ * CLI, so it is never used. There is no minimum version, as for OpenCode: a user who already has
+ * the CLI keeps it.
+ */
+export async function resolveCursorCli(
+  input: { systemCandidates?: string[]; bundledExecutable?: string | null } = {},
+): Promise<CursorCliInfo> {
+  const candidates = await cliCandidates("cursor", input.systemCandidates, input.bundledExecutable ?? null);
+  let found = false;
+  for (const candidate of candidates) {
+    if (!(await isExecutable(candidate.executable))) continue;
+    found = true;
+    try {
+      const version = parseCursorVersion(await readCliVersion(candidate.executable, "cursor"));
+      return { executable: candidate.executable, version, source: candidate.source };
+    } catch (error) {
+      if (isCliTimeout(error)) throw error;
+      /* Try the remaining installed candidates. */
+    }
+  }
+  throw new CodexCliError(
+    found ? sourceText("error.provider.cursorNotStarted") : sourceText("error.provider.cursorMissing"),
+    found ? "invalid" : "missing",
+  );
+}
+
+/**
+ * Cursor prints its build as a date and a commit, such as `2026.09.28-64d2043`. The newer form that
+ * its launcher accepts adds the time: `2026.09.28-10-15-00-64d2043`.
+ */
+function parseCursorVersion(output: string): string {
+  const version = output.trim();
+  if (!/^\d{4}\.\d{2}\.\d{2}(?:-\d{2}-\d{2}-\d{2})?-[0-9a-f]{7,40}$/u.test(version)) {
+    throw new CodexCliError(sourceText("error.provider.cursorVersionUnreadable"), "invalid");
+  }
+  return version;
+}
+
+/** The version in the manifest that a managed Cursor install writes beside `bin/`. */
+export function parseCursorManifestVersion(manifest: string): string {
+  let version: unknown = null;
+  try {
+    const value = JSON.parse(manifest);
+    if (isDynamicRecord(value)) version = value.version;
+  } catch {
+    /* Reported below. */
+  }
+  if (typeof version !== "string") {
+    throw new CodexCliError(sourceText("error.provider.cursorVersionUnreadable"), "invalid");
+  }
+  return parseCursorVersion(version);
+}
+
+/**
+ * The Cline CLI is `cline` on `PATH`, which the npm package `cline` installs. A CLI older than
+ * `MINIMUM_CLINE_VERSION` is skipped, so a managed one after it is still used. With no newer CLI,
+ * the outdated one is the error the user sees.
+ */
+export async function resolveClineCli(
+  input: { systemCandidates?: string[]; bundledExecutable?: string | null } = {},
+): Promise<ClineCliInfo> {
+  const candidates = await cliCandidates("cline", input.systemCandidates, input.bundledExecutable ?? null);
+  const failures: CodexCliError[] = [];
+  for (const candidate of candidates) {
+    if (!(await isExecutable(candidate.executable))) continue;
+    try {
+      const version = parseClineVersion(await readCliVersion(candidate.executable, "cline"));
+      if (!isMinimumVersion(version, MINIMUM_CLINE_VERSION)) {
+        throw new CodexCliError(sourceText("error.provider.clineOutdated", { version }), "outdated");
+      }
+      return { executable: candidate.executable, version, source: candidate.source };
+    } catch (error) {
+      if (isCliTimeout(error)) throw error;
+      failures.push(
+        error instanceof CodexCliError
+          ? error
+          : new CodexCliError(sourceText("error.provider.clineNotStarted"), "invalid"),
+      );
+    }
+  }
+  throw (
+    failures.find((failure) => failure.code === "outdated") ??
+    failures[0] ??
+    new CodexCliError(sourceText("error.provider.clineMissing"), "missing")
+  );
 }
 
 export function bundledOpencodeExecutable(
@@ -338,6 +455,13 @@ export function parseOpencodeVersion(output: string): string {
   return `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`;
 }
 
+/** Cline prints a bare `3.0.68`, the npm version of its package. */
+export function parseClineVersion(output: string): string {
+  const match = output.trim().match(/^(?:cline\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/i);
+  if (!match) throw new CodexCliError(sourceText("error.provider.clineVersionUnreadable"), "invalid");
+  return `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`;
+}
+
 /**
  * Bun prints a bare `1.4.2` and nothing else. It is not a provider CLI, so no discovery step reads
  * this; only `verifyInstalledRuntime` does, to confirm the binary in the store is the pinned one.
@@ -367,6 +491,11 @@ function isMinimumVersion(version: string, minimum: readonly number[]): boolean 
   return true;
 }
 
+/** The command name of a provider's CLI on `PATH`. */
+function cliCommandName(provider: AgentProviderId): string {
+  return provider === "cursor" ? "cursor-agent" : provider;
+}
+
 /** An explicit path remains under the user's control, including during managed updates. */
 export function configuredCliPath(provider: AgentProviderId): string | null {
   return process.env[`OPENBOT_${provider.toUpperCase()}_PATH`]?.trim() || null;
@@ -393,10 +522,11 @@ async function cliCandidates(
  * nothing else. A command the user typed, as for a custom agent, is resolved by
  * `resolveAgentCommand` in `acp-agent-command.ts`, which never gives it to a shell.
  */
-async function collectCandidates(command: AgentProviderId, configuredPath: string | undefined): Promise<string[]> {
+async function collectCandidates(provider: AgentProviderId, configuredPath: string | undefined): Promise<string[]> {
   const candidates: string[] = [];
   const override = configuredPath?.trim();
   if (override) return [override];
+  const command = cliCommandName(provider);
 
   if (process.platform === "win32") {
     try {
@@ -413,7 +543,7 @@ async function collectCandidates(command: AgentProviderId, configuredPath: strin
     } catch {
       // Known Windows install locations are checked next.
     }
-    candidates.push(...windowsFallbackPaths(command));
+    candidates.push(...windowsFallbackPaths(provider));
   } else {
     try {
       const path = commandPathFromShellOutput(await runInLoginShell(`command -v ${command}`));
@@ -421,17 +551,18 @@ async function collectCandidates(command: AgentProviderId, configuredPath: strin
     } catch {
       // Packaged apps often start with a restricted PATH; known locations are checked next.
     }
-    candidates.push(...posixFallbackPaths(command));
+    candidates.push(...posixFallbackPaths(provider));
   }
 
   return [...new Set(candidates)];
 }
 
 export function windowsFallbackPaths(
-  command: AgentProviderId,
+  provider: AgentProviderId,
   userHome = homedir(),
   environment: NodeJS.ProcessEnv = process.env,
 ): string[] {
+  const command = cliCommandName(provider);
   const paths: string[] = [];
   const appData = environment.APPDATA?.trim();
   const localAppData = environment.LOCALAPPDATA?.trim();
@@ -441,6 +572,10 @@ export function windowsFallbackPaths(
   }
   if (command === "claude" && localAppData) {
     paths.push(win32.join(localAppData, "Microsoft", "WinGet", "Links", "claude.exe"));
+  }
+  // Cursor's installer puts the launcher in a folder of its own and adds that folder to `PATH`.
+  if (command === "cursor-agent" && localAppData) {
+    paths.push(win32.join(localAppData, "cursor-agent", "cursor-agent.cmd"));
   }
   if (command === "grok") {
     paths.push(win32.join(userHome, ".grok", "bin", "grok.exe"));
@@ -550,13 +685,37 @@ export function runInLoginShell(script: string, shell = loginShellCommand()): Pr
   });
 }
 
-export function posixFallbackPaths(command: AgentProviderId, userHome = homedir()): string[] {
+export function posixFallbackPaths(provider: AgentProviderId, userHome = homedir()): string[] {
+  const command = cliCommandName(provider);
   const paths = [posix.join(userHome, ".local", "bin", command)];
   if (command === "claude") paths.push(posix.join(userHome, ".claude", "local", "claude"));
   if (command === "opencode") paths.push(posix.join(userHome, ".opencode", "bin", "opencode"));
   if (command === "grok") paths.push(posix.join(userHome, ".grok", "bin", "grok"));
   paths.push(`/opt/homebrew/bin/${command}`, `/usr/local/bin/${command}`, `/usr/bin/${command}`);
   return paths;
+}
+
+/**
+ * One argument on a `cmd.exe /c` line that runs a batch wrapper. `cmd.exe` reads the line first: it
+ * toggles quoting at every `"` and expands `%NAME%` inside quotes too. The wrapper then hands `%*` to
+ * a program that splits it with the C runtime rules. So an argument with any character outside a
+ * plain set is quoted, an inner `"` is written as `""` with the backslashes before it doubled, which
+ * both parsers read as one literal quote, and `%` is written as `%%cd:~,%`, which expands to one `%`.
+ */
+function batchArgument(argument: string): string {
+  if (/^[\w\-.,/:=@+\\]+$/.test(argument)) return argument;
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of argument) {
+    if (character === "\\") {
+      backslashes += 1;
+    } else {
+      if (character === '"') quoted += `${"\\".repeat(backslashes)}"`;
+      backslashes = 0;
+    }
+    quoted += character === "%" ? "%%cd:~,%" : character;
+  }
+  return `${quoted}${"\\".repeat(backslashes)}"`;
 }
 
 /**
@@ -575,7 +734,7 @@ export function cliSpawnTarget(
     return { command: executable, args: [...argv], windowsVerbatimArguments: false };
   }
 
-  const commandLine = [`"${executable.replaceAll("%", "%%")}"`, ...argv].join(" ");
+  const commandLine = [`"${executable.replaceAll("%", "%%")}"`, ...argv.map(batchArgument)].join(" ");
   return {
     command: process.env.ComSpec?.trim() || "cmd.exe",
     args: ["/d", "/s", "/c", `"${commandLine}"`],
@@ -583,25 +742,55 @@ export function cliSpawnTarget(
   };
 }
 
-async function readCliVersion(candidate: string): Promise<string> {
-  if (process.platform === "win32" && [".bat", ".cmd"].includes(extname(candidate).toLowerCase())) {
-    const commandProcessor = process.env.ComSpec?.trim() || "cmd.exe";
-    const escapedCandidate = candidate.replaceAll("%", "%%");
-    const { stdout } = await execFileAsync(commandProcessor, ["/d", "/s", "/c", `""${escapedCandidate}" --version"`], {
-      timeout: 5_000,
+/**
+ * A busy computer can take many seconds to start a CLI, so the limit is generous. A timeout is
+ * reported apart from a failure: the CLI is not broken, and reinstalling it does not help. The
+ * provider runtime tries again later, so this limit only has to cover one slow answer.
+ */
+const CLI_VERSION_TIMEOUT_MS = 10_000;
+
+/**
+ * A busy computer makes every candidate slow, so the resolvers report the first timeout and do not
+ * wait for the next candidate. It also wins over a candidate that answered as outdated.
+ */
+function isCliTimeout(error: unknown): error is CodexCliError {
+  return error instanceof CodexCliError && error.code === "timeout";
+}
+
+async function readCliVersion(candidate: string, provider: AgentProviderId): Promise<string> {
+  try {
+    if (process.platform === "win32" && [".bat", ".cmd"].includes(extname(candidate).toLowerCase())) {
+      const commandProcessor = process.env.ComSpec?.trim() || "cmd.exe";
+      const escapedCandidate = candidate.replaceAll("%", "%%");
+      const { stdout } = await execFileAsync(
+        commandProcessor,
+        ["/d", "/s", "/c", `""${escapedCandidate}" --version"`],
+        {
+          timeout: CLI_VERSION_TIMEOUT_MS,
+          maxBuffer: 64 * 1024,
+          windowsHide: true,
+          windowsVerbatimArguments: true,
+        },
+      );
+      return stdout;
+    }
+
+    const { stdout } = await execFileAsync(candidate, ["--version"], {
+      timeout: CLI_VERSION_TIMEOUT_MS,
       maxBuffer: 64 * 1024,
-      windowsHide: true,
-      windowsVerbatimArguments: true,
+      windowsHide: process.platform === "win32",
     });
     return stdout;
+  } catch (error) {
+    // `execFile` kills the child when its timer ends and marks the rejection with `killed`.
+    if (isDynamicRecord(error) && error.killed === true) {
+      throw new CodexCliError(
+        sourceText("error.provider.cliTimedOutRefresh", { provider: agentProviderName(provider) }),
+        "timeout",
+      );
+    }
+    throw error;
   }
-
-  const { stdout } = await execFileAsync(candidate, ["--version"], {
-    timeout: 5_000,
-    maxBuffer: 64 * 1024,
-    windowsHide: process.platform === "win32",
-  });
-  return stdout;
 }
 
 async function isExecutable(path: string): Promise<boolean> {

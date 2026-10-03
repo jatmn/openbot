@@ -1,16 +1,19 @@
-// Admin requests to one host: agent settings and skills, shared tables, the server name and logo,
-// the app update, MCP servers, storage and providers.
+// Admin requests to one host: agent settings and skills, shared tables, agent share links, the server name and logo,
+// the app update, MCP servers, storage, hosted sites and providers.
 //
 // The desktop sends the same routes from the main process. The web client and the mobile app send
 // them through their own transport, so the path, body and decoding of each request are here once.
 // The host answers only an owner or admin; a member gets a refusal, which the transport rejects.
 
 import type { ManagedProviderId } from "@openbot/contracts/agent-providers";
+import { parseHostedSiteList } from "@openbot/contracts/hosted-sites";
 import {
   type AddedAgent,
   type AgentAdminSettings,
   type AgentProviderId,
   type AgentStatus,
+  type AgentTemplatePreview,
+  type AgentTemplatePublication,
   assertStorageUsageScope,
   type ClearStorageInput,
   type CustomProviderResult,
@@ -21,6 +24,8 @@ import {
   decodeCustomProviderResult,
   decodeCustomProviderSummaries,
   decodeHostAddedAgent,
+  decodeHostAgentTemplatePreview,
+  decodeHostAgentTemplatePublication,
   decodeHostUpdateStatus,
   decodeInstalledSkills,
   decodeMcpServerConfigs,
@@ -30,6 +35,7 @@ import {
   decodeProviderRuntimeSnapshot,
   decodeStorageUsage,
   type GetStorageUsageInput,
+  type HostedSiteList,
   type HostUpdateSettingsChange,
   type HostUpdateStatus,
   type InstallAgentTemplateInput,
@@ -43,6 +49,7 @@ import {
   type ProviderApiKeyState,
   type ProviderCodeLoginStart,
   type ProviderRuntimeSnapshot,
+  type PublishAgentTemplateInput,
   type RemoveMcpServerInput,
   type SaveCustomProviderInput,
   type SaveMcpServerInput,
@@ -51,6 +58,7 @@ import {
   type SetProviderApiKeyInput,
   type SharedTable,
   type StorageUsage,
+  type SubmitProviderCodeLoginInput,
   type TestMcpServerInput,
   type UninstallSkillInput,
   type UpdateAgentAdminSettingsInput,
@@ -61,12 +69,15 @@ import { guardedListDecoder } from "@openbot/contracts/ipc-decoding";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import { AGENT_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/agent-admin-v1";
 import { AGENT_INSTALL_ROUTES } from "@openbot/contracts/team-protocol/agent-install-v1";
+import { AGENT_PUBLISH_IMAGE_BYTES, AGENT_PUBLISH_ROUTES } from "@openbot/contracts/team-protocol/agent-publish-v1";
 import { AGENT_UPDATE_ROUTES } from "@openbot/contracts/team-protocol/agent-update-v1";
 import { HOST_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/host-admin-v1";
 import { HOST_UPDATE_ROUTES } from "@openbot/contracts/team-protocol/host-update-v1";
+import { HOSTED_SITES_ROUTES } from "@openbot/contracts/team-protocol/hosted-sites-v1";
 import { MCP_ROUTES } from "@openbot/contracts/team-protocol/mcp-v1";
 import { PROVIDERS_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/providers-v1";
 import type { PROVIDERS_RUNTIMES_V2_ROUTES } from "@openbot/contracts/team-protocol/providers-v2";
+import { PROVIDERS_SIGN_IN_V3_ROUTES } from "@openbot/contracts/team-protocol/providers-v3";
 import { SHARED_TABLES_ROUTES } from "@openbot/contracts/team-protocol/shared-tables-v1";
 import { SKILLS_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/skills-admin-v1";
 import { STORAGE_ROUTES } from "@openbot/contracts/team-protocol/storage-v1";
@@ -157,6 +168,26 @@ export async function installAgentTemplate(
   });
 }
 
+/** What the host would publish for one of its agents, and its link when it is published. */
+export function previewAgentTemplate(request: TeamApiRequest, agentId: string): Promise<AgentTemplatePreview> {
+  return request("POST", AGENT_PUBLISH_ROUTES.preview, decodeHostAgentTemplatePreview, { agentId });
+}
+
+/** The host publishes with its own account. A card too large for the wire is left out, as one that cannot be drawn. */
+export function publishAgentTemplate(
+  request: TeamApiRequest,
+  { agentId, card }: PublishAgentTemplateInput,
+): Promise<AgentTemplatePublication> {
+  return request("POST", AGENT_PUBLISH_ROUTES.publish, decodeHostAgentTemplatePublication, {
+    agentId,
+    card: card && card.byteLength <= AGENT_PUBLISH_IMAGE_BYTES ? bytesToBase64(card) : null,
+  });
+}
+
+export function unpublishAgentTemplate(request: TeamApiRequest, agentId: string): Promise<void> {
+  return request("POST", AGENT_PUBLISH_ROUTES.unpublish, ignoreResponse, { agentId });
+}
+
 export function uninstallAgentSkill(request: TeamApiRequest, input: UninstallSkillInput): Promise<void> {
   return request("POST", SKILLS_ADMIN_ROUTES.uninstall, ignoreResponse, { ...input });
 }
@@ -244,12 +275,34 @@ export function clearStorage(request: TeamApiRequest, input: ClearStorageInput):
   return request("POST", STORAGE_ROUTES.clear, ignoreResponse, { ...input });
 }
 
+function decodeHostedSiteList(value: unknown): HostedSiteList {
+  const list = parseHostedSiteList(value);
+  if (!list) throw new Error("The host returned an invalid site list.");
+  return list;
+}
+
+/** Any member can read the sites of the server. */
+export function listHostedSites(request: TeamApiRequest): Promise<HostedSiteList> {
+  return request("POST", HOSTED_SITES_ROUTES.list, decodeHostedSiteList, {});
+}
+
+export function deleteHostedSite(request: TeamApiRequest, siteId: string): Promise<void> {
+  return request("POST", HOSTED_SITES_ROUTES.remove, ignoreResponse, { siteId });
+}
+
+/**
+ * The sign-in routes of a host: `providers-v3` signs in Codex, Claude and Grok, and `providers-v1`
+ * Codex only. The caller picks by the host's capabilities.
+ */
+export type ProviderCodeLoginRoutes = typeof PROVIDERS_SIGN_IN_V3_ROUTES | typeof PROVIDERS_ADMIN_ROUTES;
+
 /** The verification URL is https, or the reply is refused. */
 export function startProviderCodeLogin(
   request: TeamApiRequest,
   provider: AgentProviderId,
+  routes: ProviderCodeLoginRoutes = PROVIDERS_ADMIN_ROUTES,
 ): Promise<ProviderCodeLoginStart> {
-  return request("POST", PROVIDERS_ADMIN_ROUTES.codeLoginStart, decodeProviderCodeLoginStart, { provider });
+  return request("POST", routes.codeLoginStart, decodeProviderCodeLoginStart, { provider });
 }
 
 /** A change, then the host's status, so the result is the `AgentStatus` a local change gives. */
@@ -258,8 +311,20 @@ async function providerChange(request: TeamApiRequest, path: string, body: TeamP
   return request("GET", TEAM_API_ROUTES.agents.status, decodeAgentStatus);
 }
 
-export function cancelProviderCodeLogin(request: TeamApiRequest, provider: AgentProviderId): Promise<AgentStatus> {
-  return providerChange(request, PROVIDERS_ADMIN_ROUTES.codeLoginCancel, { provider });
+/** `providers-v3` only. The code is a credential: it goes in the body, and no reply carries it. */
+export function submitProviderCodeLogin(
+  request: TeamApiRequest,
+  input: SubmitProviderCodeLoginInput,
+): Promise<AgentStatus> {
+  return providerChange(request, PROVIDERS_SIGN_IN_V3_ROUTES.codeLoginSubmit, { ...input });
+}
+
+export function cancelProviderCodeLogin(
+  request: TeamApiRequest,
+  provider: AgentProviderId,
+  routes: ProviderCodeLoginRoutes = PROVIDERS_ADMIN_ROUTES,
+): Promise<AgentStatus> {
+  return providerChange(request, routes.codeLoginCancel, { provider });
 }
 
 /** Only the key's state comes back; no reply carries the key. */

@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { AGENT_ADMIN_ROUTES } from "./agent-admin-v1";
+import { AGENT_IMPORT_ROUTES } from "./agent-import-v1";
 import { AGENT_INSTALL_ROUTES } from "./agent-install-v1";
+import { AGENT_PUBLISH_ROUTES } from "./agent-publish-v1";
 import { AGENT_UPDATE_ROUTES } from "./agent-update-v1";
 import { CONTEXT_RESET_ROUTES } from "./context-reset-v1";
 import { HOST_ADMIN_ROUTES } from "./host-admin-v1";
 import { HOST_UPDATE_ROUTES, hostRestartEvent } from "./host-update-v1";
+import { HOSTED_SITES_ROUTES } from "./hosted-sites-v1";
+import { LIVE_ACTIVITY_PUSH_ROUTES } from "./live-activity-push-v1";
 import { optionalRouteCodec } from "./optional-routes";
 import { PROVIDERS_ADMIN_ROUTES } from "./providers-v1";
+import { PROVIDERS_SIGN_IN_V3_ROUTES } from "./providers-v3";
 import { SHARED_TABLES_ROUTES } from "./shared-tables-v1";
 import { SKILLS_ADMIN_ROUTES } from "./skills-admin-v1";
 
@@ -161,6 +166,37 @@ describe("providers-v1", () => {
   });
 });
 
+describe("providers-v3", () => {
+  const routes = PROVIDERS_SIGN_IN_V3_ROUTES;
+
+  it("carries a pasted code towards the host and never back", () => {
+    expect(codec(routes.codeLoginStart).request({ provider: "claude" })).toEqual({ provider: "claude" });
+    const paste = { kind: "paste", verificationUrl: "https://claude.com/cai/oauth/authorize?code=true", expiresAt: 1 };
+    expect(codec(routes.codeLoginStart).response(200, { ...paste, userCode: "extra" })).toEqual(paste);
+    const device = {
+      kind: "code",
+      userCode: "6Z9Q-HAAK",
+      verificationUrl: "https://accounts.x.ai/oauth2/device",
+      verificationUrlComplete: "https://accounts.x.ai/oauth2/device?user_code=6Z9Q-HAAK",
+      expiresAt: 1,
+    };
+    expect(codec(routes.codeLoginStart).response(200, device)).toEqual(device);
+    expect(codec(routes.codeLoginSubmit).request({ provider: "claude", code: "abc#state" })).toEqual({
+      provider: "claude",
+      code: "abc#state",
+    });
+    expect(codec(routes.codeLoginSubmit).response(200, { code: "abc#state" })).toEqual({});
+    expect(codec(routes.codeLoginCancel).request({ provider: "grok" })).toEqual({ provider: "grok" });
+  });
+
+  it("rejects malformed payloads", () => {
+    expect(() => codec(routes.codeLoginStart).request({ provider: "opencode" })).toThrow();
+    expect(() => codec(routes.codeLoginStart).response(200, { kind: "paste", expiresAt: 1 })).toThrow();
+    expect(() => codec(routes.codeLoginSubmit).request({ provider: "claude", code: "x".repeat(2049) })).toThrow();
+    expect(() => codec(routes.codeLoginSubmit).request({ provider: "claude" })).toThrow();
+  });
+});
+
 describe("host-admin-v1", () => {
   const logo = { mimeType: "image/png", data: "iVBORw0KGgo=" };
 
@@ -243,5 +279,191 @@ describe("context-reset-v1", () => {
     });
     expect(() => codec(CONTEXT_RESET_ROUTES.clear).request({})).toThrow();
     expect(codec(CONTEXT_RESET_ROUTES.clear).response(200, {})).toEqual({});
+  });
+});
+
+describe("agent-publish-v1", () => {
+  const publication = {
+    templateId: "tpl_chief",
+    shareUrl: "https://openbot.run/agents/tpl_chief",
+    publishedAt: "2026-09-29T00:00:00Z",
+  };
+  const preview = {
+    agentId: "chief",
+    name: "Chief",
+    title: "Chief of staff",
+    description: "Plan the week.",
+    avatarSeed: "chief",
+    avatarHue: 30,
+    avatarImage: { mimeType: "image/png", data: "iVBORw0KGgo=" },
+    skills: [
+      { kind: "marketplace", skillId: "s1", versionId: "v1", slug: "notes", name: "Notes", version: 2 },
+      { kind: "embedded", slug: "brief", name: "Brief", markdown: "# Brief" },
+    ],
+    routines: [
+      {
+        name: "Weekly plan",
+        instruction: "Plan the week.",
+        active: true,
+        schedule: {
+          kind: "advanced",
+          months: [1, 6],
+          days: { kind: "days-of-week", days: [1] },
+          time: { kind: "at-time", time: "09:00" },
+        },
+      },
+    ],
+    updatedAt: null,
+    publication,
+    skillsError: null,
+  };
+
+  it("carries the agent id and a card to the host, and the preview and link back", () => {
+    expect(codec(AGENT_PUBLISH_ROUTES.preview).response(200, { ...preview, avatarUrl: "file:///a.png" })).toEqual(
+      preview,
+    );
+    expect(codec(AGENT_PUBLISH_ROUTES.publish).request({ agentId: "chief", card: null, snapshot: {} })).toEqual({
+      agentId: "chief",
+      card: null,
+    });
+    expect(codec(AGENT_PUBLISH_ROUTES.publish).response(200, publication)).toEqual(publication);
+    expect(codec(AGENT_PUBLISH_ROUTES.unpublish).response(200, {})).toEqual({});
+  });
+
+  it("rejects malformed payloads", () => {
+    expect(() =>
+      codec(AGENT_PUBLISH_ROUTES.publish).request({ agentId: "chief", card: "A".repeat(699_053) }),
+    ).toThrow();
+    expect(() =>
+      codec(AGENT_PUBLISH_ROUTES.preview).response(200, { ...preview, skills: [{ kind: "folder", slug: "x" }] }),
+    ).toThrow();
+    expect(() =>
+      codec(AGENT_PUBLISH_ROUTES.preview).response(200, {
+        ...preview,
+        routines: [{ ...preview.routines[0], schedule: { kind: "yearly" } }],
+      }),
+    ).toThrow();
+  });
+});
+
+describe("agent-import-v1", () => {
+  const agent = {
+    key: "research",
+    name: "Research",
+    title: "Analyst",
+    description: "You are research.",
+    skillCount: 1,
+    routineCount: 0,
+    memoryCount: 2,
+    fileCount: 3,
+    fileBytes: 400,
+    nameExists: false,
+  };
+  const preview = {
+    token: "token-1",
+    sourceApp: "grok-bot",
+    exportedAt: null,
+    agents: [agent],
+    channels: [
+      {
+        key: "desk",
+        name: "Desk",
+        title: "",
+        memberKeys: ["research"],
+        leadKey: null,
+        memoryCount: 0,
+        routineCount: 0,
+      },
+    ],
+    warnings: [],
+  };
+
+  it("sends the preview without avatars and the result with only the new agents' ids and names", () => {
+    const withAvatar = { ...preview, agents: [{ ...agent, avatarUrl: "data:image/png;base64,AAAA" }] };
+    expect(codec(AGENT_IMPORT_ROUTES.stage).response(200, withAvatar)).toEqual(preview);
+    const result = {
+      agents: [{ agentId: "a1", name: "Research", workspacePath: "/Users/host/OpenBot/a1" }],
+      skipped: [],
+      channels: [{ id: "c1", name: "Desk" }],
+      skippedChannels: [],
+      warnings: [],
+    };
+    expect(codec(AGENT_IMPORT_ROUTES.apply).response(200, result)).toEqual({
+      ...result,
+      agents: [{ agentId: "a1", name: "Research" }],
+    });
+    const input = { token: "token-1", keys: ["research"], channelKeys: [], timezone: "Europe/Warsaw" };
+    expect(codec(AGENT_IMPORT_ROUTES.apply).request(input)).toEqual(input);
+    expect(codec(AGENT_IMPORT_ROUTES.discard).request({ token: "token-1" })).toEqual({ token: "token-1" });
+  });
+
+  it("rejects malformed payloads", () => {
+    expect(() =>
+      codec(AGENT_IMPORT_ROUTES.stage).response(200, { ...preview, agents: [{ ...agent, key: 1 }] }),
+    ).toThrow();
+    expect(() => codec(AGENT_IMPORT_ROUTES.apply).request({ token: "token-1", keys: ["research"] })).toThrow();
+    expect(() => codec(AGENT_IMPORT_ROUTES.discard).request({})).toThrow();
+  });
+});
+
+describe("live-activity-push-v1", () => {
+  const registration = {
+    serverId: "server-1",
+    token: "ab".repeat(32),
+    environment: "production",
+    secret: "A".repeat(43),
+    locale: "fr",
+    away: true,
+    photos: [{ agentId: "chief", file: "avatar-server_2d_1-chief-3.jpg" }],
+  };
+
+  it("carries the push registration and nothing else", () => {
+    expect(codec(LIVE_ACTIVITY_PUSH_ROUTES.register).request({ ...registration, name: "Ada" })).toEqual(registration);
+    expect(codec(LIVE_ACTIVITY_PUSH_ROUTES.register).response(200, {})).toEqual({});
+    expect(codec(LIVE_ACTIVITY_PUSH_ROUTES.remove).request({})).toEqual({});
+  });
+
+  it("refuses a token, secret or file name that could reach a path or a header", () => {
+    const request = codec(LIVE_ACTIVITY_PUSH_ROUTES.register).request;
+    expect(() => request({ ...registration, token: "../../3/device" })).toThrow();
+    expect(() => request({ ...registration, secret: "short" })).toThrow();
+    expect(() => request({ ...registration, photos: [{ agentId: "chief", file: "../secret.png" }] })).toThrow();
+    expect(() => request({ ...registration, environment: "staging" })).toThrow();
+  });
+});
+
+describe("hosted-sites-v1", () => {
+  const site = {
+    id: "site-1",
+    hostname: "budget-planner.openbot.site",
+    url: "https://budget-planner.openbot.site/",
+    title: "Budget planner",
+    description: "A planner.",
+    framework: "vanilla",
+    status: "active",
+    fileCount: 1,
+    size: 20,
+    expiresAt: "2026-10-30T12:00:00.000Z",
+    updatedAt: "2026-09-30T12:00:00.000Z",
+    serverId: null,
+  };
+
+  it("sends site summaries with the limit, and only a site id towards the host", () => {
+    expect(codec(HOSTED_SITES_ROUTES.list).request({ scope: "account" })).toEqual({});
+    expect(
+      codec(HOSTED_SITES_ROUTES.list).response(200, { sites: [{ ...site, token: "x" }], limit: 3, used: 1, extra: 1 }),
+    ).toEqual({ sites: [site], limit: 3, used: 1 });
+    expect(codec(HOSTED_SITES_ROUTES.remove).request({ siteId: "site-1", serverId: "server-1" })).toEqual({
+      siteId: "site-1",
+    });
+    expect(codec(HOSTED_SITES_ROUTES.remove).response(200, { deleted: true })).toEqual({});
+  });
+
+  it("rejects malformed payloads", () => {
+    expect(() => codec(HOSTED_SITES_ROUTES.remove).request({})).toThrow();
+    expect(() => codec(HOSTED_SITES_ROUTES.list).response(200, { sites: [site], limit: 3 })).toThrow();
+    expect(() =>
+      codec(HOSTED_SITES_ROUTES.list).response(200, { sites: [{ ...site, status: "uploading" }], limit: 3, used: 1 }),
+    ).toThrow();
   });
 });

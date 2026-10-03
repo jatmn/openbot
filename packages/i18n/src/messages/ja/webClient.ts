@@ -3,6 +3,12 @@ import type { messages as source } from "../en/webClient";
 
 export const messages = {
   "webClient.loading": "OpenBot を読み込んでいます…",
+  "webClient.loadingLine.wake": "エージェントを起こしています…",
+  "webClient.loadingLine.coffee": "エージェントにコーヒーを淹れています…",
+  "webClient.loadingLine.tokens": "トークンを指で数えています…",
+  "webClient.loadingLine.prompts": "プロンプトのもつれをほどいています…",
+  "webClient.loadingLine.sleepy": "寝ている子にやさしくお願いしています…",
+  "webClient.loadingLine.almost": "もうすぐです。たぶん。",
   "webClient.login.failed": "サインインに失敗しました。",
   "webClient.login.requestFailed": "アカウントのリクエストに失敗しました。",
   "webClient.login.sessionFailed": "このセッションを確認できませんでした。",
@@ -38,6 +44,8 @@ export const messages = {
   "webClient.error.hostStatus": "ホストの状態を読み取れませんでした。",
   "webClient.error.usageOffline": "使用量を表示するには、ホストに接続してください。",
   "webClient.error.desktopOnly": "この操作はデスクトップアプリで使えます。",
+  "webClient.settings.preferences.title": "環境設定",
+  "webClient.settings.preferences.description": "このブラウザーでの OpenBot の言語とサウンドを選びます。",
   "webClient.error.checkConversation": "もう一度送信する前に会話を確認してください。",
   "webClient.error.hostReported": "ホストがエラーを報告しました。会話とホストの状態を確認してください。",
   "webClient.error.requestFailed": "リクエストに失敗しました。",

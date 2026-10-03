@@ -9,13 +9,15 @@ export function responseAttachmentMessageId(threadId: string, turnId: string, ca
   return `agent-attachments:${digest}`;
 }
 
+/** A digest, because each thread keeps its signature: the JSON itself would be a second copy of the history. */
 export function conversationContentSignature(snapshot: ConversationSnapshot): string {
-  return JSON.stringify({
+  const content = JSON.stringify({
     agentId: snapshot.agentId,
     threadId: snapshot.threadId,
     activeTurnId: snapshot.activeTurnId,
     messages: snapshot.messages,
   });
+  return createHash("sha256").update(content).digest("base64");
 }
 
 export function routineStatusForDelivery(status: QueueDeliveryStatus) {
@@ -46,8 +48,8 @@ export interface DeliveryPromptSources {
   /** The conversation the delivery joins. A user reply quotes the message it answers from it. */
   snapshot: ConversationSnapshot;
   routineRun: Pick<RoutineRun, "kind"> | null;
-  /** The prompt a channel task sends in place of the delivery text. */
-  channelText?: string;
+  /** The prompt a channel task or an external message sends in place of the delivery text. */
+  executionText?: string;
 }
 
 /**
@@ -58,7 +60,7 @@ export function deliveryPromptInput(context: DeliveryContext, sources: DeliveryP
   const { delivery, managedAttachments } = context;
   const { agentNames, snapshot } = sources;
   const displayText = displayMessageReferences(delivery.text, delivery.attachments, agentNames);
-  let text = sources.channelText ?? (displayText || "The user shared attached local files.");
+  let text = sources.executionText ?? (displayText || "The user shared attached local files.");
   if (delivery.sender.kind === "user" && delivery.replyToMessageId) {
     const referenced = snapshot.messages.find((message) => message.id === delivery.replyToMessageId);
     text = [

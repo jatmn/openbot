@@ -42,6 +42,8 @@ export const messages = {
   "onboarding.provider.included": "Inclus avec OpenBot",
   "onboarding.provider.freeModels": "Modèles gratuits, aucun compte requis",
   "onboarding.provider.googlePlan": "Forfait Google AI Pro ou Ultra",
+  "onboarding.provider.cursorPlan": "Forfait Cursor ou clé API",
+  "onboarding.provider.clineAccount": "Modèles gratuits avec un compte Cline",
   "onboarding.provider.tryFree": "Essayez gratuitement",
   "onboarding.provider.noSignIn": "Aucune connexion requise",
   "onboarding.provider.more": "Plus de fournisseurs",
@@ -60,6 +62,7 @@ export const messages = {
   "onboarding.next.downloading": "{provider} est toujours en cours de téléchargement.",
   "onboarding.next.finishing": "{provider} est toujours en cours de configuration.",
   "onboarding.next.downloadError": "{provider} n’a pas pu être téléchargé. Relancez le téléchargement pour continuer.",
+  "onboarding.next.downloadErrorReason": "{provider} n’a pas pu être configuré : {reason}",
   "onboarding.next.notDownloaded": "Téléchargez {provider} pour continuer.",
   "onboarding.next.connecting": "{provider} est en cours de connexion.",
   "onboarding.next.connect": "Connectez {provider} pour continuer.",
@@ -79,6 +82,8 @@ export const messages = {
   "onboarding.meet.addToPrompt": "Ajouter à la requête",
   "onboarding.meet.sendMessage": "Envoyer le message",
   "onboarding.computer.title": "OpenBot peut contrôler votre ordinateur",
+  "onboarding.sounds.title": "Choisissez vos sons",
+  "onboarding.sounds.description": "De courts sons confirment vos actions, comme l’envoi d’un message.",
   "onboarding.jobs.title": "Donnez une mission à chaque agent",
   "onboarding.jobs.description": "Commencez par des agents ciblés, puis construisez l’équipe autour de votre travail.",
   "onboarding.jobs.example": "Exemples de missions d’agents",
@@ -89,4 +94,11 @@ export const messages = {
   "onboarding.action.connect": "Connecter",
   "onboarding.action.open": "Ouvrir OpenBot",
   "onboarding.action.next": "Suivant",
+  "onboarding.server.title": "Configurer {server}",
+  "onboarding.server.description":
+    "OpenBot n’inclut pas d’abonnement IA. Connectez votre propre fournisseur à ce serveur avant de créer un agent.",
+  "onboarding.server.label": "Choisissez le fournisseur IA de ce serveur",
+  "onboarding.server.hint":
+    "La connexion reste sur le serveur. Vous pourrez changer le fournisseur de chaque agent plus tard.",
+  "onboarding.server.continue": "Continuer",
 } as const satisfies PartialTranslation<typeof source>;

@@ -1,4 +1,4 @@
-import type { ServerConnectionState, ServerSummary } from "@openbot/contracts/ipc";
+import type { HostedServerSleep, ServerConnectionState, ServerSummary } from "@openbot/contracts/ipc";
 import type { AppTextKey, AppTranslate } from "@openbot/i18n";
 import { BellOff, buttonVariants, ContextMenu, ServerGradientLogo, Tooltip } from "@openbot/ui";
 import { createEffect, createSignal, createStore, For, onCleanup, Show } from "solid-js";
@@ -17,15 +17,36 @@ const SERVER_STATE_LABELS = {
   incompatible: "server.state.incompatible",
 } as const satisfies Record<ServerConnectionState, AppTextKey>;
 
+const HOSTED_SLEEP_LABELS = {
+  sleeping: "server.state.sleeping",
+  waking: "server.state.waking",
+} as const satisfies Record<HostedServerSleep, AppTextKey>;
+
+/** Whether a hosted server that is not connected sleeps or wakes. It replaces the connection state word. */
+export function serverHostedSleep(server: Pick<ServerSummary, "hostedSleep" | "state">): HostedServerSleep | null {
+  return server.state === "online" ? null : (server.hostedSleep ?? null);
+}
+
 /** The muted and connection state words that a server's accessible name adds after its name. */
 export function serverStatusLabels(
-  server: Pick<ServerSummary, "notificationsMuted" | "state">,
+  server: Pick<ServerSummary, "hostedSleep" | "notificationsMuted" | "state">,
   t: AppTranslate,
 ): string[] {
+  const sleep = serverHostedSleep(server);
   return [
     ...(server.notificationsMuted ? [t("server.rail.notificationsMuted")] : []),
-    ...(server.state === "online" ? [] : [t(SERVER_STATE_LABELS[server.state])]),
+    ...(sleep ? [t(HOSTED_SLEEP_LABELS[sleep])] : []),
+    ...(sleep || server.state === "online" ? [] : [t(SERVER_STATE_LABELS[server.state])]),
   ];
+}
+
+/** A small dot on a server's logo while its hosted server sleeps or wakes. */
+export function ServerSleepDot(props: { server: Pick<ServerSummary, "hostedSleep" | "state">; class: string }) {
+  return (
+    <Show when={serverHostedSleep(props.server)}>
+      {(sleep) => <span class={props.class} data-state={sleep()} aria-hidden="true" />}
+    </Show>
+  );
 }
 
 interface ServerRailProps extends ServerActionCallbacks {
@@ -33,6 +54,8 @@ interface ServerRailProps extends ServerActionCallbacks {
   onSelect: (serverId: string) => void;
   onReorder: (serverIds: string[]) => void;
   onAdd: () => void;
+  /** True when the plus button opens the hosted server plans, where the user can also join with an invite. */
+  addCreatesServer?: boolean | undefined;
 }
 
 interface DragSlot {
@@ -240,6 +263,7 @@ export function ServerRail(props: ServerRailProps) {
               onSetMuted={props.onSetMuted}
               onSetNotificationLevel={props.onSetNotificationLevel}
               onOpenUsage={props.onOpenUsage}
+              onOpenSchedule={props.onOpenSchedule}
             />
           )}
         </For>
@@ -286,6 +310,7 @@ export function ServerRail(props: ServerRailProps) {
                     onSetMuted={props.onSetMuted}
                     onSetNotificationLevel={props.onSetNotificationLevel}
                     onOpenUsage={props.onOpenUsage}
+                    onOpenSchedule={props.onOpenSchedule}
                     onMove={(direction) => moveServer(server().id, direction)}
                   />
                 </li>
@@ -303,13 +328,17 @@ export function ServerRail(props: ServerRailProps) {
           <Tooltip.Trigger
             type="button"
             class={`${buttonVariants({ variant: "outline", size: "sm" })} server-rail-button server-rail-action`}
-            aria-label={t("server.rail.addRemote")}
+            aria-label={t(props.addCreatesServer ? "server.rail.add" : "server.rail.addRemote")}
+            data-cuelume-open=""
+            data-cuelume-emphasis="subtle"
             onClick={props.onAdd}
           >
             <span class="server-rail-monogram">+</span>
           </Tooltip.Trigger>
           <Tooltip.Portal>
-            <Tooltip.Content class="server-rail-tooltip">{t("server.rail.addRemote")}</Tooltip.Content>
+            <Tooltip.Content class="server-rail-tooltip">
+              {t(props.addCreatesServer ? "server.rail.add" : "server.rail.addRemote")}
+            </Tooltip.Content>
           </Tooltip.Portal>
         </Tooltip.Root>
         <span class="sr-only" aria-live="polite">
@@ -333,6 +362,10 @@ function ServerRailButton(
   const buttonLabel = () =>
     [t("server.rail.buttonLabel", { name: props.server.name }), ...serverStatusLabels(props.server, t)].join(", ");
   const muteDescription = () => serverMuteDescription(props.server, t, format);
+  const sleepLabel = () => {
+    const sleep = serverHostedSleep(props.server);
+    return sleep ? t(HOSTED_SLEEP_LABELS[sleep]) : null;
+  };
   return (
     <Tooltip.Root
       open={overlay.tooltipOpen && !overlay.menuOpen}
@@ -363,6 +396,7 @@ function ServerRailButton(
             aria-label={buttonLabel()}
             aria-pressed={props.server.active ? "true" : "false"}
             aria-keyshortcuts={props.onMove ? "Shift+F10 Alt+ArrowUp Alt+ArrowDown" : "Shift+F10"}
+            data-cuelume-navigate=""
             onClick={() => props.onSelect(props.server.id)}
             onContextMenu={(event: MouseEvent & { currentTarget: HTMLButtonElement }) => {
               trigger = event.currentTarget;
@@ -412,6 +446,7 @@ function ServerRailButton(
                 onSetMuted={props.onSetMuted}
                 onSetNotificationLevel={props.onSetNotificationLevel}
                 onOpenUsage={props.onOpenUsage}
+                onOpenSchedule={props.onOpenSchedule}
                 onOpenSettings={props.onOpenSettings}
               />
             </ContextMenu.Content>
@@ -421,6 +456,7 @@ function ServerRailButton(
       <Tooltip.Portal>
         <Tooltip.Content class="server-rail-tooltip">
           {props.server.name}
+          {sleepLabel() ? ` · ${sleepLabel()}` : ""}
           {props.server.notificationsMuted ? ` · ${muteDescription()}` : ""}
         </Tooltip.Content>
       </Tooltip.Portal>

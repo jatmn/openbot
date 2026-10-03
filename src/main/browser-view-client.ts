@@ -67,11 +67,11 @@ export class BrowserViewClient {
           const frame = decodeBrowserViewFrame(new Uint8Array(message.data));
           this.#options.onEvent({ type: "frame", tabId, ...frame });
         } catch {
-          socket.close(1003, "Invalid browser view frame");
+          socket.close(1000, "Invalid browser view frame");
         }
       });
-      socket.addEventListener("close", () => this.#viewEnded(view, "The live view of this page ended."));
-      socket.addEventListener("error", () => this.#viewEnded(view, "The live view of this page failed."));
+      socket.addEventListener("close", () => this.#viewEnded(view, sourceText("error.backend.browserViewEnded")));
+      socket.addEventListener("error", () => this.#viewEnded(view, sourceText("error.backend.browserViewFailed")));
     });
   }
 

@@ -6,6 +6,7 @@ import type {
   ConversationReadState,
   ConversationSnapshot,
 } from "@openbot/contracts/ipc";
+import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
 import type { AgentMessage } from "@openbot/ui/data";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createStore, onCleanup, untrack } from "solid-js";
@@ -23,7 +24,6 @@ import { usePlatform } from "../../platform";
 import { createScopeGuard } from "../../scope-lifetime";
 import { createSimpleContext } from "../../simple-context";
 import { useTurns } from "../../turns";
-import { cleanAgentMessageText } from "../agents/agent-message-text";
 import { useAgentReadTracking } from "../agents/agent-read-tracking";
 import { appendLatestRuntimeMessages } from "../agents/agent-runtime-snapshot";
 import { useAgents } from "../agents/agents-context";
@@ -97,6 +97,7 @@ const Conversation = createSimpleContext({
     const {
       activeAgent,
       activeAgentId,
+      agentList,
       agentStatus,
       agentChatOpenRevision,
       setAgentChatOpenRevision,
@@ -841,6 +842,29 @@ const Conversation = createSimpleContext({
       }
     }
 
+    /** Marks each unread agent chat read through its newest message, which may not be loaded yet. */
+    async function markAllAgentMessagesRead(): Promise<void> {
+      const serverId = activeServerId();
+      // Only listed agents: a read of an id the host no longer knows creates that agent again.
+      const unread = agentList()
+        .map((agent) => agent.id)
+        .filter((agentId) => (unreadReplies()[agentId] ?? 0) > 0);
+      await Promise.all(
+        unread.map(async (agentId) => {
+          try {
+            const page = await conversationPort().agent.readConversationPage(
+              { agentId, anchor: { type: "latest" }, limit: 1 },
+              serverId,
+            );
+            const latestMessageId = page.messages.at(-1)?.id;
+            if (latestMessageId) await markAgentMessagesRead(agentId, latestMessageId, serverId);
+          } catch (error) {
+            appendUiError(agentId, error, currentText().t("chat.errorStatus.readState"), serverId);
+          }
+        }),
+      );
+    }
+
     function presentPromptResolution(agentId: string, turnId: string, requestId: string | number): void {
       const requestKey = promptRequestKey(turnId, requestId);
       if (!requestKey) return;
@@ -896,6 +920,7 @@ const Conversation = createSimpleContext({
       searchAgentMessages,
       sendMessage,
       markAgentMessagesRead,
+      markAllAgentMessagesRead,
       presentPromptResolution,
       setTeamTyping: notifyTeamTyping,
     };

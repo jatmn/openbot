@@ -53,6 +53,9 @@ const REMOTE_EVENT_RECONNECT_JITTER = 0.2;
 // focus. Focus and a manual retry still retry at once.
 const REMOTE_HOST_OFFLINE_RETRY_MS = 5 * 60_000;
 const REMOTE_HOST_OFFLINE_UNFOCUSED_RETRY_MS = 15 * 60_000;
+// A hosted server that starts after a wake request comes online in about a minute. It retries at
+// this delay, not with the backoff, so the user does not wait for a long delay after the start.
+const HOSTED_SERVER_START_RETRY_MS = 5_000;
 const REMOTE_EVENT_HEALTHY_MS = 30_000;
 const REMOTE_EVENT_PAYLOAD_LIMIT = 1024 * 1024;
 const REMOTE_EVENT_INITIAL_BUFFER_LIMIT = 1_000;
@@ -130,6 +133,8 @@ export class RemoteEventStream {
   readonly #authenticationPaused = new Set<string>();
   /** When Signal last reported each host offline. */
   readonly #offlineHosts = new Map<string, number>();
+  /** Hosted servers that start after a wake request. */
+  readonly #startingHosts = new Set<string>();
   #appFocused = true;
   #enabled = false;
 
@@ -208,6 +213,29 @@ export class RemoteEventStream {
     this.#reconnectTimers.delete(serverId);
     this.#reconnectAttempts.delete(serverId);
     this.#offlineHosts.delete(serverId);
+    this.#startingHosts.delete(serverId);
+  }
+
+  /**
+   * A hosted server starts after a wake request: it retries every few seconds until it connects, or
+   * until the caller ends the start. The first retry replaces a longer one already set.
+   */
+  setHostStarting(serverId: string, starting: boolean): void {
+    if (!starting) {
+      this.#startingHosts.delete(serverId);
+      return;
+    }
+    this.#startingHosts.add(serverId);
+    this.#offlineHosts.delete(serverId);
+    const reconnectTimer = this.#reconnectTimers.get(serverId);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    this.#reconnectTimers.delete(serverId);
+    this.scheduleReconnect(serverId);
+  }
+
+  /** Signal said that this host is not connected, and no retry has run since. */
+  isHostOffline(serverId: string): boolean {
+    return this.#offlineHosts.has(serverId);
   }
 
   /** The next retry for this host waits the offline delay, also over a shorter one already set. */
@@ -289,6 +317,7 @@ export class RemoteEventStream {
     this.#reconnectTimers.delete(serverId);
     this.#reconnectAttempts.delete(serverId);
     this.#offlineHosts.delete(serverId);
+    this.#startingHosts.delete(serverId);
     this.#authenticationPaused.delete(serverId);
     this.#sockets.delete(serverId);
   }
@@ -345,10 +374,9 @@ export class RemoteEventStream {
       ? offlineDelay
       : Math.min(REMOTE_EVENT_RECONNECT_MAX_MS, REMOTE_EVENT_RECONNECT_BASE_MS * 2 ** (attempt - 1));
     const jitter = exponentialDelay * REMOTE_EVENT_RECONNECT_JITTER * (Math.random() * 2 - 1);
-    const delay = Math.min(
-      maximumDelay,
-      Math.max(REMOTE_EVENT_RECONNECT_BASE_MS, Math.round(exponentialDelay + jitter)),
-    );
+    const delay = this.#startingHosts.has(serverId)
+      ? HOSTED_SERVER_START_RETRY_MS
+      : Math.min(maximumDelay, Math.max(REMOTE_EVENT_RECONNECT_BASE_MS, Math.round(exponentialDelay + jitter)));
     const timer = setTimeout(() => {
       this.#reconnectTimers.delete(serverId);
       // Only the attempt that follows was delayed. When it fails for another reason, for example
@@ -409,7 +437,7 @@ export class RemoteEventStream {
                   for (const event of bufferedAgentEvents) this.#agents.forward(serverId, event, true);
                   bufferedAgentEvents.length = 0;
                 })
-                .catch(() => socket.close(1011, "Initial agent state is unavailable"));
+                .catch(() => socket.close(1000, "Initial agent state is unavailable"));
             }
           },
           { once: true },
@@ -421,7 +449,7 @@ export class RemoteEventStream {
               serverId,
               new RemoteProtocolError("protocol_error", sourceText("error.remote.binaryEvent")),
             );
-            socket.close(1003, "Text event payloads are required");
+            socket.close(1000, "Text event payloads are required");
             return;
           }
           if (Buffer.byteLength(message.data) > REMOTE_EVENT_PAYLOAD_LIMIT) {
@@ -430,7 +458,7 @@ export class RemoteEventStream {
               serverId,
               new RemoteProtocolError("protocol_error", sourceText("error.remote.eventTooLarge")),
             );
-            socket.close(1009, "Event payload is too large");
+            socket.close(1000, "Event payload is too large");
             return;
           }
           try {
@@ -446,7 +474,7 @@ export class RemoteEventStream {
                 serverId,
                 new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidKnownEvent")),
               );
-              socket.close(1003, "Invalid known event payload");
+              socket.close(1000, "Invalid known event payload");
               return;
             }
             const event = decoded.event;
@@ -463,7 +491,7 @@ export class RemoteEventStream {
             } else {
               if (!agentEventsReady) {
                 if (bufferedAgentEvents.length >= REMOTE_EVENT_INITIAL_BUFFER_LIMIT) {
-                  socket.close(1013, "Initial agent event buffer is full");
+                  socket.close(1000, "Initial agent event buffer is full");
                   return;
                 }
                 bufferedAgentEvents.push(event);
@@ -477,13 +505,13 @@ export class RemoteEventStream {
               serverId,
               new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidJson")),
             );
-            socket.close(1003, "Invalid event payload");
+            socket.close(1000, "Invalid event payload");
           }
         });
         socket.addEventListener(
           "error",
           () => {
-            socket.close(1011, "Remote events are unavailable");
+            socket.close(1000, "Remote events are unavailable");
             reject(new Error(sourceText("error.remote.eventsUnavailable")));
           },
           { once: true },

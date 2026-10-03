@@ -4,17 +4,20 @@ import type { AgentProvider } from "../agent-client";
 import type { AgentStore } from "../agent-store";
 import type { ChannelService } from "../channel-service";
 import type { DeliveryContext, MailboxStore } from "../mailbox-store";
+import type { MessagingThreads } from "../messaging/messaging-threads";
 import { decodeTurnResponse } from "../protocol";
 import type { ContextCompaction } from "./context-compaction";
 import type { ConversationRuntime } from "./conversation-runtime";
 import { agentNamesById, combinedPromptInput, deliveryPromptInput } from "./delivery-content";
 import type { DuplicationGate } from "./duplication-gate";
 import type { MailboxSync } from "./mailbox-sync";
+import type { MemoryHold } from "./memory-hold";
 import type { ProfileSave } from "./profile-save";
 import type { ProviderRuntime } from "./provider-runtime";
 import type { RoutineScheduler } from "./routine-scheduler";
 import { isMissingProviderSessionError, isRequestTimeout, providerForAgent } from "./thread-items";
 import type { ThreadLifecycle } from "./thread-lifecycle";
+import { TurnSlots } from "./turn-slots";
 import { codexSandboxPolicy, workspaceWritableRoots } from "./workspace-sandbox";
 
 /** Shown to the user when a message names a model of an endpoint that was taken out. */
@@ -48,8 +51,10 @@ export interface DrainSchedulerOptions {
   compaction: ContextCompaction;
   routines: RoutineScheduler;
   threads: ThreadLifecycle;
+  memory: MemoryHold;
   hooks: DrainHooks;
   channels?: ChannelService;
+  messaging?: MessagingThreads;
 }
 
 /**
@@ -73,8 +78,14 @@ export class DrainScheduler {
   readonly #compaction: ContextCompaction;
   readonly #routines: RoutineScheduler;
   readonly #threads: ThreadLifecycle;
+  readonly #memory: MemoryHold;
+  readonly #slots: TurnSlots;
+  /** Agents that a full set of turn slots held back. A drain that may free a slot tries them again. */
+  readonly #slotWaiters = new Set<string>();
+  #wakingSlotWaiters = false;
   readonly #hooks: DrainHooks;
   readonly #channels: ChannelService | undefined;
+  readonly #messaging: MessagingThreads | undefined;
   readonly #drainingAgents = new Set<string>();
   /**
    * The model each agent's running turn was started with, by turn id. The agent record can be moved
@@ -104,10 +115,26 @@ export class DrainScheduler {
     this.#compaction = options.compaction;
     this.#routines = options.routines;
     this.#threads = options.threads;
+    this.#memory = options.memory;
     this.#hooks = options.hooks;
     this.#channels = options.channels;
+    this.#messaging = options.messaging;
+    this.#slots = new TurnSlots({
+      limit: () => this.#memory.turnLimit(),
+      agentIds: () => this.#store.list().map((agent) => agent.id),
+      // A start whose `turn/start` timed out stays "starting" with no turn ID, and its turn can still run.
+      isRunning: (agentId) =>
+        this.#drainingAgents.has(agentId) ||
+        Boolean(this.#conversation.workingSnapshot(agentId)?.activeTurnId) ||
+        this.#mailbox.startingDeliveryForAgent(agentId) !== null ||
+        !this.#compaction.mayDrain(agentId),
+      isWaiting: (agentId) =>
+        this.#mayStartNow(agentId) && this.#memory.mayDrain(agentId) && this.#mailbox.nextQueued(agentId) !== null,
+      head: (agentId) => this.#mailbox.nextQueued(agentId)?.delivery ?? null,
+    });
   }
 
+  /** The clauses of this agent's own state. `#heldByMachine` adds the memory and the turn slots. */
   mayDrain(agentId: string): boolean {
     return (
       !this.#conversation.workingSnapshot(agentId)?.activeTurnId &&
@@ -120,12 +147,34 @@ export class DrainScheduler {
   }
 
   scheduleDrain(agentId: string): void {
+    this.#scheduleDrain(agentId);
+    this.retrySlotWaiters();
+  }
+
+  /**
+   * Tries the agents that wait for a turn slot again. Each drain that ends can free a slot, and the
+   * memory sample calls this too, for a turn that ended on a path that schedules no drain.
+   */
+  retrySlotWaiters(): void {
+    if (this.#wakingSlotWaiters || this.#slotWaiters.size === 0) return;
+    this.#wakingSlotWaiters = true;
+    try {
+      const waiters = [...this.#slotWaiters];
+      this.#slotWaiters.clear();
+      for (const agentId of waiters) this.#scheduleDrain(agentId);
+    } finally {
+      this.#wakingSlotWaiters = false;
+    }
+  }
+
+  #scheduleDrain(agentId: string): void {
     if (
       this.#hooks.isStopping() ||
       !this.#providers.isReady() ||
       this.#drainingAgents.has(agentId) ||
       this.#scheduledDrains.has(agentId) ||
-      !this.mayDrain(agentId)
+      !this.mayDrain(agentId) ||
+      this.#heldByMachine(agentId)
     ) {
       return;
     }
@@ -156,11 +205,39 @@ export class DrainScheduler {
   forgetAgent(agentId: string): void {
     this.#drainingAgents.delete(agentId);
     this.#scheduledDrains.delete(agentId);
+    this.#slotWaiters.delete(agentId);
+    this.retrySlotWaiters();
   }
 
   dispose(): void {
     this.#drainingAgents.clear();
     this.#scheduledDrains.clear();
+    this.#slotWaiters.clear();
+  }
+
+  /**
+   * Whether the memory or the turn slots of the machine hold this agent back. A held agent is told
+   * about the memory, and one held by the slots waits for the next free slot.
+   */
+  #heldByMachine(agentId: string): boolean {
+    if (!this.#memory.mayDrain(agentId)) {
+      if (this.#mailbox.nextQueued(agentId)) this.#memory.held(agentId);
+      return true;
+    }
+    if (this.#slots.mayStart(agentId)) return false;
+    this.#slotWaiters.add(agentId);
+    return true;
+  }
+
+  /** The checks of `drainAgent` other than the clauses: the service runs and the provider can start. */
+  #mayStartNow(agentId: string): boolean {
+    return (
+      !this.#hooks.isStopping() &&
+      !this.#drainingAgents.has(agentId) &&
+      this.#providers.isReady() &&
+      !this.#deliveryProviders(agentId).some((provider) => this.#providers.isReplacingCli(provider)) &&
+      this.mayDrain(agentId)
+    );
   }
 
   async drainAgent(agentId: string): Promise<void> {
@@ -171,7 +248,10 @@ export class DrainScheduler {
       !this.#providers.isReady() ||
       // Before the try, so the delivery is not rescheduled in a loop while the CLI is replaced.
       // ProviderRuntime schedules this agent again once the new client is ready.
-      this.#deliveryProviders(agentId).some((provider) => this.#providers.isReplacingCli(provider))
+      this.#deliveryProviders(agentId).some((provider) => this.#providers.isReplacingCli(provider)) ||
+      // Last, because it records the agent as waiting. Another drain can take the last slot
+      // between the schedule and this start.
+      this.#heldByMachine(agentId)
     )
       return;
     this.#drainingAgents.add(agentId);
@@ -184,7 +264,7 @@ export class DrainScheduler {
       const assignment = this.#channels?.store.assignmentForDelivery(context.delivery.id);
       const publicThreadId = assignment
         ? this.#channels?.store.context(assignment.channelId, assignment.agentId).threadId
-        : agent?.threadId;
+        : (this.#messaging?.threadForDelivery(context.delivery.id) ?? agent?.threadId);
       const session =
         agent && publicThreadId ? this.#store.database.activeProviderSession(publicThreadId, agent.provider) : null;
       if (session && this.#compaction.reserve(agentId, session.externalSessionId)) {
@@ -194,16 +274,23 @@ export class DrainScheduler {
       await this.startDelivery(context);
     } finally {
       this.#drainingAgents.delete(agentId);
-      if (this.#mailbox.nextQueued(agentId)) this.scheduleDrain(agentId);
+      if (this.#mailbox.nextQueued(agentId)) this.#scheduleDrain(agentId);
+      this.retrySlotWaiters();
     }
   }
 
   async startDelivery(context: DeliveryContext): Promise<void> {
     const { delivery } = context;
     const channelDelivery = this.#channels ? this.#channels.store.assignmentForDelivery(delivery.id) !== null : false;
-    // The teammate answers that start in this turn too. A channel task always runs alone. The
-    // person's message goes last, so the turn answers it with the answers already read.
-    const companions = channelDelivery ? [] : this.#mailbox.repliesToStartWith(delivery.id);
+    const messagingDelivery = this.#messaging?.ownsDelivery(delivery.id) ?? false;
+    // The teammate answers that start in this turn too. A channel task and an external message
+    // always run alone; a teammate's answer in an external conversation takes the other answers to
+    // the same request. The person's message goes last, so the turn answers it with the answers
+    // already read.
+    const companions =
+      channelDelivery || (messagingDelivery && delivery.sender.kind !== "agent")
+        ? []
+        : this.#mailbox.repliesToStartWith(delivery.id);
     let batch = delivery.sender.kind === "user" ? [...companions, context] : [context, ...companions];
     let confirmedTurnId: string | null = null;
     const claimed = this.#deliveryProviders(delivery.recipientAgentId);
@@ -213,6 +300,10 @@ export class DrainScheduler {
     // lands in that wait closes the session and drops the routing to it, and the turn that arrives
     // afterwards runs where no completion can be delivered, holding the queue of this agent.
     let releaseRuntimeRefresh: () => void = () => {};
+    // Synchronously, before the first await, so the next drain already counts this turn's memory.
+    // Released in the `finally` when no turn starts: a start that fails uses no provider memory.
+    const releaseReservation = this.#memory.reserveTurn();
+    let turnMayRun = false;
     try {
       for (const item of batch) await this.#mailbox.markStarting(item.delivery.id);
       this.#mailboxSync.emitQueue(delivery.recipientAgentId);
@@ -244,11 +335,21 @@ export class DrainScheduler {
       this.#threads.applyPendingRuntimeRefresh(agent, new Set(batch.map((item) => item.delivery.id)));
       releaseRuntimeRefresh = this.#threads.holdRuntimeRefresh(agent.id);
       const client = await this.#providers.ensureAgentClient(agent);
-      const execution = this.#channels ? await this.#channels.prepare(context) : null;
-      if (channelDelivery && !execution) {
+      const execution = messagingDelivery
+        ? await this.#messaging?.prepare(context)
+        : this.#channels
+          ? await this.#channels.prepare(context)
+          : null;
+      if ((channelDelivery || messagingDelivery) && !execution) {
         const current = this.#mailbox.getDelivery(delivery.id)?.delivery;
         if (current?.status === "starting")
-          await this.#mailbox.markTerminal(delivery.id, "interrupted", "The channel was deleted before starting.");
+          await this.#mailbox.markTerminal(
+            delivery.id,
+            "interrupted",
+            channelDelivery
+              ? "The channel was deleted before starting."
+              : "The messaging thread was removed before starting.",
+          );
         return;
       }
       let threadId = await this.#threads.ensureThread(agent, client, execution?.threadId);
@@ -276,7 +377,7 @@ export class DrainScheduler {
             snapshot,
             routineRun:
               item.delivery.sender.kind === "routine" ? this.#routines.runForDelivery(item.delivery.id) : null,
-            channelText: execution?.text,
+            executionText: execution?.text,
           }),
         ),
         [...requestIds].flatMap((requestId) => this.#mailbox.unansweredRecipients(requestId)),
@@ -373,6 +474,7 @@ export class DrainScheduler {
         return;
       }
       if (isRequestTimeout(error, "turn/start")) {
+        turnMayRun = true;
         this.#channels?.deliveryUncertain(delivery.id);
         this.#hooks.emitError(
           "delivery_start_unconfirmed",
@@ -389,12 +491,14 @@ export class DrainScheduler {
       }
       this.#mailboxSync.emitQueue(delivery.recipientAgentId);
       this.#channels?.deliveryFailed(delivery.id, "The provider could not start this assignment. Resume to try again.");
+      this.#messaging?.deliveryFailed(delivery.id);
       this.#hooks.emitError("delivery_start_failed", error, delivery.recipientAgentId);
       this.scheduleDrain(delivery.recipientAgentId);
       // The requester may hold the other answers until this request ends.
       if (delivery.sender.kind === "agent") this.scheduleDrain(delivery.sender.agentId);
     } finally {
       releaseRuntimeRefresh();
+      if (!confirmedTurnId && !turnMayRun) releaseReservation();
       for (const provider of claimed) this.#startingDeliveries.set(provider, this.#starting(provider) - 1);
     }
   }

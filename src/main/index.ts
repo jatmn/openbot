@@ -1,11 +1,23 @@
 import { join, resolve } from "node:path";
-import { parseInviteUrl } from "@openbot/contracts/invite-links";
-import { type CentralAuthState, IPC_ENDPOINTS } from "@openbot/contracts/ipc";
+import { parseInviteUrl, selfHostedApiOrigin } from "@openbot/contracts/invite-links";
+import { type AppLogoColor, type CentralAuthState, IPC_ENDPOINTS } from "@openbot/contracts/ipc";
 import { resolveLocale, translateFor } from "@openbot/i18n";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { createRemoteDirectoryRefresh } from "@openbot/team-client/remote-directory";
-import { app, BrowserWindow, dialog, Notification, powerMonitor, protocol, screen, shell } from "electron";
-import { readAppVariant, resolveAppIconPath } from "./app-icon";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  type NativeImage,
+  Notification,
+  nativeImage,
+  net,
+  powerMonitor,
+  protocol,
+  screen,
+  shell,
+} from "electron";
+import { readAppVariant, resolveAppIconPath, resolveLogoColorIconPath } from "./app-icon";
 import { type ApplicationServices, createApplicationServices } from "./application-services";
 import { type DeepLink, findDeepLink, parseDeepLink } from "./deep-link-router";
 import { requestNotificationPermission, showRetainedNotification } from "./desktop-notifications";
@@ -18,6 +30,8 @@ import {
   shouldAutoStartHost,
 } from "./development-profile";
 import { hostAllowsTenantLaunch } from "./host-update-coordinator";
+import { takeHostedServerEnvironment } from "./hosted-server-bootstrap";
+import { takeHostingDeveloperKey } from "./hosted-server-service";
 import { accountIpcHandlers } from "./ipc/account-handlers";
 import { agentAdminIpcHandlers } from "./ipc/agent-admin-handlers";
 import { agentIpcHandlers } from "./ipc/agent-handlers";
@@ -25,6 +39,7 @@ import { agentImportIpcHandlers } from "./ipc/agent-import-handlers";
 import { agentTemplateIpcHandlers } from "./ipc/agent-template-handlers";
 import { appIpcHandlers } from "./ipc/app-handlers";
 import { attachmentIpcHandlers } from "./ipc/attachment-handlers";
+import { billingIpcHandlers } from "./ipc/billing-handlers";
 import { browserIpcHandlers } from "./ipc/browser-handlers";
 import { channelMemoryIpcHandlers } from "./ipc/channel-memory-handlers";
 import { channelRoutineIpcHandlers } from "./ipc/channel-routine-handlers";
@@ -33,11 +48,14 @@ import { customAgentIpcHandlers } from "./ipc/custom-agent-handlers";
 import { customProviderIpcHandlers } from "./ipc/custom-provider-handlers";
 import { registerIpcGroups } from "./ipc/define-ipc-group";
 import { dynamicIslandIpcHandlers } from "./ipc/dynamic-island-handlers";
+import { githubConnectorIpcHandlers } from "./ipc/github-connector-handlers";
 import { hostAdminIpcHandlers } from "./ipc/host-admin-handlers";
+import { hostedServerIpcHandlers } from "./ipc/hosted-server-handlers";
 import { hostedSiteIpcHandlers } from "./ipc/hosted-site-handlers";
 import { marketplaceAgentIpcHandlers } from "./ipc/marketplace-agent-handlers";
 import { mcpServerIpcHandlers } from "./ipc/mcp-server-handlers";
 import { memoryIpcHandlers } from "./ipc/memory-handlers";
+import { messagingIpcHandlers } from "./ipc/messaging-handlers";
 import { notificationIpcHandlers } from "./ipc/notification-handlers";
 import { pluginIpcHandlers } from "./ipc/plugin-handlers";
 import { providerAdminIpcHandlers } from "./ipc/provider-admin-handlers";
@@ -62,6 +80,8 @@ import { ensureMacApplicationPresence, secondLaunchResponse } from "./main-windo
 import { watchRemoteHostDirectory } from "./remote-server-host-directory";
 import { createRendererForwarders } from "./renderer-forwarders";
 import { sendToRenderer } from "./renderer-ipc";
+import { RoutineWake } from "./routine-wake";
+import { takeServerModeEnvironment } from "./server-mode";
 import { configureContentSecurityPolicy, configureRendererPermissions } from "./session-configuration";
 import { TeardownRegistry } from "./teardown-registry";
 import type { TraceFile } from "./trace-file";
@@ -91,8 +111,13 @@ const developmentRemoteRole =
     ? process.env.OPENBOT_DEV_REMOTE_ROLE
     : null;
 const developmentTestClientEnabled = !app.isPackaged && process.env.OPENBOT_DEV_TEST_CLIENT_ENABLED === "1";
-const developmentInviteLinkOptions = {
+// Before any child process starts: this removes the single-use claim from the environment they inherit.
+const hostedServer = takeHostedServerEnvironment(process.env, app.isPackaged, process.platform);
+const hostingDeveloperKey = takeHostingDeveloperKey(process.env, app.isPackaged);
+const serverMode = takeServerModeEnvironment(process.env, app.isPackaged, process.platform);
+const inviteLinkOptions = {
   allowLocalDevelopmentApiUrl: developmentRemoteRole !== null,
+  selfHostedApiOrigin: selfHostedApiOrigin(process.env.OPENBOT_AUTH_API_URL),
 };
 const developmentRemoteDebuggingPort = !app.isPackaged
   ? readDevelopmentRemoteDebuggingPort(process.env.OPENBOT_DEV_REMOTE_DEBUGGING_PORT)
@@ -192,14 +217,12 @@ let relaunchRequested = false;
  * and the sign-in waiting for that grant lives in this process. It is also never held: a grant is
  * answered by the sign-in that started it, and there is no such sign-in before the app is running.
  */
-type RendererDeepLink = Exclude<DeepLink, { kind: "mcp-auth" }>;
+type RendererDeepLink = Exclude<DeepLink, { kind: "mcp-auth" | "slack-workspace" }>;
 
 // One link at a time, of whichever kind: a second replaces the first, because what a user opened
 // last is what they meant. `deepLinkReceiverReady` says a window has asked for it, which is what
 // tells a link that arrives now to be sent rather than held.
-let pendingDeepLink: RendererDeepLink | null = takeRendererDeepLink(
-  findDeepLink(process.argv, developmentInviteLinkOptions),
-);
+let pendingDeepLink: RendererDeepLink | null = takeRendererDeepLink(findDeepLink(process.argv, inviteLinkOptions));
 let deepLinkReceiverReady = false;
 
 const MAIN_WINDOW_STATE_FILE = "openbot-main-window-state-v1.json";
@@ -231,6 +254,7 @@ const {
   forwardUpdatePreference,
   forwardVoiceModelStatus,
   forwardProviderRuntimeStatus,
+  forwardGitHubConnectorStatus,
   forwardHostStatus,
   forwardRemoteDesktopSessions,
   forwardServers,
@@ -271,6 +295,38 @@ const windows = createMainWindowController({
   },
   reportError: (message, error) => logger.error(message, toLogValue(error)),
 });
+
+let appIconColorImage: NativeImage | undefined;
+
+/**
+ * Shows the chosen logo color on the Dock icon, or on each window icon where there is no Dock. A dev
+ * or preview build keeps the icon of its build, so it is not mistaken for the release. macOS has no
+ * alternate app icon API, so when the app is closed the Dock shows the icon inside the app bundle:
+ * changing that file would break the code signature.
+ */
+function applyAppIconColor(color: AppLogoColor): void {
+  if (appVariant !== "production") return;
+  const icon = nativeImage.createFromPath(
+    resolveLogoColorIconPath({
+      color,
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      sourceRoot: resolve(__dirname, "../.."),
+    }),
+  );
+  if (icon.isEmpty()) return;
+  if (process.platform === "darwin") {
+    app.dock?.setIcon(icon);
+    return;
+  }
+  // A window takes `appIconPath` when it is created, so a window opened after the choice gets the
+  // chosen icon here.
+  if (!appIconColorImage)
+    app.on("browser-window-created", (_event, window) => window.setIcon(appIconColorImage ?? icon));
+  appIconColorImage = icon;
+  for (const window of BrowserWindow.getAllWindows()) window.setIcon(icon);
+}
 
 /**
  * Outside macOS, closing the main window ends OpenBot.
@@ -333,6 +389,7 @@ function registerIpcHandlers({
   service,
   providerRuntimes,
   providerCredentials,
+  messaging,
   mailbox,
   browser,
   browserPictureInPicture,
@@ -342,9 +399,11 @@ function registerIpcHandlers({
   analyticsPreferenceFile,
   updatePreferenceFile,
   requestedUpdate,
+  idleRestart,
   approvalAutomation,
   agentAdminSettings,
   language,
+  logoColor,
   notificationPreference,
   agentInitialization,
   sidebarLayout,
@@ -354,6 +413,9 @@ function registerIpcHandlers({
   centralAuth,
   skills,
   hostedSites,
+  githubConnector,
+  billing,
+  hostedServers,
   customProviderChanges,
   customAgentChanges,
   providerDetection,
@@ -386,6 +448,7 @@ function registerIpcHandlers({
       analyticsPreferenceFile,
       approvalAutomation,
       language,
+      logoColor,
       initializeAgent: () => agentInitialization.start(),
       appVariant,
       getMainWindow,
@@ -402,7 +465,10 @@ function registerIpcHandlers({
     ...voiceIpcHandlers({ voice }),
     ...accountIpcHandlers({ centralAuth, host }),
     ...skillIpcHandlers({ skills, getMainWindow, translate: language.translate }),
-    ...hostedSiteIpcHandlers({ hostedSites, getMainWindow, translate: language.translate }),
+    ...hostedSiteIpcHandlers({ hostedSites, remoteServers, getMainWindow, translate: language.translate }),
+    ...githubConnectorIpcHandlers({ githubConnector }),
+    ...billingIpcHandlers({ billing }),
+    ...hostedServerIpcHandlers({ hostedServers }),
     ...customProviderIpcHandlers(customProviderChanges),
     ...customAgentIpcHandlers(customAgentChanges),
     ...providerDetectionIpcHandlers({ detection: providerDetection, settings: providerDetectionSettings }),
@@ -413,13 +479,14 @@ function registerIpcHandlers({
     }),
     ...agentImportIpcHandlers({
       agentImport,
+      remoteServers,
       getMainWindow,
       translate: language.translate,
       exportSkillPath: app.isPackaged
         ? join(process.resourcesPath, "agent-import", "grok-bot", "SKILL.md")
         : resolve(__dirname, "../../resources/agent-import/grok-bot/SKILL.md"),
     }),
-    ...updateIpcHandlers({ updater, updatePreferenceFile, requestedUpdate }),
+    ...updateIpcHandlers({ updater, updatePreferenceFile, requestedUpdate, idleRestart }),
     ...notificationIpcHandlers({
       notificationPreference,
       translate: language.translate,
@@ -455,6 +522,7 @@ function registerIpcHandlers({
       customProviders: customProviderChanges,
       remoteServers,
     }),
+    ...messagingIpcHandlers({ messaging }),
     ...mcpServerIpcHandlers({
       service,
       remoteServers,
@@ -561,7 +629,10 @@ function forwardCentralAuth(state: CentralAuthState): void {
       } catch (error) {
         logger.error("Unable to synchronize the joined servers:", toLogValue(error));
       }
-      if (host && shouldAutoStartHost({ ...host.getStatus(), remoteRole: developmentRemoteRole })) await host.start();
+      // A self-hosted server exists to be a host, so its first sign-in names and starts it too.
+      if (host && services?.serverMode) await services.serverMode.publish();
+      else if (host && shouldAutoStartHost({ ...host.getStatus(), remoteRole: developmentRemoteRole }))
+        await host.start();
     })
     .catch((error) => {
       logger.error("Unable to synchronize the signed-in account:", toLogValue(error));
@@ -580,6 +651,10 @@ function forwardCentralAuth(state: CentralAuthState): void {
 function acceptDeepLink(link: DeepLink): void {
   if (link.kind === "mcp-auth") {
     receiveMcpAuthorizationCode(link.state, link.code);
+    return;
+  }
+  if (link.kind === "slack-workspace") {
+    receiveSlackSignIn(link);
     return;
   }
   pendingDeepLink = link;
@@ -609,7 +684,25 @@ function takePendingDeepLink(kind: RendererDeepLink["kind"]): string | null {
 
 /** A link of a kind a renderer can be sent, or null for one it cannot - which includes no link. */
 function takeRendererDeepLink(link: DeepLink | null): RendererDeepLink | null {
-  return link && link.kind !== "mcp-auth" ? link : null;
+  return link && link.kind !== "mcp-auth" && link.kind !== "slack-workspace" ? link : null;
+}
+
+/**
+ * Hands a Slack install the sealed token it is waiting for. As with an MCP grant, a link this run did
+ * not start does nothing and raises no window.
+ */
+function receiveSlackSignIn(link: Extract<DeepLink, { kind: "slack-workspace" }>): void {
+  const messaging = services?.messaging;
+  if (!messaging) return;
+  void messaging
+    .completeSlackWorkspace(link.nonce, link.grant)
+    .then((accepted) => {
+      const window = windowHolder.current;
+      if (accepted && window && !window.isDestroyed()) showMainWindow(window);
+    })
+    .catch(() => {
+      // The Slack settings show the connection's state. The error can quote Slack.
+    });
 }
 
 /**
@@ -625,7 +718,7 @@ function receiveMcpAuthorizationCode(state: string, code: string): void {
 }
 
 app.on("open-url", (event, url) => {
-  const link = parseDeepLink(url, developmentInviteLinkOptions);
+  const link = parseDeepLink(url, inviteLinkOptions);
   if (!link) return;
   event.preventDefault();
   acceptDeepLink(link);
@@ -634,7 +727,7 @@ app.on("open-url", (event, url) => {
 app.on("continue-activity", (event, type, _userInfo, details) => {
   if (type !== "NSUserActivityTypeBrowsingWeb" || !details.webpageURL) return;
   try {
-    parseInviteUrl(details.webpageURL, developmentInviteLinkOptions);
+    parseInviteUrl(details.webpageURL, inviteLinkOptions);
   } catch {
     return;
   }
@@ -647,7 +740,7 @@ if (!hasSingleInstanceLock) {
   process.exit(0);
 } else {
   app.on("second-instance", (_event, argv) => {
-    const deepLink = findDeepLink(argv, developmentInviteLinkOptions);
+    const deepLink = findDeepLink(argv, inviteLinkOptions);
     if (deepLink) acceptDeepLink(deepLink);
     const window = windowHolder.current;
     const hasMainWindow = Boolean(window && !window.isDestroyed());
@@ -662,7 +755,7 @@ if (!hasSingleInstanceLock) {
     else if (response === "relaunch" && !relaunchRequested) {
       relaunchRequested = true;
       // The new instance takes this launch's link, not the one this process may have started with.
-      const isLink = (value: string) => parseDeepLink(value, developmentInviteLinkOptions) !== null;
+      const isLink = (value: string) => parseDeepLink(value, inviteLinkOptions) !== null;
       const link = argv.find(isLink);
       const args = process.argv.slice(1).filter((value) => !isLink(value));
       app.relaunch({ args: link ? [...args, link] : args });
@@ -703,6 +796,9 @@ if (!hasSingleInstanceLock) {
         appVariant,
         developmentRemoteRole,
         developmentTestClientEnabled,
+        hostedServer,
+        serverMode,
+        hostingDeveloperKey,
         macHapticFeedback,
         teardown,
         forwardCentralAuth,
@@ -738,6 +834,7 @@ if (!hasSingleInstanceLock) {
         dynamicIsland,
         teamStore,
         language,
+        logoColor,
         trace,
       } = built;
 
@@ -745,6 +842,10 @@ if (!hasSingleInstanceLock) {
       setIpcCallObserver((call) => trace.record({ kind: "ipc", ...call }));
       service.on("event", (event) => trace.observeAgentEvent(event));
       service.on("event", (event) => forwardAgentEvent("local", event));
+      // Internal usage signals for analytics only. They are not agent events, so the renderer and
+      // Team API clients never receive them.
+      service.on("toolUsage", (usage) => built.analytics.handleToolUsage(usage));
+      built.browser.onSiteVisited((visit) => built.analytics.handleSiteVisit(visit));
       sidebarLayout.on("changed", (layout) => forwardAgentEvent("local", { type: "sidebar-layout-changed", layout }));
       built.approvalAutomation.subscribe((preference) => {
         for (const window of BrowserWindow.getAllWindows()) {
@@ -756,6 +857,7 @@ if (!hasSingleInstanceLock) {
       host.on("directMessage", (event) => forwardDirectMessage("local", event));
       host.on("directTyping", (event) => forwardDirectTyping("local", event));
       remoteDesktop.on("changed", forwardRemoteDesktopSessions);
+      built.githubConnector.onChanged(forwardGitHubConnectorStatus);
       remoteServers.on("changed", forwardServers);
       remoteServers.on("agent", (serverId, event, bufferedLive) => {
         forwardAgentEvent(serverId, event, bufferedLive);
@@ -787,6 +889,13 @@ if (!hasSingleInstanceLock) {
           sendToRenderer(window, IPC_ENDPOINTS.app.appLanguagePreference, preference);
         }
       });
+      applyAppIconColor(logoColor.preference.color);
+      logoColor.subscribe((preference) => {
+        applyAppIconColor(preference.color);
+        for (const window of BrowserWindow.getAllWindows()) {
+          sendToRenderer(window, IPC_ENDPOINTS.app.appLogoColorPreference, preference);
+        }
+      });
       await dynamicIsland
         .initialize()
         .catch((error) => logger.error("Unable to initialize Dynamic Island:", toLogValue(error)));
@@ -802,8 +911,19 @@ if (!hasSingleInstanceLock) {
       screen.on("display-metrics-changed", reconcileDynamicIsland);
       powerMonitor.on("resume", reconcileDynamicIsland);
       powerMonitor.on("resume", () => remoteServers.wake());
+      // A Slack socket can be dead after sleep without knowing it; reconnect instead of waiting for a ping.
+      powerMonitor.on("resume", () => built.messaging.resume());
+      const routineWake = new RoutineWake({ routines: service, isOnline: () => net.isOnline() });
+      powerMonitor.on("suspend", () => routineWake.suspend());
+      powerMonitor.on("resume", () => routineWake.resume());
+      teardown.push(0, "routine wake", () => routineWake.dispose());
       const teamIdentity = teamStore.getIdentity();
-      if (
+      if (built.serverMode) {
+        const serverModeControl = built.serverMode;
+        void built.centralAuthInitialization
+          .then(() => serverModeControl.publish())
+          .catch((error) => logger.error("Unable to publish this server:", toLogValue(error)));
+      } else if (
         shouldAutoStartHost({
           configured: Boolean(teamIdentity),
           enabledOnLaunch: teamIdentity?.enabledOnLaunch ?? false,

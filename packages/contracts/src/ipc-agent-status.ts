@@ -46,6 +46,15 @@ export interface AgentProviderStatus {
    * apart, and only the provider that resolved a CLI reports one at all.
    */
   cliSource?: "system" | "managed";
+  /** A restart the user asked for waits for the provider's turns to end. New turns wait for it. */
+  restartPending?: boolean;
+  /**
+   * The last failure of the provider, redacted, kept after its toast is gone and cleared by the next
+   * good model list. Only the computer that runs the provider sends it; the Team API does not.
+   */
+  lastError?: string | null;
+  /** When `lastError` happened, in milliseconds since the epoch. */
+  lastErrorAt?: number;
 }
 
 function isAgentProviderStatus(value: unknown): value is AgentProviderStatus {
@@ -58,7 +67,10 @@ function isAgentProviderStatus(value: unknown): value is AgentProviderStatus {
     (value.email === undefined || isNullableBoundedString(value.email, INPUT_LIMITS.email)) &&
     (value.connectionState === undefined || isBoundedString(value.connectionState, INPUT_LIMITS.identifier)) &&
     (value.checkError === undefined || isNullableBoundedString(value.checkError, INPUT_LIMITS.messageText)) &&
-    (value.cliSource === undefined || isBoundedString(value.cliSource, INPUT_LIMITS.identifier))
+    (value.cliSource === undefined || isBoundedString(value.cliSource, INPUT_LIMITS.identifier)) &&
+    (value.restartPending === undefined || typeof value.restartPending === "boolean") &&
+    (value.lastError === undefined || isNullableBoundedString(value.lastError, INPUT_LIMITS.messageText)) &&
+    (value.lastErrorAt === undefined || isFiniteNumber(value.lastErrorAt))
   );
 }
 
@@ -71,6 +83,8 @@ export type AgentAuthState =
   | { kind: "grok"; email: string | null }
   | { kind: "opencode"; email: string | null }
   | { kind: "antigravity"; email: string | null }
+  | { kind: "cursor"; email: string | null }
+  | { kind: "cline"; email: string | null }
   | { kind: "acp"; email: string | null };
 
 export interface AccountUsageWindow {
@@ -157,6 +171,12 @@ export interface SetProviderApiKeyInput {
   key: string;
 }
 
+/** The code a `paste` sign-in's page showed. It is a credential: it only travels towards the host. */
+export interface SubmitProviderCodeLoginInput {
+  provider: AgentProviderId;
+  code: string;
+}
+
 /**
  * Whether a key is stored. `unreadable` is a key file OpenBot could not decrypt or parse: the
  * provider then runs with no key, and the file stays on disk until the user replaces or removes it.
@@ -184,7 +204,20 @@ export type ProviderCodeLoginStart =
       userCode: string;
       /** The page to type it on. Always https. */
       verificationUrl: string;
+      /** The same page with the code filled in, when the provider gives one. The dialog's QR code opens it. */
+      verificationUrlComplete?: string;
       /** Epoch milliseconds. When OpenBot gives up on this code, which is what the dialog counts down to. */
+      expiresAt: number;
+    }
+  | {
+      /**
+       * The user signs in on the page, which then shows a code for them to copy back. OpenBot types
+       * it into the provider's CLI with `submitProviderCodeLogin`.
+       */
+      kind: "paste";
+      /** The provider's sign-in page. Always https. */
+      verificationUrl: string;
+      /** Epoch milliseconds, as for `code`. */
       expiresAt: number;
     }
   | { kind: "connected" };

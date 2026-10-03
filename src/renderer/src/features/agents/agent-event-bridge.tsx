@@ -1,4 +1,6 @@
 import type { AgentEvent, AgentRuntimeSnapshot } from "@openbot/contracts/ipc";
+import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
+import { reconcileQueuesWithRuntimeWork } from "@openbot/team-client/dynamic-island-coordinator";
 import { toast } from "@openbot/ui";
 import { currentText } from "@openbot/ui/text";
 import { classifyUserError } from "@openbot/user-errors";
@@ -16,11 +18,10 @@ import { useConversation } from "../conversation/conversation-context";
 import { useConversationController } from "../conversation/conversation-controller-context";
 import { agentConversationKey, composerDraftKey, promptRequestKey } from "../conversation/conversation-keys";
 import { latestIncomingConversationMessage } from "../conversation/conversation-read-state";
-import { reconcileQueuesWithRuntimeWork } from "../dynamic-island/dynamic-island-coordinator";
 import { useServers } from "../servers/servers-context";
 import { useSidebar } from "../sidebar/sidebar-context";
 import { claimErrorToast, readableAgentError } from "./agent-error-text";
-import { cleanAgentMessageText } from "./agent-message-text";
+import { createAgentEventSounds } from "./agent-event-sounds";
 import { reconcileAttentionApprovals, reconcileAttentionPrompts } from "./agent-runtime-snapshot";
 import { useAgents } from "./agents-context";
 import { agentsPort } from "./agents-port";
@@ -79,6 +80,9 @@ export function AgentEventBridge() {
   } = useTurns();
   const { setBrowserControlState, applyBrowserChange } = useBrowserTabs();
   const { setSidebarLayout } = useSidebar();
+  const playAgentEventSound = createAgentEventSounds((agentId) =>
+    agentList().some((agent) => agent.id === agentId && agent.notifications),
+  );
   let readRefresh = 0;
 
   function handleAgentEvent(event: AgentEvent) {
@@ -319,6 +323,7 @@ export function AgentEventBridge() {
         return;
       }
       flush(() => handleAgentEvent(event));
+      playAgentEventSound(event);
     });
     return () => {
       readRefresh += 1;

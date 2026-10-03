@@ -11,6 +11,7 @@ import {
   type AnalyticsPreference,
   type AppInfo,
   type AppLanguagePreference,
+  type AppLogoColorPreference,
   type ApprovalAutomationPreference,
   type AppSetupState,
   type AttachmentImportEvent,
@@ -25,6 +26,7 @@ import {
   composedCustomModelId,
   createMcpServerId,
   DEFAULT_AGENT_ACCESS,
+  DEFAULT_APP_LOGO_COLOR,
   DEFAULT_APPROVAL_AUTOMATION_PREFERENCE,
   DEFAULT_DYNAMIC_ISLAND_PREFERENCE,
   DEFAULT_PROVIDER_DETECTION_SETTINGS,
@@ -94,10 +96,15 @@ import {
 } from "./fixtures";
 import { mockAgentAnalytics, mockHostAnalytics } from "./mock-agent-analytics";
 import { createMockAuth, type MockAuthOptions } from "./mock-auth";
+import { createMockBilling } from "./mock-billing";
 import { createMockBrowser, type MockBrowserOptions } from "./mock-browser";
 import { createMockChannels } from "./mock-channels";
+import { createMockGitHubConnector } from "./mock-github-connector";
 import { createMockHostUpdate, type MockHostUpdateOptions } from "./mock-host-update";
+import { createMockHostedServers } from "./mock-hosted-servers";
+import { createMockMessaging } from "./mock-messaging";
 import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
+import { mockRoutineCalendar } from "./mock-routine-calendar";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
 import { createMockSkills, type MockSkillsOptions } from "./mock-skills";
 import { createMockStorage } from "./mock-storage";
@@ -207,6 +214,8 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
   let approvalAutomation = clone<ApprovalAutomationPreference>(DEFAULT_APPROVAL_AUTOMATION_PREFERENCE);
   let languagePreference = clone<AppLanguagePreference>(options.languagePreference ?? { language: "system" });
   const languageListeners = new Set<(preference: AppLanguagePreference) => void>();
+  let logoColorPreference: AppLogoColorPreference = { color: DEFAULT_APP_LOGO_COLOR };
+  const logoColorListeners = new Set<(preference: AppLogoColorPreference) => void>();
   const approvalAutomationListeners = new Set<(preference: ApprovalAutomationPreference) => void>();
   let dynamicIslandPreference: DynamicIslandPreference = { ...DEFAULT_DYNAMIC_ISLAND_PREFERENCE };
   let dynamicIslandPresentation: DynamicIslandPresentation = { serverId: "local", mode: "idle" };
@@ -352,6 +361,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       reasoningEffort: input.reasoningEffort ?? "low",
       access: input.access ?? "full",
       computerUse: input.computerUse ?? true,
+      ...(input.allowAutomation ? { allowAutomation: true } : {}),
       threadId: input.threadId ?? `thread-${id}`,
       workspacePath: input.workspacePath ?? `/mock/OpenBot/Agents/${id}`,
       preview: input.preview ?? "No messages yet",
@@ -445,6 +455,16 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       languageListeners.add(listener);
       return () => languageListeners.delete(listener);
     },
+    getAppLogoColorPreference: async () => clone(logoColorPreference),
+    setAppLogoColorPreference: async ({ color }) => {
+      logoColorPreference = { color };
+      for (const listener of logoColorListeners) listener(clone(logoColorPreference));
+      return clone(logoColorPreference);
+    },
+    onAppLogoColorPreference: (listener) => {
+      logoColorListeners.add(listener);
+      return () => logoColorListeners.delete(listener);
+    },
     onOpenSettings: () => () => undefined,
     dynamicIsland: {
       getPreference: async () => clone(dynamicIslandPreference),
@@ -456,6 +476,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         dynamicIslandPresentation = clone(presentation);
       },
       getPresentation: async () => clone(dynamicIslandPresentation),
+      getBuiltInDisplayGeometry: async () => ({ width: 192, height: 32 }),
       onPreference: () => () => undefined,
       onPresentation: () => () => undefined,
       onGeometry: () => () => undefined,
@@ -488,6 +509,9 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     connectProvider: async () => clone(agentStatus),
     updateProviderCli: async () => clone(agentStatus),
     refreshAgentProviders: async () => clone(agentStatus),
+    // The preview runs no provider process, so a restart has nothing to wait for.
+    restartProvider: async () => clone(agentStatus),
+    cancelProviderRestart: async () => clone(agentStatus),
     // A code that never completes: the preview has no provider to finish the sign-in, so this shows
     // the waiting screen and leaves it there.
     startProviderCodeLogin: async () => ({
@@ -521,7 +545,12 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     auth: mockAuth.auth,
     skills: mockSkills.skills,
     hostedSites: {
-      list: async () => clone(hostedSites),
+      // The preview server is on the Starter plan.
+      list: async () => ({
+        sites: clone(hostedSites),
+        limit: 3,
+        used: hostedSites.filter((site) => site.status === "active").length,
+      }),
       chooseDirectory: async () => "/mock/OpenBot/Sites/launch-notes",
       publish: async (input) => {
         const hostname = `${input.title.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-")}.openbot.site`;
@@ -537,6 +566,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
           size: 786_432,
           expiresAt: null,
           updatedAt: new Date().toISOString(),
+          serverId: "host-preview",
         };
         hostedSites = [site, ...hostedSites];
         return clone(site);
@@ -557,6 +587,9 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         hostedSites = hostedSites.filter((site) => site.id !== siteId);
       },
     },
+    githubConnector: createMockGitHubConnector(),
+    billing: createMockBilling(),
+    hostedServers: createMockHostedServers(),
     customProviders: {
       list: async () => clone(customProviders),
       /**
@@ -653,9 +686,22 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         return clone(detectionSettings);
       },
     },
+    // Preview has one host, so every server answers for the same agents.
+    // The Slack Orchestrator of the preview is its first agent.
+    messaging: createMockMessaging(() => agents[0]?.id ?? "preview-agent"),
     // Preview has one host, so every server answers from the same providers as this computer.
     providerAdmin: {
-      startCodeLogin: (provider) => api.startProviderCodeLogin(provider),
+      // A host signs Claude in with a code its page shows, which the user pastes back.
+      startCodeLogin: async (provider) =>
+        provider === "claude"
+          ? {
+              kind: "paste",
+              verificationUrl: "https://claude.com/cai/oauth/authorize?code=true",
+              expiresAt: Date.now() + 10 * 60_000,
+            }
+          : api.startProviderCodeLogin(provider),
+      // As with the code above, the preview has no provider to finish the sign-in.
+      submitCodeLogin: async () => clone(agentStatus),
       cancelCodeLogin: (provider) => api.cancelProviderCodeLogin(provider),
       getApiKeyState: (provider) => api.getProviderApiKeyState(provider),
       setApiKey: (input) => api.setProviderApiKey(input),
@@ -1217,6 +1263,9 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         return clone(run);
       },
       listRoutineRuns: async (input) => clone((routineRuns.get(input.routineId) ?? []).slice(0, input.limit)),
+      automationRunCommand: async (input) =>
+        `curl -sS -X POST "$(cat '/mock/automation/url')/v1/agents/${input.agentId}/routines/${input.routineId}/run" -H @'/mock/automation/headers' -H 'Content-Type: application/json' -d '{"payload":""}'`,
+      routineCalendar: async (input) => mockRoutineCalendar(input, routines, routineRuns),
       readConversation: async (agentId) => ({
         ...clone(getSnapshot(agentId)),
         readState: { unreadCount: 0, firstUnreadMessageId: null, throughMessageId: null },
@@ -1236,13 +1285,33 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         };
       },
       searchConversationMessages: async (input) => {
-        const query = input.query.trim().toLocaleLowerCase();
+        const query = input.query.trim().replace(/\s+/g, " ").toLocaleLowerCase();
         const results = agents.flatMap((agent) =>
           getSnapshot(agent.id)
-            .messages.filter((message) => message.text.toLocaleLowerCase().includes(query))
+            .messages.filter((message) => message.text.replace(/\s+/g, " ").toLocaleLowerCase().includes(query))
             .map((message) => ({ agentId: agent.id, message: clone(message) })),
         );
         return { results: results.slice(0, input.limit ?? 100), total: results.length, nextCursor: null };
+      },
+      searchConversationFiles: async (input) => {
+        const query = input.query.trim().toLocaleLowerCase();
+        const results = agents.flatMap((agent) =>
+          getSnapshot(agent.id).messages.flatMap((message) =>
+            (message.attachments ?? [])
+              .filter((attachment) => attachment.name.toLocaleLowerCase().includes(query))
+              .map((attachment) => ({
+                agentId: agent.id,
+                messageId: message.id,
+                createdAt: message.createdAt,
+                attachment: clone(attachment),
+              })),
+          ),
+        );
+        // Newest first, as the backend returns them.
+        results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        const offset = Number(input.cursor ?? 0);
+        const end = offset + (input.limit ?? 50);
+        return { results: results.slice(offset, end), nextCursor: end < results.length ? String(end) : null };
       },
       listConversationReads: async () => ({}),
       markConversationRead: async (input) => ({
@@ -1515,6 +1584,18 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       },
       cancelScheduledRestart: async () => {
         const { scheduledRestart: _cancelled, ...rest } = updateStatus;
+        updateStatus = rest;
+        emit(updateListeners, updateStatus);
+        return clone(updateStatus);
+      },
+      // The preview never restarts: the restart waits for one agent turn until it is cancelled.
+      restartWhenIdle: async (target) => {
+        updateStatus = { ...updateStatus, idleRestart: { target, waitingFor: ["agent-turn"] } };
+        emit(updateListeners, updateStatus);
+        return clone(updateStatus);
+      },
+      cancelIdleRestart: async () => {
+        const { idleRestart: _cancelled, ...rest } = updateStatus;
         updateStatus = rest;
         emit(updateListeners, updateStatus);
         return clone(updateStatus);

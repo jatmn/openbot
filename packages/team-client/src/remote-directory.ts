@@ -7,6 +7,7 @@ import {
   OPENBOT_CONTROL_PLANE_ORIGIN,
   OPENBOT_INVITE_ORIGIN,
   parseInviteUrl,
+  selfHostedApiOrigin,
 } from "@openbot/contracts/invite-links";
 import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { decodeRemoteSession, decodeRemoteSessionTicket } from "@openbot/contracts/remote-control-plane";
@@ -21,6 +22,8 @@ export interface RemoteTeamHost {
   devicePublicKey: string;
   membershipId: string;
   role: "owner" | "admin" | "member";
+  /** The active members that the host's plan allows. An account server from before plans sends none. */
+  memberLimit?: number;
 }
 
 export interface RemoteTeamMember {
@@ -107,7 +110,9 @@ export class RemoteTeamDirectoryClient {
     this.#authentication = input.authentication ?? { kind: "bearer", token: input.token ?? "" };
     this.#fetch = input.fetch;
     this.#pairedHost = input.pairedHost;
-    this.#inviteLinks = input.inviteLinks ?? {};
+    // A self-hosted account service accepts invitations that name it. `previewInvite` still refuses
+    // an invitation for any other service.
+    this.#inviteLinks = { selfHostedApiOrigin: selfHostedApiOrigin(input.apiUrl), ...input.inviteLinks };
     const keys = new Map<string, string>();
     this.#hostKeys = input.hostKeys ?? {
       get: async (hostId) => keys.get(hostId) ?? null,
@@ -124,7 +129,10 @@ export class RemoteTeamDirectoryClient {
       value.hosts.map(async (candidate): Promise<RemoteTeamHost[]> => {
         if (!isDynamicRecord(candidate) || !isString(candidate.devicePublicKey) || !candidate.devicePublicKey)
           return [];
+        const memberLimit = candidate.memberLimit;
         if (
+          (memberLimit !== undefined &&
+            (!isNumber(memberLimit) || !Number.isSafeInteger(memberLimit) || memberLimit < 1)) ||
           !isString(candidate.hostId) ||
           !isString(candidate.name) ||
           (candidate.logoKey !== null && !isString(candidate.logoKey)) ||
@@ -145,6 +153,7 @@ export class RemoteTeamDirectoryClient {
             devicePublicKey: pinnedKey ?? candidate.devicePublicKey,
             membershipId: candidate.membershipId,
             role: candidate.role,
+            ...(memberLimit === undefined ? {} : { memberLimit }),
           },
         ];
       }),
@@ -185,6 +194,9 @@ export class RemoteTeamDirectoryClient {
       token: "x".repeat(32),
     };
     createInviteUrl(payload, this.#inviteLinks);
+    // The account service sends only an openbot.run link, and a self-hosted invitation is not one.
+    if (input.email && selfHostedApiOrigin(payload.apiUrl))
+      throw new Error(sourceText("error.remote.selfHostedInviteNoEmail"));
     const value = await this.#request(`/v2/remote/hosts/${encodeURIComponent(host.hostId)}/invites`, {
       method: "POST",
       body: input,

@@ -7,6 +7,7 @@ import type {
   DynamicIslandPresentation,
   ExternalDestination,
   HostUpdateSettingsChange,
+  IdleRestartTarget,
   InstallMarketplaceAgentInput,
   InstallSkillInput,
   MacPermissionId,
@@ -18,6 +19,7 @@ import type {
   SaveSetupInput,
   SetAnalyticsPreferenceInput,
   SetAppLanguagePreferenceInput,
+  SetAppLogoColorPreferenceInput,
   SetApprovalAutomationInput,
   SetDynamicIslandInteractiveInput,
   SetEnabledSkillInput,
@@ -28,9 +30,11 @@ import type {
   VerifyEmailCodeInput,
 } from "@openbot/contracts/ipc";
 import {
+  IDLE_RESTART_TARGETS,
   isAgentModel,
   isAgentProvider,
   isAppLanguage,
+  isAppLogoColor,
   isDynamicIslandAction,
   isDynamicIslandInteractive,
   isDynamicIslandPreference,
@@ -38,7 +42,14 @@ import {
   isSetApprovalAutomationInput,
   isSkillCategory,
 } from "@openbot/contracts/ipc";
-import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
+import {
+  type DynamicRecord,
+  isBoolean,
+  isDynamicRecord,
+  isNumber,
+  isOneOf,
+  isString,
+} from "@openbot/contracts/runtime-values";
 import { validateProfileName } from "@openbot/contracts/validation";
 import { parseAvatarImage } from "./avatar-inputs";
 import { isObject, optionalBoolean, requireString } from "./validation";
@@ -78,6 +89,16 @@ export function parseApprovalAutomation(input: unknown): SetApprovalAutomationIn
 export function parseAppLanguagePreference(input: unknown): SetAppLanguagePreferenceInput {
   if (!isDynamicRecord(input) || !isAppLanguage(input.language)) throw new Error("Language preference is required.");
   return { language: input.language };
+}
+
+export function parseAppLogoColorPreference(input: unknown): SetAppLogoColorPreferenceInput {
+  if (!isDynamicRecord(input) || !isAppLogoColor(input.color)) throw new Error("Logo color is required.");
+  return { color: input.color };
+}
+
+export function parseIdleRestartTarget(input: unknown): IdleRestartTarget {
+  if (!isOneOf(IDLE_RESTART_TARGETS, input)) throw new Error("A restart target is required.");
+  return input;
 }
 
 export function parseUpdatePreference(input: unknown): UpdatePreferenceChange {
@@ -154,6 +175,7 @@ export function parseExternalDestination(input: unknown): ExternalDestination {
     input !== "feedback" &&
     input !== "message" &&
     input !== "grok-bot-export" &&
+    input !== "hosted-server-contact" &&
     input !== "mac-screen-recording"
   ) {
     throw new Error("Unknown external destination.");

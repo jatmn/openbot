@@ -15,6 +15,7 @@ import {
   decodeChannelSummaries,
   decodeSaveAgentProfileResult,
   hostAnalyticsQuery,
+  isAgentModelOption,
   parseAgentAnalyticsInput,
   parseBrowserSecretResponse,
   parseChannelCommand,
@@ -23,10 +24,12 @@ import {
   parseHostAnalyticsInput,
   parseSaveAgentProfile,
 } from "@openbot/contracts/ipc";
+import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import { CONTEXT_RESET_CAPABILITY, CONTEXT_RESET_ROUTES } from "@openbot/contracts/team-protocol/context-reset-v1";
 import { sourceText } from "@openbot/i18n/source";
+import { createOpenBotLogger } from "@openbot/logging";
 import { duplicateAgentIntoLayout } from "../../backend/agent/duplication-gate";
 import type { AgentService } from "../../backend/agent-service";
 import type { SidebarLayoutStore } from "../../backend/sidebar-layout-store";
@@ -63,6 +66,7 @@ import {
   parseQueueEdit,
   parseReadConversationPage,
   parseReorderQueue,
+  parseSearchConversationFiles,
   parseSearchConversationMessages,
   parseSendMessage,
   parseSetAgentAvatar,
@@ -71,8 +75,29 @@ import {
   parseUpdateAgent,
   parseUpdateQueuedMessage,
 } from "./agent-inputs";
-import type { IpcGroupHandlers } from "./define-ipc-group";
+import { type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
 import { scopedHandler, scopedQueryHandler } from "./scoped-handler";
+
+/** Its lines also go to the provider log. See `PROVIDER_LOG_PREFIXES`. */
+const modelLogger = createOpenBotLogger("provider-models");
+
+/**
+ * Names each member of a model list that fails `isAgentModelOption`, and returns the list unchanged.
+ * The preload refuses the whole list for one such member and has no log of its own, so without this
+ * the window shows "Invalid agent model response." and nothing records which model it was.
+ */
+function logRejectedModels<T>(models: T, source: "local" | "remote"): T {
+  if (!Array.isArray(models)) return models;
+  for (const model of models) {
+    if (isAgentModelOption(model)) continue;
+    modelLogger.warn("A model list member fails the contract, so the window refuses the list.", {
+      source,
+      provider: isDynamicRecord(model) && typeof model.provider === "string" ? model.provider : null,
+      id: isDynamicRecord(model) && typeof model.id === "string" ? model.id : null,
+    });
+  }
+  return models;
+}
 
 export interface AgentIpcDependencies {
   service: AgentService;
@@ -125,8 +150,11 @@ export function agentIpcHandlers({
             : remoteServers.request(serverId, TEAM_API_ROUTES.agents.usage, decodeAccountUsageFromHost),
       }),
       listModels: scopedQueryHandler({
-        local: () => service.listModels(),
-        remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.models, decodeAgentModelOptions),
+        local: () => logRejectedModels(service.listModels(), "local"),
+        remote: (serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agents.models, (value) =>
+            decodeAgentModelOptions(logRejectedModels(value, "remote")),
+          ),
       }),
       listAgents: scopedQueryHandler({
         local: () => service.listAgents(),
@@ -193,7 +221,7 @@ export function agentIpcHandlers({
           }),
       }),
       saveProfile: scopedHandler(parseSaveAgentProfile, {
-        local: (input) => service.saveProfile(input, sidebarLayout),
+        local: (input) => service.saveProfile(input, sidebarLayout, host.conversationSender()),
         remote: (input, serverId) =>
           remoteServers.request(serverId, TEAM_API_ROUTES.agents.saveProfile, decodeSaveAgentProfileResult, {
             method: "POST",
@@ -201,7 +229,7 @@ export function agentIpcHandlers({
           }),
       }),
       createAgent: scopedHandler(parseCreateAgent, {
-        local: (parsed) => service.createAgent(parsed),
+        local: (parsed) => service.createAgent(parsed, undefined, undefined, host.conversationSender()),
         remote: (parsed, serverId) =>
           remoteServers.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummary, {
             method: "POST",
@@ -221,6 +249,9 @@ export function agentIpcHandlers({
           }
           if (input.computerUse !== undefined) {
             throw new Error(sourceText("error.agent.computerUseLocalOnly"));
+          }
+          if (input.allowAutomation !== undefined) {
+            throw new Error(sourceText("error.agent.automationLocalOnly"));
           }
           return remoteServers.request(serverId, TEAM_API_ROUTES.agent.one(input.agentId), decodeAgentSummary, {
             method: "PATCH",
@@ -262,6 +293,9 @@ export function agentIpcHandlers({
             serverId,
           ),
       }),
+      searchConversationFiles: payloadHandler(parseSearchConversationFiles, (parsed) =>
+        host.searchAgentConversationFiles(parsed.query, parsed.cursor, parsed.limit),
+      ),
       listConversationReads: scopedQueryHandler({
         local: () => host.listAgentConversationReads(),
         remote: (serverId) => remoteServers.listAgentConversationReads(serverId),
@@ -271,7 +305,7 @@ export function agentIpcHandlers({
         remote: (parsed, serverId) => remoteServers.markAgentConversationRead(parsed, serverId),
       }),
       sendMessage: scopedHandler(parseSendMessage, {
-        local: (input) => service.sendMessage(input),
+        local: (input) => service.sendMessage(input, host.conversationSender()),
         remote: (input, serverId) =>
           remoteServers.request(serverId, TEAM_API_ROUTES.agent.messages(input.agentId), decodeQueuedMessageReceipt, {
             method: "POST",
@@ -316,7 +350,7 @@ export function agentIpcHandlers({
           }),
       }),
       editQueuedMessage: scopedHandler(parseQueueEdit, {
-        local: ({ agentId, ...input }) => service.editQueuedMessage(agentId, input),
+        local: ({ agentId, ...input }) => service.editQueuedMessage(agentId, input, host.conversationSender()),
         remote: ({ agentId, ...input }, serverId) =>
           remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueEdit(agentId), decodeQueueSnapshot, {
             method: "POST",
@@ -324,7 +358,7 @@ export function agentIpcHandlers({
           }),
       }),
       updateQueuedMessage: scopedHandler(parseUpdateQueuedMessage, {
-        local: (parsed) => service.updateQueuedMessage(parsed),
+        local: (parsed) => service.updateQueuedMessage(parsed, host.conversationSender()),
         remote: (parsed, serverId) =>
           remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueUpdate(parsed.agentId), decodeVoid, {
             method: "POST",

@@ -12,13 +12,22 @@ export const GUIDES_COLLECTION: ContentCollection<"guides"> = {
   indexRoute: "/guides",
   articleRoute: "/guides/$slug",
   name: "Guides",
-  indexTitle: "Guides — OpenBot",
-  indexDescription: "How OpenBot works and how to get started with agents on your computer.",
+  indexTitle: "OpenBot Guides: How to Run a Team of AI Agents",
+  indexDescription:
+    "How OpenBot works and how to run a team of AI agents. Start with OpenBot 101, then explore practical guides to models, agents, and the Marketplace.",
   feedTitle: "OpenBot guides",
   backLabel: "All guides",
   moreTitle: "More guides",
   imageEyebrow: "OPENBOT · GUIDES",
   articles: publishedFirst([
+    {
+      slug: "openbot-marketplace",
+      title: "How to Use the OpenBot Marketplace: Agents, Skills, and Plugins",
+      description:
+        "Browse the OpenBot Marketplace, install agents, plugins, and skills, and submit your own agent for review.",
+      publishedAt: "2026-09-29",
+      author: NEWS_AUTHOR,
+    },
     {
       slug: "what-are-ai-agents",
       title: "What Are AI Agents? How They Work and When to Use Them",

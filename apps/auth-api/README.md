@@ -14,7 +14,66 @@ ticket key pair plus random admin, report and webhook secrets, all local to the
 checkout. Nothing in it is shared with production or with another machine, so a
 fork needs no key from anyone. Delete the file and rerun to get a fresh set.
 
-`.env.production` is the only encrypted file, and its private key stays in the
+`.env.shared` holds encrypted development values that all maintainers share: the Stripe
+sandbox keys, the development `BOAT_API_KEY`, and the webhook secrets of the `test` Worker. The boat key creates real
+VMs, but only when the Worker also has `HOSTED_SERVER_TEMPLATE`. `wrangler.jsonc` sets
+`HOSTED_SERVERS_ENABLED` to `true` and `HOSTED_SERVERS_ALLOWED_USER_IDS` to `*`, so a local Worker
+with a template lets each local account create one; put account IDs in `.env.dev` to limit it. A VM
+cannot reach a local Worker, so use `bun run dev --hosting=test` for a real server (see
+[Real servers from a development build](../../docs/hosted-servers.md#real-servers-from-a-development-build)). `bun run dev:api` decrypts it in memory. Ask a maintainer for
+`DOTENV_PRIVATE_KEY_SHARED`, then export it in your shell profile or add it to the root
+`.env.keys`. The shell profile works in every worktree. Without the key, the Worker runs with no
+Stripe or boat keys. A value in `.env.dev` overrides the shared value. To change a value, run
+`bunx dotenvx set <NAME> <value> -f apps/auth-api/.env.shared -fk .env.keys`.
+
+### Stripe sandbox
+
+`bun run api:stripe:bootstrap` creates the six plan Prices (lookup keys `openbot_{plan}_{month|year}`)
+and the Customer Portal settings in the Stripe account of `STRIPE_SECRET_KEY`. It is safe to run
+again: a changed amount makes a new Price and moves the lookup key to it. In the Portal, an upgrade
+is charged at once, and a downgrade or a shorter interval starts at the next period.
+
+For a local Worker, forward the webhooks and put the secret that `stripe listen` prints in your
+own `.env.dev` as `STRIPE_WEBHOOK_SECRET`:
+
+```bash
+stripe listen --forward-to http://127.0.0.1:3100/v1/stripe/webhook
+```
+
+For the `test` Worker, `bun run hosting:setup --target=test` makes or updates its Stripe and boat
+webhooks and writes their signing secrets to `.env.shared`. Then run `bun run api:deploy:test`. It
+also sets the allow list from `HOSTED_SERVERS_TEST_ALLOW_LIST` and the developer key
+`HOSTED_SERVERS_DEVELOPER_KEY` from `.env.shared`.
+
+`scripts/stripe-flows-e2e.ts` checks the plan flows against the sandbox and a local Worker: renewal,
+failed renewal, cancel at the period end, plan change, renew, delete, another account's server, and a
+deleted customer. Each scenario uses a Stripe test clock and deletes it at the end. Start the Worker
+with `HOSTED_SERVERS_ENABLED=true`, `HOSTED_SERVERS_ALLOWED_USER_IDS` set to the output of
+`bun scripts/stripe-flows-e2e.ts --print-user-ids`, and `BOAT_API_KEY=e2e-invalid-key`, and forward
+the webhooks to it. A value in the shell overrides `.env.shared`; without the fake key, each paid
+scenario creates a real boat VM. Then, from the
+repository root:
+
+```bash
+bunx dotenvx run -q -f apps/auth-api/.env.shared -fk .env.keys -- \
+  bun scripts/stripe-flows-e2e.ts --api http://127.0.0.1:<port> [scenario ...]
+```
+
+The `portal` scenario prints a Customer Portal cancel page and then an update page, and waits until
+you use them. The report goes to `.openbot-build/stripe-flows-e2e.json`.
+
+The `boat` scenario runs only when you name it. It pays for a server, waits until OpenBot in the VM
+signs in and publishes the host, restarts the service to check the stored session, and deletes the
+server. It needs the real `BOAT_API_KEY`, a template from `bun run hosting:template` whose
+`--auth-api-url` reaches your Worker (for example a `cloudflared tunnel --url` to its port), and
+`HOSTED_SERVER_TEMPLATE` set to that template. Start the Worker with
+`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=.trycloudflare.com`, or Vite refuses the tunnel host. A boat
+trial account allows only `small` and `default`, so use a Starter or Standard plan there.
+
+`bun run api:deploy:test` reads `.env.shared` before `.env.production`. The first file wins, so the
+test Worker gets the sandbox keys, never live keys.
+
+`.env.production` is the only encrypted production file, and its private key stays in the
 ignored root `.env.keys`. Dotenvx decrypts it only in process memory, and only
 the deploy and secret-rotation commands read it.
 
@@ -77,7 +136,14 @@ EMAIL_FROM=hello@openbot.run
 For a deployed Worker, `bun run api:deploy` decrypts `.env.production`. It sends
 `EMAIL_SMTP_PASSWORD`, `SKILLS_ADMIN_TOKEN`, `REMOTE_TICKET_PRIVATE_JWK`,
 `REMOTE_TICKET_PUBLIC_JWKS`, `REMOTE_AUTH_WEBHOOK_SECRET`, and `SITE_REPORT_HASH_SECRET` to
-`wrangler secret put` through standard input. It then builds and deploys the Worker.
+`wrangler secret put` through standard input, and `GITHUB_APP_PRIVATE_KEY` when it is set. It then
+builds and deploys the Worker.
+
+`GITHUB_APP_PRIVATE_KEY` is the OpenBot GitHub App's private key as a PKCS #8 PEM. GitHub gives a
+PKCS #1 key; convert it with `openssl pkcs8 -topk8 -nocrypt -in <key>.pem`. With the key, the
+Worker gives the desktop installation tokens, so GitHub shows `openbotgit[bot]` as the author of an
+agent's work. With no key, the desktop acts as the signed-in user. In GitHub Actions the secret is
+`OPENBOT_GITHUB_APP_PRIVATE_KEY`, because GitHub refuses secret names that start with `GITHUB_`.
 Secrets are never passed as process arguments. The other values are Worker
 variables. The SMTP connection uses TLS from the start and accepts only port 465.
 
@@ -121,6 +187,14 @@ bun run api:deploy
 
 The service applies limits per email, per IP, per challenge, and per resend.
 
+## Hosted sites
+
+`/v1/sites` takes two optional headers: `OpenBot-Host-Id` and `OpenBot-Host-Token`, the machine token
+of a registered server. With them, a request sees only that server's sites, and a new site counts
+against the server plan's limit. A wrong token gets 401 `host_unauthorized`. Without them, a new site
+goes into the account's unlinked bucket of one site; `GET /v1/sites?scope=unlinked` lists only that
+bucket. `GET /v1/sites` returns `{ sites, limit, used }`.
+
 ## Authentication data retention
 
 The production Worker runs once each 5 minutes. Each run delivers pending remote
@@ -150,3 +224,25 @@ Set the private JWK, public JWKS, active key ID, Signal URL, and webhook secret 
 the encrypted environment. The private and public keys must use ES256. The Signal
 URL must point to a DNS-only host. Cloudflare carries only account and configuration
 requests. It does not carry Team API or Remote Desktop data.
+
+To deploy your own copy of this Worker with your own Signal, see
+[Self-hosted remote access](../../docs/self-hosting.md).
+
+### Live Activity relay
+
+`POST /v2/remote/hosts/:hostId/live-activity` forwards a sealed iPhone Live Activity update from a
+host to Apple Push Notification service. The host seals the content for the phone, so the Worker
+cannot read it. The Worker checks the host credential and `LIVE_ACTIVITY_RATE_LIMITER`, makes the
+APNs payload itself with no alert text, and stores and logs nothing.
+
+The relay is off until `APNS_PRIVATE_KEY` (the `.p8` key text) and `APNS_KEY_ID` are set. Create
+the key in Apple Developer > Keys with the Apple Push Notifications service, then add both to the
+encrypted environment and to the `cloudflare-production` GitHub environment. `APNS_TEAM_ID` and
+`APNS_TOPIC` are in `wrangler.jsonc`.
+
+For local development, run `bun run dev:apns-key -- ~/Downloads/AuthKey_<KEY_ID>.p8`. It saves the
+key in `.env.dev`. The local Worker runtime cannot open HTTP/2, which APNs requires, so `vite dev`
+sets `APNS_ORIGIN` and forwards the Worker's request to Apple from Node
+(`dev-apns-proxy.ts`). The Worker still checks the host and the limit, makes the payload and signs
+the token. Only a loopback caller can use the forwarder, and the Worker accepts only a loopback
+`APNS_ORIGIN`.

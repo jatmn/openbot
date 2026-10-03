@@ -15,9 +15,10 @@ export const messages = {
   "error.remote.controlSessionEnded": "リモート操作のセッションが終了しました。",
   "error.remote.testPanelFailed": "ホストがテストパネルを開けませんでした。",
   "error.remote.sessionCapacity": "ホストにはすでに 4 つの有効なセッションがあります。",
-  "error.remote.linuxUnsupported": "Linux ではリモートデスクトップのホストに対応していません。",
+  "error.remote.linuxNeedsX11":
+    "Linux のリモートデスクトップには X11 セッションが必要です。Wayland には対応していません。",
   "error.remote.runtimeMissing":
-    "Sunshine と Moonlight Web のランタイムがないか、このホストでは対応していません。Mac または Windows x64 のホストに OpenBot のフルリリースをインストールしてから、OpenBot を再起動してください。",
+    "Sunshine と Moonlight Web のランタイムがないか、このホストでは対応していません。Mac、Windows x64 または Linux x64 のホストに OpenBot のフルリリースをインストールしてから、OpenBot を再起動してください。",
   "error.remote.testActive": "リモートデスクトップのテストを実行中です。終了してから再試行してください。",
   "error.remote.screenRecordingDenied":
     "ホストが OpenBot に画面の収録を許可していません。ホストで画面収録を許可してから、再試行してください。",
@@ -29,6 +30,14 @@ export const messages = {
   "error.remote.localTestListenerUnavailable": "ローカルテストのリスナーを利用できません。",
   "error.remote.localTestNotFound": "ローカルテストのセッションが見つかりません。",
   "error.remote.runtimeUnavailable": "リモートデスクトップのランタイムを利用できません。",
+  "error.remote.sunshineStartFailed":
+    "ホストで Sunshine を起動できませんでした。ホストのリモートデスクトップのログを確認してから、もう一度お試しください。",
+  "error.remote.moonlightStartFailed":
+    "ホストで Moonlight Web を起動できませんでした。ホストのリモートデスクトップのログを確認してから、もう一度お試しください。",
+  "error.remote.pairingFailed":
+    "ホストで Moonlight と Sunshine をペアリングできませんでした。もう一度お試しください。問題が続く場合は、ホストで OpenBot を再起動してください。",
+  "error.remote.runtimeStartFailed":
+    "ホストでリモートデスクトップのランタイムを起動できませんでした。ホストのリモートデスクトップのログを確認してから、もう一度お試しください。",
   "error.remote.hostUnreachable": "ホストに接続できません。",
   "error.remote.signInToHostAgain": "このホストにもう一度サインインしてください。",
   "error.remote.invalidData": "ホストが無効なデータを返しました。",
@@ -121,6 +130,8 @@ export const messages = {
   "error.remote.pairedIdentityChanged":
     "ペアリングしたデスクトップの ID がないか、変わっています。そのデスクトップで新しいコードをスキャンしてください。",
   "error.remote.permanentInviteNoEmail": "永続的な招待はメールで送信できません。",
+  "error.remote.selfHostedInviteNoEmail":
+    "セルフホストのアカウントサービスの招待はメールで送信できません。リンクをコピーしてください。",
   "error.remote.inviteOtherService": "この招待は別の OpenBot サービスのものです。",
   "error.remote.inviteFingerprintMismatch": "招待のホストの ID がフィンガープリントと一致しません。",
   "error.remote.inviteHostKeyMissing": "招待のホストキーがありません。",

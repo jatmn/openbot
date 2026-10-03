@@ -16,9 +16,10 @@ export const messages = {
   "error.remote.controlSessionEnded": "La session de contrôle à distance est terminée.",
   "error.remote.testPanelFailed": "L’hôte n’a pas pu ouvrir le panneau de test.",
   "error.remote.sessionCapacity": "L’hôte a déjà quatre sessions actives.",
-  "error.remote.linuxUnsupported": "L’hébergement du bureau à distance n’est pas pris en charge sous Linux.",
+  "error.remote.linuxNeedsX11":
+    "Sous Linux, le bureau à distance nécessite une session X11. Wayland n’est pas pris en charge.",
   "error.remote.runtimeMissing":
-    "Le runtime Sunshine et Moonlight Web est absent ou n’est pas pris en charge sur cet hôte. Installez la version complète d’OpenBot sur un hôte Mac ou Windows x64, puis redémarrez OpenBot.",
+    "Le runtime Sunshine et Moonlight Web est absent ou n’est pas pris en charge sur cet hôte. Installez la version complète d’OpenBot sur un hôte Mac, Windows x64 ou Linux x64, puis redémarrez OpenBot.",
   "error.remote.testActive": "Un test du bureau à distance est en cours. Réessayez quand il sera terminé.",
   "error.remote.screenRecordingDenied":
     "L’hôte n’a pas autorisé OpenBot à enregistrer son écran. Autorisez l’enregistrement de l’écran sur l’hôte, puis réessayez.",
@@ -29,6 +30,14 @@ export const messages = {
   "error.remote.localTestListenerUnavailable": "L’écouteur du test local n’est pas disponible.",
   "error.remote.localTestNotFound": "Session de test local introuvable.",
   "error.remote.runtimeUnavailable": "Le runtime du bureau à distance n’est pas disponible.",
+  "error.remote.sunshineStartFailed":
+    "Sunshine n’a pas démarré sur l’hôte. Consultez les journaux du bureau à distance sur l’hôte, puis réessayez.",
+  "error.remote.moonlightStartFailed":
+    "Moonlight Web n’a pas démarré sur l’hôte. Consultez les journaux du bureau à distance sur l’hôte, puis réessayez.",
+  "error.remote.pairingFailed":
+    "Moonlight n’a pas pu s’associer à Sunshine sur l’hôte. Réessayez. Si le problème persiste, redémarrez OpenBot sur l’hôte.",
+  "error.remote.runtimeStartFailed":
+    "Le runtime du bureau à distance n’a pas démarré sur l’hôte. Consultez les journaux du bureau à distance sur l’hôte, puis réessayez.",
   "error.remote.hostUnreachable": "L’hôte est injoignable.",
   "error.remote.signInToHostAgain": "Reconnectez-vous à cet hôte.",
   "error.remote.invalidData": "L’hôte a renvoyé des données non valides.",
@@ -123,6 +132,8 @@ export const messages = {
   "error.remote.pairedIdentityChanged":
     "L’identité de l’ordinateur associé est absente ou a changé. Scannez un nouveau code depuis cet ordinateur.",
   "error.remote.permanentInviteNoEmail": "Les invitations permanentes ne peuvent pas être envoyées par e-mail.",
+  "error.remote.selfHostedInviteNoEmail":
+    "Une invitation d'un service de compte auto-hébergé ne peut pas être envoyée par e-mail. Copiez le lien.",
   "error.remote.inviteOtherService": "Cette invitation appartient à un autre service OpenBot.",
   "error.remote.inviteFingerprintMismatch": "L’identité de l’hôte de l’invitation ne correspond pas à son empreinte.",
   "error.remote.inviteHostKeyMissing": "La clé de l’hôte de l’invitation est absente.",

@@ -18,6 +18,7 @@ import { serverSupportsCapability } from "../servers/server-capabilities";
 import { useServerSettings } from "../servers/server-settings";
 import { useServers } from "../servers/servers-context";
 import { useSettings } from "../settings/settings-context";
+import { isReaderAuthor } from "../team/reader-identity";
 import { usePresence } from "../team/team-context";
 import { useUsage } from "../usage/usage-context";
 import { Conversation } from "./Conversation";
@@ -44,6 +45,8 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
     appSettingsOpen,
     skillsMarketplaceOpen,
     setSkillsMarketplaceOpen,
+    setPendingPluginSlug,
+    setPendingPluginConnect,
     setAgentAutoApprove,
     agentAutoApproves,
     generalSettings,
@@ -105,7 +108,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
   // active agent's provider and model and cleared on a switch, because a second request would hit
   // the provider's rate-limit endpoint for a card the user may never see.
   const auth = useAuth();
-  const { teamPresence } = usePresence();
+  const { teamPresence, currentTeamMember } = usePresence();
   const { selectAgent, openAgentMessage, messageFocusRequest, globalSearchOpen } = useNavigation();
 
   const activePrompt = createMemo(() => {
@@ -214,6 +217,11 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
     <Conversation
       platform={platform.appInfo()?.platform}
       onOpenMarketplace={() => setSkillsMarketplaceOpen(true)}
+      onOpenMarketplaceApp={(request) => {
+        setPendingPluginConnect(request.connect);
+        setPendingPluginSlug(request.appId);
+        setSkillsMarketplaceOpen(true);
+      }}
       onOpenUsage={(trigger) => usage.openUsage(activeServer()?.id ?? "local", trigger, activeAgent()?.id)}
       agentStatus={agentStatus()}
       accountUsage={auth.accountUsage()}
@@ -254,6 +262,14 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       server={activeServer()}
       presence={teamPresence()}
       currentUserEmail={props.account().email}
+      isOwnSender={(senderId) => {
+        const state = auth.centralAuth();
+        return isReaderAuthor(senderId, {
+          memberId: currentTeamMember()?.id ?? null,
+          accountUserId: state.status === "signed_in" ? state.user.id : null,
+          onOwnComputer: activeServer()?.kind === "local",
+        });
+      }}
       browserEnabled={!platform.landingPreview && activeServerSupportsCapability("browser-control")}
       remoteDesktopSessionActive={Boolean(activeRemoteDesktopSession())}
       remoteDesktopVisible={remoteDesktopWorkspaceVisible()}

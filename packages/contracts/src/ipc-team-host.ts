@@ -72,12 +72,21 @@ export interface ServerSummary {
   logoUrl: string | null;
   role: TeamRole | null;
   active: boolean;
+  /** The active members that the host allows. Absent when the account server did not give one. */
+  memberLimit?: number;
   compatibility?: ServerCompatibility | null;
   issue?: ServerConnectionIssue | null;
   connectionSequence?: number;
   /** The host said it restarts into an update (`host-update-v1`). Cleared when the connection comes back. */
   hostRestart?: { state: Exclude<HostRestartState, "none">; version: string | null } | null;
+  /**
+   * A hosted server that the account service stopped for no use (`sleeping`), or that starts after the
+   * user's input (`waking`). Cleared when the connection comes back.
+   */
+  hostedSleep?: HostedServerSleep | null;
 }
+
+export type HostedServerSleep = "sleeping" | "waking";
 
 export interface JoinServerInput {
   inviteUrl: string;

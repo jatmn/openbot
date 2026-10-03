@@ -1,4 +1,5 @@
 /* Import order preserves the conversation cascade. Keep later overrides after base rules. */
+@import "katex/dist/katex.min.css";
 @import "./styles/layout.css";
 @import "./styles/header-layout.css";
 @import "./styles/file-preview.css";
@@ -6,13 +7,16 @@
 @import "./styles/browser-panel.css";
 @import "./styles/agent-settings.css";
 @import "./styles/routine-schedule.css";
+@import "./styles/routine-calendar.css";
 @import "./styles/chat-action-card.css";
+@import "./styles/marketplace-suggestion.css";
 @import "./styles/task-list.css";
 @import "./styles/awaiting-replies.css";
 @import "./styles/header-controls.css";
 @import "./styles/timeline.css";
 @import "./styles/messages.css";
 @import "./styles/message-content.css";
+@import "./styles/math.css";
 @import "./styles/composer.css";
 @import "./styles/attachments.css";
 @import "./styles/image-lightbox.css";

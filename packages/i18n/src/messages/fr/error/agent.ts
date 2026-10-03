@@ -22,6 +22,14 @@ export const messages = {
   "error.agent.setupCleanupFailed":
     "La configuration de l’agent a échoué et l’agent incomplet n’a pas pu être supprimé.",
   "error.agent.modelUnavailable": "Le modèle d’agent sélectionné est indisponible.",
+  "error.agent.modelProviderNotConnected":
+    "Le modèle d’agent sélectionné « {model} » est indisponible : {provider} n’est pas connecté.",
+  "error.agent.modelListEmpty":
+    "Le modèle d’agent sélectionné « {model} » est indisponible : {provider} n’a listé aucun modèle. Dernière erreur : {detail}",
+  "error.agent.modelListEmptyNoError":
+    "Le modèle d’agent sélectionné « {model} » est indisponible : {provider} n’a listé aucun modèle.",
+  "error.agent.modelNotInProviderList":
+    "Le modèle d’agent sélectionné « {model} » est indisponible : {provider} ne le liste pas.",
   "error.agent.modelProviderMismatch": "Le modèle sélectionné n’appartient pas à ce fournisseur.",
   "error.agent.modelNotListed": "Le modèle « {model} » n’est pas disponible. Modèles disponibles : {models}.",
   "error.agent.providerNotListed":
@@ -79,6 +87,8 @@ export const messages = {
   "error.agent.computerUseLocalOnly": "Computer Use ne peut être modifié que sur l’ordinateur qui exécute l’agent.",
   "error.agent.workspaceOnlyMacOnly":
     "« Espace de travail uniquement » n’est disponible pour ce fournisseur que sur macOS. Choisissez « Accès complet » dans les réglages de l’agent.",
+  "error.agent.lowMemory":
+    "Ce serveur manque de mémoire. Votre message attend dans la file et démarre quand la mémoire est libre. Une offre plus grande donne plus de mémoire au serveur.",
   "error.agent.workspaceOnlyToolMissing":
     "« Espace de travail uniquement » nécessite {tool}, qu’OpenBot n’a pas trouvé. Installez-le, ou choisissez « Accès complet » dans les réglages de l’agent.",
 } as const satisfies PartialTranslation<typeof source>;

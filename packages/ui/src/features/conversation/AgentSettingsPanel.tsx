@@ -10,6 +10,7 @@ import {
   type AgentStatus,
   type AvatarHue,
   type AvatarImageInput,
+  agentAutomationAllowed,
   agentComputerUseEnabled,
   type CustomAgentSummary,
   type CustomProviderSummary,
@@ -21,8 +22,11 @@ import type { AppTextKey } from "@openbot/i18n";
 import {
   Button,
   ConfirmDialog,
+  IconButton,
   Input,
   Popover,
+  RefreshCw,
+  RotateCcw,
   Select,
   SelectContent,
   SelectItem,
@@ -77,6 +81,8 @@ export interface AgentSettingsPanelProps {
   accessEditable?: boolean;
   /** Computer Use is local-only too, and no remote host administers it yet. */
   computerUseEditable?: boolean;
+  /** Local scripts reach only the computer that runs the agent, so a remote server hides the control. */
+  automationEditable?: boolean;
   providerRuntimeStatuses?: Partial<Record<AgentProviderId, ProviderRuntimeStatus>>;
   /** The caller supplies providers available on the selected host. */
   customProviders?: readonly CustomProviderSummary[];
@@ -138,6 +144,7 @@ interface AgentSettingsDraft {
   notifications: boolean;
   access: AgentAccess;
   computerUse: boolean;
+  allowAutomation: boolean;
   /** Widening to full access waits here for the confirmation. */
   confirmingFullAccess: boolean;
   runtime: AgentRuntimeSettings;
@@ -178,6 +185,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
     notifications: true,
     access: DEFAULT_AGENT_ACCESS,
     computerUse: true,
+    allowAutomation: false,
     confirmingFullAccess: false,
     runtime: untrack(() => ({ ...props.runtimeSettings })),
     saveError: null,
@@ -237,6 +245,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
           String(agent.notifications),
           agent.access ?? DEFAULT_AGENT_ACCESS,
           String(agentComputerUseEnabled(agent)),
+          String(agentAutomationAllowed(agent)),
           runtimeSettings.provider,
           runtimeSettings.model,
           runtimeSettings.reasoningEffort,
@@ -271,6 +280,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
           state.notifications = agent.notifications;
           state.access = agent.access ?? DEFAULT_AGENT_ACCESS;
           state.computerUse = agentComputerUseEnabled(agent);
+          state.allowAutomation = agentAutomationAllowed(agent);
           if (agentChanged) state.confirmingFullAccess = false;
           state.runtime.provider = runtimeSettings.provider;
           state.runtime.model = runtimeSettings.model;
@@ -570,6 +580,19 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
     }
   }
 
+  async function saveAllowAutomation(next: boolean): Promise<void> {
+    const agentId = props.agent.id;
+    setDraft((state) => {
+      state.allowAutomation = next;
+    });
+    if (await saveAgentPatch({ allowAutomation: next }, agentId)) return;
+    if (!disposed && props.agent.id === agentId && draft.allowAutomation === next) {
+      setDraft((state) => {
+        state.allowAutomation = !next;
+      });
+    }
+  }
+
   return (
     <SettingsPanel
       onResizeEnd={props.onResizeEnd}
@@ -664,9 +687,10 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                   <span>{t("agentSettings.avatar.generatedFace")}</span>
                   <div class="avatar-editor-actions">
                     <Show when={draft.avatar.seed !== props.agent.id}>
-                      <Button
+                      <IconButton
                         variant="outline"
                         type="button"
+                        label={t("agentSettings.avatar.resetToId")}
                         onClick={() => {
                           setDraft((state) => {
                             state.avatar.candidateSeed = props.agent.id;
@@ -675,12 +699,13 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                           void selectGeneratedAvatar(props.agent.id);
                         }}
                       >
-                        {t("agentSettings.avatar.resetToId")}
-                      </Button>
+                        <RotateCcw aria-hidden="true" />
+                      </IconButton>
                     </Show>
-                    <Button
+                    <IconButton
                       variant="outline"
                       type="button"
+                      label={t("agentSettings.avatar.newSet")}
                       onClick={() =>
                         setDraft((state) => {
                           state.avatar.candidateSeed = state.avatar.seed;
@@ -688,8 +713,8 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                         })
                       }
                     >
-                      {t("agentSettings.avatar.newSet")}
-                    </Button>
+                      <RefreshCw aria-hidden="true" />
+                    </IconButton>
                   </div>
                 </div>
                 <fieldset class="avatar-face-grid" aria-label={t("agentSettings.avatar.faces")}>
@@ -708,6 +733,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                             : t("agentSettings.avatar.option", { number: index() + 1 })
                         }
                         aria-pressed={!avatarUrl() && draft.avatar.seed === seed ? "true" : "false"}
+                        data-cuelume-tap="select"
                         onClick={() => void selectGeneratedAvatar(seed)}
                       >
                         <AgentAvatar seed={seed} hue={draft.avatar.hue} />
@@ -726,6 +752,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                     class={["avatar-color-choice", { "avatar-choice-selected": draft.avatar.hue === null }]}
                     aria-label={t("agentSettings.avatar.autoColor")}
                     aria-pressed={draft.avatar.hue === null ? "true" : "false"}
+                    data-cuelume-tap="select"
                     onClick={() => {
                       setDraft((state) => {
                         state.avatar.hue = null;
@@ -745,6 +772,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                         class={["avatar-color-choice", { "avatar-choice-selected": draft.avatar.hue === option.hue }]}
                         aria-label={t("agentSettings.avatar.hueColor", { hue: t(AVATAR_HUE_LABEL[option.hue]) })}
                         aria-pressed={draft.avatar.hue === option.hue ? "true" : "false"}
+                        data-cuelume-tap="select"
                         onClick={() => {
                           setDraft((state) => {
                             state.avatar.hue = option.hue;
@@ -924,6 +952,20 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                 aria-label={t("agentSettings.computerUse.title")}
                 checked={draft.computerUse}
                 onChange={(next) => void saveComputerUse(next)}
+              />
+            </div>
+          </Show>
+          <Show when={props.automationEditable}>
+            <div class="agent-settings-notifications">
+              <div>
+                <strong>{t("agentSettings.automation.title")}</strong>
+                <span>{t("agentSettings.automation.description")}</span>
+              </div>
+              <Switch
+                size="sm"
+                aria-label={t("agentSettings.automation.title")}
+                checked={draft.allowAutomation}
+                onChange={(next) => void saveAllowAutomation(next)}
               />
             </div>
           </Show>

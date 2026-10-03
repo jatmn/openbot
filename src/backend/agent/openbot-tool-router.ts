@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { HOSTED_SITE_ACTIVE_LIMIT } from "@openbot/contracts/hosted-sites";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentModelOption,
@@ -13,9 +12,11 @@ import type {
 import {
   agentComputerUseEnabled,
   isMessageReaction,
+  marketplaceSuggestionItemType,
   skillConversationEventItemType,
   workspaceAccessEnforced,
 } from "@openbot/contracts/ipc";
+import { isPluginSlug } from "@openbot/contracts/plugin-links";
 import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
@@ -426,7 +427,7 @@ export class OpenBotToolRouter {
     }
 
     if (params.tool === "list_sites") {
-      return openBotToolResult({ sites: await this.#hostedSites.listSites(), limit: HOSTED_SITE_ACTIVE_LIMIT });
+      return openBotToolResult(await this.#hostedSites.listSites());
     }
 
     if (isHostedSiteMutationTool(params.tool)) throw new Error("Hosted site changes require user approval.");
@@ -491,15 +492,26 @@ export class OpenBotToolRouter {
     if (params.tool === "create_agent") {
       const args = createAgentToolSchema.parse(params.arguments);
       const hue = args.avatarHue ?? null;
+      const caller = this.#requireAgent(senderAgentId);
+      const listed = this.#hooks.listModels();
       // Checked before the agent exists: a named model the provider does not list, or an effort the
       // model does not support, is an error the calling agent can correct, never a silent default.
-      const requested = requestedToolModel(args, this.#hooks.listModels());
+      const named = requestedToolModel(args, listed);
+      // A request that names no provider and no model gives the new agent the caller's own model, so
+      // a team that one agent recruits runs where that agent runs. When the caller's provider no
+      // longer lists that model, the new agent starts where one the user creates does.
+      const inherited =
+        named === null
+          ? (listed.find((model) => model.provider === caller.provider && model.id === caller.model) ?? null)
+          : null;
+      if (inherited && args.reasoningEffort !== undefined) requireReasoningEffort(inherited, args.reasoningEffort);
+      const requested = named ?? inherited;
+      const reasoningEffort = args.reasoningEffort ?? (inherited ? caller.reasoningEffort : undefined);
       // An effort alone applies to the model the new agent starts on, known only once it exists.
       const lateEffort = requested === null ? args.reasoningEffort : undefined;
       const sectionId = this.#sidebarLayout?.getSnapshot().agentAssignments[senderAgentId] ?? null;
       // A new agent starts with Full access and Computer Use. A caller without them passes its limits
       // on, so it cannot get around them through an agent it creates.
-      const caller = this.#requireAgent(senderAgentId);
       const limits: Pick<UpdateAgentInput, "access" | "computerUse"> = {
         ...(workspaceAccessEnforced(caller) ? { access: "workspace" } : {}),
         ...(agentComputerUseEnabled(caller) ? {} : { computerUse: false }),
@@ -516,7 +528,7 @@ export class OpenBotToolRouter {
               ? {
                   provider: requested.provider,
                   model: requested.id,
-                  ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}),
+                  ...(reasoningEffort ? { reasoningEffort } : {}),
                 }
               : {}),
           },
@@ -644,6 +656,31 @@ export class OpenBotToolRouter {
     const tableResult = await handleDataTool(params.tool, params.arguments, senderAgentId, this.#tables);
     if (tableResult) return tableResult;
 
+    if (params.tool === "suggest_marketplace_app") {
+      const args = params.arguments;
+      if (!isRecord(args) || !isString(args.app) || !isPluginSlug(args.app)) {
+        throw new Error("app must be a Marketplace plugin slug, or github.");
+      }
+      const snapshot = structuredClone(this.#conversation.ensureSnapshot(senderAgentId, executionThreadId));
+      snapshot.messages.push({
+        id: randomUUID(),
+        turnId: params.turnId,
+        author: "system",
+        source: "system",
+        status: "completed",
+        createdAt: new Date().toISOString(),
+        itemType: marketplaceSuggestionItemType({ appId: args.app }),
+        // The card reads the app from the item type. A client without the card shows this line.
+        text: sourceText("status.agent.marketplaceSuggested", { app: args.app }),
+      });
+      const persisted = this.#store.database.persistConversation(snapshot, "marketplace.suggested", {
+        appId: args.app,
+      });
+      this.#conversation.setSnapshot(senderAgentId, persisted);
+      this.#conversation.publishConversation(persisted);
+      return openBotToolResult({ status: "suggested", app: args.app });
+    }
+
     if (params.tool === "react_to_user_message") {
       const args = params.arguments;
       if (!isRecord(args) || !isMessageReaction(args.emoji)) {
@@ -694,6 +731,11 @@ export class OpenBotToolRouter {
       throw new Error("expectsReply must be a boolean.");
     }
 
+    // A request from a Slack turn: the teammate's answer goes back to that Slack thread.
+    const messagingReturn = this.#mailbox
+      .findDeliveriesByTurn(senderAgentId, params.turnId)
+      .map(({ delivery }) => this.#mailbox.messagingOrigin(delivery.id))
+      .find((origin) => origin !== null);
     const receipt = await this.#mailbox.enqueue({
       sender: { kind: "agent", agentId: senderAgentId },
       recipientAgentIds: recipientValues,
@@ -701,6 +743,7 @@ export class OpenBotToolRouter {
       sourcePaths: paths,
       replyToMessageId: replyToMessageId ?? null,
       expectsReply,
+      ...(messagingReturn ? { messagingReturn } : {}),
       idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
     });
     for (const recipient of recipientValues) {

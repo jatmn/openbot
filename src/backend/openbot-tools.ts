@@ -31,7 +31,8 @@ export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
   ...LOCAL_SKILL_TOOL_DEFINITIONS,
   {
     name: "list_sites",
-    description: "List static sites hosted by the signed-in OpenBot user. Use this before retrying a hosting mutation.",
+    description:
+      "List the static sites of this OpenBot server, with its site limit and the slots in use. Use this before retrying a hosting mutation.",
     shape: {},
   },
   {
@@ -122,7 +123,7 @@ export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
   {
     name: "create_agent",
     description:
-      "Create a persistent local OpenBot agent when the user asks for a new teammate. Choose its profile from the user's request and supply its first task. Set provider, model, or reasoningEffort only when the user asks for them; call list_models first. Use update_profile for an existing agent. After it exists, add skills with install_local_skill and routines with create_routine as needed. A new agent gets your own access and Computer Use limits.",
+      "Create a persistent local OpenBot agent when the user asks for a new teammate. Choose its profile from the user's request and supply its first task. The new agent gets your provider, model, and reasoning effort. Set provider, model, or reasoningEffort only when the user asks for different ones; call list_models first. Use update_profile for an existing agent. After it exists, add skills with install_local_skill and routines with create_routine as needed. A new agent gets your own access and Computer Use limits.",
     shape: createAgentToolSchema.shape,
   },
   {
@@ -224,6 +225,20 @@ export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
         )
         .min(1)
         .max(3),
+    },
+  },
+  {
+    name: "suggest_marketplace_app",
+    description:
+      "Show the user a card in this conversation for one Marketplace app that the task needs and that is not in your tools. The user connects it, opens its listing, or dismisses the card; nothing connects without the user. Keep your normal answer.",
+    shape: {
+      app: z
+        .string()
+        .min(1)
+        .max(63)
+        .describe(
+          "The plugin slug: its name in lower case with hyphens, such as notion or linear. Use github for GitHub.",
+        ),
     },
   },
   {

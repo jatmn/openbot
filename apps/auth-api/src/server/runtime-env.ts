@@ -19,19 +19,40 @@ const LOCAL_RUNTIME_KEYS = [
   "REMOTE_SIGNAL_URL",
   "REMOTE_AUTH_WEBHOOK_URL",
   "REMOTE_AUTH_WEBHOOK_SECRET",
+  "SLACK_ROUTE_PRIVATE_JWK",
+  "SLACK_ROUTE_KEY_ID",
+  "SLACK_CLIENT_ID",
+  "SLACK_CLIENT_SECRET",
+  "SLACK_STATE_SECRET",
+  "SLACK_DEV_PUBLIC_ORIGIN",
+  "STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "HOSTED_SERVERS_ENABLED",
+  "HOSTED_SERVERS_ALLOWED_USER_IDS",
+  "HOSTED_SERVER_TEMPLATE",
+  "BOAT_API_KEY",
+  "BOAT_WEBHOOK_SECRET",
+  "GITHUB_APP_CLIENT_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "APNS_PRIVATE_KEY",
+  "APNS_KEY_ID",
+  "APNS_TEAM_ID",
+  "APNS_TOPIC",
 ] as const;
 
 const BOOLEAN_RUNTIME_KEYS = new Set<(typeof LOCAL_RUNTIME_KEYS)[number]>([
   "AUTH_EXPOSE_DEVELOPMENT_CODE",
   "SITE_PUBLISH_ENABLED",
   "SITE_COOKIE_ISOLATION_READY",
+  "HOSTED_SERVERS_ENABLED",
 ]);
 
 export function readLocalRuntimeVars(environment: NodeJS.ProcessEnv): Record<string, string> {
   const result: Record<string, string> = {};
   for (const key of LOCAL_RUNTIME_KEYS) {
     const value = environment[key];
-    if (value === undefined) continue;
+    // dotenvx passes the ciphertext on when a developer has no key for `.env.shared`.
+    if (value === undefined || value.startsWith("encrypted:")) continue;
     result[key] = BOOLEAN_RUNTIME_KEYS.has(key) ? (normalizeBooleanFlag(value) ? "true" : "false") : value;
   }
   return result;

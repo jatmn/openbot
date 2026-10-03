@@ -2,6 +2,12 @@ import { defineMessages } from "../../message";
 
 export const messages = defineMessages("webClient", {
   "webClient.loading": "Loading OpenBot…",
+  "webClient.loadingLine.wake": "Waking up the agents…",
+  "webClient.loadingLine.coffee": "Pouring coffee for the agents…",
+  "webClient.loadingLine.tokens": "Counting tokens on fingers…",
+  "webClient.loadingLine.prompts": "Untangling the prompts…",
+  "webClient.loadingLine.sleepy": "Asking the sleepy one nicely…",
+  "webClient.loadingLine.almost": "Almost there. Probably.",
   "webClient.login.failed": "Sign-in failed.",
   "webClient.login.requestFailed": "The account request failed.",
   "webClient.login.sessionFailed": "Could not check this session.",
@@ -36,6 +42,8 @@ export const messages = defineMessages("webClient", {
   "webClient.error.hostStatus": "The host status could not be read.",
   "webClient.error.usageOffline": "Connect to your host to view usage.",
   "webClient.error.desktopOnly": "This action is available in the desktop app.",
+  "webClient.settings.preferences.title": "Preferences",
+  "webClient.settings.preferences.description": "Choose the language and sounds of OpenBot in this browser.",
   "webClient.error.checkConversation": "Check the conversation before sending again.",
   "webClient.error.hostReported": "The host reported an error. Check the conversation and host status.",
   "webClient.error.requestFailed": "The request failed.",

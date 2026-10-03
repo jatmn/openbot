@@ -1,7 +1,13 @@
-import { DEFAULT_TEAM_MEMBER_LIMIT } from "@openbot/contracts/input-limits";
+import { memberLimitForPlan } from "@openbot/contracts/billing";
 import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import type { RemoteAuthEvent } from "@openbot/contracts/signal-protocol/auth-events";
+import {
+  SLACK_ROUTE_AUDIENCE,
+  SLACK_ROUTE_TEAMS_LIMIT,
+  SLACK_ROUTE_TTL_SECONDS,
+  type SlackRouteTeam,
+} from "@openbot/contracts/signal-protocol/slack-route";
 import {
   REMOTE_TICKET_AUDIENCE,
   REMOTE_TICKET_PROTOCOL_VERSION,
@@ -9,6 +15,7 @@ import {
   type RemoteTicketClaims,
 } from "@openbot/contracts/signal-protocol/ticket";
 import { importJWK, type JWK, SignJWT } from "jose";
+import { getServerEntitlement } from "./billing-entitlement";
 import { hmacSha256, randomToken, sha256 } from "./crypto";
 import { PERSISTENT_SESSION_EXPIRES_AT } from "./session-policy";
 import type { AuthUser, WorkerBindings } from "./types";
@@ -37,7 +44,7 @@ export class RemoteControlPlaneError extends Error {
 }
 
 /** A SQL condition and its binds, which a statement adds to its WHERE clause. */
-interface SqlCondition {
+export interface SqlCondition {
   sql: string;
   binds: unknown[];
 }
@@ -174,6 +181,33 @@ export class RemoteTicketSigner {
   }
 }
 
+/**
+ * Signs the Slack route ticket that names the workspaces linked to a host. It uses its own key,
+ * which the public JWKS also lists, so each key can rotate on its own.
+ */
+export class SlackRouteSigner {
+  readonly #keyId: string;
+  readonly #privateJwk: JWK;
+  #key: Awaited<ReturnType<typeof importJWK>> | null = null;
+
+  constructor(config: TicketSignerConfig) {
+    this.#keyId = requiredIdentifier(config.keyId, "Slack route key ID");
+    parseJwks(config.publicJwks, this.#keyId);
+    this.#privateJwk = parseJwk(config.privateJwk);
+  }
+
+  async issue(input: { hostId: string; teams: SlackRouteTeam[]; now: number }): Promise<string> {
+    this.#key ??= await importJWK(this.#privateJwk, "ES256");
+    const issuedAt = Math.floor(input.now / 1_000);
+    return new SignJWT({ hid: input.hostId, teams: input.teams })
+      .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: this.#keyId })
+      .setIssuedAt(issuedAt)
+      .setExpirationTime(issuedAt + SLACK_ROUTE_TTL_SECONDS)
+      .setAudience(SLACK_ROUTE_AUDIENCE)
+      .sign(this.#key);
+  }
+}
+
 /** One signer for each key: the JWKS parse and the key import are too costly for every request. */
 const ticketSigners = new Map<string, { config: TicketSignerConfig; signer: RemoteTicketSigner }>();
 
@@ -195,6 +229,7 @@ function sharedTicketSigner(config: TicketSignerConfig): RemoteTicketSigner {
 export class RemoteControlPlane {
   readonly #database: D1Database;
   readonly #signer: RemoteTicketSigner;
+  readonly #slackRouteSigner: SlackRouteSigner | null;
   readonly #webhookUrl: string | null;
   readonly #webhookSecret: string | null;
   readonly #fetch: RemoteFetch;
@@ -210,6 +245,8 @@ export class RemoteControlPlane {
       | "REMOTE_TICKET_KEY_ID"
       | "REMOTE_AUTH_WEBHOOK_URL"
       | "REMOTE_AUTH_WEBHOOK_SECRET"
+      | "SLACK_ROUTE_PRIVATE_JWK"
+      | "SLACK_ROUTE_KEY_ID"
     >,
     options: { fetch?: RemoteFetch; now?: () => number; schedule?: (delivery: Promise<void>) => void } = {},
   ) {
@@ -222,6 +259,14 @@ export class RemoteControlPlane {
       publicJwks: bindings.REMOTE_TICKET_PUBLIC_JWKS,
       keyId: bindings.REMOTE_TICKET_KEY_ID,
     });
+    this.#slackRouteSigner =
+      bindings.SLACK_ROUTE_PRIVATE_JWK && bindings.SLACK_ROUTE_KEY_ID
+        ? new SlackRouteSigner({
+            privateJwk: bindings.SLACK_ROUTE_PRIVATE_JWK,
+            publicJwks: bindings.REMOTE_TICKET_PUBLIC_JWKS,
+            keyId: bindings.SLACK_ROUTE_KEY_ID,
+          })
+        : null;
     this.#webhookUrl = bindings.REMOTE_AUTH_WEBHOOK_URL?.trim() || null;
     this.#webhookSecret = bindings.REMOTE_AUTH_WEBHOOK_SECRET?.trim() || null;
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
@@ -249,6 +294,14 @@ export class RemoteControlPlane {
     const ownerMembershipId = requiredIdentifier(input.ownerMembershipId, "owner membership ID");
     const existing = await this.#host(hostId);
     if (existing && existing.owner_user_id !== user.id) {
+      throw new RemoteControlPlaneError(403, "host_owner_mismatch", "This host belongs to another account.");
+    }
+    // The account server creates hosted server IDs, so only the account it created one for can publish it.
+    const reservation = await this.#database
+      .prepare("SELECT owner_user_id, desired_state FROM hosted_servers WHERE server_id = ? LIMIT 1")
+      .bind(hostId)
+      .first<{ owner_user_id: string; desired_state: string }>();
+    if (reservation && (reservation.owner_user_id !== user.id || reservation.desired_state === "deleted")) {
       throw new RemoteControlPlaneError(403, "host_owner_mismatch", "This host belongs to another account.");
     }
     const now = this.#now();
@@ -368,15 +421,18 @@ export class RemoteControlPlane {
         membership_id: string;
         role: RemoteMemberRole;
       }>();
-    return (result.results ?? []).map((row) => ({
-      hostId: row.host_id,
-      name: row.name,
-      logoKey: row.logo_key,
-      devicePublicKey: row.device_public_key,
-      authEpoch: row.auth_epoch,
-      membershipId: row.membership_id,
-      role: row.role,
-    }));
+    return Promise.all(
+      (result.results ?? []).map(async (row) => ({
+        hostId: row.host_id,
+        name: row.name,
+        logoKey: row.logo_key,
+        devicePublicKey: row.device_public_key,
+        authEpoch: row.auth_epoch,
+        membershipId: row.membership_id,
+        role: row.role,
+        memberLimit: await this.#memberLimit(row.host_id),
+      })),
+    );
   }
 
   async createInvite(
@@ -612,9 +668,10 @@ export class RemoteControlPlane {
         "The owner cannot accept a member invitation.",
       );
     }
-    await this.#requireMemberSeat(invite.host_id, user.id);
+    const limit = await this.#memberLimit(invite.host_id);
+    await this.#requireMemberSeat(invite.host_id, user.id, limit);
     const membershipId = crypto.randomUUID();
-    const seat = [invite.host_id, user.id, invite.host_id, DEFAULT_TEAM_MEMBER_LIMIT] as const;
+    const seat = [invite.host_id, user.id, invite.host_id, limit] as const;
     const accepted = await this.#database.batch([
       this.#database
         .prepare(
@@ -671,7 +728,7 @@ export class RemoteControlPlane {
       this.#authEventStatement({ type: "account-servers-changed", userId: user.id }, now),
     ]);
     if ((accepted[2]?.meta.changes ?? 0) !== 1 || (accepted[3]?.meta.changes ?? 0) !== 1) {
-      await this.#requireMemberSeat(invite.host_id, user.id);
+      await this.#requireMemberSeat(invite.host_id, user.id, limit);
       throw new RemoteControlPlaneError(409, "invite_already_used", "The invitation was already used.");
     }
     const membership = await this.#database
@@ -729,7 +786,10 @@ export class RemoteControlPlane {
     if (input.revoke && input.reactivate) throw invalid("member status");
     // A role change keeps an active member active, so it needs the seat as a reactivation does.
     const activating = !input.revoke && (input.reactivate === true || membership.status === "active");
-    if (activating && membership.status !== "active") await this.#requireMemberSeat(input.hostId, membership.user_id);
+    const limit = await this.#memberLimit(input.hostId);
+    if (activating && membership.status !== "active") {
+      await this.#requireMemberSeat(input.hostId, membership.user_id, limit);
+    }
     const now = this.#now();
     const activeSessions = await this.#database
       .prepare("SELECT session_id FROM remote_sessions WHERE host_id = ? AND user_id = ? AND ended_at IS NULL")
@@ -754,7 +814,7 @@ export class RemoteControlPlane {
           input.revoke ? "revoked" : activating ? "active" : membership.status,
           now,
           input.membershipId,
-          ...(activating ? [input.hostId, membership.user_id, input.hostId, DEFAULT_TEAM_MEMBER_LIMIT] : []),
+          ...(activating ? [input.hostId, membership.user_id, input.hostId, limit] : []),
         ),
       this.#database
         .prepare(
@@ -782,7 +842,7 @@ export class RemoteControlPlane {
     ]);
     await this.#flushAuthEvents();
     // A concurrent join, reactivation or revoke took the seat after the check above.
-    if (activating && (changed[0]?.meta.changes ?? 0) !== 1) throw memberLimitReached();
+    if (activating && (changed[0]?.meta.changes ?? 0) !== 1) throw memberLimitReached(limit);
   }
 
   async validateMobileConnectHost(userId: string, binding: MobileConnectHostBinding): Promise<void> {
@@ -1017,11 +1077,69 @@ export class RemoteControlPlane {
     });
   }
 
+  /** The plan of a host changed, so each member's devices read the server list, with its member limit, again. */
+  async planChanged(hostId: string): Promise<void> {
+    const now = this.#now();
+    await this.#database
+      .prepare(
+        `INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at)
+         SELECT lower(hex(randomblob(16))),
+                json_object('type', 'account-servers-changed', 'userId', user_id),
+                ?, 0, ?
+           FROM remote_memberships
+          WHERE host_id = ? AND status = 'active'`,
+      )
+      .bind(now, now, hostId)
+      .run();
+    await this.#flushAuthEvents();
+  }
+
+  /**
+   * Removes a host and its memberships, invites and sessions. Signal closes the host and client
+   * sockets, and each member's devices re-read their server list.
+   */
+  async deleteHost(ownerUserId: string, hostId: string): Promise<void> {
+    const now = this.#now();
+    await this.#database.batch([
+      this.#database
+        .prepare(
+          `INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at)
+           SELECT lower(hex(randomblob(16))),
+                  json_object('type', 'remote-session-ended', 'hostId', host_id, 'sessionId', session_id),
+                  ?, 0, ?
+             FROM remote_sessions
+            WHERE host_id = ? AND ended_at IS NULL`,
+        )
+        .bind(now, now, hostId),
+      this.#database
+        .prepare(
+          `INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at)
+           SELECT lower(hex(randomblob(16))),
+                  json_object('type', 'account-servers-changed', 'userId', user_id),
+                  ?, 0, ?
+             FROM remote_memberships
+            WHERE host_id = ? AND status = 'active'`,
+        )
+        .bind(now, now, hostId),
+      this.#database
+        .prepare(
+          "UPDATE remote_hosts SET auth_epoch = auth_epoch + 1, updated_at = ? WHERE host_id = ? AND owner_user_id = ?",
+        )
+        .bind(now, hostId, ownerUserId),
+      this.#authEpochEventStatement(hostId, now, ownerUserId),
+      // The sites stay public until they expire. The unlinked bucket keeps them in the owner's list, to delete.
+      this.#database
+        .prepare("UPDATE hosted_sites SET server_id = NULL WHERE server_id = ? AND user_id = ?")
+        .bind(hostId, ownerUserId),
+      this.#database
+        .prepare("DELETE FROM remote_hosts WHERE host_id = ? AND owner_user_id = ?")
+        .bind(hostId, ownerUserId),
+    ]);
+    await this.#flushAuthEvents();
+  }
+
   async issueHostTicket(hostId: string, machineToken: string) {
-    const host = await this.#host(hostId);
-    if (!host?.machine_token_hash || host.machine_token_hash !== (await sha256(machineToken))) {
-      throw new RemoteControlPlaneError(401, "host_unauthorized", "The host credential is invalid.");
-    }
+    const host = await this.authenticateHost(hostId, machineToken);
     return this.#signer.issue({
       sessionId: `host-${hostId}`,
       hostId,
@@ -1032,6 +1150,81 @@ export class RemoteControlPlane {
       sessionExpiresAt: PERSISTENT_SESSION_EXPIRES_AT,
       now: this.#now(),
     });
+  }
+
+  /**
+   * The route ticket that the host's Signal `ingress` socket presents: the Slack workspaces linked to
+   * this host, signed. The host asks for a new one each time the socket connects.
+   */
+  async issueSlackRoute(hostId: string, machineToken: string): Promise<{ ticket: string; teams: string[] }> {
+    if (!this.#slackRouteSigner) {
+      throw new RemoteControlPlaneError(503, "slack_not_configured", "Slack routing is not configured.");
+    }
+    await this.authenticateHost(hostId, machineToken);
+    const rows = await this.#database
+      .prepare(
+        "SELECT team_id, app_id, connected_at FROM slack_workspace_routes WHERE host_id = ? ORDER BY connected_at DESC LIMIT ?",
+      )
+      .bind(hostId, SLACK_ROUTE_TEAMS_LIMIT)
+      .all<{ team_id: string; app_id: string; connected_at: number }>();
+    const teams = rows.results.map((row) => ({ id: row.team_id, appId: row.app_id, linkedAt: row.connected_at }));
+    return {
+      ticket: await this.#slackRouteSigner.issue({ hostId, teams, now: this.#now() }),
+      teams: teams.map((team) => team.id),
+    };
+  }
+
+  /** The workspaces of a route ticket that D1 still links to the host, with the same link. */
+  async validateSlackRoute(input: { hostId: string; teams: SlackRouteTeam[] }): Promise<string[]> {
+    if (input.teams.length === 0) return [];
+    const rows = await this.#database
+      .prepare("SELECT team_id, app_id, connected_at FROM slack_workspace_routes WHERE host_id = ?")
+      .bind(input.hostId)
+      .all<{ team_id: string; app_id: string; connected_at: number }>();
+    const linked = new Map(rows.results.map((row) => [row.team_id, row]));
+    return input.teams
+      .filter((team) => {
+        const row = linked.get(team.id);
+        return row?.app_id === team.appId && row.connected_at === team.linkedAt;
+      })
+      .map((team) => team.id);
+  }
+
+  /** Unlinks a Slack workspace from this host, after the host disconnected it or Slack uninstalled it. */
+  async disconnectSlackWorkspace(hostId: string, machineToken: string, teamId: string): Promise<void> {
+    await this.authenticateHost(hostId, machineToken);
+    const link = await this.#database
+      .prepare("SELECT app_id FROM slack_workspace_routes WHERE team_id = ? AND host_id = ?")
+      .bind(teamId, hostId)
+      .first<{ app_id: string }>();
+    if (!link) return;
+    const now = this.#now();
+    // Signal drops the route now, so the host cannot keep the workspace with the ticket it holds.
+    await this.#database.batch([
+      this.#authEventStatement({ type: "slack-route-revoked", appId: link.app_id, teamId, through: now }, now, {
+        sql: "EXISTS (SELECT 1 FROM slack_workspace_routes WHERE team_id = ? AND host_id = ?)",
+        binds: [teamId, hostId],
+      }),
+      this.#database
+        .prepare("DELETE FROM slack_workspace_routes WHERE team_id = ? AND host_id = ?")
+        .bind(teamId, hostId),
+    ]);
+    await this.#flushAuthEvents();
+  }
+
+  /** Checks the credential that a host received when it registered. */
+  async authenticateHost(hostId: string, machineToken: string): Promise<RemoteHostRow> {
+    const host = await this.#host(hostId);
+    const expected = host?.machine_token_hash ?? "";
+    const provided = await sha256(machineToken);
+    let difference = expected.length ^ provided.length;
+    for (let index = 0; index < provided.length; index += 1) {
+      difference |= expected.charCodeAt(index) ^ provided.charCodeAt(index);
+    }
+    if (!host || !expected || difference !== 0) {
+      throw new RemoteControlPlaneError(401, "host_unauthorized", "The host credential is invalid.");
+    }
+    return host;
   }
 
   async #requireRole(hostId: string, userId: string, roles: RemoteMemberRole[]): Promise<RemoteMembershipRow> {
@@ -1047,12 +1240,20 @@ export class RemoteControlPlane {
     );
   }
 
-  async #requireMemberSeat(hostId: string, userId: string): Promise<void> {
+  async #requireMemberSeat(hostId: string, userId: string, limit: number): Promise<void> {
     const seat = await this.#database
       .prepare(`SELECT ${MEMBER_SEAT_AVAILABLE_SQL} AS available`)
-      .bind(hostId, userId, hostId, DEFAULT_TEAM_MEMBER_LIMIT)
+      .bind(hostId, userId, hostId, limit)
       .first<{ available: number }>();
-    if (!seat?.available) throw memberLimitReached();
+    if (!seat?.available) throw memberLimitReached(limit);
+  }
+
+  /**
+   * The active members that the host's plan allows, or the default for a host with no plan. A lower
+   * limit after a plan change removes no one: members who are active keep their seats.
+   */
+  async #memberLimit(hostId: string): Promise<number> {
+    return memberLimitForPlan((await getServerEntitlement(this.#database, hostId, this.#now()))?.plan ?? null);
   }
 
   #assertRole<Row extends RemoteMembershipRow>(membership: Row | null, roles: RemoteMemberRole[]): Row {
@@ -1134,7 +1335,7 @@ export async function notifyAccountProfileChanged(
 }
 
 /** Queues one event for Signal. `remote/api` decodes each event type with its own schema. */
-function authEventStatement(
+export function authEventStatement(
   database: D1Database,
   event: RemoteAuthEvent,
   now: number,
@@ -1148,12 +1349,8 @@ function authEventStatement(
     .bind(crypto.randomUUID(), JSON.stringify(event), now, now, ...(condition?.binds ?? []));
 }
 
-function memberLimitReached(): RemoteControlPlaneError {
-  return new RemoteControlPlaneError(
-    409,
-    "member_limit_reached",
-    `A host can have up to ${DEFAULT_TEAM_MEMBER_LIMIT} members.`,
-  );
+function memberLimitReached(limit: number): RemoteControlPlaneError {
+  return new RemoteControlPlaneError(409, "member_limit_reached", `A host can have up to ${limit} members.`);
 }
 
 export async function deliverPendingRemoteAuthEvents(

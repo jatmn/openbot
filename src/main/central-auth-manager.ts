@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { parseHostedServerClaim } from "@openbot/contracts/hosted-servers";
 import type {
   AvatarImageInput,
   CentralAuthIssue,
@@ -11,6 +12,7 @@ import type {
   MobileConnectTicket,
 } from "@openbot/contracts/ipc";
 import { decodeRecord, requiredString } from "@openbot/contracts/ipc-decoding";
+import type { LiveActivityRelayPush } from "@openbot/contracts/live-activity-relay";
 import { createMobileConnectUrl, type MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import {
   decodeRemoteSession,
@@ -326,6 +328,12 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     return result;
   }
 
+  /** The machine token of a registered host, so a site request can prove the server. Never log it. */
+  hostSiteCredential(hostId: string): { hostId: string; machineToken: string } | null {
+    const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
+    return machineToken ? { hostId, machineToken } : null;
+  }
+
   issueRemoteHostTicket(hostId: string): Promise<RemoteConnectionBootstrap> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
     if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
@@ -334,6 +342,60 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machineToken }) },
       decodeRemoteSessionTicket,
     );
+  }
+
+  /**
+   * The Slack route ticket of this host: the workspaces that the account service links to it, which
+   * Signal routes to its `ingress` socket.
+   */
+  issueSlackRoute(hostId: string): Promise<string> {
+    const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
+    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
+    return this.#request(
+      `/v2/remote/hosts/${encodeURIComponent(hostId)}/slack-route`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machineToken }) },
+      (value) => requiredString(decodeRecord(value, "Slack route"), "ticket"),
+    );
+  }
+
+  /** Unlinks a Slack workspace from this host, so Signal stops routing its events here. */
+  async unlinkSlackWorkspace(hostId: string, teamId: string): Promise<void> {
+    const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
+    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
+    await this.#request(
+      `/v2/remote/hosts/${encodeURIComponent(hostId)}/slack-disconnect`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ machineToken, teamId }),
+      },
+      () => undefined,
+    );
+  }
+
+  /**
+   * Sends one Live Activity update through the account service to Apple. The host sealed the
+   * content with keys that only the phone has, so the service forwards bytes it cannot read.
+   * Returns `gone` when Apple refused the token.
+   */
+  async sendLiveActivityPush(hostId: string, push: LiveActivityRelayPush): Promise<"sent" | "gone"> {
+    const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
+    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
+    try {
+      await this.#request(
+        `/v2/remote/hosts/${encodeURIComponent(hostId)}/live-activity`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ machineToken, ...push }),
+        },
+        () => undefined,
+      );
+      return "sent";
+    } catch (error) {
+      if (error instanceof AuthApiError && error.status === 410) return "gone";
+      throw error;
+    }
   }
 
   async startRemoteSession(hostId: string): Promise<RemoteSession> {
@@ -727,6 +789,44 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     }
   }
 
+  /** False when the session can live only in memory, so it would be lost at the next start. */
+  canPersistSession(): boolean {
+    return this.#options.canPersist();
+  }
+
+  /**
+   * Signs a new hosted server in with the claim that the account server put in its VM.
+   * The result names the host ID that the account server reserved for this account.
+   */
+  async redeemHostedServerClaim(claim: string): Promise<{ hostId: string; name: string; user: CentralAuthUser }> {
+    const redeemed = await this.#request(
+      "/v2/hosting/claims/redeem",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ claim }) },
+      (value) => {
+        const parsed = parseHostedServerClaim(value);
+        if (!parsed) throw new Error("Invalid hosted server claim.");
+        return parsed;
+      },
+    );
+    if (this.#sessionAccountId !== null && this.#sessionAccountId !== redeemed.user.id) {
+      this.#teamHostTokens.clear();
+    }
+    const previousToken = this.#sessionToken;
+    this.#sessionToken = redeemed.sessionToken;
+    // The claim is spent. A session that is not stored ends at the next start, so a failed write fails
+    // the redeem, and the session is not kept in memory. The start retry redeems the claim again in its
+    // retry window.
+    try {
+      await this.#writeStoredSession({ required: true });
+    } catch (error) {
+      this.#sessionToken = previousToken;
+      throw error;
+    }
+    const user = this.#resolveUserAvatar(redeemed.user);
+    this.#setState({ status: "signed_in", user });
+    return { hostId: redeemed.hostId, name: redeemed.name, user };
+  }
+
   async logout(): Promise<CentralAuthState> {
     this.#emailCodeRequest = null;
     if (this.#sessionToken) {
@@ -837,15 +937,10 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     timeoutMs?: number,
   ): Promise<T> {
     if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
-    return this.#request(
-      path,
-      {
-        ...init,
-        headers: { ...init.headers, Authorization: `Bearer ${this.#sessionToken}` },
-      },
-      decoder,
-      timeoutMs,
-    );
+    // A spread drops the entries of a `Headers` object, such as the hosting developer key.
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${this.#sessionToken}`);
+    return this.#request(path, { ...init, headers }, decoder, timeoutMs);
   }
 
   #resolveUserAvatar(user: CentralAuthUser): CentralAuthUser {
@@ -855,20 +950,21 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     };
   }
 
-  #writeStoredSession(): Promise<void> {
+  #writeStoredSession(options: { required?: boolean } = {}): Promise<void> {
     // Serialized: two writes racing inside their filesystem awaits would let the earlier
     // one rename its snapshot over the later one, restoring a session the user has left.
     this.#sessionWriteChain = this.#sessionWriteChain.then(
-      () => this.#writeStoredSessionNow(),
-      () => this.#writeStoredSessionNow(),
+      () => this.#writeStoredSessionNow(options.required === true),
+      () => this.#writeStoredSessionNow(options.required === true),
     );
     return this.#sessionWriteChain;
   }
 
-  async #writeStoredSessionNow(): Promise<void> {
+  async #writeStoredSessionNow(required: boolean): Promise<void> {
     if (!this.#sessionToken) return;
     if (!this.#options.canPersist()) {
       await rm(this.#options.storagePath, { force: true });
+      if (required) throw new Error("The session could not be stored.");
       return;
     }
     const temporaryPath = `${this.#options.storagePath}.${randomUUID()}.tmp`;
@@ -883,8 +979,9 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       await writeFile(temporaryPath, encrypted, { mode: 0o600 });
       await chmod(temporaryPath, 0o600);
       await rename(temporaryPath, this.#options.storagePath);
-    } catch {
+    } catch (error) {
       await Promise.allSettled([rm(this.#options.storagePath, { force: true }), rm(temporaryPath, { force: true })]);
+      if (required) throw error;
     } finally {
       await Promise.allSettled([rm(temporaryPath, { force: true })]);
     }

@@ -13,14 +13,20 @@
   "observability": {
     "enabled": true
   },
-  // The outbox and the hosted-site cleanup are both retry paths: the request path schedules the
-  // first attempt itself. A run each minute only repeated empty reads.
+  // The outbox, the hosted-site cleanup and the hosted server checks are retry paths: the request path
+  // and the webhooks do the first attempt. A run each minute only repeated empty reads. An idle server
+  // stops 15 to 20 minutes after its last use.
   "triggers": {
     "crons": ["*/5 * * * *"]
   },
   "routes": [
     {
       "pattern": "openbot.run/*",
+      "zone_id": "bac5e044ba951c390229f0e93673ebd3"
+    },
+    // `www` has no origin. The Worker answers it only with a redirect to openbot.run.
+    {
+      "pattern": "www.openbot.run/*",
       "zone_id": "bac5e044ba951c390229f0e93673ebd3"
     },
     {
@@ -46,7 +52,17 @@
     "EMAIL_FROM": "hello@openbot.run",
     "REMOTE_TICKET_KEY_ID": "openbot-remote-1",
     "REMOTE_SIGNAL_URL": "wss://signal.openbot.run/v1/signal",
-    "REMOTE_AUTH_WEBHOOK_URL": "https://signal.openbot.run/internal/auth-events"
+    "REMOTE_AUTH_WEBHOOK_URL": "https://signal.openbot.run/internal/auth-events",
+    // Creates stay off until the boat and Stripe secrets and the template are set. "false" stops new
+    // servers only.
+    "HOSTED_SERVERS_ENABLED": "true",
+    // Each account can buy a server in production. Put account IDs here to limit creates to them.
+    "HOSTED_SERVERS_ALLOWED_USER_IDS": "*",
+    // The public Client ID of the OpenBotGit GitHub App. Its private key is the optional secret
+    // GITHUB_APP_PRIVATE_KEY (PKCS #8). Without the key, agents act on GitHub as the signed-in user.
+    "GITHUB_APP_CLIENT_ID": "Iv23lik5pzHz70cb0RUL",
+    "APNS_TEAM_ID": "ZTRDTUL87R",
+    "APNS_TOPIC": "run.openbot.mobile"
   },
   "d1_databases": [
     {
@@ -93,6 +109,16 @@
       "name": "SITE_REPORT_RATE_LIMITER",
       "namespace_id": "2026083101",
       "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "GITHUB_TOKEN_RATE_LIMITER",
+      "namespace_id": "2026092911",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "LIVE_ACTIVITY_RATE_LIMITER",
+      "namespace_id": "2026092901",
+      "simple": { "limit": 300, "period": 60 }
     }
   ],
   "env": {
@@ -161,6 +187,16 @@
           "name": "SITE_REPORT_RATE_LIMITER",
           "namespace_id": "2026083102",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "GITHUB_TOKEN_RATE_LIMITER",
+          "namespace_id": "2026092912",
+          "simple": { "limit": 30, "period": 60 }
+        },
+        {
+          "name": "LIVE_ACTIVITY_RATE_LIMITER",
+          "namespace_id": "2026092902",
+          "simple": { "limit": 300, "period": 60 }
         }
       ]
     },
@@ -169,9 +205,15 @@
       "workers_dev": true,
       "preview_urls": false,
       "routes": [],
+      // Each minute: the cron starts hosted servers that stopped again, and checks servers that a webhook missed.
       "triggers": {
-        "crons": []
+        "crons": ["* * * * *"]
       },
+      // Hosted servers stay off until these are set. `api:deploy:test` sets the Stripe pair, BOAT_API_KEY,
+      // BOAT_WEBHOOK_SECRET and HOSTED_SERVERS_DEVELOPER_KEY from `.env.shared`, and
+      // HOSTED_SERVERS_ALLOWED_USER_IDS from its HOSTED_SERVERS_TEST_ALLOW_LIST.
+      // Set HOSTED_SERVER_TEMPLATE with `wrangler secret put <name> --env test`.
+      // They are not required, so the test Worker deploys without them. See docs/hosted-servers.md.
       "secrets": {
         "required": [
           "EMAIL_SMTP_PASSWORD",
@@ -192,7 +234,11 @@
         "SITE_COOKIE_ISOLATION_READY": "false",
         "REMOTE_TICKET_KEY_ID": "openbot-remote-1",
         "REMOTE_SIGNAL_URL": "wss://signal.openbot.run/v1/signal",
-        "REMOTE_AUTH_WEBHOOK_URL": "https://signal.openbot.run/internal/auth-events"
+        "REMOTE_AUTH_WEBHOOK_URL": "https://signal.openbot.run/internal/auth-events",
+        "HOSTED_SERVERS_ENABLED": "true",
+        "GITHUB_APP_CLIENT_ID": "Iv23lik5pzHz70cb0RUL",
+        "APNS_TEAM_ID": "ZTRDTUL87R",
+        "APNS_TOPIC": "run.openbot.mobile"
       },
       "d1_databases": [
         {
@@ -236,6 +282,16 @@
           "name": "SITE_REPORT_RATE_LIMITER",
           "namespace_id": "2026083103",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "GITHUB_TOKEN_RATE_LIMITER",
+          "namespace_id": "2026092913",
+          "simple": { "limit": 30, "period": 60 }
+        },
+        {
+          "name": "LIVE_ACTIVITY_RATE_LIMITER",
+          "namespace_id": "2026092903",
+          "simple": { "limit": 300, "period": 60 }
         }
       ]
     }

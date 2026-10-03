@@ -1,16 +1,20 @@
 // @vitest-environment node
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, realpath, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { serializeAttachmentReference } from "@openbot/contracts/attachment-references";
 import { serializeChatTagReference } from "@openbot/contracts/chat-tag-references";
 import {
   type AgentEvent,
   COMPUTER_USE_MCP_SERVER_ID,
   COMPUTER_USE_MCP_SERVER_NAME,
+  GITHUB_CONNECTOR_MCP_SERVER_ID,
+  GITHUB_CONNECTOR_MCP_SERVER_NAME,
+  GITHUB_CONNECTOR_MCP_SERVER_URL,
   type McpServerConfig,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AgentProvider, RequestTimeoutError } from "./agent-client";
 import type { AgentService } from "./agent-service";
@@ -35,6 +39,7 @@ import {
 } from "./agent-service-test-harness";
 import { loginShellPath, type McpToolRuntimes, NO_MCP_TOOL_RUNTIMES } from "./mcp-provider-shapes";
 import type { DynamicToolCallParams } from "./protocol";
+import { NO_PROVIDER_CREDENTIALS } from "./provider-drivers";
 import { SidebarLayoutStore } from "./sidebar-layout-store";
 
 // Every Codex session is given the plan tool.
@@ -501,7 +506,62 @@ describe.sequential("AgentService: providers", () => {
     expect(paramsRecord(starts.at(-1)?.params)?.config).toEqual({
       tools: CODEX_TOOLS,
       mcp_servers: {
-        "Signed in": { url: "https://mcp.example.com/mcp", http_headers: { Authorization: `Bearer ${token}` } },
+        Signed_in: { url: "https://mcp.example.com/mcp", http_headers: { Authorization: `Bearer ${token}` } },
+      },
+    });
+    const reported = events.filter((event) => event.type === "error");
+    expect(reported.length).toBeGreaterThan(0);
+    for (const event of reported) expect(event.message).not.toContain(token);
+    expect(service.listQueue("chief").deliveries.at(-1)?.error ?? "").not.toContain(token);
+  });
+
+  /* The GitHub connection is not an MCP sign-in and has no row, so only the hand-off record can
+     name its token. A leak here gives the user's GitHub account to whoever reads the error. */
+  it("hands the GitHub connection's token to its built-in server and keeps it out of the error it causes", async () => {
+    const { store, mailbox } = stores(root);
+    // No known token prefix: only the registration that the hand-off makes can redact it.
+    const token = "connector-opaque-token-0123456789";
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true, {}, async (method) => {
+      if (method === "turn/start") throw new Error(`GitHub MCP refused ${token}`);
+    });
+    const events: AgentEvent[] = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+      credentials: { apiKey: () => null, customProviders: () => [], mcpServers: () => [] },
+      githubConnector: {
+        mcpServer: () => ({
+          id: GITHUB_CONNECTOR_MCP_SERVER_ID,
+          name: GITHUB_CONNECTOR_MCP_SERVER_NAME,
+          transport: "http",
+          enabled: true,
+          command: "",
+          args: [],
+          env: [],
+          envPassthrough: [],
+          workingDirectory: "",
+          url: GITHUB_CONNECTOR_MCP_SERVER_URL,
+          headers: [],
+        }),
+        mcpAuthorization: async () => token,
+      },
+    });
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.every((delivery) => delivery.status === "failed"));
+
+    const starts = client.requests.filter((request) => request.method === "thread/start");
+    const servers = paramsRecord(starts.at(-1)?.params)?.config;
+    expect(servers).toMatchObject({
+      mcp_servers: {
+        [GITHUB_CONNECTOR_MCP_SERVER_NAME]: {
+          url: GITHUB_CONNECTOR_MCP_SERVER_URL,
+          http_headers: { Authorization: `Bearer ${token}` },
+        },
       },
     });
     const reported = events.filter((event) => event.type === "error");
@@ -606,7 +666,7 @@ describe.sequential("AgentService: providers", () => {
     expect(starts).toHaveLength(2);
     const config = paramsRecord(starts.at(-1)?.params)?.config;
     expect(isDynamicRecord(config) ? config.mcp_servers : undefined).toMatchObject({
-      "Npx tool": expect.anything(),
+      Npx_tool: expect.anything(),
     });
   });
 
@@ -1361,6 +1421,72 @@ describe.sequential("AgentService: providers", () => {
     expect(own?.client.running).toBe(false);
   });
 
+  it("runs a message again on a new Grok session when xAI refuses the session's reasoning", async () => {
+    process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
+    const { store, mailbox } = stores(root);
+    const clients: FakeAgentClient[] = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "grok",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider, undefined, false);
+        clients.push(client);
+        return client;
+      },
+    });
+    // The client of each `turn/start`, in order: a new session can run on a new client.
+    const turnStarts = () =>
+      clients.flatMap((client) =>
+        client.requests.filter((request) => request.method === "turn/start").map(() => client),
+      );
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    await store.getOrCreate("chief");
+    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    const refuse = async (session: string) => {
+      const started = [...events].reverse().find((event) => event.type === "turn-started");
+      if (started?.type !== "turn-started") throw new Error("The fake Grok turn did not start.");
+      const threadId = store.activeProviderSession("chief")?.externalSessionId;
+      expect(threadId).toBe(session);
+      const client = turnStarts().at(-1);
+      client?.emit(
+        "notification",
+        notification("error", {
+          threadId,
+          turnId: started.turnId,
+          message: "Internal error: reasoning `encrypted_content` was not issued to this caller",
+        }),
+      );
+      client?.emit(
+        "notification",
+        notification("turn/completed", { threadId, turn: { id: started.turnId, status: "failed" } }),
+      );
+    };
+
+    await service.sendMessage({ agentId: "chief", text: "Say hi" });
+    await waitFor(() => events.some((event) => event.type === "turn-started"));
+    await refuse("grok-session-1");
+
+    // The same message runs on a new session, and the refusal is not shown as a failure.
+    await waitFor(
+      () => turnStarts().length === 2 && events.filter((event) => event.type === "turn-started").length === 2,
+    );
+    expect(store.activeProviderSession("chief")?.externalSessionId).toBe("grok-session-2");
+    expect(turnStarts()[0]?.releasedThreads).toContain("grok-session-1");
+    expect(service.listQueue("chief").deliveries).toEqual([expect.objectContaining({ status: "running" })]);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+
+    // A second refusal fails the message with text the user can act on.
+    await refuse("grok-session-2");
+    const reason = sourceText("error.provider.foreignReasoning", { provider: "Grok" });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "failed");
+    expect(service.listQueue("chief").deliveries).toEqual([expect.objectContaining({ error: reason })]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", agentId: "chief", message: reason }));
+    expect(store.activeProviderSession("chief")).toBeNull();
+  });
+
   it("keeps the turn of a Workspace only agent when the shared Grok process exits", async () => {
     process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
     const { store, mailbox } = stores(root);
@@ -1446,6 +1572,44 @@ describe.sequential("AgentService: providers", () => {
     // The provider stays, so the agent keeps its thread; only the model it can no longer run changes.
     await waitFor(() => service?.listAgents().find((agent) => agent.id === "chief")?.model === "gpt-6-luna");
     expect(service.listAgents().find((agent) => agent.id === "chief")).toMatchObject({ provider: "codex" });
+  });
+
+  // A custom agent that starts slowly can answer `model/list` with nothing, and the router then lists
+  // only `<agent>/default`. That is no proof that the saved model is gone.
+  it("keeps a custom agent's saved model when the agent lists only its default after a restart", async () => {
+    let listed = ["goose/opus", "qwen/max"];
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
+        const client = new FakeAgentClient(provider);
+        if (provider === "acp") client.modelList = () => ({ data: listed.map((model) => ({ model })) });
+        return client;
+      },
+      credentials: {
+        ...NO_PROVIDER_CREDENTIALS,
+        customAgents: () => [
+          { id: "goose", name: "Goose", command: "goose", args: [], env: [] },
+          { id: "qwen", name: "Qwen", command: "qwen", args: [], env: [] },
+        ],
+      },
+    });
+    service = agentService;
+    await store.getOrCreate("chief");
+    await store.getOrCreate("scout");
+    await service.updateAgent({ agentId: "chief", provider: "acp", model: "goose/opus", reasoningEffort: "high" });
+    await service.updateAgent({ agentId: "scout", provider: "acp", model: "qwen/max" });
+
+    listed = ["goose/default", "qwen/mini"];
+    await service.stop();
+    await service.initialize();
+
+    // Qwen listed models and dropped `max`, so scout moves. The update after it runs after the sweep.
+    await waitFor(() => service?.listAgents().find((agent) => agent.id === "scout")?.model === "qwen/mini");
+    await service.updateAgent({ agentId: "scout", model: "qwen/mini" });
+    expect(service.listAgents().find((agent) => agent.id === "chief")).toMatchObject({
+      provider: "acp",
+      model: "goose/opus",
+      reasoningEffort: "high",
+    });
   });
 
   // The catalogue is the running CLI's answer, and a removal during a turn does not restart it. The
@@ -1577,7 +1741,7 @@ describe.sequential("AgentService: providers", () => {
     expect(service.listModels().map((model) => model.id)).toContain("house/router-llm");
     await expect(
       service.updateAgent({ agentId: "chief", provider: "opencode", model: "studio/local-llm" }),
-    ).rejects.toThrow("The selected agent model is unavailable.");
+    ).rejects.toThrow('The selected agent model "studio/local-llm" is unavailable: OpenCode does not list it.');
 
     // Saved again under the same id, and a fresh process lists it, so both the list and the
     // selection accept it once more.
@@ -1618,7 +1782,9 @@ describe.sequential("AgentService: providers", () => {
     writes[0]?.();
     await removal;
 
-    await expect(selection).rejects.toThrow("The selected agent model is unavailable.");
+    await expect(selection).rejects.toThrow(
+      'The selected agent model "studio/local-llm" is unavailable: OpenCode does not list it.',
+    );
     expect(service.listAgents().find((agent) => agent.id === "chief")).toMatchObject({ model: "house/router-llm" });
   });
 
@@ -1666,7 +1832,7 @@ describe.sequential("AgentService: providers", () => {
     expect(service.listModels().map((model) => model.id)).not.toContain("studio/local-llm");
     await expect(
       service.updateAgent({ agentId: "chief", provider: "opencode", model: "studio/local-llm" }),
-    ).rejects.toThrow("The selected agent model is unavailable.");
+    ).rejects.toThrow('The selected agent model "studio/local-llm" is unavailable: OpenCode does not list it.');
 
     // A restart that fails is reported as a provider status, not as a throw of its own, so what it
     // answers here says nothing about which process answers on the endpoint now.
@@ -1739,7 +1905,7 @@ describe.sequential("AgentService: providers", () => {
     expect(service.listModels().map((model) => model.id)).not.toContain("studio/local-llm");
     await expect(
       service.updateAgent({ agentId: "chief", provider: "opencode", model: "studio/local-llm" }),
-    ).rejects.toThrow("The selected agent model is unavailable.");
+    ).rejects.toThrow('The selected agent model "studio/local-llm" is unavailable: OpenCode does not list it.');
 
     // A process that spawned after the removal read the files as they are, so its catalogue counts.
     expect(await service.reloadOpenCodeConfig()).toBe("restarted");
@@ -2343,6 +2509,64 @@ describe.sequential("AgentService: providers", () => {
     await expect(service.resolveWorkspaceFile("missing", page)).rejects.toThrow("Unknown agent");
   });
 
+  it("opens local links to files the agent edited anywhere, but serves remote members only the workspace", async () => {
+    const { service: agentService, store } = await startService(root);
+    service = agentService;
+
+    const agent = await store.createAgent(CREATE_AGENT_INPUT);
+    const page = join(agent.workspacePath, "page.tsx");
+    const colonName = join(agent.workspacePath, "notes:2");
+    const outside = join(root, "project", "edited.ts");
+    const link = join(agent.workspacePath, "outside-link.ts");
+    await mkdir(dirname(outside), { recursive: true });
+    await writeFile(page, "export default function Page() {}\n");
+    await writeFile(colonName, "literal\n");
+    await writeFile(outside, "edited\n");
+    await symlink(outside, link);
+    const realPage = await realpath(page);
+    const realOutside = await realpath(outside);
+
+    for (const reference of ["page.tsx:12", "page.tsx:12:3", "page.tsx#L12", "page.tsx#L12-L20", "page.tsx#L12C3"]) {
+      await expect(service.resolveWorkspaceFile(agent.id, reference)).resolves.toMatchObject({
+        path: realPage,
+        insideWorkspace: true,
+      });
+    }
+    await expect(service.resolveWorkspaceFile(agent.id, "notes:2")).resolves.toMatchObject({
+      path: await realpath(colonName),
+    });
+    await expect(service.resolveWorkspaceFile(agent.id, "missing.ts:4")).rejects.toThrow(/ENOENT/u);
+
+    const home = process.env.HOME;
+    process.env.HOME = root;
+    try {
+      await expect(service.resolveLocalWorkspaceFile(agent.id, "~/project/edited.ts:7")).resolves.toMatchObject({
+        path: realOutside,
+        insideWorkspace: false,
+      });
+      await expect(service.resolveWorkspaceFile(agent.id, "~/project/edited.ts")).rejects.toThrow(
+        "inside the agent workspace",
+      );
+    } finally {
+      process.env.HOME = home;
+    }
+
+    await expect(service.resolveLocalWorkspaceFile(agent.id, outside)).resolves.toMatchObject({
+      path: realOutside,
+      name: "edited.ts",
+      insideWorkspace: false,
+    });
+    await expect(service.resolveLocalWorkspaceFile(agent.id, link)).resolves.toMatchObject({ path: realOutside });
+    // The Team API and the web client call `resolveWorkspaceFile`; it keeps the workspace boundary.
+    await expect(service.resolveWorkspaceFile(agent.id, outside)).rejects.toThrow("inside the agent workspace");
+    await expect(service.resolveWorkspaceFile(agent.id, link)).rejects.toThrow("inside the agent workspace");
+    await expect(service.resolveLocalWorkspaceFile(agent.id, join(root, "project"))).rejects.toThrow("not a file");
+
+    await store.updateAgent({ agentId: agent.id, access: "workspace" });
+    await expect(service.resolveLocalWorkspaceFile(agent.id, outside)).rejects.toThrow("inside the agent workspace");
+    await expect(service.resolveLocalWorkspaceFile(agent.id, page)).resolves.toMatchObject({ path: realPage });
+  });
+
   it("does not surface the skills context-budget notice as an agent error", async () => {
     process.env.OPENBOT_FAKE_WARNING = "Skill descriptions were shortened to fit the skills context budget.";
     const { store, mailbox } = stores(root);
@@ -2435,6 +2659,8 @@ describe.sequential("AgentService: providers", () => {
         { id: "grok", state: "not-installed", version: null },
         { id: "opencode", state: "not-installed", version: null },
         { id: "antigravity", state: "not-installed", version: null },
+        { id: "cursor", state: "not-installed", version: null },
+        { id: "cline", state: "not-installed", version: null },
         { id: "acp", state: "not-installed", version: null },
       ],
       // Unavailable because no Computer Use driver was given to this service. It no longer follows

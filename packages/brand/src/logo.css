@@ -1,5 +1,6 @@
 .app-logo {
   --app-logo-background: var(--openbot-logo-production);
+  --app-logo-eye: var(--openbot-logo-production-eye);
   position: relative;
   display: inline-block;
   overflow: hidden;
@@ -17,10 +18,12 @@
 
 .app-logo[data-variant="dev"] {
   --app-logo-background: var(--openbot-logo-dev);
+  --app-logo-eye: var(--openbot-logo-eye);
 }
 
 .app-logo[data-variant="preview"] {
   --app-logo-background: var(--openbot-logo-preview);
+  --app-logo-eye: var(--openbot-logo-eye);
 }
 
 .app-logo-background {
@@ -29,7 +32,7 @@
 
 .app-logo-eye {
   fill: none;
-  stroke: var(--openbot-logo-eye);
+  stroke: var(--app-logo-eye);
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 9.5px;
@@ -39,7 +42,8 @@
 
 .app-logo-eye-motion {
   pointer-events: none;
-  transform: translate(var(--app-logo-eye-x, 0%), var(--app-logo-eye-y, 0%));
+  /* `--app-logo-eye-squint` half closes both eyes for a moment. The blink animates the eyes inside. */
+  transform: translate(var(--app-logo-eye-x, 0%), var(--app-logo-eye-y, 0%)) scaleY(var(--app-logo-eye-squint, 1));
   transform-origin: center;
   transition: transform var(--openbot-duration-normal) cubic-bezier(0.23, 1, 0.32, 1);
 }

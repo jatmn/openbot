@@ -30,6 +30,10 @@ export const INPUT_LIMITS = {
   routineName: 80,
   routineInstruction: 100_000,
   routineRunsPage: 100,
+  // The text a local script adds to a routine run through the automation server.
+  automationPayload: 4_000,
+  // Six weeks: the longest range the routine calendar reads, with room for a month view.
+  routineCalendarDays: 42,
   routineCron: 255,
   messageText: 100_000,
   directMessageText: 20_000,
@@ -78,8 +82,8 @@ export const INPUT_LIMITS = {
   sessionsPerMember: 10,
 } as const;
 
-// Active members of one host, owner included: the owner and two others. Paid tiers will
-// raise it per host. `INPUT_LIMITS.teamMembers` stays the wire cap for stored members.
+// Active members of one host with no plan, owner included: the owner and two others. A plan sets
+// its own limit (`memberLimitForPlan`). `INPUT_LIMITS.teamMembers` stays the wire cap for stored members.
 export const DEFAULT_TEAM_MEMBER_LIMIT = 3;
 
 export const ATTACHMENT_LIMITS = {

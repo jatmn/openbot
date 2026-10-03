@@ -34,6 +34,13 @@ import type { ConversationRuntime } from "./conversation-runtime";
  * through only because one direction is `import type`.
  */
 
+/** Opens an agent's settings panel. A `routine` opens that routine's settings in it. */
+export interface AgentSettingsRequest {
+  agentId: string;
+  nonce: number;
+  routine?: { routineId: string; name: string };
+}
+
 export interface ConversationTarget {
   agentId: string;
   serverId: string;
@@ -44,6 +51,11 @@ export interface ConversationProps {
   notice?: JSX.Element;
   onOpenUsage?: (trigger: HTMLButtonElement) => void;
   onOpenMarketplace?: () => void;
+  /**
+   * Opens Marketplace at one app, from a suggestion card. `connect` is true only when the person
+   * pressed Connect or Install on the card: the page then starts the connect step.
+   */
+  onOpenMarketplaceApp?: (request: { appId: string; connect: boolean }) => void;
   platform?: import("@openbot/contracts/ipc").AppInfo["platform"];
 
   agentStatus: AgentStatus;
@@ -98,7 +110,7 @@ export interface ConversationProps {
    */
   mcpSettingsOpen?: boolean;
   globalOverlayOpen: boolean;
-  settingsRequest: { agentId: string; nonce: number } | null;
+  settingsRequest: AgentSettingsRequest | null;
   /** The account Profile panel, for a client that has no settings dialog. `profileRequest` opens it. */
   accountProfile?: Pick<
     AccountProfilePanelProps,
@@ -122,6 +134,11 @@ export interface ConversationProps {
   server: ServerSummary | undefined;
   presence: TeamPresenceSnapshot;
   currentUserEmail: string;
+  /**
+   * Is the stamped sender of a message the reader? Only another person's message draws a face and a
+   * name; a message with no sender is the reader's own, as every message was before senders.
+   */
+  isOwnSender: (senderId: string) => boolean;
   browserEnabled?: boolean;
   remoteDesktopEnabled?: boolean;
   remoteDesktopSessionActive: boolean;

@@ -62,6 +62,7 @@ function createService(
     autoDownload?: boolean;
     checkIntervalMs?: number;
     checkSiblingInstances?: () => Promise<readonly OpenBotSiblingInstance[]>;
+    currentUid?: number;
   } = {},
 ) {
   return new UpdateService(updater, {
@@ -70,6 +71,7 @@ function createService(
     autoDownload: options.autoDownload ?? false,
     beforeInstall: options.beforeInstall ?? vi.fn(async () => undefined),
     ...(options.checkSiblingInstances ? { checkSiblingInstances: options.checkSiblingInstances } : {}),
+    ...(options.currentUid !== undefined ? { currentUid: options.currentUid } : {}),
     platform: options.platform ?? "darwin",
     checkIntervalMs: options.checkIntervalMs ?? CHECK_INTERVAL,
     checkTimeoutMs: CHECK_TIMEOUT,
@@ -169,6 +171,42 @@ describe("UpdateService", () => {
     expect(updater.downloadTokens.at(0)).toBe(updater.tokens.at(0));
   });
 
+  it("replaces a waiting download when a newer release ships before the restart", async () => {
+    vi.useFakeTimers();
+    const updater = new FakeUpdater();
+    let latest = "0.1.1";
+    updater.checkForUpdates.mockImplementation(async () => ({
+      isUpdateAvailable: true,
+      updateInfo: { version: latest },
+      cancellationToken: updater.mintToken(),
+    }));
+    updater.downloadUpdate.mockImplementation(async (token?: UpdateCancellationToken) => {
+      updater.downloadTokens.push(token);
+      updater.emit("update-downloaded", { version: latest });
+      return [];
+    });
+    const service = createService(updater, { autoDownload: true });
+    service.start(false);
+    await service.checkForUpdates();
+    await vi.waitFor(() => expect(service.getStatus()).toMatchObject({ phase: "ready", availableVersion: "0.1.1" }));
+
+    // The same release again keeps the download and the restart action.
+    await vi.advanceTimersByTimeAsync(CHECK_INTERVAL);
+    expect(updater.checkForUpdates).toHaveBeenCalledTimes(2);
+    expect(updater.downloadUpdate).toHaveBeenCalledOnce();
+    expect(service.getStatus()).toMatchObject({ phase: "ready", availableVersion: "0.1.1" });
+
+    latest = "0.1.2";
+    await vi.advanceTimersByTimeAsync(CHECK_INTERVAL);
+    await vi.waitFor(() => expect(service.getStatus()).toMatchObject({ phase: "ready", availableVersion: "0.1.2" }));
+    expect(updater.downloadUpdate).toHaveBeenCalledTimes(2);
+    expect(updater.downloadTokens.at(-1)).toBe(updater.tokens.at(-1));
+
+    // One restart reaches the newest release.
+    await service.installUpdate();
+    expect(updater.quitAndInstall).toHaveBeenCalledOnce();
+  });
+
   it("waits for the download action when the preference is disabled", async () => {
     const updater = new FakeUpdater();
     makeUpdateAvailable(updater);
@@ -250,6 +288,57 @@ describe("UpdateService", () => {
     await service.installUpdate();
     expect(beforeInstall).toHaveBeenCalledOnce();
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true);
+  });
+
+  it("says the blocking process runs in this user account when every sibling does", async () => {
+    const updater = new FakeUpdater();
+    const beforeInstall = vi.fn(async () => undefined);
+    makeUpdateAvailable(updater);
+    completeDownload(updater);
+    const checkSiblingInstances = vi.fn(async () => [
+      { pid: 4242, uid: 501 },
+      { pid: 4343, uid: 501 },
+    ]);
+    const service = createService(updater, {
+      platform: "darwin",
+      beforeInstall,
+      checkSiblingInstances,
+      currentUid: 501,
+    });
+    service.start(false);
+
+    await service.checkForUpdates();
+    await service.downloadUpdate();
+
+    await expect(service.installUpdate()).rejects.toThrow(/this user account/iu);
+    expect(beforeInstall).not.toHaveBeenCalled();
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    expect(service.getStatus().phase).toBe("ready");
+  });
+
+  it("keeps the other-account refusal when any sibling runs in another account", async () => {
+    const updater = new FakeUpdater();
+    const beforeInstall = vi.fn(async () => undefined);
+    makeUpdateAvailable(updater);
+    completeDownload(updater);
+    const service = createService(updater, {
+      platform: "darwin",
+      beforeInstall,
+      checkSiblingInstances: async () => [
+        { pid: 4242, uid: 502 },
+        { pid: 4343, uid: 501 },
+      ],
+      currentUid: 501,
+    });
+    service.start(false);
+
+    await service.checkForUpdates();
+    await service.downloadUpdate();
+
+    await expect(service.installUpdate()).rejects.toThrow(/every other macOS user account/iu);
+    expect(beforeInstall).not.toHaveBeenCalled();
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+    expect(service.getStatus().phase).toBe("ready");
   });
 
   it("installs without a sibling check when none is configured", async () => {

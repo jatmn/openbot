@@ -1,7 +1,7 @@
 import type { AddedAgent, AgentProviderId, NotificationOpenedEvent, ServerSummary } from "@openbot/contracts/ipc";
-import { toast } from "@openbot/ui";
 import { currentText } from "@openbot/ui/text";
 import { onSettled } from "solid-js";
+import { actionToast } from "../../action-toast";
 import { desktopAnalytics } from "../../analytics";
 import { createSimpleContext } from "../../simple-context";
 import { useAgents } from "../agents/agents-context";
@@ -40,7 +40,7 @@ const ServerSelection = createSimpleContext({
     const { pendingInviteUrl, setPendingInviteUrl, saveSetup } = useSetup();
     const { setSkillsMarketplaceOpen } = useSettings();
     const { disconnectRemoteDesktopWorkspace } = useRemoteDesktop();
-    const { setBrowserVisibilitySuspended, setPendingAgentSelection } = useServerSwitch();
+    const { setBrowserVisibilitySuspended, setPendingAgentSelection, setPreviousServerId } = useServerSwitch();
     const { agentSetupOpen, creatingAgent } = useAgents();
     const { stopComposerTyping } = useConversationController();
     const { setDirectTyping } = useDirectMessages();
@@ -110,6 +110,7 @@ const ServerSelection = createSimpleContext({
           }
           throw error;
         }
+        if (switchingServers && previousServerId) setPreviousServerId(previousServerId);
         setServers(nextServers);
         return true;
       } finally {
@@ -126,7 +127,7 @@ const ServerSelection = createSimpleContext({
       try {
         if (!(await selectServer(serverId, false))) return;
       } catch {
-        toast.error(currentText().t("server.select.openAgentFailed", { name: agent.name }));
+        actionToast.error(currentText().t("server.select.openAgentFailed", { name: agent.name }));
         return;
       }
       // Published rather than called: if this was a switch, the navigation

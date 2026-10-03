@@ -96,6 +96,17 @@
   --openbot-onboarding-desktop-mist: #dbe9ff;
   --openbot-onboarding-desktop-blue: #7eb4f2;
   --openbot-onboarding-desktop-indigo: #6f7de8;
+  /* The dither tiles of the sound theme picker: a back and an ink color for each sound theme. */
+  --openbot-sound-warm-back: #d95926;
+  --openbot-sound-warm-ink: #f2c46b;
+  --openbot-sound-mech-back: #1f1f1f;
+  --openbot-sound-mech-ink: #dbe9ff;
+  --openbot-sound-bubble-back: #5b5fe0;
+  --openbot-sound-bubble-ink: #8bdee8;
+  --openbot-sound-press-back: #ff1e5e;
+  --openbot-sound-press-ink: #ffd8a8;
+  --openbot-sound-off-back: #212121;
+  --openbot-sound-off-ink: #4c4c4c;
   --openbot-onboarding-window: #f3f5f8;
   --openbot-text-secondary: #dcdcdc;
   --openbot-text-muted: #979797;
@@ -144,8 +155,14 @@
   --openbot-chart-storage-app: var(--openbot-text-dim);
   --openbot-logo-production: #d6adf2;
   --openbot-logo-eye: #040007;
-  --openbot-logo-dev: var(--openbot-warning);
-  --openbot-logo-preview: var(--openbot-success);
+  /* The eyes of the release logo. The logo color setting changes it with `--openbot-logo-production`;
+     a dev or preview logo keeps `--openbot-logo-eye`. */
+  --openbot-logo-production-eye: var(--openbot-logo-eye);
+  /* The build colors of the logo match the app icons in `build/icon-*.png`, so the Dock, the app
+     and the Dynamic Island show one color for each build. They are brand colors, not status
+     colors: a change to warning or success does not change them. */
+  --openbot-logo-dev: #e3b866;
+  --openbot-logo-preview: #61c985;
   --openbot-unread-surface: #74b9ff;
   --openbot-unread-text: #07131f;
   /* The last hue that had not been retuned with the rest. #61c985 was OKLCH chroma
@@ -376,6 +393,14 @@
 
 [data-provider="antigravity"] {
   --openbot-provider-current: var(--openbot-provider-antigravity);
+}
+
+[data-provider="cursor"] {
+  --openbot-provider-current: var(--openbot-text-primary);
+}
+
+[data-provider="cline"] {
+  --openbot-provider-current: var(--openbot-text-primary);
 }
 
 [data-provider="acp"] {

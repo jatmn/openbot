@@ -3,6 +3,12 @@ import type { messages as source } from "../en/webClient";
 
 export const messages = {
   "webClient.loading": "Chargement d’OpenBot…",
+  "webClient.loadingLine.wake": "Réveil des agents…",
+  "webClient.loadingLine.coffee": "Café servi aux agents…",
+  "webClient.loadingLine.tokens": "On compte les jetons sur les doigts…",
+  "webClient.loadingLine.prompts": "On démêle les prompts…",
+  "webClient.loadingLine.sleepy": "On demande gentiment au dormeur…",
+  "webClient.loadingLine.almost": "Presque prêt. Probablement.",
   "webClient.login.failed": "La connexion a échoué.",
   "webClient.login.requestFailed": "La requête du compte a échoué.",
   "webClient.login.sessionFailed": "Impossible de vérifier cette session.",
@@ -39,6 +45,8 @@ export const messages = {
   "webClient.error.hostStatus": "Impossible de lire l’état de l’hôte.",
   "webClient.error.usageOffline": "Connectez-vous à votre hôte pour voir l’utilisation.",
   "webClient.error.desktopOnly": "Cette action est disponible dans l’application de bureau.",
+  "webClient.settings.preferences.title": "Préférences",
+  "webClient.settings.preferences.description": "Choisissez la langue et les sons d’OpenBot dans ce navigateur.",
   "webClient.error.checkConversation": "Vérifiez la conversation avant d’envoyer à nouveau.",
   "webClient.error.hostReported": "L’hôte a signalé une erreur. Vérifiez la conversation et l’état de l’hôte.",
   "webClient.error.requestFailed": "La requête a échoué.",

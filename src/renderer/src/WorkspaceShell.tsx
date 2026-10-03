@@ -8,7 +8,9 @@ import { WorkspaceChannelConversation } from "./features/channels/WorkspaceChann
 import { useDirectMessages } from "./features/conversation/direct-messages-context";
 import { WorkspaceConversation } from "./features/conversation/WorkspaceConversation";
 import { WorkspaceDirectConversation } from "./features/conversation/WorkspaceDirectConversation";
+import { WorkspaceServerOnboarding } from "./features/onboarding/WorkspaceServerOnboarding";
 import { useRemoteDesktop } from "./features/remote-desktop/remote-desktop-context";
+import { SchedulePanel } from "./features/schedule/SchedulePanel";
 import { useServers } from "./features/servers/servers-context";
 import { WorkspaceServerRail } from "./features/servers/WorkspaceServerRail";
 import { WorkspaceSidebar } from "./features/sidebar/WorkspaceSidebar";
@@ -33,7 +35,8 @@ import { WorkspaceOverlays } from "./WorkspaceOverlays";
  *
  * The order of the children is the paint order the stylesheet expects, and the
  * middle-pane `<Show>`s are mutually exclusive by construction: a blocked remote
- * server wins over everything, then the Agent form, then a channel, then a
+ * server wins over everything, then a joined server's provider step, then the
+ * Agent form, then a channel, then a
  * person, then a Agent. The usage panel sits outside that group and inerts it.
  */
 export function WorkspaceShell(props: { account: () => CentralAuthUser }) {
@@ -44,12 +47,13 @@ export function WorkspaceShell(props: { account: () => CentralAuthUser }) {
   const layout = useLayout();
   const { activeServer, activeServerSupportsCapability, retryServerConnection, servers } = useServers();
   const { remoteDesktopWorkspaceVisible } = useRemoteDesktop();
-  const { agentSetupOpen } = useAgents();
+  const { agentSetupOpen, serverOnboardingOpen } = useAgents();
   const { activeDirectMember } = useDirectMessages();
 
   const blockedRemoteServer = createMemo(() => {
     const server = activeServer();
-    if (server?.kind !== "remote") return null;
+    // A hosted server that sleeps or wakes keeps the workspace on screen. The next input wakes it.
+    if (server?.kind !== "remote" || server.hostedSleep) return null;
     return server.state === "incompatible" || server.issue != null ? server : null;
   });
   const activePeopleEnabled = createMemo(
@@ -73,18 +77,32 @@ export function WorkspaceShell(props: { account: () => CentralAuthUser }) {
       usage={
         <Show when={usage.state.serverId}>
           {(serverId) => (
-            <AgentUsagePanel
-              serverId={serverId()}
-              hostName={servers().find((server) => server.id === serverId())?.name ?? "Host"}
-              agentId={usage.state.agentId}
-              onBack={usage.closeUsage}
-            />
+            <Show
+              when={usage.state.view === "schedule"}
+              fallback={
+                <AgentUsagePanel
+                  serverId={serverId()}
+                  hostName={servers().find((server) => server.id === serverId())?.name ?? "Host"}
+                  agentId={usage.state.agentId}
+                  onBack={usage.closeUsage}
+                />
+              }
+            >
+              <SchedulePanel
+                serverId={serverId()}
+                hostName={servers().find((server) => server.id === serverId())?.name ?? "Host"}
+                onBack={usage.closeUsage}
+              />
+            </Show>
           )}
         </Show>
       }
       after={<WorkspaceOverlays account={props.account} />}
     >
-      <Show when={agentSetupOpen()}>
+      <Show when={serverOnboardingOpen()}>
+        <WorkspaceServerOnboarding />
+      </Show>
+      <Show when={agentSetupOpen() && !serverOnboardingOpen()}>
         <WorkspaceAgentSetup />
       </Show>
       <Show when={activePeopleEnabled() && !agentSetupOpen() && !channelOpen() && activeDirectMember()} keyed>
