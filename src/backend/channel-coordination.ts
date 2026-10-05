@@ -56,6 +56,7 @@ interface ChannelCoordinationOptions {
   agents(): AgentSummary[];
   generate: ChannelTextModel;
   busy(agentId: string): boolean;
+  usageLimited?(agentId: string): boolean;
   canGenerate?(reserved: number): boolean;
   canRespond?(agent: AgentSummary): boolean;
   reserve?(): () => void;
@@ -177,6 +178,8 @@ export class ChannelCoordination {
       yield* this.#options.wake();
       return;
     }
+    // A control session may overlap work, but it shares the member's provider/model limit.
+    if (task.execution !== "instruction" && this.#options.usageLimited?.(agent.id)) return;
     const running: ChannelTask = { ...task, state: "running" };
     this.#options.store.update(this.#options.store.get(task.channelId), { tasks: [running] });
     const release = this.#options.reserve?.();
@@ -372,7 +375,12 @@ export class ChannelCoordination {
               ? { execution: "response" as const }
               : {}),
           ...(target ? { instructionTargetId: target.id, instructionTargetRevision: target.revision } : {}),
-          sourceMessageIds: [...new Set([...task.sourceMessageIds, ...(target?.sourceMessageIds ?? [])])].slice(-32),
+          sourceMessageIds: [
+            ...[...new Set([...task.sourceMessageIds, ...(target?.sourceMessageIds ?? [])])].filter(
+              (id) => id !== target?.requestMessageId,
+            ),
+            ...(target ? [target.requestMessageId] : []),
+          ].slice(-32),
         };
       });
       // One commit: a crash cannot publish the answer without its requested assignments.
@@ -381,13 +389,33 @@ export class ChannelCoordination {
         messages: decision.reply ? [this.#options.message(task, agent, decision.reply)] : [],
       });
     } catch {
-      if (this.current(task, signal))
+      if (this.current(task, signal)) {
+        const held = task.execution !== "instruction" && this.#options.usageLimited?.(agent.id);
         store.update(store.get(task.channelId), {
-          tasks: [{ ...task, state: "failed", error: sourceText("error.backend.channelCoordinationFailed") }],
+          tasks: [
+            {
+              ...task,
+              state: held ? "queued" : "failed",
+              error: held ? null : sourceText("error.backend.channelCoordinationFailed"),
+            },
+          ],
         });
+      }
     } finally {
       if (store.exists(task.channelId)) this.#options.changed(task.channelId);
     }
+  }).bind(this);
+
+  /** Recovery waits for the instruction outcome without cancelling its delivery. */
+  readonly settle = Effect.fn("ChannelCoordination.settle")(function* (
+    this: ChannelCoordination,
+    tasks: ChannelTask[],
+  ): Effect.fn.Return<void, ChannelOperationError> {
+    const fibers = tasks.flatMap((task) => {
+      const run = this.#runs.get(task.id);
+      return run ? [run.fiber] : [];
+    });
+    yield* Fiber.awaitAll(fibers);
   }).bind(this);
 
   readonly interrupt = Effect.fn("ChannelCoordination.interrupt")(function* (

@@ -5,6 +5,7 @@ import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   type AgentEvent,
   type AgentSummary,
+  type AttachmentSummary,
   CHANNEL_ASSIGNMENT_LIMIT,
   CHANNEL_PARALLEL_LIMIT,
   type Channel,
@@ -132,6 +133,7 @@ export class ChannelService {
       memories: this.memories,
       agents: hooks.agents,
       generate: hooks.generate,
+      usageLimited: (agentId) => hooks.usageLimited?.(agentId) ?? false,
       canGenerate: (reserved) => hooks.canGenerate?.(reserved + this.#routingGenerations) ?? true,
       ...(hooks.canRespond ? { canRespond: hooks.canRespond } : {}),
       ...(hooks.reserveGeneration ? { reserve: hooks.reserveGeneration } : {}),
@@ -339,53 +341,57 @@ export class ChannelService {
     }
     if (channel.archived) return yield* channelFailure(new Error(sourceText("error.backend.channelArchived")));
     if (command.type === "coordinate") {
-      const id = randomUUID();
-      const committed = command.attachmentDraftIds.length
-        ? yield* this.mailbox
-            .commitChannelAttachments({
-              channelId: channel.id,
-              messageId: id,
-              text: command.text,
-              draftIds: command.attachmentDraftIds,
-            })
-            .pipe(Effect.mapError(channelFailure))
-        : null;
-      const current = yield* channelSync(() => this.store.get(channel.id));
-      if (current.archived) return yield* channelFailure(new Error(sourceText("error.backend.channelArchived")));
-      const referenced = command.replyToMessageId
-        ? yield* channelSync(() => this.store.message(current.id, command.replyToMessageId))
-        : undefined;
-      if (command.replyToMessageId && !referenced)
-        return yield* channelFailure(new Error(sourceText("error.backend.channelReferenceUnavailable")));
-      const recipients =
-        command.audience === "all" ? current.members.map((member) => member.agentId) : [current.leadAgentId];
-      if (!recipients.length || recipients.some((id) => !id))
+      if (command.audience === "all" ? !channel.members.length : !channel.leadAgentId)
         return yield* channelFailure(new Error(sourceText("error.backend.channelLeadRequired")));
-      const tasks = recipients.map(
-        (agentId): ChannelTask => ({
-          ...this.newTask(current.id, id, committed?.text ?? command.text, agentId),
-          execution: command.audience === "all" ? "response" : "coordinate",
-          sourceMessageIds: command.replyToMessageId ? [id, command.replyToMessageId] : [id],
-          state: known.some((agent) => agent.id === agentId) ? "queued" : "paused",
-          error: known.some((agent) => agent.id === agentId)
-            ? null
-            : sourceText("error.backend.channelAssigneeUnavailable"),
-        }),
-      );
-      const message = this.message(
-        current.id,
-        tasks[0]?.id ?? id,
-        { kind: "member", ...actor },
-        committed?.text ?? command.text,
-        id,
-      );
-      message.taskId = null;
-      message.message.replyToMessageId = command.replyToMessageId;
-      if (committed) message.message.attachments = committed.attachments;
-      const result = yield* channelSync(() => this.store.update(current, { messages: [message], tasks }, operationId));
-      this.publish(current.id);
-      yield* this.wake(current.id);
-      return result;
+      const id = randomUUID();
+      const accept = (committed: { text: string; attachments: AttachmentSummary[] } | null) => {
+        // Re-read at acceptance: agent removal and archive can run during the file copy.
+        const current = this.store.get(channel.id);
+        if (current.archived) throw new Error(sourceText("error.backend.channelArchived"));
+        if (command.replyToMessageId && !this.store.message(current.id, command.replyToMessageId))
+          throw new Error(sourceText("error.backend.channelReferenceUnavailable"));
+        const recipients =
+          command.audience === "all" ? current.members.map((member) => member.agentId) : [current.leadAgentId];
+        if (!recipients.length || recipients.some((id) => !id))
+          throw new Error(sourceText("error.backend.channelLeadRequired"));
+        const available = this.hooks.agents();
+        const tasks = recipients.map(
+          (agentId): ChannelTask => ({
+            ...this.newTask(current.id, id, committed?.text ?? command.text, agentId),
+            execution: command.audience === "all" ? "response" : "coordinate",
+            sourceMessageIds: command.replyToMessageId ? [id, command.replyToMessageId] : [id],
+            state: available.some((agent) => agent.id === agentId) ? "queued" : "paused",
+            error: available.some((agent) => agent.id === agentId)
+              ? null
+              : sourceText("error.backend.channelAssigneeUnavailable"),
+          }),
+        );
+        const message = this.message(
+          current.id,
+          tasks[0]?.id ?? id,
+          { kind: "member", ...actor },
+          committed?.text ?? command.text,
+          id,
+        );
+        message.taskId = null;
+        message.message.replyToMessageId = command.replyToMessageId;
+        if (committed) message.message.attachments = committed.attachments;
+        this.store.update(current, { messages: [message], tasks }, operationId);
+      };
+      if (command.attachmentDraftIds.length)
+        yield* this.mailbox
+          .commitChannelAttachments({
+            channelId: channel.id,
+            messageId: id,
+            text: command.text,
+            draftIds: command.attachmentDraftIds,
+            accept,
+          })
+          .pipe(Effect.mapError(channelFailure));
+      else yield* channelSync(() => accept(null));
+      this.publish(channel.id);
+      yield* this.wake(channel.id);
+      return yield* channelSync(() => this.store.get(channel.id));
     }
     if (command.type === "send") {
       const recipientAgentId = command.recipientAgentId;
@@ -521,12 +527,28 @@ export class ChannelService {
       yield* channelSync(() => this.requireMember(channel, recipientAgentId));
     }
     if (command.type !== "stop") {
-      const pending = descendants(tasks, selected.id).filter(
-        (task) => task.execution === "instruction" && this.#coordination.owns(task.id),
+      const branchIds = new Set(descendants(tasks, selected.id).map((task) => task.id));
+      const linked = tasks.filter((instruction) => {
+        if (instruction.execution !== "instruction" || !branchIds.has(instruction.instructionTargetId ?? ""))
+          return false;
+        const target = tasks.find((task) => task.id === instruction.instructionTargetId);
+        return (
+          target &&
+          target.ownerAgentId === instruction.ownerAgentId &&
+          instruction.sourceMessageIds.includes(target.requestMessageId)
+        );
+      });
+      if (linked.some((task) => task.error === sourceText("error.backend.channelInstructionUncertain")))
+        return yield* channelFailure(new Error(sourceText("error.backend.channelInstructionUncertain")));
+      const pending = tasks.filter(
+        (task) =>
+          task.execution === "instruction" &&
+          this.#coordination.owns(task.id) &&
+          (branchIds.has(task.id) || linked.some((instruction) => instruction.id === task.id)),
       );
       if (pending.length) {
         // Recovery must first know whether an instruction has already reached its worker.
-        yield* this.#coordination.interrupt(pending);
+        yield* this.#coordination.settle(pending);
         const latest = yield* channelSync(() => this.store.tasks(channel.id));
         if (latest.find((task) => task.id === selected.id)?.revision !== selected.revision)
           return yield* channelFailure(new Error(sourceText("error.backend.channelAssignmentStopped")));
@@ -2034,7 +2056,11 @@ Follow-up instruction: ${instruction.instruction}`;
     );
     if (outcome === "accepted") {
       const latest = (yield* channelSync(() => this.store.tasks(task.channelId))).find((item) => item.id === task.id);
-      if (latest?.revision === task.revision)
+      if (
+        latest?.requestMessageId === task.requestMessageId &&
+        latest.ownerAgentId === task.ownerAgentId &&
+        latest.instruction === task.instruction
+      )
         yield* channelSync(() =>
           this.store.update(this.store.get(task.channelId), {
             tasks: [

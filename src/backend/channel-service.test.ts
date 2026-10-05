@@ -217,7 +217,7 @@ describe("shared channel coordination", () => {
           replies.set(agent.id, resolve);
           signals.set(agent.id, signal);
           signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
-        }),, catch: channelFailure }));
+        }), catch: channelFailure }));
     await runChannel(
       service.command(
         {
@@ -668,7 +668,7 @@ describe("shared channel coordination", () => {
     generate.mockImplementation(
       () => Effect.tryPromise({ try: async () => new Promise((resolve) => {
           finish = resolve;
-        }),, catch: channelFailure }));
+        }), catch: channelFailure }));
     const steer = vi.fn(() => Effect.tryPromise({ try: async () => "accepted" as const, catch: channelFailure }));
     service.hooks.steer = steer;
     await runChannel(
@@ -719,7 +719,7 @@ describe("shared channel coordination", () => {
       (agent, _prompt, signal) => Effect.tryPromise({ try: async () => new Promise((resolve, reject) => {
           replies.set(agent.id, resolve);
           signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
-        }),, catch: channelFailure }));
+        }), catch: channelFailure }));
     await runChannel(
       service.command(
         {
