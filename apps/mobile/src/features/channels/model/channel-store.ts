@@ -420,6 +420,12 @@ export class MobileChannelStore {
   /** Stop the active branches from this request; a task that finishes needs no stop. */
   async stopActiveTasks(serverId: string, channelId: string, operationId: () => string) {
     const entry = this.entry(serverId);
+    const active = new Map(
+      (this.get(serverId).pages.get(channelId)?.tasks ?? [])
+        .filter((task) => task.state === "queued" || task.state === "running" || task.state === "waiting")
+        .map((task) => [task.id, task]),
+    );
+    const requestIds = new Set([...active.values()].map((task) => task.requestMessageId));
     // A shared refresh can have started before the task finishes. Verify with a new read,
     // and publish that page without discarding history the reader already loaded.
     const read = async () => {
@@ -437,13 +443,18 @@ export class MobileChannelStore {
           this.publish(entry, { pages });
         }
       }
+      // A coordinator can finish with new independent roots while Stop waits. Include
+      // those roots for the original requests, but leave later requests alone.
+      for (const task of page.tasks) {
+        if (
+          task.parentTaskId === null &&
+          requestIds.has(task.requestMessageId) &&
+          (task.state === "queued" || task.state === "running" || task.state === "waiting")
+        )
+          active.set(task.id, task);
+      }
       return page;
     };
-    const active = new Map(
-      (this.get(serverId).pages.get(channelId)?.tasks ?? [])
-        .filter((task) => task.state === "queued" || task.state === "running" || task.state === "waiting")
-        .map((task) => [task.id, task]),
-    );
     for (const task of active.values()) {
       if (task.parentTaskId && active.has(task.parentTaskId)) continue;
       const terminal = (page: ChannelPage) => {

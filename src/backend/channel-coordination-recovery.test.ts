@@ -4,8 +4,11 @@ import { channelFailure } from "./channel-effects";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChannelCommand } from "@openbot/contracts/ipc";
+import { CHANNEL_CHATS_CAPABILITY, type ChannelCommand, parseChannelCommand } from "@openbot/contracts/ipc";
+import { CHANNEL_ROUTES, channelRequest } from "@openbot/contracts/team-protocol/channels-v1";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ChannelRequest, MobileChannelStore } from "../../apps/mobile/src/features/channels/model/channel-store";
+import { RemoteRequestError } from "../../apps/mobile/src/shared/lib/remote-request-error";
 import { stores } from "./agent-service-test-harness";
 import { AttachmentFiles } from "./attachment-files";
 import type { ChannelTextModel } from "./channel-history";
@@ -15,6 +18,7 @@ let root: string;
 let data: ReturnType<typeof stores>;
 let service: ChannelService;
 let limited = false;
+let capacity = true;
 let confirm: ((outcome: "accepted" | "rejected" | "uncertain") => void) | undefined;
 const generate = vi.fn<ChannelTextModel>();
 const actor = { id: "human", name: "Alex" };
@@ -30,11 +34,13 @@ beforeEach(async () => {
   await runChannel(data.store.getOrCreate("agent-a"));
   await runChannel(data.store.getOrCreate("agent-b"));
   limited = false;
+  capacity = true;
   confirm = undefined;
   generate.mockReset();
   service = new ChannelService(data.store.database, data.mailbox, {
     agents: () => data.store.list(),
     generate,
+    canGenerate: () => capacity,
     busy: () => limited,
     usageLimited: () => limited,
     schedule: () => {},
@@ -258,12 +264,14 @@ describe("channel coordination recovery", () => {
         throw new Error("The profile generation failed.");
       }, catch: channelFailure }));
       limited = false;
+      capacity = true;
       await runChannel(service.wake(channelId));
       await vi.waitFor(() => expect(generate).toHaveBeenCalled());
       await vi.waitFor(() => expect(service.responseCount()).toBe(0));
       expect(service.store.tasks(channelId).every((task) => task.state === "queued" && task.error === null)).toBe(true);
       generate.mockImplementation((agent) => Effect.tryPromise({ try: async () => JSON.stringify({ reply: `Status from ${agent.name}`, ...(audience === "lead" ? { actions: [] } : {}) }), catch: channelFailure }));
       limited = false;
+      capacity = true;
       await runChannel(service.wake(channelId));
       await vi.waitFor(() =>
         expect(service.store.tasks(channelId).every((task) => task.state === "completed")).toBe(true),
@@ -408,6 +416,227 @@ describe("channel coordination recovery", () => {
     await runChannel(service.command(request, actor));
     expect(service.store.messages(channelId).filter((item) => item.author.kind === "member")).toHaveLength(1);
   });
+});
+
+/** Create each task mode through public commands and a valid coordinator decision. */
+async function queuedTask(mode: "ordinary" | "coordinate" | "response" | "instruction") {
+  capacity = false;
+  service.hooks.busy = () => true;
+  if (mode === "ordinary" || mode === "instruction") {
+    await runChannel(service.command(
+      {
+        type: "send",
+        channelId,
+        operationId: "original",
+        text: "Original work",
+        recipientAgentId: "agent-a",
+        replyToMessageId: null,
+        attachmentDraftIds: [],
+      },
+      actor,
+    ));
+  }
+  if (mode === "instruction") {
+    const target = required(service.store.tasks(channelId)[0]);
+    capacity = true;
+    generate.mockImplementation(() => Effect.tryPromise({ try: async () => {
+      capacity = false;
+      return JSON.stringify({
+        reply: "",
+        actions: [{ kind: "instruct", taskId: target.id, instruction: "Keep compatibility" }],
+      });
+    }, catch: channelFailure }));
+  }
+  if (mode !== "ordinary")
+    await runChannel(service.command(coordinate("original-coordinate", mode === "response" ? "all" : "lead"), actor));
+  await vi.waitFor(() =>
+    expect(
+      service.store.tasks(channelId).some((task) => (mode === "ordinary" ? !task.execution : task.execution === mode)),
+    ).toBe(true),
+  );
+  return required(
+    service.store.tasks(channelId).find((task) => (mode === "ordinary" ? !task.execution : task.execution === mode)),
+  );
+}
+
+describe("channel task admission", () => {
+  it.each(["ordinary", "coordinate", "response", "instruction"] as const)(
+    "delivers released Send as ordinary work after routing to %s",
+    async (mode) => {
+      const previous = await queuedTask(mode);
+      for (const task of service.store.tasks(channelId).filter((task) => task.state !== "completed"))
+        await runChannel(service.command(
+          { type: "stop", channelId, operationId: `stop-${task.id}`, taskId: task.id, recipientAgentId: null },
+          actor,
+        ));
+      generate.mockImplementation((_agent, prompt) => Effect.tryPromise({ try: async () => JSON.stringify(
+          prompt.includes("Select one responsible channel member")
+            ? { taskId: previous.id }
+            : { reply: "Restricted answer", ...(mode === "response" ? {} : { actions: [] }) },
+        ), catch: channelFailure }));
+      capacity = true;
+      service.hooks.busy = () => false;
+      await runChannel(service.command(
+        {
+          type: "send",
+          channelId,
+          operationId: "fresh-send",
+          text: "Review the fresh report",
+          recipientAgentId: null,
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ));
+      await vi.waitFor(() =>
+        expect(
+          service.store.assignments(channelId).find((item) => item.taskId === previous.id)?.deliveryId,
+        ).toBeTruthy(),
+      );
+      const assignment = required(service.store.assignments(channelId).find((item) => item.taskId === previous.id));
+      const packet = required(
+        await runChannel(service.prepare(required(data.mailbox.getDelivery(required(assignment.deliveryId))))),
+      );
+      expect(packet.text).toContain("Review the fresh report");
+      expect(assignment.resources).toEqual(["host"]);
+      const work = required(service.store.tasks(channelId).find((task) => task.id === previous.id));
+      expect(work.execution).toBeUndefined();
+      expect(work.instructionTargetId).toBeUndefined();
+      expect(work.instructionTargetRevision).toBeUndefined();
+    },
+  );
+
+  it.each(["ordinary", "coordinate", "response", "instruction"] as const)(
+    "keeps removed-owner %s paused on Resume and permits Reassign",
+    async (mode) => {
+      const task = await queuedTask(mode);
+      await runChannel(service.command(
+        {
+          type: "save",
+          channelId,
+          operationId: "remove",
+          draft: { ...channelDraft, members: [{ agentId: "agent-b" }], leadAgentId: "agent-b" },
+        },
+        actor,
+      ));
+      expect(data.store.list().some((agent) => agent.id === "agent-a")).toBe(true);
+      capacity = true;
+      service.hooks.busy = () => false;
+      generate.mockClear();
+      generate.mockImplementation((_agent, prompt) => Effect.tryPromise({ try: async () => JSON.stringify({
+          reply: "Current member answer",
+          ...(prompt.includes("Coordinate this request") ? { actions: [] } : {}),
+        }), catch: channelFailure }));
+      await runChannel(service.command(
+        { type: "resume", channelId, operationId: "resume", taskId: task.id, recipientAgentId: null },
+        actor,
+      ));
+      await vi.waitFor(() => expect(service.responseCount()).toBe(0));
+      expect(service.store.tasks(channelId).find((item) => item.id === task.id)).toMatchObject({
+        state: "paused",
+        error: expect.stringContaining("unavailable"),
+      });
+      expect(generate.mock.calls.some(([agent]) => agent.id === "agent-a")).toBe(false);
+      await runChannel(service.command(
+        { type: "reassign", channelId, operationId: "reassign", taskId: task.id, recipientAgentId: "agent-b" },
+        actor,
+      ));
+      if (mode === "ordinary" || mode === "instruction") {
+        await vi.waitFor(() =>
+          expect(service.store.assignments(channelId).find((item) => item.taskId === task.id)?.deliveryId).toBeTruthy(),
+        );
+        expect(service.store.assignments(channelId).find((item) => item.taskId === task.id)?.agentId).toBe("agent-b");
+      } else {
+        await vi.waitFor(() =>
+          expect(service.store.tasks(channelId).find((item) => item.id === task.id)?.state).toBe("completed"),
+        );
+      }
+    },
+  );
+
+  it.each(["before-read", "during-stop"] as const)(
+    "mobile Stop includes coordinator assignments created %s and preserves later requests",
+    async (timing) => {
+      let finish: ((result: string) => void) | undefined;
+      const decision = new Promise<string>((resolve) => {
+        finish = resolve;
+      });
+      generate.mockReturnValue(decision);
+      service.hooks.busy = () => true;
+      await runChannel(service.command(coordinate("coordinate"), actor));
+      await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+      let stopping = false;
+      let released = false;
+      const stops: string[] = [];
+      const complete = async () => {
+        if (released) return;
+        released = true;
+        required(finish)(
+          JSON.stringify({
+            reply: "",
+            actions: [{ kind: "assign", agentId: "agent-b", instruction: "Edit the workspace", execution: "work" }],
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(service.store.tasks(channelId).some((task) => task.instruction === "Edit the workspace")).toBe(true),
+        );
+        await runChannel(service.command(
+          {
+            type: "send",
+            channelId,
+            operationId: "later",
+            text: "An unrelated later request",
+            recipientAgentId: "agent-b",
+            replyToMessageId: null,
+            attachmentDraftIds: [],
+          },
+          actor,
+        ));
+      };
+      const request: ChannelRequest = async (_method, path, decode, body) => {
+        if (path === CHANNEL_ROUTES.list) return decode(service.store.list(actor.id));
+        if (path === CHANNEL_ROUTES.read) {
+          if (stopping && timing === "before-read") await complete();
+          return decode(service.store.page(channelId));
+        }
+        if (path === CHANNEL_ROUTES.command) {
+          const command = parseChannelCommand(channelRequest(path, body));
+          if (command.type === "stop") stops.push(command.taskId);
+          if (stopping && timing === "during-stop") await complete();
+          try {
+            return decode(await runChannel(service.command(command, actor)));
+          } catch (error) {
+            // The released dispatcher maps the terminal-task error to HTTP 500.
+            if (!(error instanceof Error)) throw error;
+            expect(error.message).toBe("This task is already complete.");
+            throw new RemoteRequestError(500, "The server request failed.");
+          }
+        }
+        throw new Error("Unexpected request");
+      };
+      const mobile = new MobileChannelStore(request);
+      mobile.configure("host", [CHANNEL_CHATS_CAPABILITY]);
+      const dispose = mobile.observe("host", channelId);
+      try {
+        await mobile.refresh("host");
+        stopping = true;
+        await mobile.stopActiveTasks("host", channelId, () => `stop-${stops.length}`);
+        const worker = required(
+          service.store.tasks(channelId).find((task) => task.instruction === "Edit the workspace"),
+        );
+        expect(worker.state).toBe("paused");
+        expect(stops).toContain(worker.id);
+        const later = required(
+          service.store.tasks(channelId).find((task) => task.instruction === "An unrelated later request"),
+        );
+        expect(later.state).toBe("queued");
+        expect(stops).not.toContain(later.id);
+      } finally {
+        dispose();
+        required(finish)(JSON.stringify({ reply: "", actions: [] }));
+      }
+    },
+  );
 });
 
 function required<T>(value: T | null | undefined): T {

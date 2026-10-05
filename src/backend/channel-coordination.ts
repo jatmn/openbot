@@ -156,7 +156,10 @@ export class ChannelCoordination {
     )
       return;
     const agent = this.#options.agents().find((agent) => agent.id === task.ownerAgentId);
-    if (!agent) {
+    if (
+      !agent ||
+      !this.#options.store.get(task.channelId).members.some((member) => member.agentId === task.ownerAgentId)
+    ) {
       this.#options.store.update(this.#options.store.get(task.channelId), {
         tasks: [{ ...task, state: "paused", error: sourceText("error.backend.channelAssigneeUnavailable") }],
       });

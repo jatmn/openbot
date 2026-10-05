@@ -889,7 +889,8 @@ export class ChannelService {
                         ),
                       { ...task, state: "cancelled" },
                       {
-                        ...existing,
+                        ...ordinaryChannelTask(existing),
+                        resources: existing.execution ? ["host"] : existing.resources,
                         instruction: task.instruction,
                         requestMessageId: task.requestMessageId,
                         attachmentDraftIds: task.attachmentDraftIds,
