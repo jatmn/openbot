@@ -81,6 +81,7 @@ function ChannelChat({ channelId, serverId }: { channelId: string; serverId: str
       }}
       agents={members}
       mentionAgents={members}
+      channelGroupMentions={state.coordinationSupported}
       projectedMessages={messages}
       referenceMessages={messages}
       ready={Boolean(page)}
@@ -88,7 +89,27 @@ function ChannelChat({ channelId, serverId }: { channelId: string; serverId: str
       canSend={canSend}
       readOnly={Boolean(channel?.archived)}
       activities={activities}
-      activeTurnId={null}
+      activeTurnId={
+        page?.tasks.some((task) => ["queued", "running", "waiting"].includes(task.state)) ? channelId : null
+      }
+      stopTurn={async () => {
+        const active = new Map(
+          (page?.tasks ?? [])
+            .filter((task) => ["queued", "running", "waiting"].includes(task.state))
+            .map((task) => [task.id, task]),
+        );
+        // Stopping an active parent also stops its children. Send only the top active tasks.
+        for (const task of active.values()) {
+          if (task.parentTaskId && active.has(task.parentTaskId)) continue;
+          await state.store.command(serverId, {
+            type: "stop",
+            operationId: Crypto.randomUUID(),
+            channelId,
+            taskId: task.id,
+            recipientAgentId: null,
+          });
+        }
+      }}
       questionForm={questionForm}
       onSelectQuestion={selectPrompt}
       readBoundary={throughSequence ? String(throughSequence) : null}
@@ -112,7 +133,11 @@ function ChannelChat({ channelId, serverId }: { channelId: string; serverId: str
         sender.send(body, files, replyToMessageId, channel?.members ?? [], upload)
       }
       notice={channel?.archived ? t("mobile.channel.chat.deletedNotice") : undefined}
-      needsAction={channelTasksNeedingAction(page?.tasks ?? []).length > 0 && !channel?.archived}
+      needsAction={
+        (channelTasksNeedingAction(page?.tasks ?? []).length > 0 ||
+          (page?.tasks.some((task) => ["queued", "running", "waiting"].includes(task.state)) ?? false)) &&
+        !channel?.archived
+      }
     />
   );
 }

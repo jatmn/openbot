@@ -134,7 +134,10 @@ export class DrainScheduler {
     this.#channels = options.channels;
     this.#messaging = options.messaging;
     this.#slots = new TurnSlots({
-      limit: () => this.#memory.turnLimit(),
+      limit: () => {
+        const limit = this.#memory.turnLimit();
+        return limit === null ? null : Math.max(0, limit - (this.#channels?.responseCount() ?? 0));
+      },
       agentIds: () => this.#store.list().map((agent) => agent.id),
       // A start whose `turn/start` timed out stays "starting" with no turn ID, and its turn can still run.
       isRunning: (agentId) =>

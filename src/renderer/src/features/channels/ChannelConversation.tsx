@@ -1,5 +1,9 @@
 import { expandAttachmentReferences } from "@openbot/contracts/attachment-references";
-import { chatTagReferences, expandChatTagReferences } from "@openbot/contracts/chat-tag-references";
+import {
+  channelGroupMention,
+  chatTagReferences,
+  expandChatTagReferences,
+} from "@openbot/contracts/chat-tag-references";
 import {
   type AgentApproval,
   type AttachmentSummary,
@@ -478,20 +482,18 @@ export function ChannelConversation(props: ChannelConversationProps) {
   });
   const name = (id: string | null) =>
     agentList().find((agent) => agent.id === id)?.name ?? t("sidebar.section.unassigned");
-  /**
-   * The work that waits for the reader: one entry for each stopped run, not for each stopped task.
-   *
-   * A task the service stopped carries the reason it stopped, and an archived channel stops every
-   * task without one, so the reason is what tells the two apart. A failed task belongs here too: it
-   * carries its own reason, its parent waits for it, and nothing but the reader starts it again.
-   * The assignment limit stops a whole tree at once, and `resume` starts a task with everything
-   * under it, so the entry has to be the root: a reader who continues a child would leave the root
-   * stopped, and a card for each task would repeat one reason several times.
-   */
+  /** One status and control per run. Stop and resume also affect its child tasks. */
   const pausedTasks = createMemo(() => {
     const page = channels.state.page;
     if (!page || page.channel.archived) return [];
-    const stopped = page.tasks.filter((task) => (task.state === "paused" || task.state === "failed") && task.error);
+    const stopped = page.tasks.filter(
+      (task) =>
+        task.state === "queued" ||
+        task.state === "running" ||
+        task.state === "waiting" ||
+        task.state === "paused" ||
+        task.state === "failed",
+    );
     const roots = new Map<string, (typeof stopped)[number]>();
     for (const task of stopped) {
       const known = roots.get(task.rootTaskId);
@@ -569,11 +571,16 @@ export function ChannelConversation(props: ChannelConversationProps) {
     );
     void channels.command(
       {
-        type: "send",
+        ...(channelGroupMention(expanded) ||
+        (channels.coordinationSupported() && (!mention || mention.id === channels.state.page?.channel.leadAgentId))
+          ? {
+              type: "coordinate" as const,
+              audience: channelGroupMention(expanded) ? ("all" as const) : ("lead" as const),
+            }
+          : { type: "send" as const, recipientAgentId: mention?.id ?? null }),
         operationId: crypto.randomUUID(),
         channelId,
         text: expanded,
-        recipientAgentId: mention?.id ?? null,
         replyToMessageId,
         attachmentDraftIds: attachments.map((attachment) => attachment.id),
       },
@@ -613,7 +620,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
             variant="ghost"
             onClick={() =>
               void channels.retry((sent) => {
-                if (sent.type === "send") clearSent(sent.channelId, sent.text);
+                if (sent.type === "send" || sent.type === "coordinate") clearSent(sent.channelId, sent.text);
               })
             }
           >
@@ -943,6 +950,15 @@ export function ChannelConversation(props: ChannelConversationProps) {
                   members={page().channel.members}
                   name={name}
                   onResume={resumeTask}
+                  onStop={(taskId) =>
+                    channels.command({
+                      type: "stop",
+                      operationId: crypto.randomUUID(),
+                      channelId: page().channel.id,
+                      taskId,
+                      recipientAgentId: null,
+                    })
+                  }
                 />
                 <form
                   class="composer"
@@ -998,6 +1014,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                   <div class="composer-input-label">
                     <ComposerEditor
                       agentId={undefined}
+                      channelGroupMentions={channels.coordinationSupported()}
                       agents={agentList().filter((agent) =>
                         page().channel.members.some((member) => member.agentId === agent.id),
                       )}

@@ -6,6 +6,10 @@ import {
   type ChannelTask,
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import {
+  CHANNEL_COORDINATION_CAPABILITY,
+  CHANNEL_COORDINATION_ROUTE,
+} from "@openbot/contracts/team-protocol/channel-coordination-v1";
 import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import type { TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
 import { createWorkspacePreferences } from "@openbot/team-client";
@@ -71,6 +75,21 @@ function deferred<T>() {
 }
 
 describe("mobile channels", () => {
+  it("uses explicit group delivery only when the host supports coordination", async () => {
+    const { store, calls } = fixture(async (path) => (path === CHANNEL_ROUTES.list ? [channel] : channel));
+    const sender = new ChannelSend(store, "host-one", channel.id, () => "broadcast-one");
+    await expect(sender.send("@everyone status", [], null, channel.members)).rejects.toThrow(
+      "does not support channel coordination",
+    );
+    expect(calls).not.toHaveBeenCalled();
+    store.configure("host-one", [CHANNEL_CHATS_CAPABILITY, CHANNEL_COORDINATION_CAPABILITY]);
+    await sender.send("@everyone status", [], null, channel.members);
+    expect(calls).toHaveBeenCalledWith(
+      CHANNEL_COORDINATION_ROUTE,
+      expect.objectContaining({ type: "coordinate", audience: "all", operationId: "broadcast-one" }),
+      "host-one",
+    );
+  });
   it("preserves empty channel forms and expires superseded prompts", () => {
     const history = page(1, 1);
     const message = history.messages[0];

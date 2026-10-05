@@ -158,10 +158,16 @@ it("shows the lead's routing choice as activity, not as a message from the lead"
   await fireEvent.click(await screen.findByRole("button", { name: /Launch room/ }));
   const chat = await screen.findByRole("main", { name: "Channel conversation" });
   await within(chat).findByRole("heading", { name: "Launch room", level: 1 });
-  const composer = within(chat).getByRole("textbox", { name: "Message to channel" });
-  composer.textContent = "Someone please draft the announcement";
-  await fireEvent.input(composer);
-  await fireEvent.click(within(chat).getByRole("button", { name: "Send message" }));
+  // A released client still uses send; its routing receipt remains readable by the new UI.
+  await window.openbot.agent.channelCommand({
+    type: "send",
+    operationId: "legacy-routing",
+    channelId: "channel-routed",
+    text: "Someone please draft the announcement",
+    recipientAgentId: null,
+    replyToMessageId: null,
+    attachmentDraftIds: [],
+  });
 
   const receipt = await within(chat).findByLabelText("Assigned to Chief");
   // Activity carries no bubble, so it offers none of the actions a message row does.
@@ -767,7 +773,7 @@ it("retries a lost response once and keeps a focused draft through incoming mess
   let loseResponse = true;
   vi.spyOn(window.openbot.agent, "channelCommand").mockImplementation(async (input) => {
     const result = await originalCommand(input);
-    if (input.type === "send" && loseResponse) {
+    if (input.type === "coordinate" && loseResponse) {
       loseResponse = false;
       throw new Error("Connection lost after sending.");
     }
@@ -779,7 +785,7 @@ it("retries a lost response once and keeps a focused draft through incoming mess
   await fireEvent.click(within(chat).getByRole("button", { name: "Send message" }));
   await fireEvent.click(await within(chat).findByRole("button", { name: "Retry" }));
   expect(window.openbot.agent.channelCommand).toHaveBeenCalledWith(
-    expect.objectContaining({ type: "send", recipientAgentId: "chief" }),
+    expect.objectContaining({ type: "coordinate", audience: "lead" }),
   );
   await waitFor(() => expect(composer).toHaveTextContent(""));
   expect(within(chat).getAllByRole("article", { name: "Message from You" })).toHaveLength(1);
@@ -849,7 +855,7 @@ it("addresses a channel member only while the request names one", async () => {
   await fireEvent.input(composer);
   await fireEvent.click(within(chat).getByRole("button", { name: "Send message" }));
   await waitFor(() =>
-    expect(command).toHaveBeenCalledWith(expect.objectContaining({ type: "send", recipientAgentId: "chief" })),
+    expect(command).toHaveBeenCalledWith(expect.objectContaining({ type: "coordinate", audience: "lead" })),
   );
 
   // The composer keeps no recipient of its own; a stale one would address every later request.
@@ -859,7 +865,7 @@ it("addresses a channel member only while the request names one", async () => {
   await fireEvent.click(within(chat).getByRole("button", { name: "Send message" }));
   await waitFor(() =>
     expect(command).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "send", text: "Add the rollback step", recipientAgentId: null }),
+      expect.objectContaining({ type: "coordinate", text: "Add the rollback step", audience: "lead" }),
     ),
   );
 });
@@ -911,4 +917,34 @@ it("keeps the working indicator while the coordinator chooses an owner", async (
   // The lead is the coordinator. Its routing turn holds the task and posts nothing until it
   // decides, so the indicator is the only sign that the request is alive.
   expect(await within(chat).findByRole("status", { name: /^Chief is working: / })).toBeInTheDocument();
+});
+
+it.each(["@all", "@everyone"])("keeps %s assignments separate when one member is stopped", async (mention) => {
+  const chat = await openSavedChannel();
+  await window.openbot.agent.channelCommand({
+    type: "save",
+    operationId: "add-member",
+    channelId: "channel-test",
+    draft: {
+      name: "Project room",
+      title: "",
+      instructions: "Research the project",
+      members: [{ agentId: "chief" }, { agentId: "sales-outbound" }],
+      leadAgentId: "chief",
+    },
+  });
+  const composer = within(chat).getByRole("textbox", { name: "Message to channel" });
+  composer.textContent = `${mention} Report status`;
+  await fireEvent.input(composer);
+  await fireEvent.click(within(chat).getByRole("button", { name: "Send message" }));
+  const chief = await within(chat).findByRole("region", { name: "Task for Chief" });
+  const sales = await within(chat).findByRole("region", { name: "Task for Sales Outbound" });
+  expect(within(sales).getByRole("button", { name: "Stop this task" })).toBeEnabled();
+  await fireEvent.click(within(chief).getByRole("button", { name: "Stop this task" }));
+  await within(chat).findByRole("region", { name: "Stopped task for Chief" });
+  expect(within(chat).getByRole("region", { name: "Task for Sales Outbound" })).toBeInTheDocument();
+  const page = await window.openbot.agent.readChannel({ channelId: "channel-test" });
+  expect(page.tasks).toHaveLength(2);
+  expect(page.tasks.find((task) => task.ownerAgentId === "chief")?.state).toBe("paused");
+  expect(page.tasks.find((task) => task.ownerAgentId === "sales-outbound")?.state).toBe("queued");
 });

@@ -49,6 +49,7 @@ export interface ChatViewProps {
   queue?: ChatQueueController;
   agents: MobileAgent[];
   mentionAgents: MobileAgent[];
+  channelGroupMentions?: boolean;
   projectedMessages: ChatMessage[];
   referenceMessages: ChatMessage[];
   ready: boolean;
@@ -96,6 +97,7 @@ export function ChatView({
   queue,
   agents: serverAgents,
   mentionAgents,
+  channelGroupMentions = false,
   projectedMessages,
   referenceMessages,
   ready,
@@ -646,6 +648,7 @@ export function ChatView({
                   handoffFocusVersion={handoffFocusVersion}
                   onCancelReply={() => setReplyTarget(null)}
                   mentionAgents={mentionAgents}
+                  channelGroupMentions={channelGroupMentions}
                   key={target.id}
                   action={action}
                   actionForeground={actionForeground}

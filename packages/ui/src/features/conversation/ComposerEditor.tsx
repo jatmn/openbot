@@ -50,6 +50,7 @@ import {
 import { isSendShortcutKey, type SendShortcut } from "./send-shortcut";
 
 interface ComposerEditorProps {
+  channelGroupMentions?: boolean;
   agentId: string | undefined;
   agents: AgentProfile[];
   skills?: InstalledSkill[];
@@ -166,6 +167,11 @@ export function ComposerEditor(props: ComposerEditorProps) {
       ];
     if (trigger !== "@") return [];
     return [
+      ...(props.channelGroupMentions && !props.value.slice(0, mention()?.start ?? 0).trim()
+        ? (["all", "everyone"] as const)
+            .filter((name) => name.startsWith(mention()?.query.trim().toLowerCase() ?? ""))
+            .map((name) => ({ type: "group" as const, name }))
+        : []),
       ...matchingAgents().map((agent) => ({ type: "agent" as const, agent })),
       ...matchingAttachments().map((attachment) => ({
         type: "attachment" as const,
@@ -401,13 +407,15 @@ export function ComposerEditor(props: ComposerEditorProps) {
     if (!range) return;
     range.deleteContents();
     const token =
-      option.type === "agent"
-        ? createMentionToken(option.agent)
-        : option.type === "skill"
-          ? createSkillToken(option.skill)
-          : option.type === "mcp"
-            ? createMcpToken(option.server)
-            : createAttachmentToken(option.attachment, attachmentTokenActions);
+      option.type === "group"
+        ? document.createTextNode(`@${option.name}`)
+        : option.type === "agent"
+          ? createMentionToken(option.agent)
+          : option.type === "skill"
+            ? createSkillToken(option.skill)
+            : option.type === "mcp"
+              ? createMcpToken(option.server)
+              : createAttachmentToken(option.attachment, attachmentTokenActions);
     const trailingSpace = document.createTextNode(" ");
     range.insertNode(trailingSpace);
     range.insertNode(token);
@@ -760,7 +768,9 @@ export function ComposerEditor(props: ComposerEditorProps) {
                       }}
                       onMouseEnter={() => setActiveOption(optionIndex())}
                     >
-                      {option.type === "agent" ? (
+                      {option.type === "group" ? (
+                        <Bot aria-hidden="true" />
+                      ) : option.type === "agent" ? (
                         <AgentAvatar agent={option.agent} />
                       ) : option.type === "skill" ? (
                         <span class="mention-picker-skill-icon" aria-hidden="true">

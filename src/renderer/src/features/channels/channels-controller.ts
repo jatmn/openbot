@@ -44,6 +44,7 @@ export interface ChannelsEnvironment {
   readSelection: (scope: string) => string | null;
   writeSelection: (channelId: string | null) => void;
   supported: () => boolean;
+  coordinationSupported?: () => boolean;
   /** Whether this reader may delete a channel; `supported()` is checked as well. */
   deletionSupported: () => boolean;
   /** Clears whatever else covers the workspace, because a channel is about to cover it. */
@@ -73,6 +74,7 @@ export function createChannelsController(env: ChannelsEnvironment) {
   const readThrough = new Map<string, number>();
 
   const supported = env.supported;
+  const coordinationSupported = () => env.coordinationSupported?.() ?? false;
   /**
    * One read at a time, and at most one more behind it.
    *
@@ -229,6 +231,8 @@ export function createChannelsController(env: ChannelsEnvironment) {
       }),
     );
     try {
+      if (attempt.type === "coordinate" && !coordinationSupported())
+        throw new Error(currentText().t("error.backend.channelCoordinationUnsupported"));
       await env.port().agent.channelCommand(attempt);
       if (disposed || account !== env.scopeKey()) {
         onAccepted?.(attempt);
@@ -349,6 +353,7 @@ export function createChannelsController(env: ChannelsEnvironment) {
     });
   }
   return {
+    coordinationSupported,
     state,
     port: env.port,
     hasUnread: () => state.channels.some((channel) => channel.unreadCount > 0),

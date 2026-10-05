@@ -15,6 +15,10 @@ import {
   type UpdateChannelRoutineInput,
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import {
+  CHANNEL_COORDINATION_CAPABILITY,
+  CHANNEL_COORDINATION_ROUTE,
+} from "@openbot/contracts/team-protocol/channel-coordination-v1";
 import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import { decodeTeamProtocolV2Json, type TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
 import { sourceText } from "@openbot/i18n/source";
@@ -36,6 +40,7 @@ export interface ChannelState {
   pages: ReadonlyMap<string, ChannelPage>;
   supported: boolean;
   canDelete: boolean;
+  coordinationSupported: boolean;
   loading: boolean;
   /** The last load failure. A screen renders it in the interface language. */
   error: { cause: unknown } | null;
@@ -45,6 +50,7 @@ const EMPTY: ChannelState = {
   pages: new Map(),
   supported: false,
   canDelete: false,
+  coordinationSupported: false,
   loading: false,
   error: null,
 };
@@ -117,6 +123,7 @@ export class MobileChannelStore {
       next.pages === entry.state.pages &&
       next.supported === entry.state.supported &&
       next.canDelete === entry.state.canDelete &&
+      next.coordinationSupported === entry.state.coordinationSupported &&
       next.loading === entry.state.loading &&
       next.error === entry.state.error
     )
@@ -129,6 +136,7 @@ export class MobileChannelStore {
     this.publish(entry, {
       supported: capabilities.includes(CHANNEL_CHATS_CAPABILITY),
       canDelete: capabilities.includes(CHANNEL_DELETE_CAPABILITY),
+      coordinationSupported: capabilities.includes(CHANNEL_COORDINATION_CAPABILITY),
     });
   }
   remove(serverId: string) {
@@ -363,11 +371,13 @@ export class MobileChannelStore {
   async command(serverId: string, command: ChannelCommand, options?: { waitForRefresh: boolean }) {
     const entry = this.entry(serverId);
     if (!entry.state.supported) throw new Error(sourceText("error.remote.channelsUnsupported"));
+    if (command.type === "coordinate" && !entry.state.coordinationSupported)
+      throw new Error(sourceText("error.backend.channelCoordinationUnsupported"));
     const unreadChannel =
       command.type === "read" ? entry.state.channels.find((channel) => channel.id === command.channelId) : undefined;
     const result = await this.request(
       "POST",
-      CHANNEL_ROUTES.command,
+      command.type === "coordinate" ? CHANNEL_COORDINATION_ROUTE : CHANNEL_ROUTES.command,
       decodeChannel,
       decodeTeamProtocolV2Json(command),
       serverId,
