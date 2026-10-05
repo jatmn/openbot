@@ -92,24 +92,7 @@ function ChannelChat({ channelId, serverId }: { channelId: string; serverId: str
       activeTurnId={
         page?.tasks.some((task) => ["queued", "running", "waiting"].includes(task.state)) ? channelId : null
       }
-      stopTurn={async () => {
-        const active = new Map(
-          (page?.tasks ?? [])
-            .filter((task) => ["queued", "running", "waiting"].includes(task.state))
-            .map((task) => [task.id, task]),
-        );
-        // Stopping an active parent also stops its children. Send only the top active tasks.
-        for (const task of active.values()) {
-          if (task.parentTaskId && active.has(task.parentTaskId)) continue;
-          await state.store.command(serverId, {
-            type: "stop",
-            operationId: Crypto.randomUUID(),
-            channelId,
-            taskId: task.id,
-            recipientAgentId: null,
-          });
-        }
-      }}
+      stopTurn={() => state.store.stopActiveTasks(serverId, channelId, Crypto.randomUUID)}
       questionForm={questionForm}
       onSelectQuestion={selectPrompt}
       readBoundary={throughSequence ? String(throughSequence) : null}

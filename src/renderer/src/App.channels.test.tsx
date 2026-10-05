@@ -662,7 +662,9 @@ it("shows a channel read that lands while more changes are still arriving", asyn
   for (const release of gates) release();
 });
 
-async function openChannelWithStoppedTask(options: { withChild?: boolean; state?: "paused" | "failed" } = {}) {
+async function openChannelWithStoppedTask(
+  options: { withChild?: boolean; state?: "paused" | "failed"; waitingRoot?: boolean } = {},
+) {
   await window.openbot.agent.channelCommand({
     type: "save",
     operationId: "create",
@@ -685,7 +687,7 @@ async function openChannelWithStoppedTask(options: { withChild?: boolean; state?
     attachmentDraftIds: [],
   });
   const originalRead = window.openbot.agent.readChannel;
-  const state = { taskId: "", stopped: true };
+  const state = { taskId: "", childTaskId: "", stopped: true };
   const read = vi.spyOn(window.openbot.agent, "readChannel").mockImplementation(async (input) => {
     const page = await originalRead(input);
     state.taskId = page.tasks[0]?.id ?? "";
@@ -698,11 +700,22 @@ async function openChannelWithStoppedTask(options: { withChild?: boolean; state?
     // The assignment limit stops the root task and everything under it, so the child arrives
     // stopped with the same reason on it.
     const child = stopped[0] ? [{ ...stopped[0], id: `${stopped[0].id}-child`, parentTaskId: stopped[0].id }] : [];
+    state.childTaskId = child[0]?.id ?? "";
+    if (options.waitingRoot)
+      return {
+        ...page,
+        tasks: [...stopped.map((task) => ({ ...task, state: "waiting" as const, error: null })), ...child],
+      };
     return { ...page, tasks: options.withChild ? [...stopped, ...child] : stopped };
   });
   const originalCommand = window.openbot.agent.channelCommand;
   const command = vi.spyOn(window.openbot.agent, "channelCommand").mockImplementation(async (input) => {
-    const result = await originalCommand(input);
+    // The child exists in this read fixture; use the saved root to apply its recovery transition.
+    const result = await originalCommand(
+      (input.type === "resume" || input.type === "reassign") && input.taskId === state.childTaskId
+        ? { ...input, taskId: state.taskId }
+        : input,
+    );
     if (input.type === "resume" || input.type === "reassign") state.stopped = false;
     return result;
   });
@@ -748,6 +761,19 @@ it("reassigns a task the channel stopped with a reason", async () => {
     ),
   );
   await waitFor(() => expect(screen.queryByRole("region", { name: "Stopped task for Chief" })).not.toBeInTheDocument());
+});
+
+it.each(["paused", "failed"] as const)("keeps recovery for a %s child under a waiting root", async (state) => {
+  const { notice, command, state: tasks } = await openChannelWithStoppedTask({ waitingRoot: true, state });
+  expect(notice).toHaveTextContent(STOPPED_TASK_REASON);
+  expect(within(notice).getByRole("button", { name: "Reassign the stopped task of Chief" })).toBeInTheDocument();
+  expect(
+    within(screen.getByRole("region", { name: "Task for Chief" })).getByRole("button", { name: "Stop this task" }),
+  ).toBeInTheDocument();
+  await fireEvent.click(within(notice).getByRole("button", { name: "Continue" }));
+  await waitFor(() =>
+    expect(command).toHaveBeenCalledWith(expect.objectContaining({ type: "resume", taskId: tasks.childTaskId })),
+  );
 });
 
 it("keeps a stopped-task notice after a failed action and a refresh", async () => {

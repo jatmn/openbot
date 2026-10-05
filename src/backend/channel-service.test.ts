@@ -157,14 +157,19 @@ describe("shared channel coordination", () => {
 
   it("broadcasts once to each member and overlaps responses while the coordinator remains responsive", async () => {
     const replies = new Map<string, (value: string) => void>();
-    generate.mockImplementation((agent, prompt, signal) => Effect.tryPromise({ try: async () => {
-      if (prompt.includes("Coordinate this request"))
-        return Promise.resolve(JSON.stringify({ reply: "Two responses are running.", actions: [] }));
-      return new Promise((resolve, reject) => {
-        replies.set(agent.id, resolve);
-        signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
-      });
-    }, catch: channelFailure }));
+    generate.mockImplementation((agent, prompt, signal) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (prompt.includes("Coordinate this request"))
+            return Promise.resolve(JSON.stringify({ reply: "Two responses are running.", actions: [] }));
+          return new Promise((resolve, reject) => {
+            replies.set(agent.id, resolve);
+            signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+          });
+        },
+        catch: channelFailure,
+      }),
+    );
     const command = {
       type: "coordinate" as const,
       audience: "all" as const,
@@ -180,10 +185,9 @@ describe("shared channel coordination", () => {
     await runChannel(service.recover());
     expect(service.store.tasks("channel-1").map((task) => task.state)).toEqual(["running", "running"]);
     expect(service.store.messages("channel-1").filter((message) => message.author.kind === "member")).toHaveLength(1);
-    await runChannel(service.command(
-      { ...command, audience: "lead", operationId: operationId(), text: "What is happening?" },
-      actor,
-    ));
+    await runChannel(
+      service.command({ ...command, audience: "lead", operationId: operationId(), text: "What is happening?" }, actor),
+    );
     await vi.waitFor(() =>
       expect(
         service.store.messages("channel-1").some((entry) => entry.message.text === "Two responses are running."),
@@ -214,24 +218,28 @@ describe("shared channel coordination", () => {
           signals.set(agent.id, signal);
           signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
         }),, catch: channelFailure }));
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "all",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "@everyone status",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "all",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "@everyone status",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() => expect(replies.size).toBe(2));
     const task = required(service.store.tasks("channel-1").find((task) => task.ownerAgentId === "agent-a"));
-    await runChannel(service.command(
-      { type: "stop", channelId: "channel-1", operationId: operationId(), taskId: task.id, recipientAgentId: null },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        { type: "stop", channelId: "channel-1", operationId: operationId(), taskId: task.id, recipientAgentId: null },
+        actor,
+      ),
+    );
     expect(signals.get("agent-a")?.aborted).toBe(true);
     replies.get("agent-b")?.(JSON.stringify({ reply: "Still here" }));
     await vi.waitFor(() =>
@@ -247,18 +255,20 @@ describe("shared channel coordination", () => {
   it("queues tools-required broadcast work behind the existing host reservation", async () => {
     const work = await send("Edit project A");
     generate.mockReturnValue(Effect.succeed(JSON.stringify({ work: true })));
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "all",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "@all inspect the files",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "all",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "@all inspect the files",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() =>
       expect(
         service.store
@@ -287,28 +297,34 @@ describe("shared channel coordination", () => {
       service.accepted(deliveryId, "work-session", "work-turn");
       const steer = vi.fn(() => Effect.tryPromise({ try: async () => outcome, catch: channelFailure }));
       service.hooks.steer = steer;
-      generate.mockReturnValue(Effect.succeed(
-        JSON.stringify({
-          reply: "I will pass that instruction to the worker.",
-          actions: [{ kind: "instruct", taskId: work.id, instruction: "Support Windows too" }],
-        }),
-      ));
-      await runChannel(service.command(
-        {
-          type: "coordinate",
-          audience: "lead",
-          channelId: "channel-1",
-          operationId: operationId(),
-          text: "Tell the worker to support Windows",
-          replyToMessageId: null,
-          attachmentDraftIds: [],
-        },
-        actor,
-      ));
-      await vi.waitFor(() =>
-        expect(service.store.tasks("channel-1").find((task) => task.instructionTargetId === work.id)?.state).toBe(
-          outcome === "accepted" ? "completed" : outcome === "rejected" ? "queued" : "paused",
+      generate.mockReturnValue(
+        Effect.succeed(
+          JSON.stringify({
+            reply: "I will pass that instruction to the worker.",
+            actions: [{ kind: "instruct", taskId: work.id, instruction: "Support Windows too" }],
+          }),
         ),
+      );
+      await runChannel(
+        service.command(
+          {
+            type: "coordinate",
+            audience: "lead",
+            channelId: "channel-1",
+            operationId: operationId(),
+            text: "Tell the worker to support Windows",
+            replyToMessageId: null,
+            attachmentDraftIds: [],
+          },
+          actor,
+        ),
+      );
+      await vi.waitFor(() =>
+        expect(
+          service.store
+            .tasks("channel-1")
+            .find((task) => task.id !== work.id && task.instruction.includes("Support Windows too"))?.state,
+        ).toBe(outcome === "accepted" ? "completed" : outcome === "rejected" ? "queued" : "paused"),
       );
       expect(steer).toHaveBeenCalledTimes(1);
       expect(interrupt).not.toHaveBeenCalled();
@@ -320,6 +336,199 @@ describe("shared channel coordination", () => {
     },
   );
 
+  it.each(["coordinate", "response", "instruction"] as const)(
+    "keeps a released explicit send as ordinary work when replying to a %s result",
+    async (execution) => {
+      const work = await send("Prepare the result");
+      const assignment = required(service.store.assignments("channel-1")[0]);
+      await runChannel(data.mailbox.markTerminal(required(assignment.deliveryId), "completed"));
+      service.store.update(service.store.get("channel-1"), {
+        assignments: [{ ...assignment, state: "completed" }],
+        tasks: [
+          { ...work, execution, state: "completed", instructionTargetId: "old-target", instructionTargetRevision: 0 },
+        ],
+        messages: [
+          {
+            id: "disposable-result",
+            channelId: "channel-1",
+            sequence: 0,
+            author: { kind: "agent", id: "agent-a", name: "A" },
+            taskId: work.id,
+            superseded: false,
+            message: {
+              id: "disposable-result",
+              author: "assistant",
+              text: "Recorded result",
+              status: "completed",
+              createdAt: new Date().toISOString(),
+            },
+          },
+        ],
+      });
+      const steer = vi.fn(() => Effect.tryPromise({ try: async () => "accepted" as const, catch: channelFailure }));
+      service.hooks.steer = steer;
+      await runChannel(
+        service.command(
+          {
+            type: "send",
+            channelId: "channel-1",
+            operationId: operationId(),
+            text: "Check this result",
+            recipientAgentId: "agent-b",
+            replyToMessageId: "disposable-result",
+            attachmentDraftIds: [],
+          },
+          actor,
+        ),
+      );
+      await vi.waitFor(() =>
+        expect(
+          service.store.assignments("channel-1").some((item) => item.agentId === "agent-b" && item.deliveryId),
+        ).toBe(true),
+      );
+      const delivery = required(data.mailbox.nextQueued("agent-b"));
+      const packet = required(await runChannel(service.prepare(delivery)));
+      expect(packet.text).toContain("Check this result");
+      expect(packet.text).toContain("Recorded result");
+      expect(service.store.tasks("channel-1").find((task) => task.id === work.id)?.ownerAgentId).toBe("agent-b");
+      expect(steer).not.toHaveBeenCalled();
+      expect(generate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reassigns an uncertain additive instruction through work for the selected member", async () => {
+    const work = await send("Implement the feature");
+    const assignment = required(service.store.assignments("channel-1")[0]);
+    const deliveryId = required(assignment.deliveryId);
+    await runChannel(service.prepare(required(data.mailbox.getDelivery(deliveryId))));
+    await runChannel(data.mailbox.markStarting(deliveryId));
+    await runChannel(data.mailbox.markRunning(deliveryId, "work-turn"));
+    service.accepted(deliveryId, "work-session", "work-turn");
+    const steer = vi.fn(() => Effect.tryPromise({ try: async () => "uncertain" as const, catch: channelFailure }));
+    service.hooks.steer = steer;
+    generate.mockReturnValue(
+      Effect.succeed(
+        JSON.stringify({
+          reply: "",
+          actions: [{ kind: "instruct", taskId: work.id, instruction: "Support Windows too" }],
+        }),
+      ),
+    );
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "lead",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "Add Windows support",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
+    await vi.waitFor(() =>
+      expect(service.store.tasks("channel-1").find((task) => task.execution === "instruction")?.state).toBe("paused"),
+    );
+    const instruction = required(service.store.tasks("channel-1").find((task) => task.execution === "instruction"));
+    await runChannel(
+      service.command(
+        {
+          type: "reassign",
+          channelId: "channel-1",
+          operationId: operationId(),
+          taskId: instruction.id,
+          recipientAgentId: "agent-b",
+        },
+        actor,
+      ),
+    );
+    await runChannel(data.mailbox.markTerminal(deliveryId, "completed"));
+    service.event({
+      type: "turn-completed",
+      agentId: "agent-a",
+      threadId: service.store.context("channel-1", "agent-a").threadId,
+      turnId: "work-turn",
+      status: "completed",
+    });
+    await vi.waitFor(() =>
+      expect(service.store.assignments("channel-1").some((item) => item.agentId === "agent-b" && item.deliveryId)).toBe(
+        true,
+      ),
+    );
+    const packet = required(await runChannel(service.prepare(required(data.mailbox.nextQueued("agent-b")))));
+    expect(packet.text).toContain(`Continue task ${work.id}`);
+    expect(packet.text).toContain("Support Windows too");
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(service.store.tasks("channel-1").find((task) => task.id === work.id)?.ownerAgentId).toBe("agent-a");
+  });
+
+  it("delivers files on an additive continuation instead of text-only steering", async () => {
+    const work = await send("Implement the feature");
+    const assignment = required(service.store.assignments("channel-1")[0]);
+    const deliveryId = required(assignment.deliveryId);
+    await runChannel(service.prepare(required(data.mailbox.getDelivery(deliveryId))));
+    await runChannel(data.mailbox.markStarting(deliveryId));
+    await runChannel(data.mailbox.markRunning(deliveryId, "work-turn"));
+    service.accepted(deliveryId, "work-session", "work-turn");
+    const file = join(root, "specification.txt");
+    await writeFile(file, "Specification bytes");
+    const attachment = required((await data.mailbox.prepareAttachments([file]))[0]);
+    const steer = vi.fn(() => Effect.tryPromise({ try: async () => "accepted" as const, catch: channelFailure }));
+    service.hooks.steer = steer;
+    generate.mockReturnValue(
+      Effect.succeed(
+        JSON.stringify({
+          reply: "",
+          actions: [{ kind: "instruct", taskId: work.id, instruction: "Use the attached specification" }],
+        }),
+      ),
+    );
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "lead",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "Apply this specification",
+          replyToMessageId: null,
+          attachmentDraftIds: [attachment.id],
+        },
+        actor,
+      ),
+    );
+    await vi.waitFor(() =>
+      expect(
+        service.store
+          .tasks("channel-1")
+          .some((task) => task.id !== work.id && task.instruction.startsWith(`Continue task ${work.id}`)),
+      ).toBe(true),
+    );
+    expect(steer).not.toHaveBeenCalled();
+    await runChannel(data.mailbox.markTerminal(deliveryId, "completed"));
+    service.event({
+      type: "turn-completed",
+      agentId: "agent-a",
+      threadId: service.store.context("channel-1", "agent-a").threadId,
+      turnId: "work-turn",
+      status: "completed",
+    });
+    await vi.waitFor(() =>
+      expect(
+        service.store
+          .assignments("channel-1")
+          .some((item) => item.id !== assignment.id && item.agentId === "agent-a" && item.deliveryId),
+      ).toBe(true),
+    );
+    const delivery = required(data.mailbox.nextQueued("agent-a"));
+    const uploaded = required(delivery.delivery.attachments[0]);
+    const path = required(await data.mailbox.resolveAttachment(uploaded.id));
+    expect(await readFile(path.path, "utf8")).toBe("Specification bytes");
+    expect((await runChannel(service.prepare(delivery)))?.text).toContain("Use the attached specification");
+  });
+
   it("does not apply a coordinator decision to work revised while it was thinking", async () => {
     const work = await send("Implement the feature");
     let finish!: (value: string) => void;
@@ -329,29 +538,33 @@ describe("shared channel coordination", () => {
         }),, catch: channelFailure }));
     const steer = vi.fn(() => Effect.tryPromise({ try: async () => "accepted" as const, catch: channelFailure }));
     service.hooks.steer = steer;
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "lead",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "Add Windows support",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "lead",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "Add Windows support",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() => expect(generate).toHaveBeenCalled());
-    await runChannel(service.command(
-      {
-        type: "reassign",
-        channelId: "channel-1",
-        operationId: operationId(),
-        taskId: work.id,
-        recipientAgentId: "agent-b",
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "reassign",
+          channelId: "channel-1",
+          operationId: operationId(),
+          taskId: work.id,
+          recipientAgentId: "agent-b",
+        },
+        actor,
+      ),
+    );
     finish(
       JSON.stringify({ reply: "", actions: [{ kind: "instruct", taskId: work.id, instruction: "Support Windows" }] }),
     );
@@ -374,18 +587,20 @@ describe("shared channel coordination", () => {
           replies.set(agent.id, resolve);
           signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
         }),, catch: channelFailure }));
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "all",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "@all status",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "all",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "@all status",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() => expect(replies.size).toBe(1));
     expect(service.store.tasks("channel-1").filter((task) => task.state === "running")).toHaveLength(1);
     replies.get("agent-a")?.(JSON.stringify({ reply: "Done A" }));
@@ -400,18 +615,20 @@ describe("shared channel coordination", () => {
     service.hooks.canRespond = () => false;
     await runChannel(service.stop());
     service = new ChannelService(data.store.database, data.mailbox, service.hooks);
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "all",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "@all status",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "all",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "@all status",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() => expect(service.store.assignments("channel-1")).toHaveLength(1));
     expect(generate).not.toHaveBeenCalled();
     expect(service.store.tasks("channel-1").every((task) => !task.execution && task.resources.includes("host"))).toBe(
@@ -426,21 +643,25 @@ describe("shared channel coordination", () => {
     service = new ChannelService(data.store.database, data.mailbox, service.hooks);
     const steer = vi.fn(() => Effect.tryPromise({ try: async () => "accepted" as const, catch: channelFailure }));
     service.hooks.steer = steer;
-    generate.mockReturnValue(Effect.succeed(
-      JSON.stringify({ reply: "", actions: [{ kind: "instruct", taskId: work.id, instruction: "More" }] }),
-    ));
-    await runChannel(service.command(
-      {
-        type: "coordinate",
-        audience: "lead",
-        channelId: "channel-1",
-        operationId: operationId(),
-        text: "Add an instruction",
-        replyToMessageId: null,
-        attachmentDraftIds: [],
-      },
-      actor,
-    ));
+    generate.mockReturnValue(
+      Effect.succeed(
+        JSON.stringify({ reply: "", actions: [{ kind: "instruct", taskId: work.id, instruction: "More" }] }),
+      ),
+    );
+    await runChannel(
+      service.command(
+        {
+          type: "coordinate",
+          audience: "lead",
+          channelId: "channel-1",
+          operationId: operationId(),
+          text: "Add an instruction",
+          replyToMessageId: null,
+          attachmentDraftIds: [],
+        },
+        actor,
+      ),
+    );
     await vi.waitFor(() =>
       expect(
         service.store

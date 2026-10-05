@@ -482,7 +482,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
   });
   const name = (id: string | null) =>
     agentList().find((agent) => agent.id === id)?.name ?? t("sidebar.section.unassigned");
-  /** One status and control per run. Stop and resume also affect its child tasks. */
+  /** Group active and stopped branches separately so a waiting parent cannot hide child recovery. */
   const pausedTasks = createMemo(() => {
     const page = channels.state.page;
     if (!page || page.channel.archived) return [];
@@ -494,12 +494,13 @@ export function ChannelConversation(props: ChannelConversationProps) {
         task.state === "paused" ||
         task.state === "failed",
     );
-    const roots = new Map<string, (typeof stopped)[number]>();
-    for (const task of stopped) {
-      const known = roots.get(task.rootTaskId);
-      if (!known || task.id === task.rootTaskId) roots.set(task.rootTaskId, task);
-    }
-    return [...roots.values()];
+    const byId = new Map(stopped.map((task) => [task.id, task]));
+    const active = (task: (typeof stopped)[number]) =>
+      task.state === "queued" || task.state === "running" || task.state === "waiting";
+    return stopped.filter((task) => {
+      const parent = task.parentTaskId ? byId.get(task.parentTaskId) : undefined;
+      return !parent || active(task) !== active(parent);
+    });
   });
   // The sub-tasks that an owner waits for, above the composer, as the agent chat shows its questions.
   const awaitingSubtasks = createMemo(() => {

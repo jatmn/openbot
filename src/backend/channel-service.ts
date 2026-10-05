@@ -23,8 +23,8 @@ import {
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { Deferred, Effect, Exit, Fiber, Result, Schema, Scope } from "effect";
+import { ChannelCoordination, instructionContinuation } from "./channel-coordination";
 import { type ChannelOperationError, channelFailure, channelResult, channelSync } from "./channel-effects";
-import { ChannelCoordination } from "./channel-coordination";
 import { ChannelHistory, type ChannelTextModel } from "./channel-history";
 import { ChannelMemoryStore } from "./channel-memory-store";
 import { type ChannelAssignment, ChannelStore } from "./channel-store";
@@ -129,6 +129,7 @@ export class ChannelService {
     this.#coordination = new ChannelCoordination({
       scope: () => this.#scope,
       store: this.store,
+      memories: this.memories,
       agents: hooks.agents,
       generate: hooks.generate,
       canGenerate: (reserved) => hooks.canGenerate?.(reserved + this.#routingGenerations) ?? true,
@@ -381,9 +382,7 @@ export class ChannelService {
       message.taskId = null;
       message.message.replyToMessageId = command.replyToMessageId;
       if (committed) message.message.attachments = committed.attachments;
-      const result = yield* channelSync(() =>
-        this.store.update(current, { messages: [message], tasks }, operationId),
-      );
+      const result = yield* channelSync(() => this.store.update(current, { messages: [message], tasks }, operationId));
       this.publish(current.id);
       yield* this.wake(current.id);
       return result;
@@ -439,6 +438,11 @@ export class ChannelService {
       const task = previous
         ? {
             ...previous,
+            // Released send starts ordinary work, even when replying to a disposable task.
+            execution: undefined,
+            instructionTargetId: undefined,
+            instructionTargetRevision: undefined,
+            resources: previous.execution ? ["host"] : previous.resources,
             instruction: text,
             dependencies: [],
             requestMessageId: id,
@@ -530,7 +534,9 @@ export class ChannelService {
         : branch;
     const updated = affected.map(
       (task): ChannelTask => ({
-        ...task,
+        ...(command.type === "reassign" && task.id === selected.id && task.execution === "instruction"
+          ? instructionContinuation(task)
+          : task),
         state: command.type === "stop" ? "paused" : "queued",
         error: null,
         revision: task.revision + 1,
@@ -1259,8 +1265,9 @@ export class ChannelService {
    * Takes every agent without a record out of each channel's members. Agent deletion calls this, and
    * so does startup, for members that older versions and an interrupted deletion left behind.
    *
-   * The lead moves the way the settings panel moves it: to the first member that stays. A task the
-   * deleted agent owned needs nothing here, because the pump pauses a task whose owner is gone.
+   * The lead moves the way the settings panel moves it: to the first member that stays. Ordinary
+   * queued work is paused by the pump. Disposable work has no mailbox turn, so pause it here before
+   * removing its owner and abort its in-memory run.
    */
   removeDeletedMembers(agentIds: ReadonlySet<string>): void {
     for (const channelId of this.store.ids()) {
@@ -1270,7 +1277,21 @@ export class ChannelService {
       const leadAgentId = members.some((member) => member.agentId === channel.leadAgentId)
         ? channel.leadAgentId
         : (members[0]?.agentId ?? null);
-      this.store.update({ ...channel, members, leadAgentId });
+      const removed = this.store
+        .tasks(channelId)
+        .filter((task) => task.execution && task.ownerAgentId && !agentIds.has(task.ownerAgentId) && !terminal(task));
+      this.store.update(
+        { ...channel, members, leadAgentId },
+        {
+          tasks: removed.map((task) => ({
+            ...task,
+            state: "paused",
+            revision: task.revision + 1,
+            error: sourceText("error.backend.channelAssigneeUnavailable"),
+          })),
+        },
+      );
+      this.#dispatchEvent(this.#coordination.interrupt(removed));
       this.publish(channelId);
     }
   }
@@ -1965,13 +1986,21 @@ export class ChannelService {
     const task = (yield* channelSync(() => this.store.tasks(instruction.channelId))).find(
       (task) => task.id === instruction.instructionTargetId,
     );
-    if (!task || task.revision !== instruction.instructionTargetRevision || !task.ownerAgentId)
+    if (
+      !task ||
+      task.revision !== instruction.instructionTargetRevision ||
+      !task.ownerAgentId ||
+      task.ownerAgentId !== instruction.ownerAgentId
+    )
       return yield* channelFailure(new Error(sourceText("error.backend.channelAssignmentStopped")));
     const text = `${task.instruction}
 
 Follow-up instruction: ${instruction.instruction}`;
     if (text.length > INPUT_LIMITS.messageText)
       return yield* channelFailure(new Error(sourceText("error.backend.channelInstructionTooLong")));
+    // Steering is text-only. Rejected instructions use normal durable attachment delivery.
+    const request = yield* channelSync(() => this.store.message(instruction.channelId, instruction.requestMessageId));
+    if (request?.message.attachments?.length) return "rejected";
     const assignment = (yield* channelSync(() => this.store.assignments(task.channelId))).find(
       (item) => item.taskId === task.id && item.state === "running" && item.turnId,
     );

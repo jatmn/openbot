@@ -24,6 +24,7 @@ import { decodeTeamProtocolV2Json, type TeamProtocolV2Json } from "@openbot/cont
 import { sourceText } from "@openbot/i18n/source";
 import type { RemoteFileUpload } from "@openbot/team-client/remote-peer";
 import { replaceEqualDeep } from "@tanstack/react-query";
+import { RemoteRequestError } from "../../../shared/lib/remote-request-error";
 import { answeredPromptResolution } from "../../chat/model/question-prompt";
 
 export type ChannelRequest = <T>(
@@ -414,6 +415,62 @@ export class MobileChannelStore {
       }
     }
     return result;
+  }
+  /** Stop the active branches from this request; a task that finishes needs no stop. */
+  async stopActiveTasks(serverId: string, channelId: string, operationId: () => string) {
+    const entry = this.entry(serverId);
+    // A shared refresh can have started before the task finishes. Verify with a new read,
+    // and publish that page without discarding history the reader already loaded.
+    const read = async () => {
+      const page = await this.request("POST", CHANNEL_ROUTES.read, decodeChannelPage, { channelId }, serverId);
+      const current = entry.state.pages.get(channelId);
+      if (
+        entry.valid &&
+        entry.observed.has(channelId) &&
+        (!current || page.channel.revision >= current.channel.revision)
+      ) {
+        const merged = mergeLatestChannelPage(current, page);
+        if (merged !== current) {
+          const pages = new Map(entry.state.pages);
+          pages.set(channelId, merged);
+          this.publish(entry, { pages });
+        }
+      }
+      return page;
+    };
+    const active = new Map(
+      (this.get(serverId).pages.get(channelId)?.tasks ?? [])
+        .filter((task) => task.state === "queued" || task.state === "running" || task.state === "waiting")
+        .map((task) => [task.id, task]),
+    );
+    for (const task of active.values()) {
+      if (task.parentTaskId && active.has(task.parentTaskId)) continue;
+      const terminal = (page: ChannelPage) => {
+        const current = page.tasks.find((item) => item.id === task.id);
+        return current?.state === "completed" || current?.state === "cancelled";
+      };
+      if (terminal(await read())) continue;
+      try {
+        await this.command(serverId, {
+          type: "stop",
+          operationId: operationId(),
+          channelId,
+          taskId: task.id,
+          recipientAgentId: null,
+        });
+      } catch (error) {
+        // Released hosts return 500 if a task completes between the read and Stop. Never
+        // discard a connection or permission failure, or a failure for work still active.
+        if (!(error instanceof RemoteRequestError) || error.status !== 500) throw error;
+        let latest: ChannelPage;
+        try {
+          latest = await read();
+        } catch {
+          throw error;
+        }
+        if (!terminal(latest)) throw error;
+      }
+    }
   }
   memories(serverId: string, channelId: string) {
     return this.request("POST", CHANNEL_ROUTES.memories, decodeChannelMemories, { channelId }, serverId);
