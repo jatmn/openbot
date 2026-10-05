@@ -760,7 +760,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         return (
           (hostMemory?.level() ?? "ok") === "ok" &&
           generations < 3 &&
-          (hostMemory === null || this.#mailbox.unresolvedDeliveries().length + generations < hostMemory.turnLimit())
+          (hostMemory === null || this.#drain.occupiedTurnCount() + generations < hostMemory.turnLimit())
         );
       },
       normalBusy: () =>

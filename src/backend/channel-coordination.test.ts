@@ -1,3 +1,6 @@
+import { runChannel } from "./channel-test-runtime";
+import { Effect } from "effect";
+import { channelFailure } from "./channel-effects";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,23 +19,23 @@ const generate = vi.fn<ChannelTextModel>();
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "openbot-coordination-"));
   data = stores(root);
-  await data.store.initialize();
-  await data.mailbox.initialize();
-  await data.store.getOrCreate("agent-a");
-  await data.store.getOrCreate("agent-b");
+  await runChannel(data.store.initialize());
+  await runChannel(data.mailbox.initialize());
+  await runChannel(data.store.getOrCreate("agent-a"));
+  await runChannel(data.store.getOrCreate("agent-b"));
   generate.mockReset();
   service = new ChannelService(data.store.database, data.mailbox, {
     agents: () => data.store.list(),
     generate,
     busy: () => false,
     schedule: () => {},
-    interrupt: async () => {},
+    interrupt: () => Effect.void,
     changed: () => {},
     error: (error) => {
       throw error;
     },
   });
-  await service.command(
+  await runChannel(service.command(
     {
       type: "save",
       operationId: "create-channel",
@@ -46,11 +49,11 @@ beforeEach(async () => {
       },
     },
     actor,
-  );
+  ));
 });
 
 afterEach(async () => {
-  await service.stop();
+  await runChannel(service.stop());
   data.store.database.close();
   await rm(root, { recursive: true, force: true });
 });
@@ -59,7 +62,7 @@ describe("restricted channel context", () => {
   it.each(["lead", "all"] as const)(
     "retains referenced replies, saved facts and older live work for %s requests",
     async (audience) => {
-      await service.command(
+      await runChannel(service.command(
         {
           type: "send",
           operationId: "start-work",
@@ -70,14 +73,14 @@ describe("restricted channel context", () => {
           attachmentDraftIds: [],
         },
         actor,
-      );
+      ));
       await vi.waitFor(() => expect(service.store.assignments("channel-1")[0]?.deliveryId).toBeTruthy());
       const work = required(service.store.tasks("channel-1")[0]);
       const assignment = required(service.store.assignments("channel-1")[0]);
       const deliveryId = required(assignment.deliveryId);
-      await service.prepare(required(data.mailbox.getDelivery(deliveryId)));
-      await data.mailbox.markStarting(deliveryId);
-      await data.mailbox.markRunning(deliveryId, "release-work-turn");
+      await runChannel(service.prepare(required(data.mailbox.getDelivery(deliveryId))));
+      await runChannel(data.mailbox.markStarting(deliveryId));
+      await runChannel(data.mailbox.markRunning(deliveryId, "release-work-turn"));
       service.accepted(deliveryId, "release-session", "release-work-turn");
 
       const completed: ChannelTask[] = Array.from({ length: 80 }, (_, index) => ({
@@ -104,7 +107,7 @@ describe("restricted channel context", () => {
       }));
       service.store.update(service.store.get("channel-1"), { tasks: completed, messages });
       service.createMemory({ channelId: "channel-1", text: "SAVED_CHANNEL_RELEASE_FACT" });
-      generate.mockImplementation(async (_agent, prompt) => {
+      generate.mockImplementation((_agent, prompt) => Effect.tryPromise({ try: async () => {
         const hasContext = [
           "ORIGINAL_RELEASE_PLAN",
           "SELECTED_PLAN_REPLY",
@@ -117,8 +120,8 @@ describe("restricted channel context", () => {
           reply: hasContext ? "The plan and release facts are recorded; work is running." : "Context is missing.",
           ...(audience === "lead" ? { actions: [] } : {}),
         });
-      });
-      await service.command(
+      }, catch: channelFailure }));
+      await runChannel(service.command(
         {
           type: "coordinate",
           operationId: "reply-to-plan",
@@ -129,7 +132,7 @@ describe("restricted channel context", () => {
           attachmentDraftIds: [],
         },
         actor,
-      );
+      ));
       await vi.waitFor(() =>
         expect(
           service.store

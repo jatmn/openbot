@@ -209,32 +209,46 @@ export class ChannelCoordination {
       if (!this.current(task, signal)) return;
       if (task.execution === "instruction") {
         const outcome = channelResult(yield* Effect.result(this.#options.instruct(task)));
-        if (!this.current(task, signal)) return;
+        // A sent instruction can take effect after Stop. Keep its receipt even when
+        // generation results would be stale, without replacing a newer request.
+        if (!store.exists(task.channelId)) return;
+        const latest = store.tasks(task.channelId).find((item) => item.id === task.id);
+        const sameInstruction =
+          latest?.execution === "instruction" &&
+          latest.requestMessageId === task.requestMessageId &&
+          latest.instructionTargetId === task.instructionTargetId &&
+          latest.instructionTargetRevision === task.instructionTargetRevision &&
+          latest.instruction === task.instruction &&
+          latest.ownerAgentId === task.ownerAgentId;
+        if (outcome === "rejected" && !this.current(task, signal)) return;
         const next: ChannelTask =
           outcome === "rejected"
             ? {
-                ...instructionContinuation(task),
+                ...instructionContinuation(latest ?? task),
                 state: "queued",
               }
             : {
-                ...task,
+                ...(latest ?? task),
                 state: outcome === "accepted" ? "completed" : "paused",
                 error: outcome === "uncertain" ? sourceText("error.backend.channelInstructionUncertain") : null,
               };
         store.update(store.get(task.channelId), {
-          tasks: [next],
+          tasks: sameInstruction ? [next] : [],
           messages: [
-            this.#options.message(
-              task,
-              agent,
-              sourceText(
-                outcome === "accepted"
-                  ? "status.agent.channelInstructionAccepted"
-                  : outcome === "rejected"
-                    ? "status.agent.channelInstructionQueued"
-                    : "status.agent.channelInstructionUncertain",
+            {
+              ...this.#options.message(
+                task,
+                agent,
+                sourceText(
+                  outcome === "accepted"
+                    ? "status.agent.channelInstructionAccepted"
+                    : outcome === "rejected"
+                      ? "status.agent.channelInstructionQueued"
+                      : "status.agent.channelInstructionUncertain",
+                ),
               ),
-            ),
+              superseded: !sameInstruction,
+            },
           ],
         });
         return;

@@ -336,6 +336,139 @@ describe("shared channel coordination", () => {
     },
   );
 
+  it.each([
+    ["stop", "accepted"],
+    ["stop", "uncertain"],
+    ["stop", "rejected"],
+    ["archive", "accepted"],
+    ["archive", "uncertain"],
+    ["archive", "rejected"],
+    ["remove", "accepted"],
+    ["remove", "uncertain"],
+    ["reassign", "accepted"],
+    ["reassign", "uncertain"],
+    ["reassign", "rejected"],
+    ["invalid-reassign", "rejected"],
+    ["resume", "accepted"],
+    ["resume", "uncertain"],
+  ] as const)("retains a pending %s instruction's %s receipt without replay", async (control, outcome) => {
+    const work = await send("Implement the feature");
+    const assignment = required(service.store.assignments("channel-1")[0]);
+    const deliveryId = required(assignment.deliveryId);
+    await runChannel(service.prepare(required(data.mailbox.getDelivery(deliveryId))));
+    await runChannel(data.mailbox.markStarting(deliveryId));
+    await runChannel(data.mailbox.markRunning(deliveryId, "work-turn"));
+    service.accepted(deliveryId, "work-session", "work-turn");
+    let confirmSteering: ((outcome: "accepted" | "rejected" | "uncertain") => void) | undefined;
+    const steering = new Promise<"accepted" | "rejected" | "uncertain">((resolve) => {
+      confirmSteering = resolve;
+    });
+    const steer = vi.fn(() => steering);
+    service.hooks.steer = steer;
+    generate.mockReturnValue(Effect.succeed(
+      JSON.stringify({
+        reply: "",
+        actions: [{ kind: "instruct", taskId: work.id, instruction: "Support Windows too" }],
+      }),
+    ));
+    await runChannel(service.command(
+      {
+        type: "coordinate",
+        audience: "lead",
+        channelId: "channel-1",
+        operationId: operationId(),
+        text: "Add Windows support",
+        replyToMessageId: null,
+        attachmentDraftIds: [],
+      },
+      actor,
+    ));
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce());
+    const instruction = required(service.store.tasks("channel-1").find((task) => task.execution === "instruction"));
+    const action = {
+      channelId: "channel-1",
+      operationId: operationId(),
+      taskId: instruction.id,
+      recipientAgentId: null,
+    };
+    let pending: Promise<unknown>;
+    let stopping: Promise<unknown> | undefined;
+    if (control === "archive")
+      pending = runChannel(service.command({ type: "archive", channelId: "channel-1", operationId: operationId() }, actor));
+    else if (control === "remove")
+      pending = runChannel(service.command(
+        {
+          type: "save",
+          channelId: "channel-1",
+          operationId: operationId(),
+          draft: { ...draft, members: [{ agentId: "agent-b" }], leadAgentId: "agent-b" },
+        },
+        actor,
+      ));
+    else if (control === "resume") {
+      stopping = runChannel(service.command({ ...action, type: "stop" }, actor));
+      pending = runChannel(service.command({ ...action, operationId: operationId(), type: "resume" }, actor));
+    } else
+      pending = runChannel(service.command(
+        {
+          ...action,
+          type: control === "invalid-reassign" ? "reassign" : control,
+          recipientAgentId:
+            control === "invalid-reassign" ? "missing-member" : control === "reassign" ? "agent-b" : null,
+        },
+        actor,
+      ));
+    // Attach rejection handling before delivering the provider result.
+    const settled = pending.then(
+      () => null,
+      (error: Error) => error,
+    );
+    if (control !== "reassign" && control !== "invalid-reassign")
+      await vi.waitFor(() =>
+        expect(service.store.tasks("channel-1").find((task) => task.id === instruction.id)?.revision).toBeGreaterThan(
+          0,
+        ),
+      );
+    required(confirmSteering)(outcome);
+    const error = await settled;
+    await stopping;
+    await vi.waitFor(() => expect(service.responseCount()).toBe(0));
+    const receipt = required(service.store.tasks("channel-1").find((task) => task.id === instruction.id));
+    if (outcome === "accepted") {
+      expect(receipt.state).toBe("completed");
+      if (control === "reassign" || control === "resume") expect(error).toBeInstanceOf(Error);
+      if (control !== "archive" && control !== "remove")
+        expect(service.store.tasks("channel-1").find((task) => task.id === work.id)?.instruction).toContain(
+          "Support Windows too",
+        );
+    } else if (outcome === "uncertain") {
+      expect(receipt.state).toBe("paused");
+      expect(receipt.error).toContain("confirmed");
+      if (control === "reassign" || control === "resume") expect(error).toBeInstanceOf(Error);
+    } else expect(receipt.state).toBe(control === "reassign" || control === "invalid-reassign" ? "queued" : "paused");
+    expect(receipt.ownerAgentId).toBe(control === "reassign" && outcome === "rejected" ? "agent-b" : "agent-a");
+    expect(steer).toHaveBeenCalledOnce();
+    if (control === "invalid-reassign") expect(error).toBeInstanceOf(Error);
+    if (control === "archive")
+      await runChannel(service.command({ type: "restore", channelId: "channel-1", operationId: operationId() }, actor));
+    if (outcome === "accepted" && control === "stop") {
+      await expect(runChannel(service.command({ ...action, operationId: operationId(), type: "resume" }, actor))).rejects.toThrow();
+      await expect(
+        runChannel(service.command(
+          { ...action, operationId: operationId(), type: "reassign", recipientAgentId: "agent-b" },
+          actor,
+        )),
+      ).rejects.toThrow();
+    }
+    expect(service.store.assignments("channel-1").filter((item) => item.taskId === instruction.id)).toHaveLength(0);
+    if (outcome !== "rejected")
+      expect(
+        service.store
+          .messages("channel-1")
+          .some((entry) => entry.taskId === instruction.id && entry.author.kind === "agent"),
+      ).toBe(true);
+  });
+
   it.each(["coordinate", "response", "instruction"] as const)(
     "keeps a released explicit send as ordinary work when replying to a %s result",
     async (execution) => {

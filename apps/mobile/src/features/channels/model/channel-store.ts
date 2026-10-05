@@ -406,7 +406,8 @@ export class MobileChannelStore {
             : [...entry.state.channels, summary],
         });
       }
-      if (options?.waitForRefresh && command.type === "send") await this.refreshHistory(serverId, result.id);
+      if (options?.waitForRefresh && (command.type === "send" || command.type === "coordinate"))
+        await this.refreshHistory(serverId, result.id);
       else if (options?.waitForRefresh && (command.type === "resume" || command.type === "reassign"))
         await this.refreshHistory(serverId, result.id, sourceText("error.remote.taskHistoryRefreshFailed"));
       else {

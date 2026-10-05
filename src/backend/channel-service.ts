@@ -523,6 +523,28 @@ export class ChannelService {
       const recipientAgentId = command.recipientAgentId;
       yield* channelSync(() => this.requireMember(channel, recipientAgentId));
     }
+    if (command.type !== "stop") {
+      const pending = descendants(tasks, selected.id).filter(
+        (task) => task.execution === "instruction" && this.#coordination.owns(task.id),
+      );
+      if (pending.length) {
+        // Recovery must first know whether an instruction has already reached its worker.
+        yield* this.#coordination.interrupt(pending);
+        const latest = yield* channelSync(() => this.store.tasks(channel.id));
+        if (latest.find((task) => task.id === selected.id)?.revision !== selected.revision)
+          return yield* channelFailure(new Error(sourceText("error.backend.channelAssignmentStopped")));
+        if (
+          pending.some(
+            (task) =>
+              latest.find((item) => item.id === task.id)?.error ===
+              sourceText("error.backend.channelInstructionUncertain"),
+          )
+        )
+          return yield* channelFailure(new Error(sourceText("error.backend.channelInstructionUncertain")));
+        // Stop/archive can commit during the wait. Re-read all command guards and ownership.
+        return yield* this.apply(command, actor);
+      }
+    }
     // `stop` and `resume` hold the whole run below the selected task. `reassign` gives one task
     // another owner, but it must start the rest of the stopped run with it: a parent waits for each
     // task it delegated, so a root that started alone would wait for a stopped child for ever. A

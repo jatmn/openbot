@@ -955,29 +955,35 @@ describe("channel data in the shared chat", () => {
     ]);
   });
 
-  it("returns a history-only retry after acceptance and keeps it pending through failed reads", async () => {
-    let failRead = false;
-    const { store, calls } = fixture(async (path) => {
-      if (path === CHANNEL_ROUTES.list) return [channel];
-      if (path === CHANNEL_ROUTES.command) return channel;
-      if (failRead) throw new Error("Offline");
-      return page(1, 2);
-    });
-    const stop = store.observe("host-one", channel.id);
-    await store.refresh("host-one");
-    const cached = store.get("host-one").pages.get(channel.id);
-    failRead = true;
-    const sender = new ChannelSend(store, "host-one", channel.id, () => "accepted");
-    const receipt = await sender.send("Hello", [], null, channel.members);
-    expect(receipt).not.toBeNull();
-    if (!receipt) throw new Error("Expected a pending history receipt");
-    expect(store.get("host-one").pages.get(channel.id)).toBe(cached);
-    await expect(receipt.refreshHistory()).rejects.toThrow("chat history could not refresh");
-    failRead = false;
-    await receipt.refreshHistory();
-    expect(calls.mock.calls.filter(([path]) => path === CHANNEL_ROUTES.command)).toHaveLength(1);
-    stop();
-  });
+  it.each(["send", "lead", "all"] as const)(
+    "returns a history-only retry after accepted %s and keeps it pending through failed reads",
+    async (mode) => {
+      let failRead = false;
+      const { store, calls } = fixture(async (path) => {
+        if (path === CHANNEL_ROUTES.list) return [channel];
+        if (path === CHANNEL_ROUTES.command || path === CHANNEL_COORDINATION_ROUTE) return channel;
+        if (failRead) throw new Error("Offline");
+        return page(1, 2);
+      });
+      if (mode !== "send") store.configure("host-one", [CHANNEL_CHATS_CAPABILITY, CHANNEL_COORDINATION_CAPABILITY]);
+      const stop = store.observe("host-one", channel.id);
+      await store.refresh("host-one");
+      const cached = store.get("host-one").pages.get(channel.id);
+      failRead = true;
+      const sender = new ChannelSend(store, "host-one", channel.id, () => "accepted");
+      const receipt = await sender.send(mode === "all" ? "@all Hello" : "Hello", [], null, channel.members);
+      expect(receipt).not.toBeNull();
+      if (!receipt) throw new Error("Expected a pending history receipt");
+      expect(store.get("host-one").pages.get(channel.id)).toBe(cached);
+      await expect(receipt.refreshHistory()).rejects.toThrow("chat history could not refresh");
+      failRead = false;
+      await receipt.refreshHistory();
+      expect(
+        calls.mock.calls.filter(([path]) => path === CHANNEL_ROUTES.command || path === CHANNEL_COORDINATION_ROUTE),
+      ).toHaveLength(1);
+      stop();
+    },
+  );
 
   it("uses a new operation when the restored draft changes", async () => {
     const { store } = fixture(async () => [channel]);

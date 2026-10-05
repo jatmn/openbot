@@ -574,7 +574,7 @@ export function createWebWorkspaceRuntime(
       },
       async channelCommand(command) {
         const channel = await channels.channelCommand(command);
-        if (command.type === "send") removeCompletedDrafts(command.attachmentDraftIds);
+        if (command.type === "send" || command.type === "coordinate") removeCompletedDrafts(command.attachmentDraftIds);
         return channel;
       },
     },
