@@ -299,7 +299,7 @@ function StoppedTaskConversation(props: {
           <div class="composer-input-label">
             <ComposerEditor
               agentId={undefined}
-              channelGroupMentions={props.active}
+              channelGroupMentions={props.active === true}
               agents={STORY_AGENTS}
               value={state.text}
               placeholder="Message Project room"

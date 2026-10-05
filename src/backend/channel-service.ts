@@ -23,7 +23,7 @@ import {
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { Deferred, Effect, Exit, Fiber, Result, Schema, Scope } from "effect";
-import { ChannelCoordination, instructionContinuation } from "./channel-coordination";
+import { ChannelCoordination, instructionContinuation, ordinaryChannelTask } from "./channel-coordination";
 import { type ChannelOperationError, channelFailure, channelResult, channelSync } from "./channel-effects";
 import { ChannelHistory, type ChannelTextModel } from "./channel-history";
 import { ChannelMemoryStore } from "./channel-memory-store";
@@ -133,8 +133,8 @@ export class ChannelService {
       agents: hooks.agents,
       generate: hooks.generate,
       canGenerate: (reserved) => hooks.canGenerate?.(reserved + this.#routingGenerations) ?? true,
-      canRespond: hooks.canRespond,
-      reserve: hooks.reserveGeneration,
+      ...(hooks.canRespond ? { canRespond: hooks.canRespond } : {}),
+      ...(hooks.reserveGeneration ? { reserve: hooks.reserveGeneration } : {}),
       busy: (agentId) =>
         hooks.busy(agentId) ||
         this.store
@@ -437,11 +437,8 @@ export class ChannelService {
           : undefined;
       const task = previous
         ? {
-            ...previous,
+            ...ordinaryChannelTask(previous),
             // Released send starts ordinary work, even when replying to a disposable task.
-            execution: undefined,
-            instructionTargetId: undefined,
-            instructionTargetRevision: undefined,
             resources: previous.execution ? ["host"] : previous.resources,
             instruction: text,
             dependencies: [],

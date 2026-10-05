@@ -67,14 +67,20 @@ interface ChannelCoordinationOptions {
   wake(): Effect.Effect<void, ChannelOperationError>;
 }
 
+/** Clears disposable execution metadata while preserving the underlying work request. */
+export function ordinaryChannelTask(task: ChannelTask): ChannelTask {
+  const work = { ...task };
+  delete work.execution;
+  delete work.instructionTargetId;
+  delete work.instructionTargetRevision;
+  return work;
+}
+
 /** Returns an additive instruction to the existing work and attachment delivery path. */
 export function instructionContinuation(task: ChannelTask): ChannelTask {
   return {
-    ...task,
+    ...ordinaryChannelTask(task),
     instruction: `Continue task ${task.instructionTargetId}. Apply this additional instruction to its existing result; do not repeat completed actions. Read the referenced request and channel history first.\n\n${task.instruction}`,
-    execution: undefined,
-    instructionTargetId: undefined,
-    instructionTargetRevision: undefined,
     resources: ["host"],
   };
 }
@@ -160,9 +166,9 @@ export class ChannelCoordination {
       this.#options.store.update(this.#options.store.get(task.channelId), {
         tasks: [
           {
-            ...task,
+            ...(task.execution === "response" ? ordinaryChannelTask(task) : task),
             ...(task.execution === "response"
-              ? { execution: undefined, state: "queued" as const, resources: ["host"] }
+              ? { state: "queued" as const, resources: ["host"] }
               : { state: "paused" as const, error: sourceText("error.backend.channelRestrictedProviderRequired") }),
           },
         ],
@@ -301,7 +307,7 @@ export class ChannelCoordination {
         task.execution === "response" &&
         store.message(task.channelId, task.requestMessageId)?.message.attachments?.length
       ) {
-        store.update(channel, { tasks: [{ ...task, execution: undefined, state: "queued", resources: ["host"] }] });
+        store.update(channel, { tasks: [{ ...ordinaryChannelTask(task), state: "queued", resources: ["host"] }] });
         return;
       }
       const schema = task.execution === "coordinate" ? DECISION.describe() : RESPONSE.describe();
@@ -321,7 +327,7 @@ export class ChannelCoordination {
           store.get(task.channelId),
           "work" in response
             ? {
-                tasks: [{ ...task, execution: undefined, state: "queued", resources: ["host"] }],
+                tasks: [{ ...ordinaryChannelTask(task), state: "queued", resources: ["host"] }],
               }
             : {
                 tasks: [{ ...task, state: "completed" }],
@@ -360,14 +366,12 @@ export class ChannelCoordination {
         const next = this.#options.createTask(task.channelId, task.requestMessageId, action.instruction, agentId);
         return {
           ...next,
-          execution:
-            action.kind === "instruct"
-              ? ("instruction" as const)
-              : action.execution === "response"
-                ? ("response" as const)
-                : undefined,
-          instructionTargetId: target?.id,
-          instructionTargetRevision: target?.revision,
+          ...(action.kind === "instruct"
+            ? { execution: "instruction" as const }
+            : action.execution === "response"
+              ? { execution: "response" as const }
+              : {}),
+          ...(target ? { instructionTargetId: target.id, instructionTargetRevision: target.revision } : {}),
           sourceMessageIds: [...new Set([...task.sourceMessageIds, ...(target?.sourceMessageIds ?? [])])].slice(-32),
         };
       });
