@@ -208,7 +208,11 @@ export function createChannelsController(env: ChannelsEnvironment) {
    * reader leaves the scope during the request, it runs at once and the result is `false`: a sent
    * message must still leave the composer, or it comes back as a draft.
    */
-  async function command(input: ChannelCommand, onAccepted?: (accepted: ChannelCommand) => void, bulkStop = false): Promise<boolean> {
+  async function command(
+    input: ChannelCommand,
+    onAccepted?: (accepted: ChannelCommand) => void,
+    bulkStop = false,
+  ): Promise<boolean> {
     const account = env.scopeKey();
     // Only the save that creates a channel opens it, and only while the reader has stayed where
     // the save started. The sidebar takes a click through a save of the settings, and settings

@@ -193,7 +193,8 @@ export class ChannelService {
               }),
             ),
           );
-          const fiber = yield* Effect.forkIn(work, this.#scope, { startImmediately: false, uninterruptible: false });
+          // Enter an available command before a delivery receipt can overtake its recovery guards.
+          const fiber = yield* Effect.forkIn(work, this.#scope, { startImmediately: true, uninterruptible: false });
           this.#commandFibers.add(fiber);
           fiber.addObserver(() => this.#commandFibers.delete(fiber));
           return yield* restore(Fiber.join(fiber));
@@ -837,7 +838,7 @@ export class ChannelService {
                   Effect.gen({ self: this }, function* () {
                     this.#routingGenerations--;
                     yield* this.#releaseHeldAgents();
-                  }),
+                  }).pipe(Effect.orDie),
                 ),
               ),
             ),
@@ -2050,7 +2051,8 @@ Follow-up instruction: ${instruction.instruction}`;
       (item) => item.taskId === task.id && item.state === "running" && item.turnId,
     );
     if (!assignment?.turnId || !this.hooks.steer) return "rejected";
-    const threadId = (yield* channelSync(() => this.store.context(task.channelId, task.ownerAgentId))).threadId;
+    const ownerAgentId = task.ownerAgentId;
+    const threadId = (yield* channelSync(() => this.store.context(task.channelId, ownerAgentId))).threadId;
     const outcome = yield* this.hooks.steer(
       task.ownerAgentId,
       threadId,

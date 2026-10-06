@@ -193,7 +193,7 @@ export class ChannelCoordination {
           this.#runs.delete(task.id);
           release?.();
           yield* this.#options.wake();
-        }),
+        }).pipe(Effect.orDie),
       ),
     );
     const fiber = yield* Effect.forkIn(work, this.#options.scope(), { startImmediately: false });

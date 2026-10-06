@@ -739,7 +739,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
                 Effect.gen({ self: this }, function* () {
                   if (signal) this.#responsiveClients--;
                   yield* this.channels.wake();
-                }),
+                }).pipe(Effect.orDie),
               ),
             );
         }).pipe(toChannelOperationError),

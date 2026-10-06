@@ -36,21 +36,23 @@ describe("Team API channel access", () => {
       await Effect.runPromise(channels.stop());
       data.store.database.close();
     });
-    await Effect.runPromise(channels.command(
-      {
-        type: "save",
-        operationId: "create",
-        channelId: "channel-1",
-        draft: {
-          name: "Team",
-          title: "",
-          instructions: "",
-          members: [{ agentId: "agent-a" }, { agentId: "agent-b" }],
-          leadAgentId: "agent-a",
+    await Effect.runPromise(
+      channels.command(
+        {
+          type: "save",
+          operationId: "create",
+          channelId: "channel-1",
+          draft: {
+            name: "Team",
+            title: "",
+            instructions: "",
+            members: [{ agentId: "agent-a" }, { agentId: "agent-b" }],
+            leadAgentId: "agent-a",
+          },
         },
-      },
-      { id: "host", name: "Host" },
-    ));
+        { id: "host", name: "Host" },
+      ),
+    );
     const { base } = await fixture.start({ channels });
     const token = await fixture.signIn();
     const headers = {

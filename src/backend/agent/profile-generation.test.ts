@@ -10,7 +10,6 @@ import { type ProviderClientOperationError, providerFailure } from "../provider-
 import { ProfileClients } from "./profile-clients";
 import { generateProfile, generateTextWithoutTools, profilePrompt } from "./profile-generation";
 
-
 const draft: AgentProfileDraft = {
   name: "Researcher",
   title: "Research assistant",
@@ -167,13 +166,15 @@ it("aborts a channel generation that has started without waiting for its timeout
     return original(method, params, decode);
   });
   const abort = new AbortController();
-  const generation = runCauseEffect(generateTextWithoutTools(
-    client,
-    { ...model, supportedReasoningEfforts: ["medium"] },
-    "Status",
-    () => false,
-    abort.signal,
-  ));
+  const generation = runCauseEffect(
+    generateTextWithoutTools(
+      client,
+      { ...model, supportedReasoningEfforts: ["medium"] },
+      "Status",
+      () => false,
+      abort.signal,
+    ),
+  );
   const stopped = expect(generation).rejects.toThrow();
   await vi.waitFor(() => expect(started).toBe(true));
   abort.abort();
@@ -186,32 +187,40 @@ it("bounds disposable sessions and cancels queued channel work before it can sta
   const clients = new ProfileClients();
   const finish: (() => void)[] = [];
   const active = Array.from({ length: 3 }, () =>
-    runCauseEffect(clients.run(new ProfileClient(""), () => Effect.promise(() => new Promise<void>((resolve) => finish.push(resolve))))),
+    runCauseEffect(
+      clients.run(new ProfileClient(""), () =>
+        Effect.promise(() => new Promise<void>((resolve) => finish.push(resolve))),
+      ),
+    ),
   );
   await vi.waitFor(() => expect(finish).toHaveLength(3));
   const abort = new AbortController();
   const cancelledClient = new ProfileClient("{}");
-  const queued = runCauseEffect(clients.run(
-    cancelledClient,
-    (cancelled) =>
-      generateTextWithoutTools(
-        cancelledClient,
-        { ...model, supportedReasoningEfforts: ["medium"] },
-        "Status",
-        cancelled,
-        abort.signal,
-      ),
-    abort.signal,
-  ));
+  const queued = runCauseEffect(
+    clients.run(
+      cancelledClient,
+      (cancelled) =>
+        generateTextWithoutTools(
+          cancelledClient,
+          { ...model, supportedReasoningEfforts: ["medium"] },
+          "Status",
+          cancelled,
+          abort.signal,
+        ),
+      abort.signal,
+    ),
+  );
   const rejected = expect(queued).rejects.toThrow();
   expect(cancelledClient.starts).toBe(0);
   abort.abort();
   await rejected;
   expect(cancelledClient.starts).toBe(0);
   const waitingClient = new ProfileClient("Status");
-  const waiting = runCauseEffect(clients.run(waitingClient, (cancelled) =>
-    generateTextWithoutTools(waitingClient, { ...model, supportedReasoningEfforts: ["medium"] }, "Status", cancelled),
-  ));
+  const waiting = runCauseEffect(
+    clients.run(waitingClient, (cancelled) =>
+      generateTextWithoutTools(waitingClient, { ...model, supportedReasoningEfforts: ["medium"] }, "Status", cancelled),
+    ),
+  );
   expect(waitingClient.starts).toBe(0);
   finish[0]?.();
   await expect(waiting).resolves.toBe("Status");

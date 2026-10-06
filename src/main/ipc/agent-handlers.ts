@@ -210,12 +210,14 @@ export function agentIpcHandlers({
             !remoteServers.supportsCapability(serverId, CHANNEL_COORDINATION_CAPABILITY)
           )
             throw new Error(sourceText("error.backend.channelCoordinationUnsupported"));
-          return runCauseEffect(remoteServers.request(
-            serverId,
-            input.type === "coordinate" ? CHANNEL_COORDINATION_ROUTE : CHANNEL_ROUTES.command,
-            decodeChannel,
-            { method: "POST", body: input },
-          ));
+          return runCauseEffect(
+            remoteServers.request(
+              serverId,
+              input.type === "coordinate" ? CHANNEL_COORDINATION_ROUTE : CHANNEL_ROUTES.command,
+              decodeChannel,
+              { method: "POST", body: input },
+            ),
+          );
         },
       }),
       deleteChannel: scopedHandler(parseChannelId, {
