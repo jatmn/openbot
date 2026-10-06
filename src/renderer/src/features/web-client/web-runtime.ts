@@ -389,7 +389,10 @@ export function createWebWorkspaceRuntime(
     const result = await peer.execute({ id: crypto.randomUUID(), type: "request", method, path, body, upload });
     if (disposed || generation !== current) throw new Error(currentText().t("webClient.error.hostChanged"));
     if (!result.ok || (result.status ?? 500) >= 400)
-      throw new Error(hostRefusal(result.status, result.body) ?? currentText().t("webClient.error.requestIncomplete"));
+      throw Object.assign(
+        new Error(hostRefusal(result.status, result.body) ?? currentText().t("webClient.error.requestIncomplete")),
+        { status: result.status },
+      );
     return result.body;
   }
   // The shared Team API requests decode their own responses. A declaration, like `request`, so the

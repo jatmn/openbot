@@ -643,3 +643,57 @@ function required<T>(value: T | null | undefined): T {
   if (value === null || value === undefined) throw new Error("The expected test record is missing.");
   return value;
 }
+
+it.each(["replace", "new-root"] as const)("mobile Stop preserves later %s request identity", async (mode) => {
+  service.hooks.busy = () => true;
+  const send = (operationId: string, recipientAgentId: string, replyToMessageId: string | null = null) =>
+    runChannel(service.command(
+      {
+        type: "send",
+        channelId,
+        operationId,
+        text: operationId,
+        recipientAgentId,
+        replyToMessageId,
+        attachmentDraftIds: [],
+      },
+      actor,
+    ));
+  await send("first-original", "agent-a");
+  await send("second-original", "agent-b");
+  const first = required(service.store.tasks(channelId)[0]);
+  const second = required(service.store.tasks(channelId)[1]);
+  let replaced = false;
+  let laterRequestId = "";
+  const stopped: string[] = [];
+  const request: ChannelRequest = async (_method, path, decode, body) => {
+    if (path === CHANNEL_ROUTES.list) return decode(service.store.list(actor.id));
+    if (path === CHANNEL_ROUTES.read) return decode(service.store.page(channelId));
+    const command = parseChannelCommand(channelRequest(path, body));
+    if (command.type === "stop") {
+      stopped.push(command.taskId);
+      if (command.taskId === first.id && !replaced) {
+        replaced = true;
+        await send("later-request", "agent-b", mode === "replace" ? second.requestMessageId : null);
+        laterRequestId = required(
+          service.store.tasks(channelId).find((task) => task.instruction === "later-request"),
+        ).requestMessageId;
+      }
+    }
+    return decode(await runChannel(service.command(command, actor)));
+  };
+  const mobile = new MobileChannelStore(request);
+  mobile.configure("host", [CHANNEL_CHATS_CAPABILITY]);
+  const dispose = mobile.observe("host", channelId);
+  try {
+    await mobile.refresh("host");
+    let counter = 0;
+    await mobile.stopActiveTasks("host", channelId, () => `bulk-stop-${counter++}`);
+    const later = required(service.store.tasks(channelId).find((task) => task.requestMessageId === laterRequestId));
+    expect(service.store.tasks(channelId).find((task) => task.id === first.id)?.state).toBe("paused");
+    expect(later.state).toBe("queued");
+    expect(stopped).not.toContain(later.id);
+  } finally {
+    dispose();
+  }
+});

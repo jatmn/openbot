@@ -461,7 +461,11 @@ export class MobileChannelStore {
         const current = page.tasks.find((item) => item.id === task.id);
         return current?.state === "completed" || current?.state === "cancelled";
       };
-      if (terminal(await read())) continue;
+      const latest = await read();
+      const current = latest.tasks.find((item) => item.id === task.id);
+      // Released Send can continue this task ID with a later request while another Stop waits.
+      if (current && !requestIds.has(current.requestMessageId)) continue;
+      if (terminal(latest)) continue;
       try {
         await this.command(serverId, {
           type: "stop",

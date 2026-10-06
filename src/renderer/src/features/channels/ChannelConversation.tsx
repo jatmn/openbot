@@ -533,25 +533,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
     }
     return [...runs];
   });
-  /**
-   * One stop at a time, and none after the first that fails: the controller keeps one failed
-   * command for its retry, and a later stop that succeeds would clear the error of the one that
-   * failed.
-   */
-  const stopWork = async () => {
-    const channelId = channels.state.page?.channel.id;
-    if (!channelId) return;
-    for (const taskId of activeRuns()) {
-      const stopped = await channels.command({
-        type: "stop",
-        operationId: crypto.randomUUID(),
-        channelId,
-        taskId,
-        recipientAgentId: null,
-      });
-      if (!stopped) return;
-    }
-  };
+  const stopWork = () => channels.stopActiveTasks(activeRuns());
   const resumeTask = (taskId: string, recipientAgentId: string | null) =>
     channels.command({
       type: recipientAgentId ? "reassign" : "resume",

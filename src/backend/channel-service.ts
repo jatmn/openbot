@@ -148,8 +148,11 @@ export class ChannelService {
           ),
       workCount: (channelId) => this.store.assignments(channelId).filter(activeAssignment).length,
       createTask: (channelId, messageId, text, agentId) => this.newTask(channelId, messageId, text, agentId),
-      message: (task, agent, text) =>
-        this.message(task.channelId, task.id, { kind: "agent", id: agent.id, name: agent.name }, text),
+      message: (task, agent, text) => {
+        const message = this.message(task.channelId, task.id, { kind: "agent", id: agent.id, name: agent.name }, text);
+        if (task.execution !== "instruction") message.message.author = "assistant";
+        return message;
+      },
       instruct: (task) => this.deliverInstruction(task),
       changed: (channelId) => this.publish(channelId),
       wake: () => this.#releaseHeldAgents(),

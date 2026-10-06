@@ -1,3 +1,4 @@
+import type { ChannelPage } from "@openbot/contracts/ipc";
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { assert, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -973,4 +974,112 @@ it.each(["@all", "@everyone"])("keeps %s assignments separate when one member is
   expect(page.tasks).toHaveLength(2);
   expect(page.tasks.find((task) => task.ownerAgentId === "chief")?.state).toBe("paused");
   expect(page.tasks.find((task) => task.ownerAgentId === "sales-outbound")?.state).toBe("queued");
+});
+
+it.each([
+  { scenario: "before read", timing: "before-read", error: null, continues: true },
+  {
+    scenario: "IPC completion",
+    timing: "during-stop",
+    error: new Error("Error invoking remote method: Error: This task is already complete."),
+    continues: true,
+  },
+  {
+    scenario: "remote IPC completion",
+    timing: "during-stop",
+    error: new Error("Error invoking remote method 'agent:channelCommand': Error: Request failed."),
+    continues: true,
+  },
+  {
+    scenario: "HTTP completion",
+    timing: "during-stop",
+    error: Object.assign(new Error("Host request failed"), { status: 500 }),
+    continues: true,
+  },
+  {
+    scenario: "permission failure",
+    timing: "during-stop",
+    error: Object.assign(new Error("Permission denied"), { status: 403 }),
+    continues: false,
+  },
+  { scenario: "connection failure", timing: "during-stop", error: new Error("Connection lost"), continues: false },
+])("Stop tracks assigned work and later requests: $scenario", async ({ timing, error, continues }) => {
+  const chat = await openSavedChannel();
+  await window.openbot.agent.channelCommand({
+    type: "coordinate",
+    audience: "lead",
+    operationId: "coordination-probe",
+    channelId: "channel-test",
+    text: "Please edit the project",
+    replyToMessageId: null,
+    attachmentDraftIds: [],
+  });
+  const initial = await window.openbot.agent.readChannel({ channelId: "channel-test" });
+  const coordinator = initial.tasks[0];
+  assert(coordinator);
+  const reused = {
+    ...coordinator,
+    id: "reused-worker",
+    rootTaskId: "reused-worker",
+    ownerAgentId: "sales-outbound",
+    state: "queued" as const,
+  };
+  const page: ChannelPage = {
+    ...initial,
+    tasks: [{ ...coordinator, execution: "coordinate", state: "running" }, reused],
+  };
+  const originalCommand = window.openbot.agent.channelCommand;
+  const stops: string[] = [];
+  const worker = {
+    ...coordinator,
+    id: "review-worker",
+    rootTaskId: "review-worker",
+    instruction: "Edit the project",
+    state: "queued" as const,
+  };
+  const later = { ...worker, id: "later-worker", rootTaskId: "later-worker", requestMessageId: "later-request" };
+  const complete = () => {
+    page.tasks = [
+      { ...coordinator, execution: "coordinate", state: "completed" },
+      worker,
+      later,
+      { ...reused, requestMessageId: "replaced-request" },
+    ];
+    page.channel = { ...page.channel, revision: page.channel.revision + 1 };
+  };
+  let stopping = false;
+  const originalRead = window.openbot.agent.readChannel;
+  vi.spyOn(window.openbot.agent, "readChannel").mockImplementation(async (input) => {
+    if (input.channelId !== "channel-test") return originalRead(input);
+    if (stopping && timing === "before-read" && page.tasks[0]?.state === "running") complete();
+    return structuredClone(page);
+  });
+  vi.spyOn(window.openbot.agent, "channelCommand").mockImplementation(async (input) => {
+    if (input.type !== "stop") return originalCommand(input);
+    stops.push(input.taskId);
+    if (input.taskId === coordinator.id) {
+      complete();
+      emitAgentEvent?.({ type: "channels-changed", channelId: "channel-test", revision: page.channel.revision });
+      throw error;
+    }
+    page.tasks = page.tasks.map((task) => (task.id === input.taskId ? { ...task, state: "paused" } : task));
+    return page.channel;
+  });
+  emitAgentEvent?.({ type: "channels-changed", channelId: "channel-test", revision: page.channel.revision + 1 });
+  await within(chat).findByRole("region", { name: "Task for Sales Outbound" });
+  stopping = true;
+  await fireEvent.click(within(chat).getByRole("button", { name: "Stop work" }));
+  if (!continues) {
+    assert(error);
+    expect(await within(chat).findByRole("alert")).toHaveTextContent(error.message);
+    expect(page.tasks.find((task) => task.id === worker.id)?.state).toBe("queued");
+    expect(stops).toEqual([coordinator.id]);
+    return;
+  }
+  await waitFor(() => expect(page.tasks.find((task) => task.id === worker.id)?.state).toBe("paused"));
+  expect(page.tasks.find((task) => task.id === reused.id)?.state).toBe("queued");
+  expect(stops).not.toContain(reused.id);
+  expect(page.tasks.find((task) => task.id === later.id)?.state).toBe("queued");
+  expect(stops).not.toContain(later.id);
+  expect(within(chat).queryByRole("alert")).not.toBeInTheDocument();
 });

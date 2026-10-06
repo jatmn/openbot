@@ -6,3 +6,4 @@
 ### Fixed
 
 - Keep ordinary channel work when Send continues a coordinator task. Tasks for removed members stay paused until reassigned.
+- Stop all includes work assigned by the lead while Stop waits and leaves later requests running.
